@@ -271,14 +271,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     /// #112 rework: build an overlay decoder for any embedded subtitle stream (text or
     /// bitmap), seeded exactly like the tap routes. The drainer owns the returned decoder.
-    func makeOverlayDecoder(streamIndex: Int32) -> EmbeddedSubtitleDecoder? {
+    func makeOverlayDecoder(streamIndex: Int32, preserveASSMarkup: Bool) -> EmbeddedSubtitleDecoder? {
         guard let dem = demuxer, let stream = dem.stream(at: streamIndex) else { return nil }
         let w = savedVideoConfig.map { Int32($0.codecpar.pointee.width) } ?? 1920
         let h = savedVideoConfig.map { Int32($0.codecpar.pointee.height) } ?? 1080
         return EmbeddedSubtitleDecoder(stream: stream,
                                        sourceVideoWidth: w > 0 ? w : 1920,
                                        sourceVideoHeight: h > 0 ? h : 1080,
-                                       preserveASSMarkup: preserveASSMarkupForSubtitleTap,
+                                       preserveASSMarkup: preserveASSMarkup,
                                        teletextPage: teletextPageForSubtitleTap)
     }
 

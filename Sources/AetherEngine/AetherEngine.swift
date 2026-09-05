@@ -634,7 +634,10 @@ public final class AetherEngine: ObservableObject {
         didSet {
             // SW-PiP Phase C: flip the frame compositor with the PiP state so subtitles appear in the
             // window and never double-draw under the fullscreen host overlay.
-            softwareHost?.updateSubtitleCompositor(cues: subtitleCues + secondarySubtitleCues, enabled: pictureInPictureActive)
+            softwareHost?.updateSubtitleCompositor(
+                cues: softwarePiPSubtitleCues(primary: subtitleCues, secondary: secondarySubtitleCues),
+                enabled: pictureInPictureActive)
+            refreshInjectedASSSubtitleRendering()
             #if os(tvOS)
             // PiP window closed while backgrounded: nothing keeps the app running anymore, so run the
             // wedge-safe teardown now, before idle suspension (mirrors the iOS pause-while-backgrounded path).
@@ -1869,6 +1872,10 @@ public final class AetherEngine: ObservableObject {
     /// one of these must drive AVMediaSelection, not the sidecar overlay, or the two draw on top of
     /// each other. Empty when no proxy is standing.
     var injectedSubtitleRenditionNames: [Int: String] = [:]
+    /// Injected ASS keeps raw overlay cues locally and a plain native rendition for
+    /// PiP/external playback. Remember the host's surface request across track picks.
+    var injectedSubtitleRenderingRequested = false
+    var injectedSubtitleSelectionTask: Task<Void, Never>?
 
     /// Deferred lazy-reader start while a producer restart is in flight (#93 residual): the
     /// readers' side demuxer competed with the restart for the starved link. Cancelled by
@@ -3330,6 +3337,9 @@ public final class AetherEngine: ObservableObject {
         remoteHLSSubtitleProxy?.tearDown()   // #316
         remoteHLSSubtitleProxy = nil
         injectedSubtitleRenditionNames = [:]
+        injectedSubtitleRenderingRequested = false
+        injectedSubtitleSelectionTask?.cancel()
+        injectedSubtitleSelectionTask = nil
         stallRecoveryWindowUntil = .distantPast
         stallRecoveryReasserts = 0
         stallReengageTask?.cancel()
@@ -5143,6 +5153,9 @@ public final class AetherEngine: ObservableObject {
         remoteHLSSubtitleProxy?.tearDown()
         remoteHLSSubtitleProxy = nil
         injectedSubtitleRenditionNames = [:]
+        injectedSubtitleRenderingRequested = false
+        injectedSubtitleSelectionTask?.cancel()
+        injectedSubtitleSelectionTask = nil
         // Font attachments are session-scoped but must survive stopInternal (audio-track-switch skips the probe;
         // clearing in stopInternal would leave the session with an empty font list after any audio switch).
         fontAttachments = []
@@ -5426,6 +5439,7 @@ public final class AetherEngine: ObservableObject {
                            + "holding the edge until the rebuilt item settles", category: .engine)
             return
         }
+        refreshInjectedASSSubtitleRendering()
         // #315: an already-ready session that only now loses the picture to an external screen gets no further
         // readiness edge, and on the wired path no reload either, so latch here too. No-op once latched.
         if active { latchFirstFrameForExternalPlaybackIfNeeded() }

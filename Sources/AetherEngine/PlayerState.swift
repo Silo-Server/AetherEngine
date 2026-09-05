@@ -434,7 +434,7 @@ public struct LoadOptions: Sendable, Equatable {
     /// it along with the watchdog.
     public var nativeRemoteHLSIngestFallback: Bool
 
-    /// Emit raw ASS event lines (`ReadOrder,Layer,Style,...,Text` including override tags) instead of plain-text extraction. Opt-in for hosts that render ASS styling themselves; pair with `TrackInfo.assHeader`. Only affects ASS / SSA codecs. Default `false` (AetherEngine#30).
+    /// Emit raw primary ASS event lines (`ReadOrder,Layer,Style,...,Text` including override tags) for host styling; pair with `TrackInfo.assHeader` or `sidecarASSHeader`. Secondary subtitles and software PiP retain resolved text. Only affects ASS / SSA codecs. Default `false` (AetherEngine#30).
     public var preserveASSMarkup: Bool
 
     /// Declare a mov_text track in the init moov so text subtitles survive PiP / AirPlay / external display via AVMediaSelection. Bitmap codecs (PGS / DVB / DVD) excluded automatically. Default `false` (#55).

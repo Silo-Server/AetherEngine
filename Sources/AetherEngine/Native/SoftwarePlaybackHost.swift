@@ -842,14 +842,12 @@ final class SoftwarePlaybackHost {
     /// reassembly in the packet store. Captured at load, read by the tap sink per packet.
     private(set) var splitDisplaySetSubtitleStreamIndices: Set<Int32> = []
 
-    /// Host's ASS markup preference for overlay decoders (mirrors the HLS session flag).
-    var preserveASSMarkupForSubtitleTap = false
     var teletextPageForSubtitleTap: Int? = nil
     var deinterlaceConfig = DeinterlaceConfig()
 
     /// #112 rework: build an overlay decoder for any embedded subtitle stream, seeded from the
     /// session's video dims like the HLS tap routes. The drainer owns the returned decoder.
-    func makeOverlayDecoder(streamIndex: Int32) -> EmbeddedSubtitleDecoder? {
+    func makeOverlayDecoder(streamIndex: Int32, preserveASSMarkup: Bool) -> EmbeddedSubtitleDecoder? {
         guard let dem = demuxer, let stream = dem.stream(at: streamIndex) else { return nil }
         let vpar = dem.stream(at: videoStreamIndex)?.pointee.codecpar
         let w = vpar?.pointee.width ?? 1920
@@ -857,7 +855,7 @@ final class SoftwarePlaybackHost {
         return EmbeddedSubtitleDecoder(stream: stream,
                                        sourceVideoWidth: w > 0 ? w : 1920,
                                        sourceVideoHeight: h > 0 ? h : 1080,
-                                       preserveASSMarkup: preserveASSMarkupForSubtitleTap,
+                                       preserveASSMarkup: preserveASSMarkup,
                                        teletextPage: teletextPageForSubtitleTap)
     }
 

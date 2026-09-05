@@ -1614,7 +1614,9 @@ extension AetherEngine {
         Publishers.CombineLatest($subtitleCues, $secondarySubtitleCues)
             .sink { [weak self, weak host] primary, secondary in
                 guard let self, let host else { return }
-                host.updateSubtitleCompositor(cues: primary + secondary, enabled: self.pictureInPictureActive)
+                host.updateSubtitleCompositor(
+                    cues: self.softwarePiPSubtitleCues(primary: primary, secondary: secondary),
+                    enabled: self.pictureInPictureActive)
             }
             .store(in: &softwareCancellables)
         // #131: no demuxable CC track on the SW path either: arm an A53 tap fed by decoded-frame
@@ -1642,7 +1644,6 @@ extension AetherEngine {
         // playhead-paced drainer reads it exactly like the HLS session's store.
         let packetStore = SubtitlePacketStore()
         self.softwareSubtitlePacketStore = packetStore
-        host.preserveASSMarkupForSubtitleTap = loadedOptions.preserveASSMarkup
         host.teletextPageForSubtitleTap = loadedOptions.teletextPage
         host.subtitleTapSink = { idx, pkt, tb, assembleSplitSets in
             packetStore.harvest(streamIndex: idx, packet: pkt, timeBase: tb,

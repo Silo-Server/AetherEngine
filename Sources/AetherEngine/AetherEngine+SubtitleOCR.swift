@@ -80,7 +80,7 @@ extension AetherEngine {
             window = (from, through)
         }
         if subtitleOCRDecoder == nil {
-            subtitleOCRDecoder = makeSubtitleDrainDecoder(streamIndex: streamIndex)
+            subtitleOCRDecoder = makeSubtitleDrainDecoder(streamIndex: streamIndex, channel: .primary)
         }
         guard let decoder = subtitleOCRDecoder else { return closed }
         let entries = packetStore.entries(streamIndex: streamIndex,
