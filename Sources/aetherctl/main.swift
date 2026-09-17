@@ -67,10 +67,11 @@ func printUsage() {
 
     Usage:
       aetherctl probe <url>
-      aetherctl serve [--no-dv] [--force-dv] [--start-position S] <url>
-      aetherctl validate [--no-dv] [--force-dv] <url>
+      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] <url>
+      aetherctl validate [--no-dv] [--force-dv] [--dv-base-layer] <url>
       aetherctl swdecode [--frames N] <url>
       aetherctl play [--seconds N] [--live] [--fast-zap] [--live-start-immediately] [--dvr-window N] [--subs <codec-or-lang>]
+                 [--assert-dv] [--dv-base-layer]
                  [--start-position S] [--switch-audio <index>[@ms]]
                  [--teletext-page N] [--switch-teletext-page <page|auto>[@ms]]
                  [--audio-delay <ms>] [--switch-audio-delay <ms>[@ms]]... [--paused]
@@ -96,13 +97,13 @@ func printUsage() {
                       --reload-applying corrects a LoadOption on the playing
                       session through #460's session-preserving reload, repeatable;
                       keys header.<Name>, audio-bridge, preferred-audio,
-                      decode-path, is-live
+                      decode-path, dolby-vision, is-live
                       (is-live is there to show the refusal: a field that names the
                       session is refused, not silently ignored), default +20 s;
                       --sequential-origin declares a fake-range origin (one unranged
                       GET, no ranged probes) and needs --declared-duration on VOD
                       since the tail estimate is skipped)
-      aetherctl segverify [--from N] [--count K] [--no-dv] [--force-dv] [--dump <dir>] <url>
+      aetherctl segverify [--from N] [--count K] [--no-dv] [--force-dv] [--dv-base-layer] [--dump <dir>] <url>
                           (#92: SW-decode each segment in isolation; framesDecoded==0 => not independent)
       aetherctl disc-inspect <disc.iso>
       aetherctl dovitest <file>
@@ -112,10 +113,10 @@ func printUsage() {
                          (#95: decode the loopback audio track to mono 48k WAV, print continuity stats;
                           --software runs a real session through the SW sink, exit 3 if it yields no audible PCM)
       aetherctl customio [--memory] [--forward-only] [--audio-only] [--reload] [--switch-audio] [--select-subs] [--extract] [--audio-index N] [--reload-decode-path automatic|software] <file>
-      aetherctl customio --live [--rate-kbps N] [--seconds N] [--dvr-window N] [--report-size] [--no-wrap] [--malloc-census] [--foundation-reader] [--host-carry none|removeFirst|subdata] [--reload-at S] [--cancel-latches] [--reload-decode-path automatic|software] <file.ts>
+      aetherctl customio --live [--rate-kbps N] [--seconds N] [--dvr-window N] [--report-size] [--no-wrap] [--malloc-census] [--foundation-reader] [--host-carry none|removeFirst|subdata] [--reload-at S] [--cancel-latches] [--reload-decode-path automatic|software] [--reader-axis absolute|join|mismatched] [--join-offset-mb N] <file.ts>
                          (AE#445: a host-owned live spool behind MediaSource.custom, paced at the mux rate,
                           never EOF, unknown size; prints physFP and its slope against that rate)
-      aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--serve-only] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--reload-test] [--sw] [--drop-after N] [--discontinuity-at N] [--realtime] [--fast-zap] [--preroll N] [--rewind-hold N] [--gen-highbitrate-seed]
+      aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--serve-only] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--reload-test] [--sw] [--drop-after N] [--discontinuity-at N] [--realtime] [--realtime-rate X] [--fast-zap] [--preroll N] [--rewind-hold N] [--gen-highbitrate-seed]
                      [--freeze-after N] [--unfreeze-after N] [--rewind-before-freeze N] [--force-recovery-reload-at N] [--live-only] [--no-blocking-reload] [--force-master]
                      [--freeze-after N] [--unfreeze-after N] [--rewind-before-freeze N] [--force-recovery-reload-at N]
                      [--no-blocking-reload]
@@ -141,12 +142,41 @@ func printUsage() {
                      pretend the display can't render Dolby Vision.
                      Mirrors what AetherEngine.loadNative passes on a
                      non-DV TV / on macOS (where displayCapabilities
-                     reports supportsDolbyVision=false anyway).
+                     reports supportsDolbyVision=false unless the
+                     session asserts it, see `play --assert-dv`).
       --force-dv     AE#455: serve a DV Profile 8.1 source as Profile 5
                      (dvh1 + dvcC profile=5, CODECS=dvh1.05.LL) so
                      AVPlayer composes the RPU itself. Only has an
                      effect together with --no-dv; a display that does
                      Dolby Vision keeps the P8.1 route.
+      --dv-base-layer
+                     LoadOptions.dolbyVisionHandling = .baseLayerOnly:
+                     present the HDR10 / HLG base layer of a Dolby
+                     Vision source and leave the DV out of the container
+                     (plain hvc1 / av01, dvcC stripped, no
+                     SUPPLEMENTAL-CODECS), on any display. Covers HEVC
+                     P7 / P8.1 / P8.4, AV1 P10.1 / P10.4, and a P5
+                     record over a BT.2020 YCbCr VUI (a relabelled P7 /
+                     P8 remux); a genuine P5 has no base layer and keeps
+                     its route. Also accepted by `play`.
+
+    Flags (play only):
+      --assert-dv    AE#493: set LoadOptions.panelPresentsDolbyVision,
+                     the host's assertion that this display presents
+                     Dolby Vision. macOS has no per-mode capability API
+                     (AVPlayer.availableHDRModes is unavailable there)
+                     and HDR eligibility answers HDR10 and HLG but not
+                     DV, so a DV source otherwise plays as its HDR10
+                     base layer with effective-format=hdr10. The flag
+                     moves that label and the tvOS criteria request; it
+                     no longer moves the packaging of a P5 / P8.1 / P8.4
+                     source, which since 6.72.0 / 6.73.0 carries its
+                     dvcC and SUPPLEMENTAL-CODECS on every display (the
+                     served master, media playlist, init.mp4 and
+                     segments are byte-identical either way). P7 and AV1
+                     DV are still gated on it. A wrong claim costs one
+                     in-place media-playlist fallback (-11868 / -11848),
+                     not the item.
 
     Flags (serve / seektest):
       --throttle-kbps N
@@ -298,6 +328,7 @@ if first == "segverify" {
     let count   = takeIntFlag("--count", from: &rest) ?? 12
     let noDV    = takeFlag("--no-dv", from: &rest)
     let forceDV = takeFlag("--force-dv", from: &rest)
+    let dvBaseLayer = takeFlag("--dv-base-layer", from: &rest)
     let dumpDir = takeStringFlag("--dump", from: &rest)
     guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
         print("ERROR: segverify requires a <url> argument")
@@ -306,7 +337,9 @@ if first == "segverify" {
     rest.removeAll { $0 == urlArg }
     rejectStrayFlags(rest, subcommand: "segverify")
     exit(runSegVerify(url: parseSourceURL(urlArg), from: fromIdx, count: count, dvModeAvailable: !noDV,
-                      forceDVWithoutDisplay: forceDV, dumpDir: dumpDir))
+                      forceDVWithoutDisplay: forceDV,
+                      dolbyVisionHandling: dvBaseLayer ? .baseLayerOnly : .automatic,
+                      dumpDir: dumpDir))
 }
 
 // Rapid-seek burst repro (issue #35).
@@ -480,6 +513,15 @@ if first == "live" {
     // --preroll N: backlog seconds the paced fixture bursts before 1x pacing (default 30).
     // 0 models a strict-realtime origin with no backlog (the AE#195 slow-join case).
     let preroll = takeDoubleFlag("--preroll", from: &rest)
+    // --realtime-rate X: pace at X times wall clock after the preroll (implies --realtime). 1x is
+    // `--realtime`; unpaced is a burst that ENDS. Neither covers an origin that keeps running ahead
+    // for the whole session, which is what makes a live edge outrun the client that tracks it.
+    let realtimeRate = takeDoubleFlag("--realtime-rate", from: &rest)
+    // --origin-lead N: how far ahead of the wall clock the paced origin is allowed to run, which is
+    // the standing distance a raw live client ends up reading behind. A tuner or a transcode route
+    // hands over seconds at a time and keeps that lead; the built-in 2 s sits exactly on the old
+    // edge tolerance and hides everything either side of it (Sodalite#104 round 2).
+    let originLead = takeDoubleFlag("--origin-lead", from: &rest)
     // --gen-highbitrate-seed: generate ~22 Mbps 1080p H.264 MPEG-TS seed for RSS-retention measurement.
     if takeFlag("--gen-highbitrate-seed", from: &rest) {
         let path = seed ?? "Fixtures/user/highbitrate-1080p.ts"
@@ -513,6 +555,10 @@ if first == "live" {
     // the device's own route, and every live leg before this ran media-direct, so nothing here had
     // ever exercised it.
     let liveForceMaster = takeFlag("--force-master", from: &rest)
+    // AE#509: --start-position S loads the live session with a resume anchor, the same one
+    // `load(url:startPosition:)` takes. Live callers normally pass nil, so the anchor's own live
+    // handling had never been drivable from here.
+    let liveStartPosition = takeDoubleFlag("--start-position", from: &rest)
     // --sliding: accepted but ignored; sliding is now unconditional for live sessions.
     _ = takeFlag("--sliding", from: &rest)
     rejectStrayFlags(rest, subcommand: "live")
@@ -521,14 +567,16 @@ if first == "live" {
                  reportCacheBytes: reportCacheBytes, rewindTest: rewindTest,
                  reloadTest: reloadTest,
                  forceSoftware: forceSW, dropAfter: dropAfter,
-                 discontinuityAt: discontinuityAt, realtime: realtime,
-                 fastZap: fastZap, pacingPreroll: preroll,
+                 discontinuityAt: discontinuityAt, realtime: realtime || realtimeRate != nil,
+                 fastZap: fastZap, pacingPreroll: preroll, pacingRate: realtimeRate,
+                 originLead: originLead,
                  freezeAfter: freezeAfter, unfreezeAfter: unfreezeAfter,
                  rewindBeforeFreeze: rewindBeforeFreeze,
                  forceRecoveryReloadAt: forceRecoveryReloadAt,
                  rewindHold: rewindHold,
                  blockingReload: noBlockingReload ? false : nil,
-                 liveOnly: liveOnly, forceMaster: liveForceMaster))
+                 liveOnly: liveOnly, forceMaster: liveForceMaster,
+                 startPosition: liveStartPosition))
 }
 
 if first == "play" {
@@ -538,6 +586,12 @@ if first == "play" {
     // AE#293: the nativeRemoteHLS bypass, the path the #168 carriage watchdog and the carriage probe
     // live on. Pair with --live; without it the m3u8 goes to the raw live path, which rejects it.
     let nativeHLS = takeFlag("--native-hls", from: &rest)
+    // AE#495: stand in for a host that has answered `EngineTLS.serverTrustEvaluator`, which is what
+    // decides whether a remote https master is relayed through the loopback origin instead of being
+    // handed to AVPlayer (which asks no delegate and cannot be told about a private certificate).
+    // Without it the relay had no harness at all: every run here reaches an origin the system
+    // already trusts, which is the one case the relay is deliberately not used for.
+    let trustAnyCertificate = takeFlag("--trust-any-certificate", from: &rest)
     let liveIngest = takeFlag("--live-ingest", from: &rest)
     // AE#374: the join profile a host ships, against an origin of its own rather than the built-in
     // fixture `live` carries. fastZap plus an external HLS origin is the shape a downstream player
@@ -570,6 +624,28 @@ if first == "play" {
     let seekCount = takeIntFlag("--seek-count", from: &rest)
     let mallocCensus = takeFlag("--malloc-census", from: &rest)
     let playForceSW = takeFlag("--sw", from: &rest)
+    // AE#493: `LoadOptions.panelPresentsDolbyVision`, the host assertion. macOS has no per-mode display
+    // capability API, so DV is unclaimable from inside the engine and a Mac run routes every DV source
+    // as its HDR10 base layer until the host says otherwise.
+    let playAssertDV = takeFlag("--assert-dv", from: &rest)
+    // `LoadOptions.dolbyVisionHandling = .baseLayerOnly`: the base layer of a Dolby Vision source, the
+    // Dolby Vision left out of the container. The harness for a record the bitstream contradicts.
+    let playDVHandling: DolbyVisionHandling = takeFlag("--dv-base-layer", from: &rest) ? .baseLayerOnly : .automatic
+    // AE#492: `LoadOptions.deinterlaceFieldRate`. `send_field` (the default) emits one frame per
+    // FIELD, so a 29.97i source hands the layer 59.94 frames per second against 23.976 for a
+    // progressive one. That is the confound in every per-seek drop count taken across the two, and
+    // `--deinterlace-field-rate frame` is the A/B that separates the rate from the path.
+    let playFieldRateSpec = takeStringFlag("--deinterlace-field-rate", from: &rest)
+    let playFieldRate: DeinterlaceFieldRate
+    if let playFieldRateSpec {
+        guard let parsed = DeinterlaceFieldRate(rawValue: playFieldRateSpec) else {
+            print("ERROR: --deinterlace-field-rate takes field|frame, got '\(playFieldRateSpec)'")
+            exit(64)
+        }
+        playFieldRate = parsed
+    } else {
+        playFieldRate = .field
+    }
     // AE#462: force the audio pipeline to fail so the video-only drop is observable end to end.
     // There is no fixture for it: the drop needs a codec this build has no decoder for (AC-4 is the
     // realistic one), and a threshold that plausible is worth less than the real published value.
@@ -593,10 +669,16 @@ if first == "play" {
     // open against the origin at once across every path it fetches on. `1` also switches off the
     // speculative parallel paths. This is the knob for reproducing a connection-metered CDN.
     let maxConcurrentRequests = takeIntFlag("--max-concurrent-requests", from: &rest)
+    // #377: LoadOptions.heldSourceConnection. The reader asks the origin once and pulls the file
+    // over that one connection, instead of ending at the window high water and asking again every
+    // drain cycle. This is the knob for an origin that refuses new requests in windows: run it
+    // against one and count the ranges in its own log, or read `conn start ... held` here.
+    let heldConnection = takeFlag("--held-connection", from: &rest)
     let declaredDuration = takeDoubleFlag("--declared-duration", from: &rest)
     // #311: install the software frame-time observer and read the presentation timebase, so the
     // per-frame boundaries and the clock a host would pace an overlay against are both observable.
     let frameTimes = takeFlag("--frame-times", from: &rest)
+    let presentTimes = takeFlag("--present-times", from: &rest)
     let pictureProbe = takeFlag("--picture-probe", from: &rest)
     // #316: declare sidecar subtitles at load, the LoadOptions.externalSubtitles a host passes.
     // Comma-separated `lang=path-or-url` entries, e.g. --sidecar en=/tmp/en.srt,de=/tmp/de.srt.
@@ -689,14 +771,26 @@ if first == "play" {
                 exit(64)
             }
             optionChanges.append(.decodePath(path))
+        } else if key == "dolby-vision" {
+            guard let handling = DolbyVisionHandling(rawValue: value) else {
+                print("ERROR: --reload-applying dolby-vision takes \(DolbyVisionHandling.allCases.map(\.rawValue).joined(separator: "|")), got '\(value)'")
+                exit(64)
+            }
+            optionChanges.append(.dolbyVisionHandling(handling))
         } else if key == "is-live" {
             guard let flag = Bool(value) else {
                 print("ERROR: --reload-applying is-live takes true|false, got '\(value)'")
                 exit(64)
             }
             optionChanges.append(.isLive(flag))
+        } else if key == "autoplay" {
+            guard let flag = Bool(value) else {
+                print("ERROR: --reload-applying autoplay takes true|false, got '\(value)'")
+                exit(64)
+            }
+            optionChanges.append(.autoplay(flag))
         } else {
-            print("ERROR: --reload-applying key '\(key)' is not one of header.<Name>, audio-bridge, preferred-audio, decode-path, is-live")
+            print("ERROR: --reload-applying key '\(key)' is not one of header.<Name>, audio-bridge, preferred-audio, decode-path, dolby-vision, is-live, autoplay")
             exit(64)
         }
     }
@@ -727,16 +821,25 @@ if first == "play" {
         printUsage()
         exit(64)
     }
+    if trustAnyCertificate {
+        // The blunt answer the engine documents, which is the one a harness wants: every origin.
+        EngineTLS.serverTrustEvaluator = { _ in true }
+        print("[aetherctl] AE#495: accepting any server certificate for this run")
+    }
     exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: playFastZap, liveStartImmediately: liveStartImmediately, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: playStartPosition, mallocCensus: mallocCensus, forceSoftware: playForceSW,
-                 censusThresholdMB: censusThresholdMB, censusHz: censusHz, frameTimes: frameTimes, pictureProbe: pictureProbe, sidecars: sidecars,
+                 censusThresholdMB: censusThresholdMB, censusHz: censusHz, frameTimes: frameTimes, presentTimes: presentTimes, pictureProbe: pictureProbe, sidecars: sidecars,
                  audioSwitch: audioSwitch,
                  teletextPage: teletextPage, teletextSwitch: teletextSwitch,
                  audioDelayMs: audioDelayMs, audioDelaySwitches: audioDelaySwitches,
                  pausedMount: pausedMount,
                  optionCorrection: optionCorrection,
                  sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests,
+                 heldConnection: heldConnection,
                  declaredDuration: declaredDuration,
-                 httpHeaders: playHeaders))
+                 httpHeaders: playHeaders,
+                 deinterlaceFieldRate: playFieldRate,
+                 assertDolbyVision: playAssertDV,
+                 dolbyVisionHandling: playDVHandling))
 }
 
 if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].contains(first) {
@@ -744,6 +847,8 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     let noDV = takeFlag("--no-dv", from: &rest)
     // AE#455: opt-in P8.1-as-P5 routing, which only has an effect alongside --no-dv.
     let forceDV = takeFlag("--force-dv", from: &rest)
+    // The base layer of a Dolby Vision source, the Dolby Vision left out of the container.
+    let dvHandling: DolbyVisionHandling = takeFlag("--dv-base-layer", from: &rest) ? .baseLayerOnly : .automatic
     let framesOverride = takeIntFlag("--frames", from: &rest)
     let atSeconds = takeDoubleFlag("--at", from: &rest) ?? 60.0
     let extractLoops = takeIntFlag("--loops", from: &rest) ?? 1
@@ -776,6 +881,18 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     // reader's in-flight-request cancel becomes. Contract says unblock only; this measures the cost
     // of the other reading rather than leaving it to be discovered on a host.
     let customCancelLatches = takeFlag("--cancel-latches", from: &rest)
+    // AE#460 round 3: which byte axis the harness reader speaks. `join` is the reporter's shape (a
+    // spool that counts from where its stream joined), `mismatched` the non-conforming control that
+    // reports one axis and takes the other. `--join-offset-mb` is where in the file the join sits,
+    // so the two axes are far enough apart for a disagreement to show as bytes rather than as noise.
+    let customReaderAxis: ReaderAxis = takeStringFlag("--reader-axis", from: &rest).map { value in
+        guard let axis = ReaderAxis(rawValue: value) else {
+            print("ERROR: --reader-axis takes absolute|join|mismatched, got '\(value)'")
+            exit(64)
+        }
+        return axis
+    } ?? .absolute
+    let customJoinOffsetMB = takeIntFlag("--join-offset-mb", from: &rest) ?? 4
     // AE#461 follow-up: drive the decode-path correction on a CUSTOM source. `--reload-at`'s own
     // correction (an httpHeaders probe) is inert on this shape by design, so it measures the rebuild
     // and cannot measure this field; this one is the field.
@@ -825,10 +942,12 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
         exit(runProbe(url: url))
     case "serve":
         runServe(url: url, dvModeAvailable: dvModeAvailable, forceDVWithoutDisplay: forceDV,
+                 dolbyVisionHandling: dvHandling,
                  nativeSubsIndex: nativeSubsIndex, startPosition: startPosition,
                  audioDelayMs: serveAudioDelayMs)
     case "validate":
-        exit(runValidate(url: url, dvModeAvailable: dvModeAvailable, forceDVWithoutDisplay: forceDV))
+        exit(runValidate(url: url, dvModeAvailable: dvModeAvailable, forceDVWithoutDisplay: forceDV,
+                         dolbyVisionHandling: dvHandling))
     case "swdecode":
         exit(runSWDecode(url: url, maxPackets: framesOverride ?? 100))
     case "extract":
@@ -849,7 +968,8 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
                                     foundationReader: customFoundationReader,
                                     carryTrim: customCarryTrim, reloadAt: customReloadAt,
                                     cancelLatches: customCancelLatches,
-                                    reloadDecodePath: customReloadDecodePath))
+                                    reloadDecodePath: customReloadDecodePath,
+                                    axis: customReaderAxis, joinOffsetMB: customJoinOffsetMB))
         }
         exit(runCustomIO(path: urlArg, inMemory: inMemory, forwardOnly: forwardOnly, audioOnly: audioOnlyFlag, reload: reloadFlag, switchAudio: switchAudioFlag, selectSubs: selectSubsFlag, extract: extractFlag, audioIndex: customAudioIndex, reloadDecodePath: customReloadDecodePath))
     default:

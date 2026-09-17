@@ -12,13 +12,9 @@ enum VTCapabilityProbe {
         if #available(tvOS 26.2, iOS 26.2, macOS 16.0, visionOS 26.2, *) {
             VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_AV1)
         }
-        if #available(tvOS 17.0, iOS 17.0, macOS 14.0, *) {
-            let supported = VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1)
-            EngineLog.emit("[VTProbe] codec=av01 hwSupported=\(supported)", category: .engine)
-            return supported
-        }
-        EngineLog.emit("[VTProbe] codec=av01 hwSupported=false (pre-iOS17/tvOS17)", category: .engine)
-        return false
+        let supported = VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1)
+        EngineLog.emit("[VTProbe] codec=av01 hwSupported=\(supported)", category: .engine)
+        return supported
     }()
 
     /// True when VideoToolbox can build a HARDWARE-accelerated decompression session for this exact
@@ -77,15 +73,10 @@ enum VTCapabilityProbe {
         guard fdStatus == noErr, let formatDesc = formatDescription else { return true }
 
         // Require hardware, matching HardwareVideoDecoder's session spec: a format VT can only software-decode
-        // is exactly what we want to hand to libavcodec instead (predictable path, no black screen). The
-        // require-hardware key is iOS 17 / tvOS 17+ (the symbol did not exist on iOS before then), so guard it
-        // the same way HardwareVideoDecoder does; on the rare pre-17 build the probe just skips the constraint.
-        var decoderSpec: NSDictionary?
-        if #available(tvOS 17.0, iOS 17.0, *) {
-            decoderSpec = [
-                kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: true,
-            ]
-        }
+        // is exactly what we want to hand to libavcodec instead (predictable path, no black screen).
+        let decoderSpec: NSDictionary = [
+            kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: true,
+        ]
         var session: VTDecompressionSession?
         let status = VTDecompressionSessionCreate(
             allocator: kCFAllocatorDefault,

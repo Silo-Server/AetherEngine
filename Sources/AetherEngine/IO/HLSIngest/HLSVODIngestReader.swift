@@ -64,7 +64,9 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
             configuration.timeoutIntervalForResource = 45
             configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
             configuration.urlCache = nil
-            self.session = URLSession(configuration: configuration)
+            self.session = URLSession(
+                configuration: configuration, delegate: EngineTLS.sessionDelegate,
+                delegateQueue: nil)
             ownsSession = true
         }
     }

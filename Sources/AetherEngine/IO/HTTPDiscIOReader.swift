@@ -60,7 +60,8 @@ final class HTTPDiscIOReader: IOReader, @unchecked Sendable {
             c.requestCachePolicy = .reloadIgnoringLocalCacheData
             return c
         }()
-        self.session = URLSession(configuration: config)
+        self.session = URLSession(
+            configuration: config, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
 
         guard let size = Self.probeSize(
             url: url, extraHeaders: extraHeaders, session: session,

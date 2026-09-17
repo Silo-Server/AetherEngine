@@ -156,7 +156,8 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         config.timeoutIntervalForRequest = 10
         config.timeoutIntervalForResource = 30
         // 30s resource ceiling: one-shot fetches must fail fast so the host can fall back. The c7592ed no-ceiling lesson applies to long-lived stream connections, not bounded one-shot fetches.
-        self.session = URLSession(configuration: config)
+        self.session = URLSession(
+            configuration: config, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
     }
 
     // MARK: - IOReader

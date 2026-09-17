@@ -31,6 +31,7 @@ struct SubtitleSessionCarryover: Sendable, Equatable {
     var secondaryTrackIndex: Int?
     var secondarySidecarURL: URL?
     var nativeReapplyOrdinal: Int?
+    var injectedSubtitleRenderingRequested = false
     /// True when the ordinal equals the mapping of the active track through the pre-reload
     /// rendition table (a `setNativeSubtitleRendering` pick). Such ordinals are recomputed
     /// against the reloaded table, which the seeded externals can grow or reorder; a diverging

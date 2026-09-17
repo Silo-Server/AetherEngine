@@ -105,6 +105,17 @@ final class SoftwarePlaybackHost {
     private var audioDecoder: AudioDecoder?
     private var audioOutput: AudioOutput?
     private var demuxer: Demuxer?
+    private var vodPacketReadAhead: SoftwarePacketReadAhead?
+
+    /// The same public buffered-position axis as the live and native hosts, but backed by
+    /// actual compressed A/V packet coverage. nil when no continuous cache span contains the clock.
+    var cachedVODSessionTime: Double? {
+        guard let frontier = vodPacketReadAhead?.snapshot.frontier else { return nil }
+        return max(0, frontier - max(0, clockSessionZero))
+    }
+
+    var cachedVODBytes: Int64? { vodPacketReadAhead.map { Int64($0.snapshot.residentBytes) } }
+    var vodPacketCacheSnapshot: SoftwarePacketReadAhead.Snapshot? { vodPacketReadAhead?.snapshot }
 
     private let demuxQueue = DispatchQueue(label: "engine.sw.demux", qos: .userInitiated)
 
@@ -305,6 +316,52 @@ final class SoftwarePlaybackHost {
         feedLock.lock(); _seekGeneration &+= 1; feedLock.unlock()
     }
 
+    /// AE#491 round 2: the generation whose seek is FINISHED, meaning the source stands at that
+    /// target and the clock has been re-anchored there. The gap to `_seekGeneration` is the seek
+    /// window; see `SeekWindow` for what a packet read inside it does to the frontier and to the
+    /// audio lead.
+    nonisolated(unsafe) private var _settledSeekGeneration: UInt64 = 0
+
+    nonisolated var seekWindowOpen: Bool {
+        feedLock.lock(); defer { feedLock.unlock() }
+        return SeekWindow.isOpen(requested: _seekGeneration, settled: _settledSeekGeneration)
+    }
+
+    /// A single seek-state snapshot is needed for packet, EOF and error admission. Reading the
+    /// generation and window separately can straddle a seek that opens and settles between them.
+    nonisolated private func admitsRead(generation: UInt64) -> Bool {
+        feedLock.lock()
+        let requested = _seekGeneration
+        let settled = _settledSeekGeneration
+        feedLock.unlock()
+        return SoftwareReadAdmission.admits(readGeneration: generation,
+            requestedGeneration: requested, settledGeneration: settled, stopRequested: stopRequested)
+    }
+
+    nonisolated private func noteSeekSettled(_ generation: UInt64) {
+        feedLock.lock()
+        if SeekWindow.closes(settling: generation, live: _seekGeneration) {
+            _settledSeekGeneration = generation
+        }
+        feedLock.unlock()
+        demuxCondition.lock()
+        demuxCondition.broadcast()
+        demuxCondition.unlock()
+    }
+
+    /// AE#491: the generation the packet now in the decoder was read under. The decoder callback
+    /// compares it against the live one, because a flush cannot reach a frame that is already
+    /// inside the decoder: `videoDecoder.flush()` runs on the actor while the demux thread sits in
+    /// `decode(packet:)`, and the hardware decoder answers on its own thread later still. A frame
+    /// that comes out under a newer generation belongs to the position the seek left behind, and
+    /// handing it over makes it the renderer's newest timestamp - the frame after it then reports
+    /// the whole seek distance as one inter-frame interval.
+    nonisolated(unsafe) private var _decodeGeneration: UInt64 = 0
+    nonisolated private var decodeGeneration: UInt64 {
+        get { feedLock.lock(); defer { feedLock.unlock() }; return _decodeGeneration }
+        set { feedLock.lock(); _decodeGeneration = newValue; feedLock.unlock() }
+    }
+
     /// Set when pause() stopped the synchronizer; play() restores the rate (previously play() only flipped isPlaying, leaving the clock frozen).
     private var pausedByHost = false
 
@@ -391,15 +448,16 @@ final class SoftwarePlaybackHost {
 
     /// #315: publish the renderer layer's own `readyForDisplay` as `isVideoReadyForDisplay`.
     /// AVFoundation posts a notification for it rather than supporting KVO, and it arrived in
-    /// tvOS/iOS 17.4, macOS 14.4 and visionOS 1.1, below the engine's own floor. Where it is missing
-    /// the fallback is the first frame handed to the renderer (`disarmedFallbackFirstFrame`), which
-    /// is one hop earlier than presentation and is documented as such on the public property.
+    /// tvOS/iOS 17.4, macOS 14.4 and visionOS 1.1. Only visionOS still has a floor below that (1.0).
+    /// Where it is missing the fallback is the first frame handed to the renderer
+    /// (`disarmedFallbackFirstFrame`), which is one hop earlier than presentation and is documented as
+    /// such on the public property.
     ///
     /// #344: visionOS has to be named. Falling through to `*` resolves it to the package's declared
     /// visionOS floor, which is 1.0, and that is a compile error rather than a runtime fallback.
     private func armReadyForDisplayObserver() {
         disarmReadyForDisplayObserver()
-        guard #available(tvOS 17.4, iOS 17.4, macOS 14.4, visionOS 1.1, *) else { return }
+        guard #available(visionOS 1.1, *) else { return }
         let layer = renderer.displayLayer
         readyForDisplayObserver = NotificationCenter.default.addObserver(
             forName: .AVSampleBufferDisplayLayerReadyForDisplayDidChange,
@@ -426,12 +484,12 @@ final class SoftwarePlaybackHost {
         }
     }
 
-    /// #315 fallback below tvOS/iOS 17.4, macOS 14.4 and visionOS 1.1: no `readyForDisplay` on the
-    /// layer, so the first frame the decoder hands the renderer is the closest observable. Called
-    /// off-main. Mirrors the observer's list exactly: a platform named there and not here would get
-    /// neither the notification nor the fallback, so it would never publish readiness at all.
+    /// #315 fallback below visionOS 1.1, the one floor that predates `readyForDisplay` on the layer,
+    /// so the first frame the decoder hands the renderer is the closest observable. Called off-main.
+    /// Mirrors the observer's list exactly: a platform named there and not here would get neither the
+    /// notification nor the fallback, so it would never publish readiness at all.
     nonisolated private func noteFirstFrameEnqueuedForDisplayFallback() {
-        guard #unavailable(tvOS 17.4, iOS 17.4, macOS 14.4, visionOS 1.1) else { return }
+        guard #unavailable(visionOS 1.1) else { return }
         Task { @MainActor [weak self] in self?.isVideoReadyForDisplay = true }
     }
 
@@ -483,8 +541,8 @@ final class SoftwarePlaybackHost {
 
     // MARK: - Init
 
-    init() {
-        self.renderer = SampleBufferRenderer()
+    init(videoGravity: AVLayerVideoGravity = .resizeAspect) {
+        self.renderer = SampleBufferRenderer(videoGravity: videoGravity)
         // Default to the software decoder; load() swaps it for the
         // VT-backed one when the source's video codec is HEVC.
         self.videoDecoder = SoftwareVideoDecoder()
@@ -582,7 +640,8 @@ final class SoftwarePlaybackHost {
         startPosition: Double?,
         audioSourceStreamIndex: Int32?,
         isLive: Bool = false,
-        dvrWindowSeconds: Double? = nil
+        dvrWindowSeconds: Double? = nil,
+        forwardBufferSegments: Int? = nil
     ) async throws {
         self.demuxer = dem
         self.duration = dem.duration
@@ -686,11 +745,14 @@ final class SoftwarePlaybackHost {
         (videoDecoder as? SoftwareVideoDecoder)?.deinterlaceConfig = deinterlaceConfig
 
         try videoDecoder.open(stream: vStream) { [weak self] pixelBuffer, pts, hdr10PlusData in
+            guard let self else { return }
+            // AE#491: a frame decoded from a pre-seek packet is not late, it is from somewhere else.
+            guard self.decodeGeneration == self.seekGeneration else { return }
             // Decoder callback is off-main; SampleBufferRenderer is internally locked.
-            self?.renderer.enqueue(pixelBuffer: pixelBuffer, pts: pts, hdr10PlusData: hdr10PlusData)
+            self.renderer.enqueue(pixelBuffer: pixelBuffer, pts: pts, hdr10PlusData: hdr10PlusData)
             // First-frame milestone: demux reached a video packet + decoder produced a pixel buffer.
-            if self?.bumpFramesEnqueued() == 0 {
-                self?.noteFirstFrameEnqueuedForDisplayFallback()
+            if self.bumpFramesEnqueued() == 0 {
+                self.noteFirstFrameEnqueuedForDisplayFallback()
                 let pfType = CVPixelBufferGetPixelFormatType(pixelBuffer)
                 EngineLog.emit(
                     "[SWHost] first video frame enqueued: "
@@ -790,6 +852,56 @@ final class SoftwarePlaybackHost {
             initialClockTime = .zero
         }
 
+        // A local path is left on the direct loop: the spool exists to avoid a second trip to a
+        // SOURCE, and re-reading a file is a page-cache hit. Measured on a file:// session, the
+        // cache wrote 14 MB of temporary chunks in 25 s (the source bitrate) for a seek that would
+        // have cost nothing anyway.
+        if !isLive, dem.isSourceSeekable, !dem.readsSourceDirectly {
+            let video = SoftwarePacketReadAhead.Stream(index: videoStreamIndex,
+                                                       numerator: vtb.num, denominator: vtb.den)
+            let audio: SoftwarePacketReadAhead.Stream? = audioStreamIndex >= 0
+                ? dem.stream(at: audioStreamIndex).map {
+                    .init(index: audioStreamIndex, numerator: $0.pointee.time_base.num,
+                          denominator: $0.pointee.time_base.den)
+                } : nil
+            let initialSourceClock = initialClockTime.seconds
+            let videoReorderDepth: Int? = vCodecID == AV_CODEC_ID_H264.rawValue ? 32 : nil
+            let cacheResult = await Task.detached(priority: .utility) { () throws -> SoftwarePacketReadAhead? in
+                let temp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+                let available = (try? temp.resourceValues(forKeys: [.volumeAvailableCapacityKey]))?
+                    .volumeAvailableCapacity.map(Int64.init)
+                let segments = HLSVideoEngine.clampedForwardWindow(forwardBufferSegments)
+                let bytes = HLSVideoEngine.sessionRetentionBudgetBytes(
+                    volumeAvailableBytes: available,
+                    capRelaxed: HLSVideoEngine.retentionCapRelaxed(forwardWindowSegments: segments))
+                guard bytes > 0 else { return Optional<SoftwarePacketReadAhead>.none }
+                let fifo = try SoftwarePacketDiskFIFO(
+                    chunkTargetBytes: min(4 << 20, max(8, bytes)), retainConsumed: true)
+                return SoftwarePacketReadAhead(
+                    video: video, audio: audio, byteBudget: bytes,
+                    forwardSeconds: Double(segments) * 4,
+                    initialSourceClock: initialSourceClock, fifo: fifo,
+                    videoReorderDepth: videoReorderDepth
+                ) { isCurrent in
+                    guard let packet = try dem.readPacket(isCurrent: isCurrent) else { return nil }
+                    defer { av_packet_unref(packet); av_packet_free_safe(packet) }
+                    return try SoftwareStoredPacket(copying: packet)
+                }
+            }.result
+            let readAhead: SoftwarePacketReadAhead?
+            switch cacheResult {
+            case .success(let cache): readAhead = cache
+            case .failure:
+                // A cache-directory failure must not stop a source that the old direct loop can
+                // still play. Runtime spool corruption is explicit, never silently skipped.
+                EngineLog.emit("[SWHost] packet cache unavailable; retaining direct playback", category: .swPlayback)
+                readAhead = nil
+            }
+            guard !stopRequested else { readAhead?.close(); return }
+            vodPacketReadAhead = readAhead
+            readAhead?.start()
+        }
+
         startTimeUpdates()
         isReady = true
     }
@@ -807,7 +919,7 @@ final class SoftwarePlaybackHost {
             }
         }
         if !demuxLoopStarted, let aOut = audioOutput {
-            aOut.attachVideoLayer(renderer.displayLayer)
+            aOut.attachVideoRenderer(renderer.videoRenderer)
         }
         if !demuxLoopStarted {
             demuxLoopStarted = true
@@ -842,14 +954,12 @@ final class SoftwarePlaybackHost {
     /// reassembly in the packet store. Captured at load, read by the tap sink per packet.
     private(set) var splitDisplaySetSubtitleStreamIndices: Set<Int32> = []
 
-    /// Host's ASS markup preference for overlay decoders (mirrors the HLS session flag).
-    var preserveASSMarkupForSubtitleTap = false
     var teletextPageForSubtitleTap: Int? = nil
     var deinterlaceConfig = DeinterlaceConfig()
 
     /// #112 rework: build an overlay decoder for any embedded subtitle stream, seeded from the
     /// session's video dims like the HLS tap routes. The drainer owns the returned decoder.
-    func makeOverlayDecoder(streamIndex: Int32) -> EmbeddedSubtitleDecoder? {
+    func makeOverlayDecoder(streamIndex: Int32, preserveASSMarkup: Bool) -> EmbeddedSubtitleDecoder? {
         guard let dem = demuxer, let stream = dem.stream(at: streamIndex) else { return nil }
         let vpar = dem.stream(at: videoStreamIndex)?.pointee.codecpar
         let w = vpar?.pointee.width ?? 1920
@@ -857,7 +967,7 @@ final class SoftwarePlaybackHost {
         return EmbeddedSubtitleDecoder(stream: stream,
                                        sourceVideoWidth: w > 0 ? w : 1920,
                                        sourceVideoHeight: h > 0 ? h : 1080,
-                                       preserveASSMarkup: preserveASSMarkupForSubtitleTap,
+                                       preserveASSMarkup: preserveASSMarkup,
                                        teletextPage: teletextPageForSubtitleTap)
     }
 
@@ -889,9 +999,11 @@ final class SoftwarePlaybackHost {
             lastAudioPts: demuxDiag.snapshot.lastAudioPts
         )
         guard tail > 0 else { return parkClockNow() }
+        let generation = seekGeneration
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(tail * 1_000_000_000))
-            self?.parkClockNow()
+            guard let self, self.admitsRead(generation: generation) else { return }
+            self.parkClockNow()
         }
     }
 
@@ -963,11 +1075,17 @@ final class SoftwarePlaybackHost {
     /// that read (App Hangs of 4.4 s and 5.2 s in the field on a WAN source).
     @discardableResult
     func seek(to seconds: Double) async -> Demuxer.RepositionOutcome {
+        guard !stopRequested else { return .superseded }
         guard let dem = demuxer else { return .stalled }
         // Stop loop + bump generation to invalidate in-flight packets. Captured right after, so the
         // reposition can tell on `seekQueue` whether a newer seek has already taken over.
         bumpSeekGeneration()
         let generation = seekGeneration
+        didReachEnd = false
+        didParkClockAtEnd = false
+        didEmitParkedDiag = false
+        let packetSource = vodPacketReadAhead
+        let cacheGeneration = packetSource?.beginSeek(to: seconds)
         // #292: inside another seek's window `isPlaying` is that seek's parked flag, not the transport's
         // intent. Inherit what it captured, and hand the same value on to whoever supersedes this one.
         let wasPlaying = SeekResumeIntent.resolve(isPlaying: isPlaying,
@@ -990,6 +1108,7 @@ final class SoftwarePlaybackHost {
         // Live source is forward-only; DVR rewind reseeds decoders from the ring without touching the live demuxer's read position.
         if isLive, let ring = dvrRing {
             await seekLiveDVR(to: seconds, ring: ring, wasPlaying: wasPlaying)
+            noteSeekSettled(generation)
             return .landed
         }
 
@@ -997,9 +1116,60 @@ final class SoftwarePlaybackHost {
         // path's optimistic publish does instead of drifting on the stale synchronizer anchor.
         currentTime = seconds
         seekInFlight = true
-        let outcome = await dem.seekBounded(
-            to: seconds, timeout: Self.seekBudgetSeconds, on: seekQueue,
-            isSuperseded: { [weak self] in self?.seekGeneration != generation })
+
+        // AE#491: armed BEFORE the reposition, not after it. The flushes above emptied both queues,
+        // but the reposition is awaited and the decode thread runs under it, so a frame from a
+        // packet read before the seek used to meet a renderer with no threshold standing and was
+        // taken. It then owns the newest handed-over timestamp, and the first real post-seek frame
+        // reports the entire seek distance as one inter-frame interval.
+        let targetTime = CMTime(seconds: seconds, preferredTimescale: 90000)
+        videoDecoder.skipUntilPTS = targetTime
+        renderer.setSkipThreshold(targetTime)
+
+        var cacheHit = false
+        if let packetSource, let cacheGeneration {
+            let preparation = await Task.detached(priority: .userInitiated) {
+                try packetSource.prepareSeek(cacheGeneration, to: seconds)
+            }.result
+            guard seekGeneration == generation, !stopRequested else { return .superseded }
+            switch preparation {
+            case .success(let hit):
+                cacheHit = hit
+                EngineLog.emit(
+                    "[SWHost] packet cache seek generation=\(generation) "
+                    + "result=\(hit ? "hit" : "miss") "
+                    + "target_s=\(String(format: "%.3f", seconds)) "
+                    + "resident_bytes=\(packetSource.snapshot.residentBytes)",
+                    category: .swPlayback
+                )
+            case .failure(SoftwarePacketReadAhead.ReadError.interrupted),
+                 .failure(SoftwarePacketReadAhead.ReadError.closed):
+                return .superseded
+            case .failure:
+                // A corrupt/unreadable retained packet must not be silently skipped or treated as
+                // a normal cache miss. Leave playback parked and publish an explicit failure.
+                seekInFlight = false
+                packetSource.close()
+                noteSeekSettled(generation)
+                EngineLog.emit("[SWHost] packet cache seek generation=\(generation) result=error",
+                               category: .swPlayback)
+                failure = PlaybackErrorInfo(kind: .softwarePipelineFailed,
+                                            message: "Playback cache could not reposition.")
+                return .stalled
+            }
+        }
+        let outcome: Demuxer.RepositionOutcome
+        if cacheHit {
+            // The decode cursor now points at retained preroll. The source reader remains at its
+            // existing frontier; seeking it too would duplicate or skip already retained packets.
+            outcome = .landed
+        } else {
+            outcome = await dem.seekBounded(
+                to: seconds, timeout: Self.seekBudgetSeconds, on: seekQueue,
+                isSuperseded: { [weak self] in
+                    self?.seekGeneration != generation || (self?.stopRequested ?? true)
+                })
+        }
         // A newer seek owns the state from here: it published its own target and clears the hold itself.
         // stop() can also land in the await now that this suspends, and re-arming the clock or flipping
         // isPlaying on a torn-down session would resurrect a loop that has already been told to quit.
@@ -1013,7 +1183,9 @@ final class SoftwarePlaybackHost {
             )
         }
 
-        let targetTime = CMTime(seconds: seconds, preferredTimescale: 90000)
+        // Re-armed after the landing: a pre-seek frame PAST the target (a backward seek) clears the
+        // threshold on its way through, and the generation guard on the decoder callback is what
+        // stops it. Both stand, because neither alone covers both seek directions.
         videoDecoder.skipUntilPTS = targetTime
         renderer.setSkipThreshold(targetTime)
 
@@ -1033,6 +1205,10 @@ final class SoftwarePlaybackHost {
         }
         // Arm now so the demux loop doesn't re-arm at stale initialClockTime (a pre-first-audio seek snapped back to session start without this).
         clockArmed = true
+        // The source stands at the target and the clock is anchored on it: everything the loop
+        // reads from here belongs to this position. Closing the window releases the loop.
+        noteSeekSettled(generation)
+        if let cacheGeneration { packetSource?.endSeek(cacheGeneration, sourceClock: seconds) }
         return outcome
     }
 
@@ -1087,7 +1263,8 @@ final class SoftwarePlaybackHost {
         audioStreamIndex: Int32,
         videoTimeBaseSeconds: Double,
         audioTimeBaseSeconds: Double,
-        audioTapSink: (@Sendable (CMSampleBuffer) -> Void)?
+        audioTapSink: (@Sendable (CMSampleBuffer) -> Void)?,
+        noteDecodeGeneration: @Sendable () -> Void
     ) -> Bool {
         let tbSec = pkt.isVideo ? videoTimeBaseSeconds : audioTimeBaseSeconds
         guard tbSec > 0, !pkt.bytes.isEmpty else { return false }
@@ -1108,7 +1285,10 @@ final class SoftwarePlaybackHost {
         p.pointee.stream_index = pkt.isVideo ? videoStreamIndex : audioStreamIndex
 
         if pkt.isVideo {
-            videoDecoder.decode(packet: p)
+            noteDecodeGeneration()
+            // AE#492: no epoch. This replays from the DVR ring after a reseed, so there is no batch
+            // of packets decided on before a flush for one to invalidate.
+            videoDecoder.decode(packet: p, epoch: nil)
             return false
         } else if let aDec = audioDecoder, let aOut = audioOutput {
             var enqueued = false
@@ -1126,8 +1306,12 @@ final class SoftwarePlaybackHost {
         stopRequested = true
         isPlaying = false
         seekInFlight = false
+        // A teardown inside a seek's window would otherwise leave it open on this instance.
+        noteSeekSettled(seekGeneration)
         timeTimer?.cancel()
         timeTimer = nil
+        vodPacketReadAhead?.close()
+        vodPacketReadAhead = nil
         renderer.subtitleCompositor.reset()
 
         dvrRing?.close()
@@ -1139,7 +1323,7 @@ final class SoftwarePlaybackHost {
 
         if let aOut = audioOutput {
             aOut.stop()
-            aOut.detachVideoLayer(renderer.displayLayer)
+            aOut.detachVideoRenderer(renderer.videoRenderer)
         }
         audioOutput = nil
         audioDecoder?.close()
@@ -1202,21 +1386,30 @@ final class SoftwarePlaybackHost {
         let subIndices = subtitleStreamIndices
         let subTimeBases = subtitleStreamTimeBases
         let subSplitSetIndices = splitDisplaySetSubtitleStreamIndices
-        let onError: @Sendable (String) -> Void = { [weak self] msg in
+        let onErrorForGeneration: @Sendable (String, UInt64) -> Void = { [weak self] msg, generation in
             Task { @MainActor [weak self] in
-                self?.failure = PlaybackErrorInfo(kind: .softwarePipelineFailed, message: msg)
+                guard let self, self.admitsRead(generation: generation) else { return }
+                self.failure = PlaybackErrorInfo(kind: .softwarePipelineFailed, message: msg)
             }
         }
-        let onEnd: @Sendable () -> Void = { [weak self] in
-            // AE#374: the diagnostic line has to say the producer is done, or a falling aLead over a
-            // frozen audio PTS reads exactly like drift on a running session.
-            self?.demuxDiag.markSourceExhausted()
+        let onEndForGeneration: @Sendable (UInt64) -> Void = { [weak self] generation in
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self, self.admitsRead(generation: generation) else { return }
+                // Only current EOF may mark the diagnostic source exhausted or stop playback.
+                // A queued pre-seek EOF task must not end a freshly positioned generation.
+                self.demuxDiag.markSourceExhausted()
                 self.parkClockAtEndOfMedia()
                 self.didReachEnd = true
                 self.isPlaying = false
             }
+        }
+        let onError: @Sendable (String) -> Void = { [weak self] message in
+            guard let self else { return }
+            onErrorForGeneration(message, self.seekGeneration)
+        }
+        let onEnd: @Sendable () -> Void = { [weak self] in
+            guard let self else { return }
+            onEndForGeneration(self.seekGeneration)
         }
 
         // Live + DVR ring: reader/feeder split; live-only and VOD use the combined loop below.
@@ -1228,6 +1421,19 @@ final class SoftwarePlaybackHost {
         }
         let getSeekGeneration: @Sendable () -> UInt64 = { [weak self] in
             self?.seekGeneration ?? 0
+        }
+        let admitsRead: @Sendable (UInt64) -> Bool = { [weak self] generation in
+            self?.admitsRead(generation: generation) ?? false
+        }
+        let getSeekWindowOpen: @Sendable () -> Bool = { [weak self] in
+            self?.seekWindowOpen ?? false
+        }
+        let setDecodeGeneration: @Sendable (UInt64) -> Void = { [weak self] gen in
+            self?.decodeGeneration = gen
+        }
+        let noteDecodeGeneration: @Sendable () -> Void = { [weak self] in
+            guard let self else { return }
+            self.decodeGeneration = self.seekGeneration
         }
         let getBackgroundAudioOnly: @Sendable () -> Bool = { [weak self] in
             self?.backgroundAudioOnly ?? false
@@ -1297,16 +1503,19 @@ final class SoftwarePlaybackHost {
                     clockArmed: getClockArmed,
                     markClockArmed: setClockArmed,
                     onEnd: onEnd,
-                    audioTapSink: getAudioTapSink
+                    audioTapSink: getAudioTapSink,
+                    noteDecodeGeneration: noteDecodeGeneration
                 )
             }
             return
         }
 
         let diag = demuxDiag
+        let readAhead = vodPacketReadAhead
         demuxQueue.async {
             Self.runDemuxLoop(
                 demuxer: dem,
+                readAhead: readAhead,
                 videoDecoder: vDec,
                 videoStreamIndex: vIdx,
                 audioDecoder: aDec,
@@ -1330,9 +1539,13 @@ final class SoftwarePlaybackHost {
                 markClockArmed: setClockArmed,
                 onClockAnchored: onClockAnchored,
                 seekGeneration: getSeekGeneration,
+                admitsRead: admitsRead,
+                seekWindowOpen: getSeekWindowOpen,
+                setDecodeGeneration: setDecodeGeneration,
+                noteDecodeGeneration: noteDecodeGeneration,
                 backgroundAudioOnly: getBackgroundAudioOnly,
-                onError: onError,
-                onEnd: onEnd,
+                onError: onErrorForGeneration,
+                onEnd: onEndForGeneration,
                 audioTapSink: getAudioTapSink,
                 subtitleStreamIndices: subIndices,
                 subtitleTimeBases: subTimeBases,
@@ -1527,7 +1740,8 @@ final class SoftwarePlaybackHost {
         clockArmed: @Sendable () -> Bool,
         markClockArmed: @Sendable () -> Void,
         onEnd: @Sendable () -> Void,
-        audioTapSink: @Sendable () -> ((@Sendable (CMSampleBuffer) -> Void)?)
+        audioTapSink: @Sendable () -> ((@Sendable (CMSampleBuffer) -> Void)?),
+        noteDecodeGeneration: @Sendable () -> Void
     ) {
         // Audio look-ahead pump (#107 audio chopping): feed audio packets ahead of the
         // combined cursor so the audio renderer holds AudioLookaheadPolicy.targetLeadSeconds
@@ -1569,7 +1783,8 @@ final class SoftwarePlaybackHost {
                     audioStreamIndex: audioStreamIndex,
                     videoTimeBaseSeconds: videoTimeBaseSeconds,
                     audioTimeBaseSeconds: audioTimeBaseSeconds,
-                    audioTapSink: audioTapSink()
+                    audioTapSink: audioTapSink(),
+                    noteDecodeGeneration: noteDecodeGeneration
                 )
                 if !armed {
                     preArmPacketsFed += 1
@@ -1747,7 +1962,8 @@ final class SoftwarePlaybackHost {
                 audioStreamIndex: audioStreamIndex,
                 videoTimeBaseSeconds: videoTimeBaseSeconds,
                 audioTimeBaseSeconds: audioTimeBaseSeconds,
-                audioTapSink: audioTapSink()
+                audioTapSink: audioTapSink(),
+                noteDecodeGeneration: noteDecodeGeneration
             )
 
             // Arm clock once on first packet PTS (anchoring at .zero caused delay). Audio: first decoded buffers; video-only: first video packet (no clock without audio = frozen frame).
@@ -1801,6 +2017,7 @@ final class SoftwarePlaybackHost {
     /// Demux loop: reads packets, dispatches by stream index, back-pressures against renderer's isReadyForMoreMediaData, flushes decoders at EOF.
     nonisolated private static func runDemuxLoop(
         demuxer: Demuxer,
+        readAhead: SoftwarePacketReadAhead?,
         videoDecoder: any VideoDecodingPipeline,
         videoStreamIndex: Int32,
         audioDecoder: AudioDecoder?,
@@ -1823,9 +2040,13 @@ final class SoftwarePlaybackHost {
         markClockArmed: @Sendable () -> Void,
         onClockAnchored: @Sendable (Double) -> Void,
         seekGeneration: @Sendable () -> UInt64,
+        admitsRead: @Sendable (UInt64) -> Bool,
+        seekWindowOpen: @Sendable () -> Bool,
+        setDecodeGeneration: @Sendable (UInt64) -> Void,
+        noteDecodeGeneration: @Sendable () -> Void,
         backgroundAudioOnly: @Sendable () -> Bool,
-        onError: @Sendable (String) -> Void,
-        onEnd: @Sendable () -> Void,
+        onError: @Sendable (String, UInt64) -> Void,
+        onEnd: @Sendable (UInt64) -> Void,
         audioTapSink: @Sendable () -> ((@Sendable (CMSampleBuffer) -> Void)?),
         subtitleStreamIndices: Set<Int32> = [],
         subtitleTimeBases: [Int32: AVRational] = [:],
@@ -1867,6 +2088,7 @@ final class SoftwarePlaybackHost {
         // pump get it from the DVR feeder arm on its own thread.
         var parkedVideo: [UnsafeMutablePointer<AVPacket>] = []
         let parkedVideoCap = 256
+        var terminalGeneration = SoftwareTerminalGeneration()
         var lastEnqueuedAudioPtsSec = Double.nan
         var rebuffering = false
         // The pause/rebuffer arm stays off until the source has proven it can deliver a real
@@ -1888,12 +2110,28 @@ final class SoftwarePlaybackHost {
         // Generation-checked: the blocking waits below can sit here across a seek, and the
         // lockstep gate discards a pre-seek packet for the same reason (decoding one clears
         // the decoder's skip threshold = visible fast-forward burst).
+        //
+        // AE#492: the check is per PACKET, and the epoch travels with it. Read once at the top, this
+        // loop emptied the whole four-second FIFO into the decoder while a seek was landing, so the
+        // packets kept arriving AFTER that seek's `videoDecoder.flush()` and refilled what the flush
+        // had just cleared. Their own frames were still refused at the decoder callback, but the last
+        // one stayed inside the deinterlacer's lookahead and came out on the FIRST post-seek decode,
+        // by which time `decodeGeneration` was the new one and every gate passed it. One such frame
+        // is a sample whose presentation time is the whole seek distance in the future: the layer
+        // takes it, holds it, stops reporting `isReadyForMoreMediaData`, and the loop parks on that
+        // signal until its FIFO caps out. Measured here as three to four seconds of `enq=+0` with the
+        // audio lead decaying under it, on a session that reports playing and never rebuffers.
         func drainParkedVideoNonblocking() {
             if seekGeneration() != parkedSeekGeneration { return }
+            let epoch = videoDecoder.feedEpoch
             while !parkedVideo.isEmpty, renderer.isReadyForMoreMediaData,
                   !stopRequested(), !backgroundAudioOnly() {
+                // Leave the rest standing: the next iteration of the loop frees the FIFO as a batch
+                // once it has read the new generation.
+                if seekGeneration() != parkedSeekGeneration { return }
                 let p = parkedVideo.removeFirst()
-                videoDecoder.decode(packet: p)
+                setDecodeGeneration(parkedSeekGeneration)
+                videoDecoder.decode(packet: p, epoch: epoch)
                 av_packet_unref(p)
                 av_packet_free_safe(p)
             }
@@ -2029,9 +2267,27 @@ final class SoftwarePlaybackHost {
         }
 
         func demuxIteration() -> Bool {
-            if !isPlaying() {
+            // A valid EOF/error can be queued for MainActor just before a newer seek supersedes
+            // it. Keep the VOD consumer parked (without duplicate callbacks), not permanently
+            // exited, so that newer generation still has a loop to consume its retained packets.
+            if !isLive, terminalGeneration.shouldPark(generation: seekGeneration()) {
                 condition.lock()
-                while !isPlaying() && !stopRequested() {
+                while terminalGeneration.shouldPark(generation: seekGeneration()), !stopRequested() {
+                    autoreleasepool {
+                        _ = condition.wait(until: Date(timeIntervalSinceNow: 0.5))
+                    }
+                }
+                condition.unlock()
+                return !stopRequested()
+            }
+            // AE#491 round 2: the seek window is part of this park, not a second one. Keyed on it,
+            // the loop stands still from the generation bump until the source and the clock are
+            // both at the target, so nothing it does can be measured against, or fed from, the
+            // position the seek left behind.
+            if !SeekWindow.loopMayRead(isPlaying: isPlaying(), windowOpen: seekWindowOpen()) {
+                condition.lock()
+                while !SeekWindow.loopMayRead(isPlaying: isPlaying(), windowOpen: seekWindowOpen()),
+                      !stopRequested() {
                     autoreleasepool {
                         _ = condition.wait(until: Date(timeIntervalSinceNow: 0.5))
                     }
@@ -2069,34 +2325,49 @@ final class SoftwarePlaybackHost {
             }
 
             let genBeforeRead = seekGeneration()
+            // AE#492: captured before the read, so a flush that lands during it retires this packet
+            // inside the decoder rather than leaving the caller to re-check a value it cannot hold
+            // across the call.
+            var epochBeforeRead = videoDecoder.feedEpoch
             let packet: UnsafeMutablePointer<AVPacket>?
             do {
-                packet = try demuxer.readPacket()
+                if let readAhead {
+                    packet = try readAhead.read(isCurrent: { admitsRead(genBeforeRead) })?.makeAVPacket()
+                } else {
+                    packet = try demuxer.readPacket(isCurrent: { admitsRead(genBeforeRead) })
+                }
             } catch {
+                // Stop/seek cancellation is not a playback failure, including a normal .closed
+                // returned by the packet source during teardown. Errors belong to the read's
+                // captured host generation, just like packets and EOF.
+                guard admitsRead(genBeforeRead) else { return !stopRequested() }
+                if case SoftwarePacketReadAhead.ReadError.interrupted = error { return true }
                 EngineLog.emit("[SWHost] demux read failed: \(error)", category: .swPlayback)
-                onError("Playback error: \(error.localizedDescription)")
-                return false
+                if terminalGeneration.record(genBeforeRead) {
+                    onError("Playback error: \(error.localizedDescription)", genBeforeRead)
+                }
+                return !isLive
             }
 
+            // Admit every result BEFORE interpreting nil as EOF. Otherwise an old read can drain
+            // or end the new seek generation without ever reaching the old packet-only gate.
+            guard admitsRead(genBeforeRead) else {
+                if let packet { av_packet_unref(packet); av_packet_free_safe(packet) }
+                return !stopRequested()
+            }
             guard let packet else {
                 // Play the parked tail out before the flush: nothing more will arrive, the queues
                 // must drain to end-of-media. The wait lifts a rebuffer hold on its own - held,
                 // the clock would never take the tail and end-of-media would never be reached.
                 releaseRebufferHold("end of media, nothing left to rebuffer from")
                 waitForRenderer(.drainAll)
+                guard admitsRead(genBeforeRead) else { return !stopRequested() }
                 freeParkedVideo()
                 videoDecoder.flush()
                 audioDecoder?.flush()
                 renderer.drainReorderBuffer()
-                onEnd()
-                return false
-            }
-
-            // Stale packet from before seek flush: decoding would clear the skip threshold (visible fast-forward burst). Discard.
-            if seekGeneration() != genBeforeRead {
-                av_packet_unref(packet)
-                av_packet_free_safe(packet)
-                return true
+                if terminalGeneration.record(genBeforeRead) { onEnd(genBeforeRead) }
+                return !isLive
             }
 
             let streamIdx = packet.pointee.stream_index
@@ -2117,6 +2388,11 @@ final class SoftwarePlaybackHost {
                         waitForRenderer(.drainAll)
                         freeParkedVideo()
                         videoDecoder.flush()
+                        // AE#492: this flush is THIS thread's, made after the read and on behalf of
+                        // the packet in hand. Retiring that packet along with the seam it opens
+                        // would drop the first picture of every new segment, so the epoch moves with
+                        // it. A seek's flush comes from the other thread and is not re-read here.
+                        epochBeforeRead = videoDecoder.feedEpoch
                         audioDecoder?.flush()
                         renderer.drainReorderBuffer()
                         // Chunked archives seam every minute or two; log each seam (bounded by the
@@ -2251,7 +2527,8 @@ final class SoftwarePlaybackHost {
                     av_packet_free_safe(packet)
                     return true
                 }
-                videoDecoder.decode(packet: packet)
+                setDecodeGeneration(genBeforeRead)
+                videoDecoder.decode(packet: packet, epoch: epochBeforeRead)
                 // Video-only / undecodable audio fallback: arm clock off first video packet (50+ audio packets with zero buffers = decoder not recovering).
                 if !clockArmed(), let aOut = audioOutput,
                    audioDecoder == nil || (audioPacketsSeen >= 50 && !audioBuffersProduced) {
@@ -2282,10 +2559,26 @@ final class SoftwarePlaybackHost {
                         return false
                     }
                 }
+                // AE#491: the video branch discards a pre-seek packet here and audio has to do the
+                // same. `audioOutput.flush()` has already emptied the queue these buffers would
+                // join, and their PTS is the marker `applyAudioClockAction` measures the lead
+                // against: one pre-seek buffer past this point reads as a lead the size of the
+                // seek and pauses the clock for a rebuffer that is not happening.
+                if seekGeneration() != genBeforeRead {
+                    av_packet_unref(packet)
+                    av_packet_free_safe(packet)
+                    return true
+                }
                 audioPacketsSeen += 1
                 let buffers = aDec.decode(packet: packet)
                 if !buffers.isEmpty { audioBuffersProduced = true }
                 let tapSink = audioTapSink()
+                // The flush can also land inside `decode`, so the buffers are checked out again.
+                if seekGeneration() != genBeforeRead {
+                    av_packet_unref(packet)
+                    av_packet_free_safe(packet)
+                    return true
+                }
                 for buf in buffers {
                     tapSink?(buf)   // #95: mirror before enqueue
                     aOut.enqueue(sampleBuffer: buf)
@@ -2349,6 +2642,7 @@ final class SoftwarePlaybackHost {
                 let raw = aOut.currentTimeSeconds
                 self.emitDiagIfDue(clock: raw)
                 if raw.isFinite, raw >= 0 {
+                    self.vodPacketReadAhead?.updatePlayhead(raw)
                     // Raw clock = source/subtitle axis; published alongside the mapped position (#107).
                     self.sourceClockSeconds = raw
                     // Live: subtract sessionStartPts to convert to "seconds since first frame"; VOD
@@ -2461,7 +2755,7 @@ final class SoftwarePlaybackHost {
             let r4d: String
             // #344: `*` is visionOS's declared floor (1.0), not "anything newer", and
             // isReadyForDisplay arrived in 1.1. Name the platform or the visionOS build breaks.
-            if #available(tvOS 17.4, iOS 17.4, macOS 14.4, visionOS 1.1, *) {
+            if #available(visionOS 1.1, *) {
                 r4d = layer.isReadyForDisplay ? "y" : "n"
             } else {
                 r4d = "-"
@@ -2541,6 +2835,7 @@ final class SWPlaybackDiagState: @unchecked Sendable {
         if generation >= _audioFlushGeneration {
             _audioFlushGeneration = generation
             _lastAudioPts = .nan
+            _sourceExhausted = false
         }
         lock.unlock()
     }

@@ -55,11 +55,15 @@ extension AetherEngine {
         // Phase D: every selection change disarms the OCR worker first; the embedded bitmap
         // branch below re-arms it (cursors persist, so a reselect resumes coverage).
         cancelSubtitleOCRWorker()
-        // #316: an external track the remote-HLS proxy declared as a rendition is rendered by AVPlayer
-        // itself, so it must NOT also start a sidecar decode; the overlay would draw the same cues a
-        // second time, and only the rendition survives PiP / AirPlay / an external display.
+        // Preserved ASS needs raw events even when the remote-HLS proxy also prepared
+        // a native text rendition. Only the native rendition follows PiP/AirPlay.
         if let renditionName = injectedSubtitleRenditionNames[index] {
-            selectInjectedSubtitleRendition(id: index, name: renditionName)
+            if let track = styledInjectedSubtitleTrack(id: index) {
+                selectExternalSubtitleTrack(id: index, track: track)
+                refreshInjectedASSSubtitleRendering()
+            } else {
+                selectInjectedSubtitleRendition(id: index, name: renditionName)
+            }
             return
         }
         // #88: external ids route onto the sidecar decode path; no side demuxer, no loadedURL needed.
@@ -80,6 +84,7 @@ extension AetherEngine {
         }
         guard index < Self.externalSubtitleTrackIDBase else { return }  // unknown external id: no-op
         guard loadedURL != nil else { return }
+        deselectInjectedSubtitleForOverlay()
 
         // #77: in-band CEA-608/708 is fed by the always-on producer CC tap (set up at load), not a side
         // demuxer. Selecting it just makes it the active track and mirrors the tap's cue snapshot. Tear down
@@ -88,7 +93,7 @@ extension AetherEngine {
         if let codec = subtitleTracks.first(where: { $0.id == index })?.codec,
            Self.isEmbeddedClosedCaptionCodec(codec) {
             cancelSidecarTask()
-            clearSubtitleDrainTarget(channel: .primary)   // #112 rework: CC is tap-fed, not drained
+            clearSubtitleDrainTarget(channel: .primary, reason: .closedCaptionsSelected)   // #112 rework: CC is tap-fed, not drained
             isSubtitleActive = true
             activeEmbeddedSubtitleStreamIndex = Int32(index)
             activeSubtitleTrackIndex = index
@@ -166,7 +171,7 @@ extension AetherEngine {
         hostExplicitSubtitleAction = true
         if let external = externalSubtitleRegistry[index] {
             cancelSidecarTask(channel: .secondary)
-            clearSubtitleDrainTarget(channel: .secondary)   // #112 rework
+            clearSubtitleDrainTarget(channel: .secondary, reason: .secondarySidecarSelected)   // #112 rework
             activeSecondaryEmbeddedSubtitleStreamIndex = -1
             activeSecondaryExternalSubtitleTrackID = index
             startSecondarySidecarDecode(url: external.url, httpHeaders: external.httpHeaders,
@@ -225,9 +230,10 @@ extension AetherEngine {
     }
 
     /// Build a fresh overlay decoder for the stream on whichever host owns the session demuxer.
-    func makeSubtitleDrainDecoder(streamIndex: Int32) -> EmbeddedSubtitleDecoder? {
-        nativeVideoSession?.makeOverlayDecoder(streamIndex: streamIndex)
-            ?? softwareHost?.makeOverlayDecoder(streamIndex: streamIndex)
+    func makeSubtitleDrainDecoder(streamIndex: Int32, channel: SubtitleChannel) -> EmbeddedSubtitleDecoder? {
+        let preserveASS = channel == .primary && loadedOptions.preserveASSMarkup
+        return nativeVideoSession?.makeOverlayDecoder(streamIndex: streamIndex, preserveASSMarkup: preserveASS)
+            ?? softwareHost?.makeOverlayDecoder(streamIndex: streamIndex, preserveASSMarkup: preserveASS)
     }
 
     /// Start (or keep) the 500ms drain loop. Performs an immediate tick so a fresh selection
@@ -244,7 +250,7 @@ extension AetherEngine {
         }
     }
 
-    func stopSubtitleDrainer() {
+    func stopSubtitleDrainer(reason: SubtitleDrainStopReason) {
         subtitleDrainerTask?.cancel()
         subtitleDrainerTask = nil
         subtitleDrainDecoders.removeAll()
@@ -253,11 +259,11 @@ extension AetherEngine {
         subtitleResolutionLastFrontier.removeAll()   // #250
         subtitleResolutionCoverageStated.removeAll()   // #318
         subtitleDeliveryLastOutcome.removeAll()   // #357
-        cancelSubtitleForwardPrefetcher()   // #151
+        cancelSubtitleForwardPrefetcher(reason: reason)   // #151
     }
 
     /// Clear one channel's drain target; stops the loop when no channel remains active.
-    func clearSubtitleDrainTarget(channel: SubtitleChannel) {
+    func clearSubtitleDrainTarget(channel: SubtitleChannel, reason: SubtitleDrainStopReason) {
         subtitleDrainTargets[channel] = nil
         subtitleDrainDecoders[channel] = nil
         subtitleDrainCursors[channel] = nil
@@ -265,7 +271,7 @@ extension AetherEngine {
         subtitleResolutionCoverageStated.remove(channel)   // #318
         subtitleDeliveryLastOutcome[channel] = nil   // #357
         refreshSubtitleStoreProtection()   // #166
-        if subtitleDrainTargets.isEmpty { stopSubtitleDrainer() }
+        if subtitleDrainTargets.isEmpty { stopSubtitleDrainer(reason: reason) }
     }
 
     /// #166: keep the store's aggregate-eviction protected set in sync with the active drain
@@ -348,7 +354,7 @@ extension AetherEngine {
                 window = (from, through)
             }
             if subtitleDrainDecoders[channel] == nil {
-                subtitleDrainDecoders[channel] = makeSubtitleDrainDecoder(streamIndex: streamIndex)
+                subtitleDrainDecoders[channel] = makeSubtitleDrainDecoder(streamIndex: streamIndex, channel: channel)
             }
             guard let decoder = subtitleDrainDecoders[channel] else {
                 // #357: a channel holding a drain target whose decoder cannot be built delivers
@@ -626,7 +632,7 @@ extension AetherEngine {
             reanchor.request(anchor, seekGeneration: currentSeekGeneration)
             return
         }
-        cancelSubtitleForwardPrefetcher()
+        cancelSubtitleForwardPrefetcher(reason: .prefetchRebuild)
         guard Self.shouldRunSubtitleForwardPrefetch(
             isLive: isLive,
             hasEmbeddedDrainTargets: !subtitleDrainTargets.isEmpty,
@@ -714,7 +720,17 @@ extension AetherEngine {
 
     /// Cancel the prefetcher + markClosed its side demuxer so a parked AVIO read cannot survive
     /// teardown (same rule as the native readers).
-    func cancelSubtitleForwardPrefetcher() {
+    ///
+    /// #496: the cancel says why. The task's own exit line reports `cancelled=true` and nothing
+    /// more, and it lands whenever the loop next looks (seconds later, from a parked read), so
+    /// without this the only evidence of the cause is whatever else happened to log nearby.
+    func cancelSubtitleForwardPrefetcher(reason: SubtitleDrainStopReason) {
+        if subtitleForwardPrefetchTask != nil {
+            lastSubtitleDrainStopReason = reason
+            EngineLog.emit(
+                "[AetherEngine] #151 forward prefetch cancelled (reason=\(reason.rawValue))",
+                category: .engine)
+        }
         subtitleForwardPrefetchTask?.cancel()
         subtitleForwardPrefetchTask = nil
         subtitleForwardPrefetchDemuxer?.markClosed()
@@ -1311,8 +1327,9 @@ extension AetherEngine {
            !nativeSubtitleTrackTable[ordinal].needsOCR,
            let store = nativeStore(atOrdinal: ordinal),
            store.isFinished, store.cueCount > 0 {
+            deselectInjectedSubtitleForOverlay()
             cancelSidecarTask()
-            clearSubtitleDrainTarget(channel: .primary)   // #112 rework
+            clearSubtitleDrainTarget(channel: .primary, reason: .externalStoreBackfill)   // #112 rework
             activeEmbeddedSubtitleStreamIndex = -1
             loadedSidecarURL = track.url
             sidecarASSHeader = nil
@@ -1412,9 +1429,19 @@ extension AetherEngine {
     /// forward-guard matched the stale index and kept appending).
     func startSidecarDecode(url: URL, httpHeaders: [String: String]?, externalTrackID: Int?,
                             sourceStreamIndex: Int32? = nil) {
+        deselectInjectedSubtitleForOverlay()
         cancelSidecarTask()
+        // #496: say what is taking over before it takes over. A sidecar replacing a running
+        // embedded selection ends the drainer and the prefetcher with it, and until this line the
+        // takeover itself logged nothing at all: a decode that starts and never publishes left the
+        // session with no drain target, no cues and no trace of who emptied it.
+        EngineLog.emit(
+            "[AetherEngine] sidecar decode start: id=\(externalTrackID.map(String.init) ?? "-") "
+            + "stream=\(sourceStreamIndex.map(String.init) ?? "auto") "
+            + "replacing embedded stream=\(activeEmbeddedSubtitleStreamIndex)",
+            category: .engine)
         // Sidecar replaces any active embedded stream.
-        clearSubtitleDrainTarget(channel: .primary)   // #112 rework
+        clearSubtitleDrainTarget(channel: .primary, reason: .sidecarSelected)   // #112 rework
         activeEmbeddedSubtitleStreamIndex = -1
         activeSubtitleTrackIndex = externalTrackID
 
@@ -1451,9 +1478,19 @@ extension AetherEngine {
                 guard !Task.isCancelled, let self = self else { return }
                 guard self.isSubtitleActive else { return }
                 // Sidecar cues are in source PTS; host renders against engine.sourceTime (which folds playlistShiftSeconds).
-                self.subtitleCues = result.cues
                 self.sidecarASSHeader = result.assHeader
+                self.subtitleCues = result.cues
                 self.isLoadingSubtitles = false
+                // #496: the counterpart to the drainer's "overlay fed by packet-store drainer"
+                // line. Without it a whole-file publish is invisible, and a static `subCues` in
+                // the memprobe reads as a drainer that stopped filling rather than as a complete
+                // track that needs no filling.
+                EngineLog.emit(
+                    "[AetherEngine] overlay fed by sidecar decode: id="
+                    + "\(externalTrackID.map(String.init) ?? "-") "
+                    + "stream=\(sourceStreamIndex.map(String.init) ?? "auto") "
+                    + "(\(result.cues.count) cues)",
+                    category: .engine)
                 // Native mov_text moov is declared at load; runtime sidecars drive only the host overlay (#55).
                 // Phase D: an external bitmap sidecar fills its OCR rendition store from THIS
                 // decode's image cues (no second download).
@@ -1466,7 +1503,7 @@ extension AetherEngine {
     public func selectSecondarySidecarSubtitle(url: URL, httpHeaders: [String: String]? = nil) {
         hostExplicitSubtitleAction = true
         cancelSidecarTask(channel: .secondary)
-        clearSubtitleDrainTarget(channel: .secondary)   // #112 rework
+        clearSubtitleDrainTarget(channel: .secondary, reason: .secondarySidecarSelected)   // #112 rework
         activeSecondaryEmbeddedSubtitleStreamIndex = -1
         activeSecondaryExternalSubtitleTrackID = nil
         startSecondarySidecarDecode(url: url, httpHeaders: httpHeaders)
@@ -1508,6 +1545,8 @@ extension AetherEngine {
     /// Disable primary subtitles, clear cues, cancel sidecar task + side demuxer, cancel multi-decode reader, clear native mov_text stores (#55, all-tracks). `nativeSubtitleTracks` is NOT cleared: the host needs the list to re-select after an audio/subtitle switch; only `stop()` / `load()` reset it.
     public func clearSubtitle() {
         hostExplicitSubtitleAction = true
+        injectedSubtitleSelectionTask?.cancel()
+        injectedSubtitleSelectionTask = nil
         // AE#359: subtitles off ends the rendition poll. The renditions themselves stay listed, only
         // the fetching stops, so re-selecting the track starts fresh from the current window.
         liveSubtitleFetchTask?.cancel()
@@ -1516,9 +1555,10 @@ extension AetherEngine {
         // pipeline; deselect it on the item (criteria pinned manual so system caption prefs
         // don't immediately re-select).
         // #316: an injected external rendition is the same kind of selection, under an external id.
-        if let active = activeSubtitleTrackIndex,
-           RemoteHLSMediaSelection.ordinal(forTrackID: active) != nil
-            || injectedSubtitleRenditionNames[active] != nil,
+        if let active = activeSubtitleTrackIndex, injectedSubtitleRenditionNames[active] != nil {
+            forceNativeLegibleDeselectedUntilHostSelects()
+        } else if let active = activeSubtitleTrackIndex,
+           RemoteHLSMediaSelection.ordinal(forTrackID: active) != nil,
            let item = currentAVPlayer?.currentItem {
             Task { @MainActor in
                 self.currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically = false
@@ -1528,7 +1568,7 @@ extension AetherEngine {
         }
         cancelSidecarTask()
         cancelSubtitleOCRWorker()   // Phase D: subtitles off = worker off (cursors persist)
-        clearSubtitleDrainTarget(channel: .primary)   // #112 rework
+        clearSubtitleDrainTarget(channel: .primary, reason: .subtitlesCleared)   // #112 rework
         activeEmbeddedSubtitleStreamIndex = -1
         activeSubtitleTrackIndex = nil
         loadedSidecarURL = nil
@@ -1565,7 +1605,7 @@ extension AetherEngine {
     public func clearSecondarySubtitle() {
         hostExplicitSubtitleAction = true
         cancelSidecarTask(channel: .secondary)
-        clearSubtitleDrainTarget(channel: .secondary)   // #112 rework
+        clearSubtitleDrainTarget(channel: .secondary, reason: .subtitlesCleared)   // #112 rework
         activeSecondaryEmbeddedSubtitleStreamIndex = -1
         activeSecondaryExternalSubtitleTrackID = nil
         loadedSecondarySidecarURL = nil
@@ -2076,8 +2116,10 @@ extension AetherEngine {
         for (ordinal, entry) in table.enumerated() {
             // Phase D: OCR entries defer to the selection-time sidecar decode (OCR of a whole
             // .sup at load would violate the selection gating).
-            guard !entry.needsOCR, let extID = entry.externalID,
+            guard let extID = entry.externalID,
                   let track = registry[extID], ordinal < stores.count else { continue }
+            stores[ordinal].setExternalTimelineOffsetSeconds(track.nativeTimelineOffsetSeconds)
+            guard !entry.needsOCR else { continue }
             let key = Key(url: track.url, headers: track.httpHeaders ?? defaultHeaders)
             if targetsByKey[key] == nil { order.append(key) }
             targetsByKey[key, default: []].append(
@@ -2153,12 +2195,17 @@ extension AetherEngine {
     /// active subtitle has no native text equivalent: a bitmap (PGS/DVB), CEA-708 (608 now rides a native
     /// rendition, #98), or a track added after load (dynamic external / one-shot sidecar).
     public func setNativeSubtitleRendering(_ active: Bool) {
+        injectedSubtitleRenderingRequested = active
         // #170: the AirPlay flip triggers both the engine's LAN-swap reload and the host's
         // documented rendering call; landing mid-reload the active track is transiently nil and
         // this call would be misread as a deselect. Latch the newest request instead;
         // restoreSubtitleSelection applies it once the reload has re-established the selection.
         if sessionPreservingReloadInFlight {
             pendingNativeRenderingRequest = active
+            return
+        }
+        if let id = activeSubtitleTrackIndex, styledInjectedSubtitleTrack(id: id) != nil {
+            refreshInjectedASSSubtitleRendering()
             return
         }
         guard active, let activeIdx = activeSubtitleTrackIndex,
@@ -2200,6 +2247,7 @@ extension AetherEngine {
         carryover.secondarySidecarURL = (isSecondarySubtitleActive && carryover.secondaryTrackIndex == nil)
             ? loadedSecondarySidecarURL : nil
         carryover.nativeReapplyOrdinal = nativeSubtitleReapplyOrdinal
+        carryover.injectedSubtitleRenderingRequested = injectedSubtitleRenderingRequested
         carryover.reapplyOrdinalMatchesActiveTrack = currentReapplyOrdinalMatchesActiveTrack()
         return carryover
     }
@@ -2210,6 +2258,7 @@ extension AetherEngine {
     /// the #88 registration point, BEFORE the native rendition table is built, so mid-session
     /// tracks become rendition-eligible on the reloaded item.
     func applySubtitleSessionCarryoverRegistrations(_ carryover: SubtitleSessionCarryover) {
+        injectedSubtitleRenderingRequested = carryover.injectedSubtitleRenderingRequested
         for entry in carryover.externalTracks {
             externalSubtitleRegistry[entry.id] = entry.track
             subtitleTracks.append(entry.track.makeTrackInfo(
@@ -2301,9 +2350,10 @@ extension AetherEngine {
         nativeLegibleDeselectPinTask = Task { @MainActor [weak self] in
             guard let self,
                   let group = try? await item.asset.loadMediaSelectionGroup(for: .legible),
-                  !group.options.isEmpty else { return }
+                  !Task.isCancelled, !group.options.isEmpty else { return }
             var attempts = 0
             while attempts < 25,
+                  !Task.isCancelled,
                   self.nativeSubtitleReapplyOrdinal == nil,
                   self.currentAVPlayer?.currentItem === item {
                 if attempts == 0 || item.currentMediaSelection.selectedMediaOption(in: group) != nil {
@@ -2313,7 +2363,7 @@ extension AetherEngine {
                 attempts += 1
                 try? await Task.sleep(nanoseconds: 40_000_000)
             }
-            guard self.nativeSubtitleReapplyOrdinal == nil,
+            guard !Task.isCancelled, self.nativeSubtitleReapplyOrdinal == nil,
                   self.currentAVPlayer?.currentItem === item else { return }
             self.armNativeLegibleReselectionObserver(item: item, group: group)
         }
@@ -2439,15 +2489,27 @@ extension AetherEngine {
                 // declared under, not as a second identity in the legible id range.
                 let selectedName = await RemoteHLSMediaSelection.playlistName(of: selected)
                     ?? selected.displayName
-                self.activeSubtitleTrackIndex = self.injectedSubtitleRenditionNames
-                    .first { $0.value == selectedName }?.key
-                    ?? RemoteHLSMediaSelection.subtitleTrackIDBase + ordinal
-                self.isSubtitleActive = true
-                EngineLog.emit(
-                    "[AetherEngine] AE#154: mirrored auto-selected legible option ordinal=\(ordinal)",
-                    category: .engine)
+                self.adoptRemoteHLSSubtitleSelection(name: selectedName, ordinal: ordinal, from: item)
             }
         }
+    }
+
+    /// Metadata lookup suspends. The current item and the host's newest choice,
+    /// including Off, must still own the selection when that lookup completes.
+    func adoptRemoteHLSSubtitleSelection(name: String, ordinal: Int, from item: AVPlayerItem) {
+        guard !Task.isCancelled, currentAVPlayer?.currentItem === item,
+              !hostExplicitSubtitleAction else { return }
+        let id = injectedSubtitleRenditionNames.first { $0.value == name }?.key
+            ?? RemoteHLSMediaSelection.subtitleTrackIDBase + ordinal
+        if styledInjectedSubtitleTrack(id: id) != nil {
+            selectSubtitleTrack(index: id, startAt: sourceTime)
+        } else {
+            activeSubtitleTrackIndex = id
+            isSubtitleActive = true
+        }
+        EngineLog.emit(
+            "[AetherEngine] AE#154: mirrored auto-selected legible option ordinal=\(ordinal)",
+            category: .engine)
     }
 
     /// #316: activate a sidecar the proxy declared in the served master. The track keeps the external id
@@ -2458,9 +2520,9 @@ extension AetherEngine {
     /// origin's own names), and `AVMediaSelectionOption.displayName` is the rendition's NAME attribute.
     /// A miss leaves the previous selection alone and says so rather than silently reporting success.
     func selectInjectedSubtitleRendition(id: Int, name: String) {
-        guard let item = currentAVPlayer?.currentItem else { return }
+        guard currentAVPlayer?.currentItem != nil else { return }
         cancelSidecarTask()
-        clearSubtitleDrainTarget(channel: .primary)
+        clearSubtitleDrainTarget(channel: .primary, reason: .injectedRenditionSelected)
         activeEmbeddedSubtitleStreamIndex = -1
         // AVPlayer owns the drawing here; leaving overlay cues behind would double up.
         subtitleCues = []
@@ -2468,13 +2530,60 @@ extension AetherEngine {
         isSubtitleActive = true
         activeSubtitleTrackIndex = id
         isLoadingSubtitles = false
-        Task { @MainActor in
+        updateInjectedSubtitleMediaSelection(id: id, name: name, nativeRendering: true)
+    }
+
+    private func styledInjectedSubtitleTrack(id: Int) -> ExternalSubtitleTrack? {
+        guard loadedOptions.preserveASSMarkup,
+              injectedSubtitleRenditionNames[id] != nil,
+              let track = externalSubtitleRegistry[id],
+              ExternalSubtitleTrack.codecName(url: track.url, formatHint: track.formatHint) == "ass" else {
+            return nil
+        }
+        return track
+    }
+
+    /// Called only after a selection has resolved to an actual overlay path.
+    /// Unknown track IDs must leave the current native rendition untouched.
+    private func deselectInjectedSubtitleForOverlay() {
+        guard let id = activeSubtitleTrackIndex, injectedSubtitleRenditionNames[id] != nil else { return }
+        injectedSubtitleSelectionTask?.cancel()
+        injectedSubtitleSelectionTask = nil
+        forceNativeLegibleDeselectedUntilHostSelects()
+    }
+
+    /// Keep the same raw sidecar selection and cue snapshot when the video moves
+    /// between the host overlay and a native PiP/AirPlay surface.
+    func refreshInjectedASSSubtitleRendering() {
+        guard let id = activeSubtitleTrackIndex,
+              styledInjectedSubtitleTrack(id: id) != nil,
+              let name = injectedSubtitleRenditionNames[id] else { return }
+        updateInjectedSubtitleMediaSelection(id: id, name: name,
+            nativeRendering: injectedSubtitleRenderingRequested || pictureInPictureActive
+                || externalPlaybackHoldsThePicture)
+    }
+
+    private func updateInjectedSubtitleMediaSelection(id: Int, name: String, nativeRendering: Bool) {
+        injectedSubtitleSelectionTask?.cancel()
+        injectedSubtitleSelectionTask = nil
+        if !nativeRendering {
+            forceNativeLegibleDeselectedUntilHostSelects()
+            return
+        }
+        cancelNativeLegibleDeselectPin()
+        guard let item = currentAVPlayer?.currentItem else { return }
+        injectedSubtitleSelectionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
             self.currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically = false
-            guard let group = try? await item.asset.loadMediaSelectionGroup(for: .legible) else { return }
+            guard let group = try? await item.asset.loadMediaSelectionGroup(for: .legible),
+                  !Task.isCancelled, self.currentAVPlayer?.currentItem === item,
+                  self.activeSubtitleTrackIndex == id else { return }
             var match: AVMediaSelectionOption?
             var seen: [String] = []
             for option in group.options {
                 let playlistName = await RemoteHLSMediaSelection.playlistName(of: option)
+                guard !Task.isCancelled, self.currentAVPlayer?.currentItem === item,
+                      self.activeSubtitleTrackIndex == id else { return }
                 seen.append(playlistName ?? option.displayName)
                 if match == nil, playlistName == name || option.displayName == name { match = option }
             }
@@ -2497,6 +2606,7 @@ extension AetherEngine {
     func selectRemoteHLSSubtitleTrack(id: Int) {
         guard let ordinal = RemoteHLSMediaSelection.ordinal(forTrackID: id),
               let item = currentAVPlayer?.currentItem else { return }
+        cancelNativeLegibleDeselectPin()
         cancelSidecarTask()
         subtitleCues = []
         isSubtitleActive = true

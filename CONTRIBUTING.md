@@ -10,7 +10,7 @@ If the problem is in a host app's UI rather than the engine, report it on that a
 
 ## Building and testing
 
-AetherEngine is a Swift package. It builds for iOS 16+, tvOS 17+, macOS 14+, and visionOS 1+.
+AetherEngine is a Swift package. It builds for iOS 18+, tvOS 18+, macOS 15+, and visionOS 1+.
 
 ```bash
 swift build

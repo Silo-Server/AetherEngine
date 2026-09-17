@@ -92,6 +92,84 @@ struct LogRedactionTests {
         #expect(line == "a=1&api_key=<redacted>&b=2&access_token=<redacted>&c=3")
     }
 
+    // MARK: - Credentials that no key name points at
+
+    /// Reported privately against 6.70.0. Several debrid and proxy add-ons in the Stremio ecosystem
+    /// carry the account token in a PATH segment, as base64url-encoded JSON, with no parameter name
+    /// anywhere near it, so every matcher above walks straight past it.
+    ///
+    /// Adding names cannot reach this one, and the decoded payload is why: its keys are `stores`, `c`
+    /// and `t`. Matching key names inside the decoded JSON would still miss it. The encoding itself is
+    /// the only thing that marks the segment as a carrier, so that is what this matches on.
+    @Test("a credential encoded into a path segment goes, although nothing in the line names it")
+    func encodedPathSegment() {
+        // {"stores":[{"c":"tb","t":"9f2c1ab34de5470fa1b6c8d90e7f2a11abcd"}]}
+        let segment = "eyJzdG9yZXMiOlt7ImMiOiJ0YiIsInQiOiI5ZjJjMWFiMzRkZTU0NzBmYTFiNmM4ZDkwZTdmMmExMWFiY2QifV19"
+        let line = LogRedaction.redact(
+            "[AetherEngine] load url=https://proxy.example.org/stremio/torz/\(segment)" +
+            "/_/strem/tt0111161/tb/9a3f/0/Some.Film.2009.mkv source-format=mkv"
+        )
+        #expect(!line.contains(segment))
+        #expect(!line.contains("ImMiOiJ0YiIsInQi"))
+        #expect(line.contains("/stremio/torz/<redacted>/_/strem/"))
+        #expect(line.contains("proxy.example.org"))
+        #expect(line.contains("Some.Film.2009.mkv"))
+        #expect(line.hasSuffix("source-format=mkv"))
+    }
+
+    /// The same shape without a key name, in the other place a URL hides one. `config=` is not a
+    /// credential parameter and never will be, so the value has to answer for itself.
+    @Test("an encoded blob in a query value goes even though its parameter is not a credential name")
+    func encodedQueryValue() {
+        let segment = "eyJzdG9yZXMiOlt7ImMiOiJ0YiIsInQiOiI5ZjJjMWFiMzRkZTU0NzBmYTFiNmM4ZDkwZTdmMmExMWFiY2QifV19"
+        let line = LogRedaction.redact("[x] https://s/a?config=\(segment)&Static=true")
+        #expect(!line.contains(segment))
+        #expect(line == "[x] https://s/a?config=<redacted>&Static=true")
+    }
+
+    /// A bearer token is the other nameless carrier: `Authorization` is not a credential key, `Bearer`
+    /// is a scheme, and the secret is the signature at the end. All three parts go, since a JWT missing
+    /// only its header is still a JWT to anyone who knows the algorithm.
+    @Test("a bearer JSON web token goes whole, signature included")
+    func bearerJSONWebToken() {
+        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+            + ".eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4ifQ"
+            + ".dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXkw"
+        let line = LogRedaction.redact("[http] GET /Items Authorization: Bearer \(jwt)")
+        #expect(!line.contains("dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXkw"))
+        #expect(!line.contains("eyJzdWIiOiIxMjM0NTY3ODkw"))
+        #expect(line == "[http] GET /Items Authorization: Bearer <redacted>")
+    }
+
+    /// The other nameless carrier, found by comparing this file against the copy Sodalite kept: a URL
+    /// can put the credential in its authority, where no key precedes it either. `load url=` logs
+    /// `absoluteString`, so a share opened as `smb://user:pw@host` or a server behind basic auth walked
+    /// straight into all three sinks. The user name stays: a log that cannot say which account failed
+    /// is worth less, and the name is not the secret.
+    @Test("a password in the authority goes, and the account name it identifies stays", arguments: [
+        "smb://media-ro:\(#"hunter2secretpw"#)@nas.local/Films/A.mkv",
+        "https://media-ro:\(#"hunter2secretpw"#)@jf.example.org/Videos/abc/stream.mkv",
+    ])
+    func userInfoInTheAuthority(url: String) {
+        let line = LogRedaction.redact("[AetherEngine] load url=\(url) source-format=mkv")
+        #expect(!line.contains("hunter2secretpw"))
+        #expect(line.contains("media-ro:<redacted>@"))
+        #expect(line.hasSuffix("source-format=mkv"))
+    }
+
+    /// The gate has to be the encoding, not a resemblance to it. An episode file that happens to start
+    /// with the same two letters, an item id, a hash: all of these are what a playback report is
+    /// actually diagnosed from, and none of them may be swallowed.
+    @Test("an ordinary segment that merely looks encoded is left alone", arguments: [
+        "[AetherEngine] load url=https://s/Videos/Eyewitness.S01E04.mkv source-format=mkv",
+        "[AetherEngine] load url=https://s/Videos/eyewitness-report-2011.mkv source-format=mkv",
+        "[AetherEngine] load url=https://s/Videos/a1b2c3d4e5f60718293a4b5c6d7e8f90/stream.mkv?Static=true",
+        "[hls.server] GET /master.m3u8 -> 200",
+    ])
+    func ordinarySegmentsSurvive(line: String) {
+        #expect(LogRedaction.redact(line) == line)
+    }
+
     /// The point of putting this in EngineLog rather than in each host: the handler a host installs
     /// must never see the raw token, whether or not that host scrubs its own log.
     @Test("the host handler receives the redacted line")
@@ -101,9 +179,11 @@ struct LogRedactionTests {
         EngineLog.handler = { box.append($0) }
         defer { EngineLog.handler = previous }
 
-        EngineLog.emit("[test] load url=https://s/v?api_key=\(token)&Static=true", category: .engine)
+        EngineLog.emit("[test-496a] load url=https://s/v?api_key=\(token)&Static=true", category: .engine)
 
-        let captured = box.lines
+        // #496: the handler is a process-wide singleton, so every line any concurrently running
+        // suite emits lands in this box too. Assert on THIS test's line, not on the box.
+        let captured = box.lines.filter { $0.contains("[test-496a]") }
         #expect(captured.count == 1)
         #expect(captured.first?.contains("api_key=<redacted>") == true)
         #expect(captured.first?.contains(token) == false)
@@ -119,9 +199,11 @@ struct LogRedactionTests {
         EngineLog.handler = { box.append($0) }
         defer { EngineLog.handler = previous }
 
-        EngineLog.emit("[test] per-segment trace api_key=\(token)", category: .session, level: .verbose)
+        EngineLog.emit("[test-496b] per-segment trace api_key=\(token)", category: .session, level: .verbose)
 
-        #expect(box.lines.isEmpty)
+        // #496: same singleton, same rule. The bare `box.lines.isEmpty` failed a full run once on
+        // an unrelated AVIOReader line from a parallel suite, which says nothing about `.verbose`.
+        #expect(box.lines.filter { $0.contains("[test-496b]") }.isEmpty)
     }
 
     /// The handler is called on whatever thread emitted, so the capture needs its own lock.

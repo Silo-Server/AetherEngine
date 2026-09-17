@@ -1,23 +1,38 @@
 import Foundation
 
-/// #316: stands a loopback origin in front of a remote HLS master so host-declared sidecars can be
-/// declared as legible renditions, without moving a single media byte off the origin.
+/// Stands a loopback origin in front of a remote HLS master, for either of two reasons.
 ///
-/// The sequence is deliberately cheap and entirely optional. Two playlist GETs (the master, then one
-/// variant for the program duration and the VOD verdict), a rewrite, a socket. Anything that does not
-/// line up, and the caller keeps the origin URL it already had: the sidecars stay overlay-only, exactly
-/// as before, and the load is never failed over a subtitle feature.
+/// #316: host-declared sidecars can only be declared as legible renditions through a playlist, so the
+/// engine writes a master of its own, without moving a single media byte off the origin.
+///
+/// AE#495: a host has answered `EngineTLS.serverTrustEvaluator`, and AVPlayer asks no delegate about a
+/// certificate inside its own networking, so the media has to move onto a session the engine owns. An
+/// `HLSOriginRelay` mounted on the same server does that.
+///
+/// They compose. With both, the master carries the injected renditions AND its variants come back
+/// through the relay, so a self-signed origin with sidecars gets both rather than choosing. With only
+/// the relay there are no tracks and no provider, and the player is pointed straight at the relay.
+///
+/// The #316 sequence is deliberately cheap and entirely optional. Two playlist GETs (the master, then
+/// one variant for the program duration and the VOD verdict), a rewrite, a socket. Anything that does
+/// not line up, and the sidecars stay overlay-only exactly as before. A load is never failed over a
+/// subtitle feature. A refusal with a relay wanted still stands the relay up on its own, because the
+/// media has nowhere else to go.
 enum RemoteHLSSubtitleProxy {
 
-    /// A standing proxy: the caller plays `masterURL` and owns the teardown.
+    /// A standing stand-in: the caller plays `masterURL` and owns the teardown.
     struct Prepared {
         let server: HLSLocalServer
-        let provider: RemoteHLSSubtitleProvider
+        let provider: RemoteHLSSubtitleProvider?
         let masterURL: URL
 
+        /// False when the relay stands alone and nothing was injected.
+        var servesSubtitleRenditions: Bool { provider != nil }
+
         func tearDown() {
-            provider.cancelFill()
+            provider?.cancelFill()
             server.stop()
+            server.relay?.stop()
         }
     }
 
@@ -36,22 +51,55 @@ enum RemoteHLSSubtitleProxy {
 
     static func prepare(originURL: URL,
                         tracks: [RemoteHLSSubtitleProvider.Track],
-                        httpHeaders: [String: String]) async -> Prepared? {
-        guard !tracks.isEmpty else { return nil }
+                        httpHeaders: [String: String],
+                        needsRelay: Bool) async -> Prepared? {
+        guard !tracks.isEmpty || needsRelay else { return nil }
+        if !tracks.isEmpty {
+            do {
+                let prepared = try await build(
+                    originURL: originURL, tracks: tracks, httpHeaders: httpHeaders,
+                    needsRelay: needsRelay)
+                EngineLog.emit(
+                    "[AetherEngine] #316: serving \(tracks.count) external subtitle rendition(s) over a "
+                    + "rewritten master at \(prepared.masterURL.absoluteString), media "
+                    + (needsRelay ? "comes back through the AE#495 relay" : "stays at the origin"),
+                    category: .engine)
+                return prepared
+            } catch {
+                EngineLog.emit(
+                    "[AetherEngine] #316: no subtitle renditions on this remote-HLS source (\(reason(error))), "
+                    + "the declared sidecars stay host-overlay only",
+                    category: .engine)
+            }
+        }
+        guard needsRelay else { return nil }
+        return relayOnly(originURL: originURL, httpHeaders: httpHeaders)
+    }
+
+    /// The AE#495 half with nothing to inject: no provider, no playlist reads, and the player is
+    /// pointed at the relay's own address for the origin.
+    private static func relayOnly(originURL: URL, httpHeaders: [String: String]) -> Prepared? {
+        let relay = HLSOriginRelay()
+        relay.admit(originURL, httpHeaders: httpHeaders)
+        let server = HLSLocalServer(relay: relay)
         do {
-            let prepared = try await build(originURL: originURL, tracks: tracks, httpHeaders: httpHeaders)
-            EngineLog.emit(
-                "[AetherEngine] #316: serving \(tracks.count) external subtitle rendition(s) over a "
-                + "rewritten master at \(prepared.masterURL.absoluteString); media stays at the origin",
-                category: .engine)
-            return prepared
+            try server.start()
         } catch {
             EngineLog.emit(
-                "[AetherEngine] #316: no subtitle renditions on this remote-HLS source (\(reason(error))); "
-                + "the declared sidecars stay host-overlay only",
-                category: .engine)
+                "[AetherEngine] AE#495: relay did not start (\(error)). AVPlayer goes to the origin, "
+                + "which needs a certificate the system trusts", category: .engine)
+            relay.stop()
             return nil
         }
+        guard let entry = server.relayURL(for: originURL) else {
+            server.stop()
+            relay.stop()
+            return nil
+        }
+        EngineLog.emit(
+            "[AetherEngine] AE#495: routing \(originURL.host ?? "the origin") through the relay so the "
+            + "handshake runs where the evaluator is asked", category: .engine)
+        return Prepared(server: server, provider: nil, masterURL: entry)
     }
 
     private static func reason(_ error: Error) -> String {
@@ -69,7 +117,8 @@ enum RemoteHLSSubtitleProxy {
 
     private static func build(originURL: URL,
                               tracks: [RemoteHLSSubtitleProvider.Track],
-                              httpHeaders: [String: String]) async throws -> Prepared {
+                              httpHeaders: [String: String],
+                              needsRelay: Bool) async throws -> Prepared {
         let session = makeSession()
         defer { session.finishTasksAndInvalidate() }
 
@@ -86,15 +135,28 @@ enum RemoteHLSSubtitleProxy {
         let provider = RemoteHLSSubtitleProvider(tracks: tracks, masterBody: master,
                                                  programDuration: duration,
                                                  defaultHeaders: httpHeaders)
-        let server = HLSLocalServer(provider: provider)
+        let relay: HLSOriginRelay? = needsRelay ? HLSOriginRelay() : nil
+        relay?.admit(finalURL, httpHeaders: httpHeaders)
+        let server = HLSLocalServer(provider: provider, relay: relay)
         do {
             try server.start()
         } catch {
+            relay?.stop()
             throw Refusal.serverUnavailable("\(error)")
         }
         guard let masterURL = server.playlistURL else {
             server.stop()
+            relay?.stop()
             throw Refusal.serverUnavailable("no playlist URL after start")
+        }
+        // The variants in that master are the origin's, and with a relay mounted they have to come
+        // back through it. Only now, because the address they point at is this server's own and does
+        // not exist until it is listening. The injected renditions are relative and stay untouched.
+        if let relay {
+            provider.setMasterPlaylistBody(
+                relay.rewritePlaylist(
+                    master, relativeTo: finalURL, port: server.port, token: server.pathToken,
+                    absoluteOnly: true))
         }
         // Decode up front: the rendition is fetched the moment the host selects it, and a whole-program
         // .vtt is fetched once and never again.
@@ -109,7 +171,8 @@ enum RemoteHLSSubtitleProxy {
         config.timeoutIntervalForRequest = budgetSeconds / 2
         config.timeoutIntervalForResource = budgetSeconds
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        return URLSession(configuration: config)
+        return URLSession(
+            configuration: config, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
     }
 
     /// Returns the body and the URL it finally came from; every relative URI in the playlist resolves

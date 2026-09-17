@@ -114,6 +114,11 @@ final class LiveFixture: @unchecked Sendable {
     var pacingLeadSeconds: Double = 2.0 // max emitter lead before sleeping
     /// Preroll served at full speed before the 1x gate engages, so the producer can finalize its first segment before AVPlayer's initial-buffering stall timer (CoreMedia -12888).
     var pacingPrerollSeconds: Double = 30.0
+    /// Multiple of wall clock the paced fixture holds AFTER the preroll burst. 1.0 is a strict
+    /// realtime origin; above it is an origin that keeps handing over faster than it happens, which
+    /// is the shape a restreamer with a standing buffer serves and the one `--realtime` (1x) and an
+    /// unpaced fixture (a burst that ENDS) bracket without covering.
+    var pacingRateMultiple: Double = 1.0
     private var discontinuityArmed = false // timer-driven so the jump fires even while serve loop is blocked in send()
     private var didFireDiscontinuity = false
 
@@ -446,7 +451,7 @@ final class LiveFixture: @unchecked Sendable {
                             stateLock.unlock()
                             if stopNow { return }
                             let wall = Date().timeIntervalSince(pacingClockStart!)
-                            let lead = mediaPastPreroll - wall
+                            let lead = mediaPastPreroll / max(0.01, pacingRateMultiple) - wall
                             if lead <= pacingLeadSeconds { break }
                             let nap = min(lead - pacingLeadSeconds, 0.25) // cap each nap so stop() is honoured promptly
                             usleep(useconds_t(max(0.005, nap) * 1_000_000))

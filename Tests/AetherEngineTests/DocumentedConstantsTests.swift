@@ -19,6 +19,17 @@ import AetherLibavcodec
 @MainActor
 final class DocumentedConstantsTests: XCTestCase {
 
+    func testPartialCompositionHoldBoundsMatchDocumentation() throws {
+        let docs = try documentation()
+        XCTAssertEqual(H264PartialCompositionRepair.maximumReorderDepth, 16)
+        XCTAssertEqual(H264PartialCompositionRepair.maximumHeldPackets, 1024)
+        XCTAssertEqual(H264PartialCompositionRepair.maximumHeldBytes, 32 << 20)
+        XCTAssertEqual(H264PartialCompositionRepair.maximumProofPictures, 64)
+        assertDocumented("to **16 pictures**", docs)
+        assertDocumented("**1024 interleaved packets and\n32 MiB**", docs)
+        assertDocumented("within **64 pictures**", docs)
+    }
+
     // MARK: - Documentation corpus
 
     private static var repoRoot: URL {

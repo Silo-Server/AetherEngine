@@ -39,6 +39,12 @@ final class FrameDecodeContext: @unchecked Sendable {
     /// this the thumbnail draws square-pixel and looks stretched. Defaults 1:1.
     private var streamSAR = AVRational(num: 1, den: 1)
     private(set) var isOpen = false
+    /// AE#499: the container's colour declaration, captured at open. `isHDR` below is read off
+    /// exactly this, so a frame whose VUI says nothing has to inherit it or the two disagree: the gate
+    /// switches tone mapping on from the container while zscale reads the frame and finds no path to
+    /// linear (`code 3074`), and the still falls back to an untone-mapped conversion.
+    private var containerColor = ColorDescription.unspecified
+
     private(set) var isHDR = false
     /// True for Dolby Vision Profile 5 / Profile 10.0 (no base layer): the decoded planes are
     /// IPT-PQ-C2, not standard YCbCr, so they route through DolbyVisionStillConverter (#103).
@@ -201,6 +207,7 @@ final class FrameDecodeContext: @unchecked Sendable {
         if declared.num > 0, declared.den > 0 {
             streamSAR = declared
         }
+        containerColor = ColorDescription(codecpar: codecpar)
         isHDR = Self.isHDRTransfer(codecpar.pointee.color_trc)
         isDolbyVisionNoBaseLayer = Self.isDVNoBaseLayer(codecpar: codecpar)
         guard let codec = avcodec_find_decoder(codecpar.pointee.codec_id) else {
@@ -508,6 +515,10 @@ final class FrameDecodeContext: @unchecked Sendable {
                     if draining { return nil }      // avoid re-flushing the same error forever
                     break                           // real error: try next packet
                 }
+
+                // AE#499: before the DV, tone-map and sws branches below read it, and before the
+                // hardware transfer copies its props onto the software frame.
+                ColorDescription.backfill(frame: f, container: containerColor)
 
                 // Skip frames before targetPTS for frame-accuracy. No-PTS frames
                 // (AV_NOPTS_VALUE == Int64.min) are accepted, so PTS-less streams
