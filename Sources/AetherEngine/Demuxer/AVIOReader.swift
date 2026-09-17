@@ -164,6 +164,31 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
     }
 
+    /// Whether the consumer intends to play, mirrored from the same source the segment producer
+    /// reads (`HLSVideoEngine.playIntentProvider`). Nil is an intent nobody reported, and that is
+    /// read as stopped rather than as playing: every path that plays wires this, so the reader
+    /// left without it is one whose consumer the engine cannot vouch for, and the safe answer
+    /// there is the bounded one. Choosing "playing" would let such a reader hold a dormant flow
+    /// for as long as it lives, which is the #310 exposure this flag is supposed to bound.
+    ///
+    /// Behind a leaf lock like the phase sink below, and for the same reason: the demuxer forwards
+    /// it whenever the engine assigns it, which may be after `open()`, while the held connection's
+    /// pump thread reads it. Taken UNDER `winCond`, never the other way round.
+    var playIntentProvider: (@Sendable () -> Bool)? {
+        get {
+            playIntentLock.lock()
+            defer { playIntentLock.unlock() }
+            return _playIntentProvider
+        }
+        set {
+            playIntentLock.lock()
+            _playIntentProvider = newValue
+            playIntentLock.unlock()
+        }
+    }
+    private let playIntentLock = NSLock()
+    private var _playIntentProvider: (@Sendable () -> Bool)?
+
     /// Leaf lock over the sink and its gate: takes no other lock, and no other lock is held across it.
     private let networkPhaseLock = NSLock()
     private var _onNetworkPhaseChanged: (@Sendable (ReaderNetworkPhase) -> Void)?
@@ -416,13 +441,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         OriginRequestBudget.shared.requiresSerialRequests(requestURL())
     }
 
-    /// #377: hand back the origin slot a persistent connection holds, synchronously.
-    /// `didCompleteWithError` would do it too, but it arrives asynchronously, and every caller
-    /// here is about to ask for a slot again. Idempotent, so the later callback is a no-op.
-    static func releaseBudgetTicket(of task: URLSessionTask?) {
-        (task?.delegate as? PersistentReadDelegate)?.releaseTicket()
-    }
-
     private func addBytesFetched(_ n: Int) {
         counterLock.lock()
         _cumulativeBytesFetched &+= Int64(n)
@@ -495,6 +513,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// on it rather than handing FFmpeg an empty stream to misreport as invalid data. Written on
     /// the delegate queue before `streamEnded`; guarded by `streamLock`.
     private var streamRefusedStatus = 0
+    /// AE#495: the `NSURLErrorDomain` code of a TLS trust refusal seen on any of this reader's tasks,
+    /// 0 when none. Recorded rather than thrown from where it happens, because the task that sees it
+    /// is not the one the open is waiting on: without it the open fails as FFmpeg's invalid data and a
+    /// self-signed origin is indistinguishable from a corrupt file. Guarded by `streamLock`.
+    private var transportSecurityCode = 0
 
     // MARK: - Persistent Mode (single forward-streaming connection, playback path)
 
@@ -549,6 +572,46 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     // one request per range boundary while the consumer keeps up, one per
     // highWater-to-lowWater drain cycle when the origin outruns it.
     static let persistentRangeBytes: Int64 = 32 * 1024 * 1024
+
+    /// #377: the smallest window room worth a read on a held connection, and therefore the length
+    /// of a dormant stretch in the steady state (this over media rate). #310's dose is that
+    /// length: 16 MB of window at 1.2 Mbps is ~100 s dormant and produced 11 starvation episodes
+    /// in 80 min, the same window at 88 Mbps is 1.4 s and produced none in 118 min. 64 KB is 0.4 s
+    /// at that same 1.2 Mbps and 7 ms at 70 Mbps, so the steady state sits in the regime that
+    /// never fired rather than relying on a measurement nobody can take on demand.
+    private static let heldPullSlack = 64 * 1024
+    /// How often a held connection on a full window re-reads the play intent. A pause is not
+    /// broadcast on `winCond` -- nothing reads during one -- so this is what lets the paused
+    /// budget below start at all.
+    private static let heldPlayIntentPollSeconds: TimeInterval = 1
+    /// How long a held connection may stay open while the consumer is PAUSED before it is ended.
+    /// Playback never spends this: a parked producer is not a stopped one, and a reader that reads
+    /// the first as the second re-requests every few seconds, which is what this flag exists to
+    /// stop. A pause is the unbounded case #310's worst episode came from (11 minutes), so it is
+    /// bounded here and nowhere else.
+    ///
+    /// The number is half the longest dormancy measured clean on the device, which is the whole of
+    /// its derivation. Arm B on an Apple TV 4K 3rd gen (tvOS 26.6) held a stream task on a closed
+    /// receive window for 600 s against the origin from #377: 1180 canary requests at 1 Hz, to that
+    /// origin and to a host that is not it, all 206, and about 3 MB resident when the reads resumed
+    /// against the ~12 GB the wire could have carried, so the window really was shut for the whole
+    /// stretch. That is #310's wire condition itself rather than a proxy for it, and no cliff sits
+    /// under twice this value. It stays at half of it because a clean run is not a threshold, and
+    /// because being wrong here is cheap: one frontier request per pause that outlives the bound,
+    /// against the 218 an hour this flag used to spend on parked producers alone.
+    ///
+    /// Media rate is not on this axis. A paused consumer takes no bytes, so the dormant stretch is
+    /// the pause, whatever the file's rate; the rate only decides how quickly the socket buffer
+    /// fills before the window shuts, which is the 3 MB above. #310's window-over-media-rate dose
+    /// is the PLAYING case and it belongs to `heldPullSlack`, not here.
+    static let heldPausedBudgetDefault: TimeInterval = 300
+
+    /// Overridable so a test can express a pause without sleeping through the real budget.
+    nonisolated(unsafe) var heldPausedBudgetSeconds: TimeInterval = AVIOReader.heldPausedBudgetDefault
+    /// Ceiling on a single pull. The window's remaining room is normally the smaller number; this
+    /// only keeps one read from asking the transport for an unbounded amount while the window is
+    /// empty (an open, a seek).
+    private static let heldMaxPullBytes = 1 * 1024 * 1024
     // #377: how long a pump range waits for an origin slot before going on the link anyway. The
     // pump is the main line and everything that can be holding a slot ahead of it is short (a 4 MB
     // detour block, a size probe), so this is "wait for the short thing", not "give up". Generous
@@ -669,7 +732,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var connRetryAfter: TimeInterval = 0
     // Bumped on every (re)connect; stale delegate callbacks are ignored.
     private var connGeneration = 0
-    private var activeTask: URLSessionDataTask?
+    /// #377: what is on the link for this reader. Either shape is ONE request against the
+    /// origin holding one slot of its budget; they differ only in who decides when bytes
+    /// move, and every other piece of this reader (window, frontier, reconnect ladder,
+    /// diagnostics) is written against the transfer rather than against a URLSession task.
+    private var activeTransfer: (any PersistentTransfer)?
 
     /// #174: winCond-guarded snapshots, internal so the task-level backpressure is
     /// unit-tested against a loopback origin without private state access.
@@ -689,13 +756,29 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return rateLimitStreak
     }
 
+    /// Bytes the window holds ahead of the cursor. Caller holds `winCond`. The held pull budget
+    /// and the delivery-gap watchdog both decide on the room this leaves, and they have to agree:
+    /// the watchdog stands aside exactly where the pump waits.
+    private func windowAheadLocked() -> Int {
+        window.count - max(0, Int(position - winStart))
+    }
+
+    /// The delivery gap the watchdog would judge right now. A test reads it to state the invariant
+    /// the field case turns on: a stretch with no read outstanding does not accumulate against the
+    /// read that follows it.
+    var deliveryGapSecondsForTesting: Double {
+        winCond.lock()
+        defer { winCond.unlock() }
+        return Double(DispatchTime.now().uptimeNanoseconds - lastDeliveryAt.uptimeNanoseconds) / 1_000_000_000
+    }
+
     /// Whether a transfer is still installed. A test that needs a range to have COMPLETED, rather
     /// than merely to have delivered, waits on this instead of on a sleep: the completion callback
-    /// is what clears `activeTask`, and that clearing is the state the behaviour turns on.
+    /// is what clears `activeTransfer`, and that clearing is the state the behaviour turns on.
     var hasLiveConnectionForTesting: Bool {
         winCond.lock()
         defer { winCond.unlock() }
-        return activeTask != nil
+        return activeTransfer != nil
     }
 
     /// #220/#310: set when WE ended the connection at `winHighWater` (ending is the only
@@ -907,6 +990,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// hook would leak into whatever suite runs concurrently. The shipped values are the
     /// two statics above.
     private let winHighWater: Int
+    /// `LoadOptions.heldSourceConnection` (#377): this reader asks the origin once and pulls,
+    /// instead of ending at the high water and asking again at low water. Opt in, an init
+    /// parameter rather than a process-wide hook for the same reason `winHighWater` is one, and
+    /// off for every reader whose caller did not ask (the subtitle side reader included, whose
+    /// deliberate multi-minute parks are the shape a held connection must not take).
+    private let heldConnectionEnabled: Bool
     private var throttleVClockNs: UInt64 = 0
     private let throttleLock = NSLock()
 
@@ -914,7 +1003,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// origin at once and the line used to name none of them.
     private let label: String
 
-    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, windowHighWater: Int? = nil) {
+    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, windowHighWater: Int? = nil, heldConnection: Bool = false) {
         self.url = url
         self.label = label
         self.extraHeaders = extraHeaders
@@ -931,6 +1020,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         self.connStallTimeout = max(0.05, connStallTimeout)
         self.winHighWater = max(1, windowHighWater
             ?? (isLive ? Self.liveWinHighWaterDefault : Self.winHighWaterDefault))
+        self.heldConnectionEnabled = heldConnection
     }
 
     /// Slow-CDN simulation: hold delivered bytes to `throttleKbps` by sleeping the demux thread before the
@@ -1034,9 +1124,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 // a size; if not, abandon it (generation bump ignores a size landing in the
                 // race window). fileSize is read under the lock because the delegate thread now
                 // writes it (issue #70 review #4/#5).
-                let (haveSize, abandonedTask, pumpStatus) = resolveOptimisticOpen()
-                abandonedTask?.cancel()
-                Self.releaseBudgetTicket(of: abandonedTask)
+                let (haveSize, abandoned, pumpStatus) = resolveOptimisticOpen()
+                abandoned?.cancelTransfer()
+                abandoned?.releaseOriginTicket()
                 if !haveSize {
                     tookFallback = true
                     // A 401/403/404/410 at byte 0 is the origin's answer to the RESOURCE, not to
@@ -1128,6 +1218,21 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// publishes the status. `fallbackStatus` is the ranged open's refusal (0 when there was
     /// none): a hung-up unranged GET whose header never arrived within the open budget still
     /// carries the verdict the origin already gave. Demux thread, open-time only.
+    /// AE#495: record a TLS trust refusal off any task of this reader, and name it once in the log.
+    /// Everything else is left to the caller's own error handling; this only classifies.
+    func noteTransportSecurityFailure(_ error: Error?) {
+        guard let code = TransportSecurityFailure.code(in: error) else { return }
+        streamLock.lock()
+        let first = transportSecurityCode == 0
+        transportSecurityCode = code
+        streamLock.unlock()
+        guard first else { return }
+        EngineLog.emit(
+            "[AVIOReader] \(label) TLS refused (NSURLError \(code)): "
+            + "\(TransportSecurityFailure.sentence(for: code))",
+            category: .demux)
+    }
+
     private func failIfStreamingRefused(fallbackStatus: Int) throws {
         streamLock.lock()
         let refused = streamRefusedStatus
@@ -1135,6 +1240,21 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let empty = streamBuffer.isEmpty && streamBytesRead == 0
         streamLock.unlock()
         let status = refused != 0 ? refused : ((ended && empty) ? fallbackStatus : 0)
+        // AE#495: a handshake the system refused outranks a status, because there was never a
+        // response to carry one. Same reason this function exists at all: the demuxer would be handed
+        // nothing and report invalid data.
+        streamLock.lock()
+        let tlsCode = transportSecurityCode
+        streamLock.unlock()
+        if tlsCode != 0 {
+            EngineLog.emit(
+                "[AVIOReader] \(label) source unreachable: \(TransportSecurityFailure.sentence(for: tlsCode)); "
+                + "failing the open typed",
+                category: .demux)
+            markClosed()
+            close()
+            throw AVIOReaderError.transportSecurityFailed(code: tlsCode)
+        }
         guard status != 0 else { return }
         EngineLog.emit(
             "[AVIOReader] \(label) source refused: HTTP \(status); failing the open typed",
@@ -1178,18 +1298,18 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// the lock. Demux thread, open-time only; leaves the AVIO context intact (unlike close()).
     /// `pumpStatus` is the HTTP status the abandoned connection was answered with (0 when no
     /// response arrived), so the caller can tell a refused resource from a length-less one.
-    private func resolveOptimisticOpen() -> (haveSize: Bool, abandonedTask: URLSessionDataTask?, pumpStatus: Int) {
+    private func resolveOptimisticOpen() -> (haveSize: Bool, abandoned: (any PersistentTransfer)?, pumpStatus: Int) {
         winCond.lock()
         defer { winCond.unlock() }
         if fileSize > 0 { return (true, nil, connStatus) }
         let status = connStatus
         connGeneration &+= 1
-        let task = activeTask
-        activeTask = nil
+        let transfer = activeTransfer
+        activeTransfer = nil
         window = Data()
         connEnded = true
         winCond.broadcast()
-        return (false, task, status)
+        return (false, transfer, status)
     }
 
     // Close flags written on the teardown thread (markClosed / fullyClose) and read on the demux
@@ -1277,8 +1397,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // fresh reader's cold read, which is exactly the per-connection starvation behind the residual
         // 15-30s cold reads. The AVIO context is untouched (close() still frees it); only the socket
         // is released. Grab under winCond, invalidate outside it (mirrors close()).
-        let task = activeTask
-        activeTask = nil
+        let transfer = activeTransfer
+        activeTransfer = nil
         connEnded = true
         // #281: a speculative fetch outlives nothing. Same reasoning as the persistent GET above:
         // an abandoned reader's in-flight request fair-shares the origin with the fresh reader's
@@ -1289,8 +1409,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         openPhaseActive = false
         winCond.broadcast()
         winCond.unlock()
-        task?.cancel()
-        Self.releaseBudgetTicket(of: task)   // #377: the fresh reader asks for this slot next
+        transfer?.cancelTransfer()
+        transfer?.releaseOriginTicket()   // #377: the fresh reader asks for this slot next
         tailTask?.cancel()
     }
 
@@ -1338,8 +1458,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         winCond.lock()
         connGeneration &+= 1
         connEnded = true
-        let task = activeTask
-        activeTask = nil
+        let transfer = activeTransfer
+        activeTransfer = nil
         window = Data()
         // #281: both spans hold real bytes (up to headSpanMaxBytes + tailPrefetchBytes), so they
         // are released with the window rather than living until the reader is deallocated.
@@ -1352,10 +1472,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         winCond.broadcast()
         winCond.unlock()
         tailTask?.cancel()
-        // #220: the shared session is never invalidated, so the task has to be cancelled
+        // #220: the shared session is never invalidated, so the transfer has to be cancelled
         // explicitly. Invalidating used to be what released this connection.
-        task?.cancel()
-        Self.releaseBudgetTicket(of: task)
+        transfer?.cancelTransfer()
+        transfer?.releaseOriginTicket()
     }
 
     // MARK: - Read (called by FFmpeg on demux thread)
@@ -1728,7 +1848,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // water (or immediately once the window is empty), keeping every delivered byte.
             //
             // `windowCanServe` is excluded for exactly the same reason, and the omission was
-            // measurable: a range delivered IN FULL also clears `activeTask`, so a consumer
+            // measurable: a range delivered IN FULL also clears `activeTransfer`, so a consumer
             // slower than the transfer (the parse pass, which reads one 256 KB AVIO buffer at a
             // time) reached this branch with the rest of the range still resident and re-fetched
             // it. Measured against a Range-logging origin, a 764450 B trailing `moov` cost three
@@ -1747,7 +1867,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // generation that delivered at least one byte keeps the fast path.
             let endedInError = connEnded && !connEndedAtRangeEnd && !connEndedByBackpressure
                 && !connFirstDataSeen
-            if activeTask == nil, !connEndedByBackpressure, !windowCanServe, !endedInError {
+            if activeTransfer == nil, !connEndedByBackpressure, !windowCanServe, !endedInError {
                 let target = position
                 winCond.unlock()
                 timedReconnect(seek: true, at: target)
@@ -1878,7 +1998,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 var refillRetryAfter: TimeInterval = 0
                 let undrained = window.count - max(0, Int(position - winStart))
                 let frontier = winStart + Int64(window.count)
-                if activeTask == nil, undrained <= Self.winLowWater,
+                if activeTransfer == nil, undrained <= Self.winLowWater,
                    isLive || fileSize <= 0 || frontier < fileSize {
                     if connEndedAtRangeEnd || connEndedByBackpressure {
                         refillFrom = frontier
@@ -2557,7 +2677,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // size is not resolved yet, where there is nothing to clamp the last range against. An
         // explicit caller bound (boundedInitialFetch) still wins. `fileSize` is read here
         // because winCond is already held, as every fileSize access requires.
+        // #377: a held connection is open-ended by construction. Bounded ranges (#220) exist
+        // because a pushed transport delivers everything it was asked for whether or not the
+        // consumer is ready, so the ASK is what bounds the window. A pull bounds it at the read
+        // instead, and asking for a finite range would put the request cadence straight back. An
+        // explicit caller bound still wins, because that caller wants a specific amount read.
         let resolvedBound: Int64? = boundedTo ?? {
+            guard !heldConnectionEnabled else { return nil }
             guard !isLive else { return nil }
             // fileSize is still 0 on the very first connection, since the response's
             // Content-Range is what resolves it. Asking for a fixed amount anyway is both safe
@@ -2605,17 +2731,17 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // The timestamp is cleared by proof of delivery (`appendPersistentData`, first data) and
         // by an intentional reposition (`seekReconnect`), the two events that genuinely end a
         // faulted lineage.
-        let oldTask = activeTask
-        activeTask = nil
+        let oldTransfer = activeTransfer
+        activeTransfer = nil
         winCond.broadcast()
         winCond.unlock()
 
-        oldTask?.cancel()
+        oldTransfer?.cancelTransfer()
         // #377: hand the old range's origin slot back HERE rather than waiting for its
         // `didCompleteWithError`, which arrives asynchronously. On a single-slot origin the pump
         // would otherwise queue behind its own previous range at every 32 MB boundary and spend
         // its whole acquire budget waiting for itself.
-        Self.releaseBudgetTicket(of: oldTask)
+        oldTransfer?.releaseOriginTicket()
 
         if isClosed { return }
 
@@ -2649,28 +2775,43 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let ticket = OriginRequestBudget.shared.acquire(
             for: requestURLForBudget, label: "\(label) pump", timeout: Self.pumpSlotWaitSeconds)
 
-        let delegate = PersistentReadDelegate(
-            reader: self,
-            generation: generation,
-            extraHeaders: extraHeaders,
-            ticket: ticket,
-            originURL: requestURLForBudget
-        )
-        let task = Self.persistentSession.dataTask(with: request)
-        task.delegate = delegate
+        let transfer: any PersistentTransfer
+        if heldConnectionEnabled {
+            transfer = HeldSourceConnection(
+                url: request.url ?? requestURLForBudget,
+                offset: offset,
+                extraHeaders: extraHeaders,
+                userAgent: nil,
+                label: label,
+                generation: generation,
+                ticket: ticket,
+                delegate: self
+            )
+        } else {
+            let delegate = PersistentReadDelegate(
+                reader: self,
+                generation: generation,
+                extraHeaders: extraHeaders,
+                ticket: ticket,
+                originURL: requestURLForBudget
+            )
+            let task = Self.persistentSession.dataTask(with: request)
+            task.delegate = delegate
+            transfer = task
+        }
 
         winCond.lock()
         // A close() that raced in bumped the generation; don't install a stale connection.
         guard generation == connGeneration, !isClosed else {
             winCond.unlock()
-            task.cancel()
-            delegate.releaseTicket()   // never resumed, so no completion callback will free it
+            transfer.cancelTransfer()
+            transfer.releaseOriginTicket()   // never started, so no completion callback will free it
             return
         }
-        activeTask = task
+        activeTransfer = transfer
         winCond.unlock()
 
-        task.resume()
+        transfer.startTransfer()
         // #309: from here the generation is watched on wall-clock time, not on consumer cadence.
         armDeliveryGapWatchdog(generation: generation, after: connStallTimeout)
         armFirstByteWitness(generation: generation, originURL: requestURLForBudget)
@@ -2681,6 +2822,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         EngineLog.emit(
             "[AVIOReader] \(label) conn start gen=\(generation) offset=\(offset)"
             + (resolvedBound.map { " len=\($0 / 1024 / 1024)MB" } ?? " open-ended")
+            + (heldConnectionEnabled ? " held" : "")
             + reResolveNote(),
             category: .demux)
     }
@@ -2711,7 +2853,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         winCond.lock()
         // Nothing to report: a newer generation owns the link, this one already ended, no transfer
         // is installed, or the first byte landed while this closure was queued.
-        guard generation == connGeneration, !connEnded, activeTask != nil, !connFirstDataSeen else {
+        guard generation == connGeneration, !connEnded, activeTransfer != nil, !connFirstDataSeen else {
             winCond.unlock()
             return
         }
@@ -2755,12 +2897,31 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         winCond.lock()
         // Nothing to watch: a newer generation owns the link, the connection already ended
         // (delivered range, high-water end, transport error), or no transfer is installed.
-        guard generation == connGeneration, !connEnded, let task = activeTask else {
+        guard generation == connGeneration, !connEnded, let transfer = activeTransfer else {
             winCond.unlock()
             return
         }
         let gap = Double(DispatchTime.now().uptimeNanoseconds - lastDeliveryAt.uptimeNanoseconds)
             / 1_000_000_000
+        // A held connection sitting on a full window has no read outstanding: the pump asked for a
+        // budget, was told there was no room, and is waiting. Nothing is late, so there is no gap to
+        // judge. The pushed path cannot reach this state -- it ends at the high water instead -- which
+        // is why the verdict was safe to take on a full window before. Re-arm rather than end, and the
+        // watchdog still owns the case this path can have: bytes asked for and none arriving.
+        let heldAndFull = heldConnectionEnabled
+            && (winHighWater - windowAheadLocked()) < Self.heldPullSlack
+        if heldAndFull {
+            // The clock restarts with the stretch it must not measure. Left running, it spends the
+            // whole parked stretch, and the read the consumer's return issues is then born already
+            // late: the next tick ends a connection that was healthy throughout, which is the
+            // re-request this flag exists to remove, booked as a stall. A full period rather than
+            // what is left of one, because once the gap has outgrown the timeout that remainder is
+            // 20 ms and this would re-arm at 50 Hz for the length of the park.
+            lastDeliveryAt = DispatchTime.now()
+            winCond.unlock()
+            armDeliveryGapWatchdog(generation: generation, after: connStallTimeout)
+            return
+        }
         if gap < connStallTimeout {
             winCond.unlock()
             // Data landed since this closure was scheduled; wait out what is left of the window.
@@ -2768,14 +2929,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             return
         }
         connEnded = true
-        activeTask = nil
+        activeTransfer = nil
         let frontier = winStart + Int64(window.count)
         let ahead = window.count - max(0, Int(position - winStart))
         let sawData = connFirstDataSeen
         winCond.broadcast()
         winCond.unlock()
-        task.cancel()
-        Self.releaseBudgetTicket(of: task)   // #377: a stalled connection must not hold the slot
+        transfer.cancelTransfer()
+        transfer.releaseOriginTicket()   // #377: a stalled connection must not hold the slot
         // The witness the field case had no line for: `bytesFetched` sat frozen for minutes and
         // nothing said so. Release-visible, and rare by construction (one per faulted generation).
         EngineLog.emit(
@@ -2865,13 +3026,18 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // re-fetched, or left as a hole. The window keeps every byte already delivered
         // (they are valid and the consumer reads them) and the read loop re-requests at
         // the frontier once the consumer drains below low water.
-        var toCancel: URLSessionDataTask?
+        var toCancel: (any PersistentTransfer)?
         let ahead = window.count - max(0, Int(position - winStart))
-        if ahead > winHighWater, !connEnded, !isClosed, activeTask != nil {
+        // #377: a demand-driven transfer is not ended here. Its backpressure is the pull budget,
+        // which never asks for more than the window has room for, so reaching this point at all
+        // would be a bookkeeping surprise rather than an origin outrunning the consumer; ending it
+        // would put back exactly the request-per-drain-cycle cadence the flag exists to remove.
+        if ahead > winHighWater, !connEnded, !isClosed,
+           let installed = activeTransfer, !installed.isDemandDriven {
             connEndedByBackpressure = true
             connEnded = true
-            toCancel = activeTask
-            activeTask = nil
+            toCancel = activeTransfer
+            activeTransfer = nil
             winCond.broadcast()
         }
         winCond.unlock()
@@ -2880,10 +3046,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 "[AVIOReader] \(label) window high water: \(ahead / 1024 / 1024)MB ahead; ending the "
                 + "connection, will re-request at the frontier once the consumer drains",
                 category: .demux)
-            toCancel.cancel()
+            toCancel.cancelTransfer()
             // #377: the frontier re-request follows as soon as the consumer drains, so give the
             // slot back now instead of leaving it to the completion callback.
-            Self.releaseBudgetTicket(of: toCancel)
+            toCancel.releaseOriginTicket()
         }
         if let overshootToLog {
             EngineLog.emit(
@@ -3019,7 +3185,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             connEnded = true
             // #220: the refill below keys off there being no live connection, so the finished
             // task must not stay installed.
-            activeTask = nil
+            activeTransfer = nil
         }
         // #310: our own high-water cancel completes here as NSURLErrorCancelled. That end was
         // already logged where it was decided; reporting it as an error too would make every
@@ -3030,6 +3196,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         winCond.unlock()
         if let error, !(deliberateEnd && (error as? URLError)?.code == .cancelled) {
             EngineLog.emit("[AVIOReader] \(label) conn gen=\(generation) ended with error: \(error.localizedDescription)", category: .demux)
+            noteTransportSecurityFailure(error)
         }
         if isCurrentGen && isLive {
             EngineLog.emit("[AVIOReader] Live source: connection ended gen=\(generation) buffered=\(windowAhead / 1024)KB; reconnect will fire when buffer drains", category: .demux)
@@ -3269,7 +3436,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let config = URLSessionConfiguration.default
         config.urlCache = nil
         config.timeoutIntervalForRequest = 20
-        return URLSession(configuration: config, delegate: nil, delegateQueue: nil)
+        return URLSession(configuration: config, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
     }()
 
     /// Total size from a data-connection response: `Content-Range` total on a 206, or
@@ -3538,7 +3705,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// No invalidation overhead.
     private static let chunkSession: URLSession = {
         let config = makeSessionConfig()
-        return URLSession(configuration: config, delegate: nil, delegateQueue: nil)
+        return URLSession(configuration: config, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
     }()
 
     /// #220: long-lived session for the persistent streaming path, paired with a per-task
@@ -3554,7 +3721,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     ///
     /// Never invalidated. Releasing a connection is `task.cancel()` now, not session teardown.
     private static let persistentSession: URLSession = {
-        URLSession(configuration: makeSessionConfig(longLived: true), delegate: nil, delegateQueue: nil)
+        URLSession(configuration: makeSessionConfig(longLived: true), delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
     }()
 
     /// Outcome of an abortable semaphore wait (issue #27).
@@ -3669,7 +3836,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
         // A truncating cancel is this reader hanging up on purpose, so the cancellation error it
         // produces is not a failed fetch: the prefix the request asked for is in hand (#255).
-        if let err = delegate.error, !delegate.truncated { throw err }
+        if let err = delegate.error, !delegate.truncated {
+            noteTransportSecurityFailure(err)
+            throw err
+        }
         guard let response = delegate.response else { throw AVIOReaderError.noResponse }
         if delegate.truncated {
             EngineLog.emit(
@@ -3784,13 +3954,152 @@ private func redirectPreservingHeaders(
 /// Forwards deliveries into the reader's sliding window with generation tagging
 /// so stale-connection late callbacks are no-ops. @unchecked Sendable: only
 /// mutable coupling is weak reader, guarded by winCond.
+// MARK: - #377 held connection
+
+extension AVIOReader: HeldSourceConnectionDelegate {
+    func heldConnection(_ connection: HeldSourceConnection,
+                        didReceive response: HTTPURLResponse,
+                        from url: URL) -> Bool {
+        persistentReceivedResponse(response, respondedBy: url, generation: connection.generation)
+    }
+
+    func heldConnection(_ connection: HeldSourceConnection, didReceive data: Data) {
+        appendPersistentData(data, generation: connection.generation)
+    }
+
+    /// How many bytes the held connection may pull next, and the one place this flag's #310
+    /// exposure is decided.
+    ///
+    /// #310's dose is the LENGTH of a dormant stretch rather than its existence, and a pull that
+    /// tops the window up as the consumer takes bytes is dormant for `heldPullSlack` over media
+    /// rate, which is the regime the starvation never fired in. The stretch that is NOT bounded
+    /// that way is a consumer which has STOPPED: a paused viewer holds one for the length of the
+    /// pause, and that is where #310's worst episode came from. So a pause carries a budget, and
+    /// running it out ends the connection exactly the way the high water ends a pushed one. The
+    /// read loop then re-requests at the frontier when playback resumes, which is the same path a
+    /// completed range takes.
+    ///
+    /// A FULL WINDOW IS NOT THAT CASE, and reading it as one is what this method got wrong until
+    /// the field hour on the reporter's origin: 213 connections ended in 60 minutes with the viewer
+    /// never pausing once, because the segment producer races ahead, parks with a full cache while
+    /// the muxer works, and looks from here exactly like a consumer that stopped. That is 218
+    /// requests where the design describes one, and against an origin that refuses requests it is
+    /// 218 chances to be refused. So a playing consumer on a full window is waited out, not ended.
+    /// Waiting costs nothing on the wire: no read is issued, the socket buffer fills, and the
+    /// sender stops itself, which is what ffmpeg's reader does whenever its demuxer stops reading.
+    /// The 16 MB window stays what it always was, a ceiling on a transport that could not be
+    /// stopped (#174 crashed at 3.4 GB still delivering, #220 measured 911 MB after a suspend);
+    /// a pull transport has no such problem, so here the window fills and drains rather than being
+    /// held under. On the device, arm B of the transport probe held a stream task on a closed
+    /// window for 600 s with 1 Hz canaries against the origin and a neutral host clean throughout,
+    /// 1180 requests and not one refusal.
+    ///
+    /// Blocks on `winCond`, which is what the consumer broadcasts on after every read, so a
+    /// generation that is abandoned (a seek, a close, a reconnect) wakes this immediately and
+    /// answers 0 rather than waiting out its budget.
+    func heldConnectionPullBudget(_ connection: HeldSourceConnection) -> Int {
+        var budget = 0
+        var pausedEndAhead: Int? = nil
+        // Only a paused consumer carries a deadline, and only from the moment it paused.
+        var pauseDeadline: Date? = nil
+        winCond.lock()
+        while true {
+            guard connection.generation == connGeneration, !connEnded, !isClosed else { break }
+            let ahead = windowAheadLocked()
+            let room = winHighWater - ahead
+            if room >= Self.heldPullSlack {
+                budget = min(room, Self.heldMaxPullBytes)
+                // A read begins here, and the gap watchdog judges an OUTSTANDING one. Without this
+                // the wait that preceded the grant counts against the read it granted: coming back
+                // from a park longer than connStallTimeout, the first tick after this would see a
+                // gap older than the timeout and end a connection nothing is wrong with.
+                lastDeliveryAt = DispatchTime.now()
+                break
+            }
+            let playing = playIntentProvider?() ?? false
+            if playing {
+                // A full window under a playing consumer is the producer parked with a full
+                // segment cache, not a stopped one. Issue no read and wait: no byte is on the
+                // wire, the socket fills, and the sender stops itself.
+                //
+                // The wait carries a poll rather than blocking outright, because the thing it is
+                // waiting to hear about does not broadcast: nobody reads during a pause, so a
+                // consumer that pauses AFTER the window filled would never wake this loop and the
+                // paused budget below would never start. Measured: a 420 s pause held the
+                // connection to the end of the drill with no bound spent.
+                pauseDeadline = nil
+                _ = winCond.wait(until: Date().addingTimeInterval(Self.heldPlayIntentPollSeconds))
+                continue
+            }
+            let deadline = pauseDeadline ?? Date().addingTimeInterval(heldPausedBudgetSeconds)
+            pauseDeadline = deadline
+            if Date() >= deadline {
+                connEndedByBackpressure = true
+                connEnded = true
+                activeTransfer = nil
+                pausedEndAhead = ahead
+                winCond.broadcast()
+                break
+            }
+            _ = winCond.wait(until: deadline)
+        }
+        winCond.unlock()
+        if let pausedEndAhead {
+            EngineLog.emit(
+                "[AVIOReader] \(label) held connection paused for "
+                + "\(Int(heldPausedBudgetSeconds))s with \(pausedEndAhead / 1024 / 1024)MB "
+                + "ahead; ending it, will re-request at the frontier when playback resumes",
+                category: .demux)
+        }
+        return budget
+    }
+
+    func heldConnection(_ connection: HeldSourceConnection, didEndWith error: Error?) {
+        connection.releaseOriginTicket()
+        persistentConnectionEnded(error: error, generation: connection.generation)
+    }
+}
+
+// MARK: - Persistent transfer
+
+/// #377: the one request this reader has on the link, whichever transport carries it.
+///
+/// Two shapes exist. A `URLSessionDataTask` is PUSHED: it delivers on the transport's schedule and
+/// the only backpressure available is to end it, which is why the reader ends its connection at the
+/// window high water and asks again at low water (#310, after #220 measured the suspend advisory).
+/// A `HeldSourceConnection` is PULLED: nothing arrives that was not asked for, so one request can
+/// serve a whole file, which is the entire point of `LoadOptions.heldSourceConnection`.
+protocol PersistentTransfer: AnyObject {
+    /// Put it on the link. Called once, after the reader has installed it.
+    func startTransfer()
+    /// End it. Idempotent, and never called while `winCond` is held.
+    func cancelTransfer()
+    /// Hand the origin slot back synchronously. The transfer's own completion would do it too, but
+    /// that arrives asynchronously and every caller here is about to ask for a slot again.
+    /// Idempotent, so the later callback is a no-op.
+    func releaseOriginTicket()
+    /// True when bytes only move because the reader asked. The high-water end exists to stop a
+    /// transport delivering on its own schedule; against a pull it would end a healthy connection
+    /// and put back the request cadence the held path exists to remove.
+    var isDemandDriven: Bool { get }
+}
+
+extension URLSessionDataTask: PersistentTransfer {
+    func startTransfer() { resume() }
+    func cancelTransfer() { cancel() }
+    /// The ticket lives on the delegate because the delegate's lifetime IS the task's; see the
+    /// note on `PersistentReadDelegate.ticket`.
+    func releaseOriginTicket() { (delegate as? PersistentReadDelegate)?.releaseTicket() }
+    var isDemandDriven: Bool { false }
+}
+
 private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     weak var reader: AVIOReader?
     let generation: Int
     let extraHeaders: [String: String]
     /// #377: the origin slot this connection occupies, held here because the delegate's lifetime
-    /// IS the task's. Seven paths in the reader clear `activeTask` and only one of them is the
-    /// task ending, so a ticket released alongside `activeTask` would leak on the other six.
+    /// IS the task's. Seven paths in the reader clear `activeTransfer` and only one of them is the
+    /// task ending, so a ticket released alongside `activeTransfer` would leak on the other six.
     /// `didCompleteWithError` is the one point every ending passes through, cancels included.
     private let ticketLock = NSLock()
     private var ticket: OriginRequestBudget.Ticket?
@@ -3820,6 +4129,15 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
         ticket = nil
         ticketLock.unlock()
         OriginRequestBudget.shared.release(held)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        EngineTLS.resolve(challenge, completionHandler: completionHandler)
     }
 
     func urlSession(
@@ -3912,6 +4230,15 @@ private final class ChunkFetchDelegate: NSObject, URLSessionDataDelegate, @unche
     init(extraHeaders: [String: String], bodyLimit: Int?) {
         self.extraHeaders = extraHeaders
         self.bodyLimit = bodyLimit
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        EngineTLS.resolve(challenge, completionHandler: completionHandler)
     }
 
     func urlSession(
@@ -4037,6 +4364,15 @@ private final class StreamingDelegate: NSObject, URLSessionDataDelegate {
 
     func urlSession(
         _ session: URLSession,
+        task: URLSessionTask,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        EngineTLS.resolve(challenge, completionHandler: completionHandler)
+    }
+
+    func urlSession(
+        _ session: URLSession,
         dataTask: URLSessionDataTask,
         didReceive response: URLResponse,
         completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
@@ -4082,6 +4418,15 @@ private final class ProbeDelegate: NSObject, URLSessionDataDelegate, @unchecked 
 
     init(extraHeaders: [String: String]) {
         self.extraHeaders = extraHeaders
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        EngineTLS.resolve(challenge, completionHandler: completionHandler)
     }
 
     func urlSession(
@@ -4343,6 +4688,10 @@ enum AVIOReaderError: Error, Equatable, CustomStringConvertible, LocalizedError 
     /// instead of the AVERROR_INVALIDDATA FFmpeg reports for an empty or error-page stream, and so the
     /// error page never reaches the demuxer.
     case httpStatus(Int)
+    /// AE#495: the transport was refused over certificate trust, so no body ever existed. Typed for
+    /// the same reason `httpStatus` is: without it the open surfaces FFmpeg's invalid data and a
+    /// self-signed origin reads as a corrupt file.
+    case transportSecurityFailed(code: Int)
 
     var description: String {
         switch self {
@@ -4352,6 +4701,8 @@ enum AVIOReaderError: Error, Equatable, CustomStringConvertible, LocalizedError 
         case .hlsPlaylistOnRawLivePath: return "HLS playlist supplied to the raw live path"
         case .hlsPlaylistOnVODPath: return "HLS playlist supplied to the VOD loopback path"
         case .httpStatus(let status): return "Origin answered HTTP \(status) for the source"
+        case .transportSecurityFailed(let code):
+            return TransportSecurityFailure.sentence(for: code)
         }
     }
 

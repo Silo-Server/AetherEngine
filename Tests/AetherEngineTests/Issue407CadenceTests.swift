@@ -63,6 +63,7 @@ struct Issue407CadenceTests {
     }
 
     @Test("the duration reaches the sample buffer")
+    @MainActor
     func durationOnSampleBuffer() throws {
         let renderer = SampleBufferRenderer()
         let sample = try #require(renderer.createSampleBuffer(
@@ -76,6 +77,7 @@ struct Issue407CadenceTests {
     /// The failure this exists for: a per-second frame count that cannot tell an even timeline from
     /// one with a hole in it. Both runs hand over the same number of frames.
     @Test("a hole in the timeline shows in the spacing, not in the count")
+    @MainActor
     func spacingSeesWhatTheCountCannot() throws {
         let pixelBuffer = try Self.makePixelBuffer()
 
@@ -97,6 +99,7 @@ struct Issue407CadenceTests {
     }
 
     @Test("the spacing extremes describe the interval, not the session")
+    @MainActor
     func spacingResetsPerSnapshot() throws {
         let renderer = SampleBufferRenderer()
         let pixelBuffer = try Self.makePixelBuffer()
@@ -116,6 +119,7 @@ struct Issue407CadenceTests {
     }
 
     @Test("no frames handed over means no spacing to report")
+    @MainActor
     func emptyIntervalReportsNoSpacing() {
         let cadence = SampleBufferRenderer().takeCadence()
         #expect(cadence.minDeltaSeconds == nil)
@@ -125,6 +129,7 @@ struct Issue407CadenceTests {
     /// A seek does not connect the frame before it to the frame after it. Left standing, the series
     /// would report the distance travelled as one enormous frame interval.
     @Test("the spacing series does not survive a flush")
+    @MainActor
     func flushBreaksTheSeries() throws {
         let renderer = SampleBufferRenderer()
         let pixelBuffer = try Self.makePixelBuffer()
@@ -146,6 +151,7 @@ struct Issue407CadenceTests {
 
     /// The gap `enq` cannot show: frames the decoder produced that the layer never received.
     @Test("frames lost before the layer are counted apart from the ones handed over")
+    @MainActor
     func lostFramesCounted() throws {
         let renderer = SampleBufferRenderer()
         let pixelBuffer = try Self.makePixelBuffer()
@@ -162,6 +168,7 @@ struct Issue407CadenceTests {
     }
 
     @Test("the counts are cumulative across snapshots")
+    @MainActor
     func countsAreCumulative() throws {
         let renderer = SampleBufferRenderer()
         let pixelBuffer = try Self.makePixelBuffer()

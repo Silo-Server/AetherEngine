@@ -32,38 +32,28 @@ final class AudioOutput: @unchecked Sendable {
         AudioRatePolicy.apply(to: renderer)
     }
 
-    /// Add the video display layer to the synchronizer for automatic A/V sync + frame pacing. On iOS18/tvOS18/
-    /// macOS15+ Apple split the queue rendering surface onto displayLayer.sampleBufferRenderer; direct
-    /// addRenderer(layer) still type-checks but on tvOS 26+ fails with FigVideoQueueRemote err=-12080 after the
-    /// first enqueue, so attach the renderer instead.
-    func attachVideoLayer(_ displayLayer: AVSampleBufferDisplayLayer) {
-        if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
-            synchronizer.addRenderer(displayLayer.sampleBufferRenderer)
-        } else {
-            synchronizer.addRenderer(displayLayer)
-        }
+    /// Add the video renderer to the synchronizer for automatic A/V sync + frame pacing. The display layer's
+    /// `sampleBufferRenderer`, never the layer: addRenderer(layer) still type-checks but on tvOS 26+ fails with
+    /// FigVideoQueueRemote err=-12080 after the first enqueue. Taken as the renderer rather than read off the
+    /// layer here, because the layer is main-actor isolated in the 27 SDKs and this runs off it (#351).
+    func attachVideoRenderer(_ videoRenderer: AVSampleBufferVideoRenderer) {
+        synchronizer.addRenderer(videoRenderer)
     }
 
-    /// Remove the video display layer and block until removal completes. The synchronizer detaches asynchronously;
+    /// Remove the video renderer and block until removal completes. The synchronizer detaches asynchronously;
     /// if the caller immediately assigns displayLayer.controlTimebase for a new Atmos session the layer is briefly
     /// owned by both (Apple-documented UB). Symptom: first PCM->Atmos switch after launch throws FigVideoQueueRemote
     /// err=-12080 and the display layer stops rendering (audio keeps going). The semaphore wait (sub-100ms) makes
     /// the handoff deterministic.
-    func detachVideoLayer(_ displayLayer: AVSampleBufferDisplayLayer) {
+    func detachVideoRenderer(_ videoRenderer: AVSampleBufferVideoRenderer) {
         let semaphore = DispatchSemaphore(value: 0)
-        if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
-            synchronizer.removeRenderer(displayLayer.sampleBufferRenderer, at: synchronizer.currentTime()) { _ in
-                semaphore.signal()
-            }
-        } else {
-            synchronizer.removeRenderer(displayLayer, at: synchronizer.currentTime()) { _ in
-                semaphore.signal()
-            }
+        synchronizer.removeRenderer(videoRenderer, at: synchronizer.currentTime()) { _ in
+            semaphore.signal()
         }
         let result = semaphore.wait(timeout: .now() + .seconds(1))
         #if DEBUG
         if result == .timedOut {
-            EngineLog.emit("[AudioOutput] detachVideoLayer: timed out waiting for synchronizer removal", category: .swPlayback)
+            EngineLog.emit("[AudioOutput] detachVideoRenderer: timed out waiting for synchronizer removal", category: .swPlayback)
         }
         #endif
     }

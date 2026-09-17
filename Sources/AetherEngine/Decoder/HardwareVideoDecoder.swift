@@ -74,6 +74,12 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// Protects `session` across the demux thread (decode), main thread (close/flush), and VT callback (delivery).
     private let lock = NSLock()
 
+    /// AE#492: guarded by `lock`, the same one `flush()` and `decode(packet:epoch:)` take.
+    private var _feedEpoch: UInt64 = 0
+    var feedEpoch: UInt64 {
+        lock.lock(); defer { lock.unlock() }; return _feedEpoch
+    }
+
     /// Heap-allocated box carrying a weak self reference for the C decompression callback's refCon.
     /// Separate object so we can pass UnsafeMutablePointer<RefConBox> to VT without unsafe bit-casts.
     /// `fileprivate` so the file-level C callback can access the type.
@@ -145,15 +151,11 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
         formatDescription = formatDesc
 
-        // 2. Require hardware on tvOS 17+ so VT fails outright rather than silently falling back to SW
-        //    (which would show only as pathological CPU + frame drops at 4K). Deployment target is tvOS 26
-        //    so the if-available branch is always taken in production.
-        var decoderSpec: NSDictionary?
-        if #available(tvOS 17.0, iOS 17.0, *) {
-            decoderSpec = [
-                kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: true,
-            ]
-        }
+        // 2. Require hardware so VT fails outright rather than silently falling back to SW
+        //    (which would show only as pathological CPU + frame drops at 4K).
+        let decoderSpec: NSDictionary = [
+            kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: true,
+        ]
 
         // 3. Pixel buffer attributes: 10-bit biplanar for HDR, 8-bit for SDR; IOSurface-backed for Metal rendering.
         let bitsPerSample = codecpar.pointee.bits_per_raw_sample
@@ -200,13 +202,11 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         session = createdSession
 
         // 5. Pass through per-frame HDR metadata for correct tone mapping; unknown-key set returns -12911 on older OSes (swallowed).
-        if #available(tvOS 17.0, iOS 17.0, *) {
-            VTSessionSetProperty(
-                createdSession,
-                key: kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata,
-                value: kCFBooleanTrue
-            )
-        }
+        VTSessionSetProperty(
+            createdSession,
+            key: kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata,
+            value: kCFBooleanTrue
+        )
 
         EngineLog.emit(
             "[HardwareVideoDecoder] opened HEVC \(width)x\(height) "
@@ -218,8 +218,10 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     // MARK: - Decode
 
-    func decode(packet: UnsafeMutablePointer<AVPacket>) {
+    func decode(packet: UnsafeMutablePointer<AVPacket>, epoch: UInt64? = nil) {
         lock.lock()
+        // AE#492: see `SoftwareVideoDecoder.decode`. Same rule, same lock as `flush()`.
+        if let epoch, epoch != _feedEpoch { lock.unlock(); return }
         guard let session = session, let formatDesc = formatDescription else {
             lock.unlock()
             return
@@ -321,6 +323,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     func flush() {
         lock.lock()
+        _feedEpoch &+= 1   // AE#492
         let session = self.session
         lock.unlock()
         guard let session else { return }

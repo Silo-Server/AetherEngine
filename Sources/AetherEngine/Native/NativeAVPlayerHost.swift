@@ -41,6 +41,9 @@ final class NativeAVPlayerHost {
     @Published private(set) var failure: PlaybackErrorInfo?
     /// #50: monotonic token; bumped on each deferred .failed so a superseding failure or item swap cancels the in-flight confirmation.
     private var failureConfirmToken: Int = 0
+    /// AE#495: what the AE#495 relay knows about the origin's certificate, when the item this host
+    /// plays is served by one. Set by the engine at mount, read only while classifying a failure.
+    var upstreamTrustRefusal: (@Sendable () -> Int?)?
     /// #50: latched on first .playing; discriminates startup failures (never played) from mid-playback transients. .failed and timeControlStatus KVOs are unsynchronized, so instantaneous status is unreliable. Reset with the item on a reused host.
     private var hasEverPlayed = false
     @Published private(set) var didReachEnd: Bool = false
@@ -372,6 +375,10 @@ final class NativeAVPlayerHost {
         var armIngestFallback: Bool = false
         /// #334: the ceiling on silence for a path with no other readiness watchdog.
         var readinessDeadline: Double?
+        /// AE#520: this session stream-copies an EAC3 bitstream that carries JOC. HDMI passthrough
+        /// then tunnels it through a 2-channel MAT carrier, so the route's channel count is not a
+        /// statement about the audio and the surround-downmix warning below must not read it as one.
+        var audioIsAtmosStreamCopy: Bool = false
     }
 
     /// AE#446 round 5: a fresh item is about to attach, invoked before anything can fetch a playlist
@@ -457,7 +464,14 @@ final class NativeAVPlayerHost {
                 "[NativeAVPlayerHost] #\(sid) layer.isReadyForDisplay=\(ready) t+\(String(format: "%.2f", elapsed))s",
                 category: .engine
             )
-            Task { @MainActor in self?.isVideoReadyForDisplay = ready }
+            // AE#158: the handover leaves the outgoing item on this layer through the load gap, so it
+            // keeps producing changes past the false unloadCurrentItem published. Without the session
+            // guard the item observers carry, the previous episode's picture reads as the successor's
+            // first frame.
+            Task { @MainActor in
+                guard let self, self.sessionID == sid else { return }
+                self.isVideoReadyForDisplay = ready
+            }
         }
 
         let asset = AVURLAsset(url: url, options: Self.assetCreationOptions(httpHeaders: httpHeaders))
@@ -666,7 +680,8 @@ final class NativeAVPlayerHost {
                         guard let self = self, let item = self.playerItem else { return }
                         Self.dumpAudioRoute(sid: sid, phase: "settled")
                         await Self.warnIfFLACSurroundExceedsRoute(item, sid: sid)
-                        await Self.warnIfEAC3SurroundOnStereoRoute(item, sid: sid)
+                        await Self.warnIfEAC3SurroundOnStereoRoute(
+                            item, sid: sid, isAtmosStreamCopy: contract.audioIsAtmosStreamCopy)
                         // #168: the video track can be absent from item.tracks at readyToPlay for HLS;
                         // re-read once playing so the remote-HLS badge settles on the real dynamic range.
                         await self.publishDetectedVideoFormat(from: item)
@@ -831,6 +846,18 @@ final class NativeAVPlayerHost {
 
         // Explicit seek prevents AVPlayer from defaulting to the EVENT-playlist live edge. Remote-HLS and loopback live REJOINS set skipInitialSeek (backlog-start seek was the prime suspect for permanent waitingToPlay on rejoin; see LiveReloadPolicy.skipInitialSeek).
         if !skipInitialSeek {
+            // AE#509: name the seek and the axis it is spent on. This is the only unconditional
+            // reposition of a fresh item, it happens before the item can answer for itself, and
+            // nothing logged it: a session parked at an unreachable position looked exactly like a
+            // session that placed nothing. `startPosition` is an ITEM-axis anchor, while a live
+            // host only ever sees the published clock (item + shift), so a live anchor that is not
+            // nil is the one shape where those two axes can be confused.
+            EngineLog.emit(
+                "[NativeAVPlayerHost] #\(sid) mount seek: item axis "
+                + String(format: "%.2f", startPosition ?? 0) + "s "
+                + "(startPosition=\(startPosition.map { String(format: "%.2f", $0) } ?? "nil"), "
+                + "live=\(contract.isLive))",
+                category: .engine)
             // Load-time seek (not a user scrub): no seekInFlight needed; the async seek(to:) carries #37/#38 semantics for user seeks.
             avPlayer.seek(to: CMTime(seconds: startPosition ?? 0, preferredTimescale: 600),
                           toleranceBefore: .zero, toleranceAfter: .zero)
@@ -931,7 +958,8 @@ final class NativeAVPlayerHost {
                                                            domain: (item.error as NSError?)?.domain)
                 return
             }
-            failure = PlaybackErrorInfo(kind: .nativeItemFailed, message: desc, underlying: item.error)
+            failure = Self.itemFailureInfo(desc: desc, itemError: item.error,
+                                           relayRefusalCode: upstreamTrustRefusal?())
             return
         }
 
@@ -959,7 +987,8 @@ final class NativeAVPlayerHost {
                     + "clock=\(String(format: "%.2f", self.renderedTime)))",
                     category: .engine
                 )
-                self.failure = PlaybackErrorInfo(kind: .nativeItemFailed, message: desc, underlying: item.error)
+                self.failure = Self.itemFailureInfo(desc: desc, itemError: item.error,
+                                                    relayRefusalCode: self.upstreamTrustRefusal?())
             } else {
                 EngineLog.emit(
                     "[NativeAVPlayerHost] #\(self.sessionID) deferred failure cleared: player recovered "
@@ -1262,7 +1291,8 @@ final class NativeAVPlayerHost {
                         + "stall-avoidance wait alone (buffer ahead "
                         + String(format: "%.2f", reading.aheadSeconds)
                         + "s, empty=\(reading.bufferEmpty), floor "
-                        + String(format: "%.2f", Self.minimumLiveJoinBufferAhead) + "s)",
+                        + String(format: "%.2f", Self.minimumLiveJoinBufferAhead) + "s)"
+                        + (Self.liveJoinPlacementClause(reading: reading).map { "; " + $0 } ?? ""),
                         category: .engine
                     )
                 }
@@ -1407,6 +1437,7 @@ final class NativeAVPlayerHost {
         let seen: String = reading.map {
             "last reading ahead \(String(format: "%.2f", $0.aheadSeconds))s, "
             + "empty=\($0.bufferEmpty), floor \(floor)s"
+            + (liveJoinPlacementClause(reading: $0).map { "; " + $0 } ?? "")
         } ?? "no reading of its own was taken before it ended, so the cushion named at the refusal is "
             + "the last one measured (floor \(floor)s)"
         let ahead = reading.map { String(format: "%.2f", $0.aheadSeconds) } ?? "n/a"
@@ -1475,13 +1506,100 @@ final class NativeAVPlayerHost {
             // Contiguous from the playhead, not the sum of every loaded range: an island past a gap
             // cannot sustain a rate that has to cross the gap to reach it.
             let ahead = NativeAVPlayerHost.contiguousBufferedEnd(ranges: ranges, now: now) - now
-            return LiveJoinBufferReading(bufferEmpty: item.isPlaybackBufferEmpty, aheadSeconds: ahead)
+            let placement = NativeAVPlayerHost.liveJoinPlacement(ranges: ranges, now: now)
+            return LiveJoinBufferReading(bufferEmpty: item.isPlaybackBufferEmpty, aheadSeconds: ahead,
+                                         playheadSeconds: now,
+                                         loadedRangeCount: placement.count,
+                                         nearestRangeOffsetSeconds: placement.nearestOffset,
+                                         itemStatus: item.status)
         }
     }
 
     struct LiveJoinBufferReading: Sendable {
         let bufferEmpty: Bool
         let aheadSeconds: Double
+        /// Where the item says it is, which is the axis every other number here is measured against.
+        var playheadSeconds: Double = .nan
+        /// How many loaded ranges the item holds at all.
+        var loadedRangeCount: Int = 0
+        /// Signed distance from the playhead to the nearest loaded range that does not contain it:
+        /// positive when the nearest one STARTS that far ahead, negative when the nearest one ENDED
+        /// that far behind. nil when a range contains the playhead, or when there are none.
+        var nearestRangeOffsetSeconds: Double? = nil
+        /// AVPlayer's own verdict on the item, read in the same batch as everything above it.
+        /// nil only where a caller builds a reading without one.
+        var itemStatus: AVPlayerItem.Status? = nil
+    }
+
+    /// AE#447 follow-up: `ahead 0.00s` is two different facts and the line printed one word for both.
+    ///
+    /// `contiguousBufferedEnd` returns the playhead itself whenever no range touches it, so an item
+    /// that has placed NOTHING AT ALL and an item that holds media somewhere else entirely read
+    /// identically, while `empty=false` (AVPlayer's own answer about the item) is true in both. Those
+    /// two need opposite investigations: nothing placed points at the fetch, placed elsewhere points at
+    /// the item and the playlist disagreeing about where the media sits. A field report that has to be
+    /// cross-referenced against a 1 Hz verbose `[LagDiag] fwd=-` to tell them apart is one nobody reads
+    /// that way, which is how a 20 s wedge arrived with the discriminating fact already in the capture
+    /// and unread.
+    nonisolated static func liveJoinPlacement(ranges: [(Double, Double)],
+                                              now: Double) -> (count: Int, nearestOffset: Double?) {
+        let usable = ranges.filter { $0.0.isFinite && $0.1.isFinite }
+        guard now.isFinite, !usable.isEmpty else { return (usable.count, nil) }
+        // The same tolerance the contiguity test uses, so "contains the playhead" means the same thing
+        // in both places and a range can never be reported as both.
+        if usable.contains(where: { $0.0 <= now + 1.0 && $0.1 >= now }) { return (usable.count, nil) }
+        let offsets = usable.map { $0.0 > now ? $0.0 - now : $0.1 - now }
+        let nearest = offsets.min(by: { abs($0) < abs($1) })
+        return (usable.count, nearest)
+    }
+
+    /// AE#509: the item's own verdict, said out loud by the account that describes the wedge.
+    ///
+    /// `item.status` is otherwise carried by a KVO observer that fires on a CHANGE, so an item that
+    /// never leaves `.unknown` produces no status line at all: the engine is silent about the item in
+    /// exactly the state where the item is the question. A 20 s field wedge arrived with "nothing
+    /// placed" from here and `.unknown` from the host's own private dump, and only the pair of them
+    /// said anything. The two readings point opposite ways: `.unknown` is AVPlayer never accepting the
+    /// media (look at the segment bytes), `.readyToPlay` is an accepted item that places nothing (look
+    /// at the fetch).
+    nonisolated static func liveJoinStatusClause(_ status: AVPlayerItem.Status?) -> String {
+        switch status {
+        case .unknown:
+            return ", and the item's own status has not left unknown, so AVPlayer has not accepted "
+                + "the media at all"
+        case .readyToPlay:
+            return ", on an item AVPlayer has accepted (status readyToPlay)"
+        case .failed:
+            return ", on an item AVPlayer has failed (status failed)"
+        case .none:
+            return ""
+        @unknown default:
+            return ""
+        }
+    }
+
+    /// The placement clause the two accounts below carry when the cushion reads zero. nil when a range
+    /// contains the playhead: there the depth is the whole story and this would only add noise.
+    nonisolated static func liveJoinPlacementClause(reading: LiveJoinBufferReading) -> String? {
+        guard reading.aheadSeconds <= 0 else { return nil }
+        let head = reading.playheadSeconds.isFinite
+            ? String(format: "%.2f", reading.playheadSeconds) + "s"
+            : "an unreadable position"
+        let status = liveJoinStatusClause(reading.itemStatus)
+        if reading.loadedRangeCount == 0 {
+            return "the item holds no loaded range at all, so nothing has been placed on its axis "
+                + "since it was mounted (playhead \(head))" + status
+        }
+        guard let offset = reading.nearestRangeOffsetSeconds else {
+            // A range does contain the playhead and the depth is simply zero: starved at the edge.
+            return "the item holds \(reading.loadedRangeCount) loaded range(s) and the playhead sits "
+                + "inside one of them with nothing ahead of it (playhead \(head))" + status
+        }
+        let where_ = offset > 0
+            ? "starts \(String(format: "%.2f", offset))s AHEAD of it"
+            : "ended \(String(format: "%.2f", -offset))s BEHIND it"
+        return "the item holds \(reading.loadedRangeCount) loaded range(s) but none at the playhead: "
+            + "the nearest \(where_) (playhead \(head))" + status
     }
 
     func play() {
@@ -2159,6 +2277,10 @@ final class NativeAVPlayerHost {
     /// format instead of the `.sdr` default. Called at readyToPlay and again at first `.playing` (an HLS
     /// video track can be absent from `item.tracks` at the readyToPlay instant). No-op for the item once it
     /// has been replaced; leaves `detectedVideoFormat` nil while no video track resolves (audio-only black).
+    ///
+    /// AE#515: this runs on every native session, the loopback route included, where the engine reads it
+    /// as a Dolby Vision label upgrade rather than as the format itself. The line used to name itself
+    /// `remote-HLS` on both, which cost a reporter time on a log where the route was the question.
     @MainActor
     private func publishDetectedVideoFormat(from item: AVPlayerItem) async {
         let sid = sessionID
@@ -2178,7 +2300,7 @@ final class NativeAVPlayerHost {
             if detectedVideoFormat != fmt {
                 detectedVideoFormat = fmt
                 EngineLog.emit(
-                    "[NativeAVPlayerHost] #\(sessionID) remote-HLS videoFormat=\(fmt) "
+                    "[NativeAVPlayerHost] #\(sessionID) item videoFormat=\(fmt) "
                     + "subType='\(fourccString(subType))' transfer=\(transfer ?? "nil") "
                     + "rate=\(rate.map { String(format: "%.3f", $0) } ?? "nil")",
                     category: .engine
@@ -2275,9 +2397,21 @@ final class NativeAVPlayerHost {
         #endif
     }
 
-    /// Warn when EAC3/AC3 multichannel plays into a stereo-only HDMI route. Atmos excluded (ch=2 MAT carrier is correct for Atmos passthrough). Cause: Sonos Arc reports ch=2 LPCM after boot or HDMI handshake glitch; fix is power-cycling the sink. Not a pipeline bug (dec3 bitstream is identical across runs).
-    private static func warnIfEAC3SurroundOnStereoRoute(_ item: AVPlayerItem, sid: Int) async {
+    /// Warn when EAC3/AC3 multichannel plays into a stereo-only HDMI route. Cause: Sonos Arc reports
+    /// ch=2 LPCM after boot or HDMI handshake glitch; fix is power-cycling the sink. Not a pipeline
+    /// bug (dec3 bitstream is identical across runs).
+    ///
+    /// AE#520: Atmos is excluded, and until this the exclusion existed only in the docstring and in
+    /// the warning's own closing sentence. Every EAC3+JOC session matches the condition by
+    /// construction, because a 6-channel `ec-3` track tunnelling through a 2-channel MAT carrier is
+    /// what correct Atmos passthrough looks like, so the line fired on exactly the sessions it then
+    /// told the reader to ignore it for. The reporter had to reason it away himself while chasing a
+    /// real defect. The route cannot answer this (a MAT carrier and a stereo LPCM route both report
+    /// two channels); the session can, and now says so through the contract.
+    private static func warnIfEAC3SurroundOnStereoRoute(_ item: AVPlayerItem, sid: Int,
+                                                        isAtmosStreamCopy: Bool) async {
         #if os(iOS) || os(tvOS)
+        guard !isAtmosStreamCopy else { return }
         var trackChannels: Int = 0
         var codecID: String = ""
         for itemTrack in item.tracks {
@@ -2363,4 +2497,26 @@ final class NativeAVPlayerHost {
         return parts.joined(separator: " ")
     }
 
+}
+
+extension NativeAVPlayerHost {
+    /// AE#495: classify a failed item before publishing it. AVFoundation's own error is what
+    /// `item.error` reports (`-11800` and friends), and a refused certificate rides one or two levels
+    /// below it in `NSUnderlyingErrorKey`, so a host reading domain and code alone sees AVFoundation
+    /// giving up and nothing about why. Everything that is not a trust refusal keeps
+    /// `nativeItemFailed` exactly as before.
+    ///
+    /// `relayRefusalCode` is the same verdict reached one hop away. With the AE#495 relay mounted the
+    /// player's request went to loopback and came back a plain 502, so the chain it would have been
+    /// read off no longer exists on this side; the relay lost the handshake and remembers it.
+    nonisolated static func itemFailureInfo(desc: String, itemError: Error?,
+                                            relayRefusalCode: Int? = nil) -> PlaybackErrorInfo {
+        if let code = TransportSecurityFailure.code(in: itemError) ?? relayRefusalCode {
+            return PlaybackErrorInfo(kind: .sourceCertificateRejected,
+                                     message: TransportSecurityFailure.sentence(for: code),
+                                     underlyingDomain: NSURLErrorDomain,
+                                     underlyingCode: code)
+        }
+        return PlaybackErrorInfo(kind: .nativeItemFailed, message: desc, underlying: itemError)
+    }
 }

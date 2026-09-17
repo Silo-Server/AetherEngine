@@ -284,7 +284,28 @@ extension HLSVideoEngine {
         }
 
         if codecID == AV_CODEC_ID_AV1 {
-            let dvRecord = effectiveDvMode ? doviConfigRecord(from: codecpar) : nil
+            let sourceRecord = doviConfigRecord(from: codecpar)
+            // `dolbyVisionHandling = .baseLayerOnly`: read the record for nothing but the log, and
+            // strip it on the way out, so the source takes the plain av01 branch below whatever the
+            // display can do. Same predicate as the HEVC path and the format clamp.
+            let presentsBaseLayer = sourceRecord.map { r in
+                VideoRoutingPolicy.presentsDolbyVisionBaseLayer(
+                    handling: dolbyVisionHandling,
+                    codecID: AV_CODEC_ID_AV1,
+                    dvProfile: Int(r.dv_profile),
+                    dvBlCompatID: Int(r.dv_bl_signal_compatibility_id),
+                    colorTransfer: codecpar.pointee.color_trc,
+                    colorMatrix: codecpar.pointee.color_space)
+            } ?? false
+            if presentsBaseLayer, let r = sourceRecord {
+                EngineLog.emit(
+                    "[HLSVideoEngine] AV1 DV Profile \(r.dv_profile) compat=\(r.dv_bl_signal_compatibility_id): "
+                    + "presenting the base layer only (dolbyVisionHandling=baseLayerOnly), plain av01, "
+                    + "dvcC stripped, no SUPPLEMENTAL-CODECS",
+                    category: .session
+                )
+            }
+            let dvRecord = (effectiveDvMode && !presentsBaseLayer) ? sourceRecord : nil
             let dvVariant = classifyDVVariant(dvRecord, codecID: AV_CODEC_ID_AV1)
 
             let av1ProfileRaw = Int(codecpar.pointee.profile)
@@ -372,9 +393,12 @@ extension HLSVideoEngine {
                     videoRange: videoRange,
                     primaryCodecs: primary,
                     supplementalCodecs: nil,
-                    doviConfig: dvVariant == .av1Profile102 ? .strip : .keep,
+                    doviConfig: (dvVariant == .av1Profile102 || presentsBaseLayer) ? .strip : .keep,
                     convertP7ToProfile81: false,
-                    dvVariant: dvVariant
+                    // The source is still what it is; the log should name it even when the record
+                    // was read for nothing else.
+                    dvVariant: presentsBaseLayer
+                        ? classifyDVVariant(sourceRecord, codecID: AV_CODEC_ID_AV1) : dvVariant
                 )
             // HEVC DV variants can't reach this switch (classifyDVVariant
             // is called with AV_CODEC_ID_AV1) but Swift's exhaustivity
@@ -388,10 +412,27 @@ extension HLSVideoEngine {
         // DV decoder tonemaps IPT-PQ-c2 internally; without dvh1 IPT chroma reads as YCbCr (green/purple
         // cast, AetherEngine#4 Build 160+163 / DrHurt#19). The dvh1.05 master is accepted on non-DV
         // HDR10 panels and tonemapped (#98), so P5 routes like any HDR source (resolveUseMasterPlaylist).
-        let dvRecord = doviConfigRecord(from: codecpar)
+        let sourceDVRecord = doviConfigRecord(from: codecpar)
+        // AE#532: a Profile 5 record its own RPU contradicts is served as what the RPU says. The audit
+        // ran at load time and only for that class (`DolbyVisionRecordAudit`), so this is a verdict
+        // already reached, not a question asked here. Correcting the record before the classification is
+        // the whole change: a 7 lands on the Profile 7 branch and a 8 on the Profile 8.1 branch, whose
+        // compatibility rewrite turns the record's 0 into the 1 it should have carried.
+        var dvRecord = sourceDVRecord
+        let correctedDVProfile = DolbyVisionRecordAudit.correctedProfile(
+            record: sourceDVRecord.map { Int($0.dv_profile) }, rpu: dolbyVisionRPUProfile)
+        if let corrected = correctedDVProfile {
+            dvRecord?.dv_profile = UInt8(corrected)
+            EngineLog.emit(
+                "[HLSVideoEngine] AE#532: DV Profile 5 record contradicted by its own RPU "
+                + "(RPU reads profile \(corrected)); serving it as Profile \(corrected), not as "
+                + "Profile 5. A Profile 5 RPU cannot carry a residual or an NLQ",
+                category: .session
+            )
+        }
         let dvVariant = classifyDVVariant(dvRecord, codecID: AV_CODEC_ID_HEVC)
 
-        if let r = dvRecord {
+        if let r = sourceDVRecord {
             let cp = Int(codecpar.pointee.color_primaries.rawValue)
             let trc = Int(codecpar.pointee.color_trc.rawValue)
             let csp = Int(codecpar.pointee.color_space.rawValue)
@@ -411,6 +452,64 @@ extension HLSVideoEngine {
         let hevcLevel = hevcLevelRaw > 0 ? hevcLevelRaw : 150
         let dvLevelStr = String(format: "%02d", dvLevel)
 
+        if let r = dvRecord {
+            let recordProfile = Int(r.dv_profile)
+            let recordCompat = Int(r.dv_bl_signal_compatibility_id)
+            let vuiNamesYCbCrBase = VideoRoutingPolicy.vuiDeclaresYCbCrHDRBase(
+                colorTransfer: codecpar.pointee.color_trc, colorMatrix: codecpar.pointee.color_space)
+            // A Profile 5 record over a VUI that names a YCbCr HDR base is a container contradicting
+            // its bitstream (the measured shape is a Profile 7 remux relabelled 5: NLQ and residual in
+            // the RPU, identity mapping, HDR10 static metadata on the base). Served as dvh1.05 the
+            // decoder reads YCbCr as IPT and the picture comes out green / violet. Said out loud on the
+            // default route, because the fix is a host option and the host has to know to offer it.
+            if dvVariant == .profile5, vuiNamesYCbCrBase, dolbyVisionHandling == .automatic {
+                EngineLog.emit(
+                    "[HLSVideoEngine] DV Profile 5 record over a BT.2020 YCbCr VUI "
+                    + "(trc=\(codecpar.pointee.color_trc.rawValue) matrix=\(codecpar.pointee.color_space.rawValue)); "
+                    + "a genuine Profile 5 leaves both unspecified. If the picture is green / violet the record "
+                    + "is wrong and the base layer is HDR10: LoadOptions.dolbyVisionHandling = .baseLayerOnly "
+                    + "presents it as such",
+                    category: .session
+                )
+            }
+            if VideoRoutingPolicy.presentsDolbyVisionBaseLayer(
+                handling: dolbyVisionHandling,
+                codecID: AV_CODEC_ID_HEVC,
+                dvProfile: recordProfile,
+                dvBlCompatID: recordCompat,
+                colorTransfer: codecpar.pointee.color_trc,
+                colorMatrix: codecpar.pointee.color_space
+            ) {
+                // The base layer on its own, on every display: plain hvc1, the record stripped so no
+                // dvcC reaches the sample entry, no SUPPLEMENTAL, and no P7 conversion (its RPU is
+                // dropped with the record). The RPU NAL units stay in the samples and are ignored, the
+                // route a Profile 7 already takes on a display without Dolby Vision. The range is the
+                // base layer's: PQ for 7 / 8.1 and a relabelled 5, HLG for 8.4, the VUI's for 8.2.
+                let baseRange: HLSVideoRange
+                switch dvVariant {
+                case .profile84: baseRange = .hlg
+                case .profile81, .profile7: baseRange = .pq
+                default: baseRange = manifestVideoRange(codecpar)
+                }
+                EngineLog.emit(
+                    "[HLSVideoEngine] DV Profile \(recordProfile) compat=\(recordCompat): presenting the "
+                    + "\(baseRange.rawValue) base layer only (dolbyVisionHandling=baseLayerOnly), plain hvc1, "
+                    + "dvcC stripped, no SUPPLEMENTAL-CODECS"
+                    + (dvVariant == .profile7 ? ", no P7 -> P8.1 conversion" : ""),
+                    category: .session
+                )
+                return CodecRoute(
+                    codecTagOverride: "hvc1",
+                    videoRange: baseRange,
+                    primaryCodecs: plainHEVCCodecs(codecpar: codecpar, fallbackLevel: hevcLevel),
+                    supplementalCodecs: nil,
+                    doviConfig: .strip,
+                    convertP7ToProfile81: false,
+                    dvVariant: dvVariant
+                )
+            }
+        }
+
         switch dvVariant {
         case .profile5:
             // P5: DV-only (IPT-PQ-c2, no base). dvh1 always required; see HEVC-path comment above.
@@ -429,9 +528,16 @@ extension HLSVideoEngine {
             // P8.1 (HDR10-compat base).
             // DV panel: hvc1 + dvvC (muxer writes dvvC automatically) + SUPPLEMENTAL dvh1.08.XX/db1p.
             //   db1p required; without it AVPlayer treats variant as plain HDR10 and DV never engages.
-            // Non-DV panel: strip dvvC (hvc1 + dvvC trips -11868 even without SUPPLEMENTAL, 2026-05-26).
-            // "P8.6" malformed compat (#53): the dvcC rewrite normalizes the container to compat=1;
-            //   on non-DV panel the strip path handles it without rewrite.
+            // Non-DV panel: keep the dvvC, no SUPPLEMENTAL. The strip that stood here was measured
+            //   against tvOS 26.0 in May 2026 (hvc1 + dvvC trips -11868 even without SUPPLEMENTAL) and no
+            //   longer reproduces: on tvOS 26.6, an Apple TV 4K 3rd gen at an HDR10-only Samsung plays the
+            //   unstripped packaging with no error log entry at all, and on the media-direct route (panel
+            //   parked in SDR) the dvvC is what makes AVPlayer put the RPU on the pixels instead of
+            //   tone-mapping the flat base layer. The box is the whole gain: the same run showed the
+            //   SUPPLEMENTAL inert on a panel without DV (AVPlayer resolves the item as hdr10 either way),
+            //   so it stays gated on effectiveDvMode where its own black-picture history is (f7e9f77f).
+            // "P8.6" malformed compat (#53): normalize the container to compat=1 on both branches now that
+            //   the non-DV branch keeps the record rather than dropping it.
             // AE#455, opt-in: on a display with no Dolby Vision of its own, serve the P8.1 the way a P5
             // is served, so AVPlayer composes the RPU itself instead of the panel receiving the bare
             // HDR10 base layer with its one static grade. The bitstream is untouched; what moves is the
@@ -459,20 +565,21 @@ extension HLSVideoEngine {
             }
             let compat = Int(dvRecord?.dv_bl_signal_compatibility_id ?? 1)
             let needsCompatRewrite = compat != 1
-            let supplemental: String?
-            let doviConfig: MP4SegmentMuxer.DoviConfigPolicy
-            if effectiveDvMode {
-                supplemental = "dvh1.08.\(dvLevelStr)/db1p"
-                doviConfig = needsCompatRewrite ? .rewriteToProfile81 : .keep
-            } else {
-                supplemental = nil
-                doviConfig = .strip
-            }
-            if needsCompatRewrite && effectiveDvMode {
+            // Emitted on every display, not only a DV-capable one. The pairing of a plain `hvc1` CODECS
+            // with a DV SUPPLEMENTAL is what the HLS authoring spec asks for, and it exists precisely so a
+            // client that does not know `dvh1` reads the base layer instead of failing, which is not a
+            // hypothetical audience here: the loopback master is handed to wireless AirPlay receivers, and
+            // an AirPlay 2 television is that client. The gate that stood here was a real measurement
+            // (f7e9f77f: black picture on an HDR10-only panel) from the same afternoon as the strip above,
+            // and it does not reproduce on tvOS 26.6 either.
+            let supplemental: String? = "dvh1.08.\(dvLevelStr)/db1p"
+            let doviConfig: MP4SegmentMuxer.DoviConfigPolicy =
+                needsCompatRewrite ? .rewriteToProfile81 : .keep
+            if needsCompatRewrite {
                 EngineLog.emit(
                     "[HLSVideoEngine] HEVC DV Profile 8 with invalid compat="
                     + "\(compat) (\"P8.6\"); normalizing container dvcC to "
-                    + "P8.1 (compat=1) for AVPlayer on DV panel",
+                    + "P8.1 (compat=1)",
                     category: .session
                 )
             }
@@ -488,17 +595,16 @@ extension HLSVideoEngine {
         case .profile84:
             // P8.4 (HLG-compat base). Mirrors P8.1 routing.
             // DV panel: hvc1 + dvvC + SUPPLEMENTAL dvh1.08.XX/db4h. db4h marks HLG-base for AVKit criteria.
-            // Non-DV panel: strip dvvC (same -11868 risk as P8.1). Plain HLG plays + tonemaps on all panels.
-            // Note: dvh1 sample entry is never valid for HLG-base (AVPlayer rejects it, DrHurt#4 Build 160).
-            let supplemental: String?
-            let doviConfig: MP4SegmentMuxer.DoviConfigPolicy
-            if effectiveDvMode {
-                supplemental = "dvh1.08.\(dvLevelStr)/db4h"
-                doviConfig = .keep
-            } else {
-                supplemental = nil
-                doviConfig = .strip
-            }
+            // Non-DV panel: keep the dvvC, no SUPPLEMENTAL, for the reason written out on the P8.1 branch
+            //   above. The -11868 that both strips were built against was one panel on tvOS 26.0 and does
+            //   not reproduce on 26.6. P8.4 is measured separately from P8.1 rather than assumed: its base
+            //   layer is HLG, so the conversion AVPlayer performs on a panel that is not in HDR is a
+            //   different one, and the dvcC it would consult claims compat=4 rather than 1.
+            // Note: dvh1 sample entry is never valid for HLG-base (AVPlayer rejects it, DrHurt#4 Build 160),
+            //   so there is no P5-style masquerade here, only the record itself.
+            // Unconditional for the same reason as P8.1 above; db4h is the HLG-base brand.
+            let supplemental: String? = "dvh1.08.\(dvLevelStr)/db4h"
+            let doviConfig: MP4SegmentMuxer.DoviConfigPolicy = .keep
             return CodecRoute(
                 codecTagOverride: "hvc1",
                 videoRange: .hlg,

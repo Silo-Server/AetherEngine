@@ -62,6 +62,12 @@ final class OriginRequestBudget: @unchecked Sendable {
     /// per refusal on a rule it is not testing, and five such tests were enough to starve unrelated
     /// suites of threads on a CI runner. Pinned on `.shared` by those suites; the pacer's own tests
     /// build their own instances and keep the shipped ladder.
+    ///
+    /// Those suites pin it in `init` and never put it back, and suites run in parallel, so from the
+    /// first of them onward `.shared` has no quiet ladder for the rest of the process. A test that
+    /// asserts `isPaced` on `.shared` therefore passes under `--filter` and fails in a full run,
+    /// which is not a flake but the reading order. Assert on `snapshot(for:)`, whose refusal count
+    /// and learned limit this seam does not touch.
     var quietPeriodCapForTesting: TimeInterval?
 
     /// Scheme + host + port, matching `SuffixRangeSupport.originKey`. Deliberately NOT the full

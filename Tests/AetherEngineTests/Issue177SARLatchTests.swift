@@ -141,6 +141,7 @@ struct Issue177SARLatchTests {
     }
 
     @Test("a PAR change at identical geometry invalidates the cached format description")
+    @MainActor
     func parChangeInvalidatesFormatCache() throws {
         let renderer = SampleBufferRenderer()
 

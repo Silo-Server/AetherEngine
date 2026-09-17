@@ -12,7 +12,12 @@ import Foundation
 @Suite("Rate-limited VOD source revive", .serialized)
 struct RateLimitedSourceReviveTests {
 
-    private let meteredURL = URL(string: "https://cdn.example.com/signed/movie.mkv?token=a")!
+    /// A host of this suite's own, per test instance. `OriginRequestBudget` is one process-wide
+    /// object keyed by origin, and the way to start from nothing on it is to be somewhere nobody
+    /// else is: `resetForTesting()` used to stand here instead, and it empties the budget for every
+    /// suite running alongside, which reads as a flake in whichever one was mid-assertion.
+    private let meteredURL = URL(
+        string: "https://cdn-\(UUID().uuidString).example.com/signed/movie.mkv?token=a")!
 
     private final class Surfaced: @unchecked Sendable {
         private let lock = NSLock()
@@ -33,7 +38,6 @@ struct RateLimitedSourceReviveTests {
 
     @Test("an exhausted rate-limit revive says metered, not unreadable")
     func exhaustedMeteredGateSurfacesRateLimited() {
-        OriginRequestBudget.shared.resetForTesting()
         OriginRequestBudget.shared.noteRefusal(for: meteredURL, status: 429)
 
         let engine = makeEngine()
@@ -47,12 +51,10 @@ struct RateLimitedSourceReviveTests {
                 "a host that reads this as a dead source hands off to another player, which the same origin refuses")
         #expect(surfaced.code == -1)
         #expect(surfaced.reason?.contains("rate limiting") == true)
-        OriginRequestBudget.shared.resetForTesting()
     }
 
     @Test("a metered read error spends the rate-limit budget, not the ordinary one")
     func meteredExitDoesNotSpendTheOrdinaryGate() {
-        OriginRequestBudget.shared.resetForTesting()
         OriginRequestBudget.shared.noteRefusal(for: meteredURL, status: 429)
 
         let engine = makeEngine()
@@ -68,12 +70,10 @@ struct RateLimitedSourceReviveTests {
             that is what killed the session inside a minute
             """)
         #expect(engine.rateLimitReviveGate.attempts == 3)
-        OriginRequestBudget.shared.resetForTesting()
     }
 
     @Test("with no refusal on record the ordinary read-error path is unchanged")
     func unmeteredExitKeepsTheOldBehaviour() {
-        OriginRequestBudget.shared.resetForTesting()
 
         let engine = makeEngine()
         engine.readErrorReviveGate = MuxerFailureReviveGate(maxAttempts: 0)
@@ -89,7 +89,6 @@ struct RateLimitedSourceReviveTests {
 
     @Test("a refusal older than the verdict window is not read as metering")
     func staleRefusalDoesNotClassify() {
-        OriginRequestBudget.shared.resetForTesting()
         OriginRequestBudget.shared.noteRefusal(for: meteredURL, status: 429)
 
         // The window is what separates "the read that just failed was refused" from "this origin
@@ -97,7 +96,6 @@ struct RateLimitedSourceReviveTests {
         #expect(OriginRequestBudget.shared.refusedRecently(meteredURL, within: 60))
         #expect(!OriginRequestBudget.shared.refusedRecently(meteredURL, within: 0))
         #expect(HLSVideoEngine.rateLimitVerdictWindowSeconds == 60)
-        OriginRequestBudget.shared.resetForTesting()
     }
 
     @Test("the backoff ladder grows and then holds, so re-asking stops being immediate")

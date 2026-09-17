@@ -16,7 +16,11 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
     }
 
     let tracks: [Track]
-    let staticMasterPlaylistBody: String?
+
+    /// Settable because the relay can only rewrite this once the server it is mounted on has a
+    /// port and a token, which is after the provider exists. Written once during build, before
+    /// the server has answered anything.
+    private(set) var staticMasterPlaylistBody: String?
 
     /// Total program seconds, summed from the origin's own variant playlist. TARGETDURATION and the
     /// single EXTINF of every subtitle rendition are built from it.
@@ -44,6 +48,12 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
         self.defaultHeaders = defaultHeaders
         self.vttFillWaitSeconds = vttFillWaitSeconds
         self.stores = tracks.map { _ in NativeSubtitleCueStore() }
+    }
+
+    /// Replaces the served master. Only the relay calls this, to send the origin's variants back
+    /// through the engine once the server's address is known.
+    func setMasterPlaylistBody(_ body: String) {
+        staticMasterPlaylistBody = body
     }
 
     /// The renditions as the rewriter needs to declare them, in `subs_{ordinal}` order.

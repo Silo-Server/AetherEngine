@@ -93,7 +93,7 @@ extension AetherEngine {
         if let codec = subtitleTracks.first(where: { $0.id == index })?.codec,
            Self.isEmbeddedClosedCaptionCodec(codec) {
             cancelSidecarTask()
-            clearSubtitleDrainTarget(channel: .primary)   // #112 rework: CC is tap-fed, not drained
+            clearSubtitleDrainTarget(channel: .primary, reason: .closedCaptionsSelected)   // #112 rework: CC is tap-fed, not drained
             isSubtitleActive = true
             activeEmbeddedSubtitleStreamIndex = Int32(index)
             activeSubtitleTrackIndex = index
@@ -171,7 +171,7 @@ extension AetherEngine {
         hostExplicitSubtitleAction = true
         if let external = externalSubtitleRegistry[index] {
             cancelSidecarTask(channel: .secondary)
-            clearSubtitleDrainTarget(channel: .secondary)   // #112 rework
+            clearSubtitleDrainTarget(channel: .secondary, reason: .secondarySidecarSelected)   // #112 rework
             activeSecondaryEmbeddedSubtitleStreamIndex = -1
             activeSecondaryExternalSubtitleTrackID = index
             startSecondarySidecarDecode(url: external.url, httpHeaders: external.httpHeaders,
@@ -250,7 +250,7 @@ extension AetherEngine {
         }
     }
 
-    func stopSubtitleDrainer() {
+    func stopSubtitleDrainer(reason: SubtitleDrainStopReason) {
         subtitleDrainerTask?.cancel()
         subtitleDrainerTask = nil
         subtitleDrainDecoders.removeAll()
@@ -259,11 +259,11 @@ extension AetherEngine {
         subtitleResolutionLastFrontier.removeAll()   // #250
         subtitleResolutionCoverageStated.removeAll()   // #318
         subtitleDeliveryLastOutcome.removeAll()   // #357
-        cancelSubtitleForwardPrefetcher()   // #151
+        cancelSubtitleForwardPrefetcher(reason: reason)   // #151
     }
 
     /// Clear one channel's drain target; stops the loop when no channel remains active.
-    func clearSubtitleDrainTarget(channel: SubtitleChannel) {
+    func clearSubtitleDrainTarget(channel: SubtitleChannel, reason: SubtitleDrainStopReason) {
         subtitleDrainTargets[channel] = nil
         subtitleDrainDecoders[channel] = nil
         subtitleDrainCursors[channel] = nil
@@ -271,7 +271,7 @@ extension AetherEngine {
         subtitleResolutionCoverageStated.remove(channel)   // #318
         subtitleDeliveryLastOutcome[channel] = nil   // #357
         refreshSubtitleStoreProtection()   // #166
-        if subtitleDrainTargets.isEmpty { stopSubtitleDrainer() }
+        if subtitleDrainTargets.isEmpty { stopSubtitleDrainer(reason: reason) }
     }
 
     /// #166: keep the store's aggregate-eviction protected set in sync with the active drain
@@ -632,7 +632,7 @@ extension AetherEngine {
             reanchor.request(anchor, seekGeneration: currentSeekGeneration)
             return
         }
-        cancelSubtitleForwardPrefetcher()
+        cancelSubtitleForwardPrefetcher(reason: .prefetchRebuild)
         guard Self.shouldRunSubtitleForwardPrefetch(
             isLive: isLive,
             hasEmbeddedDrainTargets: !subtitleDrainTargets.isEmpty,
@@ -720,7 +720,17 @@ extension AetherEngine {
 
     /// Cancel the prefetcher + markClosed its side demuxer so a parked AVIO read cannot survive
     /// teardown (same rule as the native readers).
-    func cancelSubtitleForwardPrefetcher() {
+    ///
+    /// #496: the cancel says why. The task's own exit line reports `cancelled=true` and nothing
+    /// more, and it lands whenever the loop next looks (seconds later, from a parked read), so
+    /// without this the only evidence of the cause is whatever else happened to log nearby.
+    func cancelSubtitleForwardPrefetcher(reason: SubtitleDrainStopReason) {
+        if subtitleForwardPrefetchTask != nil {
+            lastSubtitleDrainStopReason = reason
+            EngineLog.emit(
+                "[AetherEngine] #151 forward prefetch cancelled (reason=\(reason.rawValue))",
+                category: .engine)
+        }
         subtitleForwardPrefetchTask?.cancel()
         subtitleForwardPrefetchTask = nil
         subtitleForwardPrefetchDemuxer?.markClosed()
@@ -1319,7 +1329,7 @@ extension AetherEngine {
            store.isFinished, store.cueCount > 0 {
             deselectInjectedSubtitleForOverlay()
             cancelSidecarTask()
-            clearSubtitleDrainTarget(channel: .primary)   // #112 rework
+            clearSubtitleDrainTarget(channel: .primary, reason: .externalStoreBackfill)   // #112 rework
             activeEmbeddedSubtitleStreamIndex = -1
             loadedSidecarURL = track.url
             sidecarASSHeader = nil
@@ -1421,8 +1431,17 @@ extension AetherEngine {
                             sourceStreamIndex: Int32? = nil) {
         deselectInjectedSubtitleForOverlay()
         cancelSidecarTask()
+        // #496: say what is taking over before it takes over. A sidecar replacing a running
+        // embedded selection ends the drainer and the prefetcher with it, and until this line the
+        // takeover itself logged nothing at all: a decode that starts and never publishes left the
+        // session with no drain target, no cues and no trace of who emptied it.
+        EngineLog.emit(
+            "[AetherEngine] sidecar decode start: id=\(externalTrackID.map(String.init) ?? "-") "
+            + "stream=\(sourceStreamIndex.map(String.init) ?? "auto") "
+            + "replacing embedded stream=\(activeEmbeddedSubtitleStreamIndex)",
+            category: .engine)
         // Sidecar replaces any active embedded stream.
-        clearSubtitleDrainTarget(channel: .primary)   // #112 rework
+        clearSubtitleDrainTarget(channel: .primary, reason: .sidecarSelected)   // #112 rework
         activeEmbeddedSubtitleStreamIndex = -1
         activeSubtitleTrackIndex = externalTrackID
 
@@ -1462,6 +1481,16 @@ extension AetherEngine {
                 self.sidecarASSHeader = result.assHeader
                 self.subtitleCues = result.cues
                 self.isLoadingSubtitles = false
+                // #496: the counterpart to the drainer's "overlay fed by packet-store drainer"
+                // line. Without it a whole-file publish is invisible, and a static `subCues` in
+                // the memprobe reads as a drainer that stopped filling rather than as a complete
+                // track that needs no filling.
+                EngineLog.emit(
+                    "[AetherEngine] overlay fed by sidecar decode: id="
+                    + "\(externalTrackID.map(String.init) ?? "-") "
+                    + "stream=\(sourceStreamIndex.map(String.init) ?? "auto") "
+                    + "(\(result.cues.count) cues)",
+                    category: .engine)
                 // Native mov_text moov is declared at load; runtime sidecars drive only the host overlay (#55).
                 // Phase D: an external bitmap sidecar fills its OCR rendition store from THIS
                 // decode's image cues (no second download).
@@ -1474,7 +1503,7 @@ extension AetherEngine {
     public func selectSecondarySidecarSubtitle(url: URL, httpHeaders: [String: String]? = nil) {
         hostExplicitSubtitleAction = true
         cancelSidecarTask(channel: .secondary)
-        clearSubtitleDrainTarget(channel: .secondary)   // #112 rework
+        clearSubtitleDrainTarget(channel: .secondary, reason: .secondarySidecarSelected)   // #112 rework
         activeSecondaryEmbeddedSubtitleStreamIndex = -1
         activeSecondaryExternalSubtitleTrackID = nil
         startSecondarySidecarDecode(url: url, httpHeaders: httpHeaders)
@@ -1539,7 +1568,7 @@ extension AetherEngine {
         }
         cancelSidecarTask()
         cancelSubtitleOCRWorker()   // Phase D: subtitles off = worker off (cursors persist)
-        clearSubtitleDrainTarget(channel: .primary)   // #112 rework
+        clearSubtitleDrainTarget(channel: .primary, reason: .subtitlesCleared)   // #112 rework
         activeEmbeddedSubtitleStreamIndex = -1
         activeSubtitleTrackIndex = nil
         loadedSidecarURL = nil
@@ -1576,7 +1605,7 @@ extension AetherEngine {
     public func clearSecondarySubtitle() {
         hostExplicitSubtitleAction = true
         cancelSidecarTask(channel: .secondary)
-        clearSubtitleDrainTarget(channel: .secondary)   // #112 rework
+        clearSubtitleDrainTarget(channel: .secondary, reason: .subtitlesCleared)   // #112 rework
         activeSecondaryEmbeddedSubtitleStreamIndex = -1
         activeSecondaryExternalSubtitleTrackID = nil
         loadedSecondarySidecarURL = nil
@@ -2493,7 +2522,7 @@ extension AetherEngine {
     func selectInjectedSubtitleRendition(id: Int, name: String) {
         guard currentAVPlayer?.currentItem != nil else { return }
         cancelSidecarTask()
-        clearSubtitleDrainTarget(channel: .primary)
+        clearSubtitleDrainTarget(channel: .primary, reason: .injectedRenditionSelected)
         activeEmbeddedSubtitleStreamIndex = -1
         // AVPlayer owns the drawing here; leaving overlay cues behind would double up.
         subtitleCues = []

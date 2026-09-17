@@ -51,6 +51,7 @@ final class PublicAPIDocumentationTests: XCTestCase {
         "Diagnostics/EngineDiagnostics.swift",
         "Diagnostics/LiveTelemetry.swift",
         "Diagnostics/EngineLog.swift",
+        "Network/EngineTLS.swift",
         "FrameExtractor/FrameExtractor.swift",
     ]
 

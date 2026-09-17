@@ -79,6 +79,38 @@ extension AetherEngine {
         }
     }
 
+    /// AE#509: the item's own account of itself, in the three fields a host dumps when a live join
+    /// fetches a whole window and presents none of it.
+    ///
+    /// The engine publishes `item time + playlistShiftSeconds`, so on a live source whose axis is
+    /// hours into an encoder clock the session clock and the ITEM clock are thousands of seconds
+    /// apart in a perfectly healthy session. A diagnostic that prints only the published clock
+    /// therefore cannot be read against a reporter's `AVPlayerItem.currentTime()` at all: the two
+    /// disagree by the shift by construction, which is the same disagreement a wedged session is
+    /// being accused of. Print both or neither.
+    ///
+    /// Off-main for the same reason as the buffer probe (AE#422).
+    public struct NativeItemReading: Sendable {
+        /// `AVPlayerItem.currentTime().seconds`, on the ITEM axis. NaN before the item resolves.
+        public let playhead: Double
+        /// `AVPlayerItem.loadedTimeRanges.count`. Zero is "nothing has been PLACED", which no buffer
+        /// depth can say: `isPlaybackBufferEmpty` is false on an item that fetched and placed
+        /// nothing (AE#418, a fetch is not a placement).
+        public let loadedRangeCount: Int
+        /// `AVPlayerItem.status.rawValue`: 0 unknown, 1 readyToPlay, 2 failed.
+        public let status: Int
+    }
+
+    /// The reading above, or nil when no native item is mounted (software path, pre-load, torn down).
+    public func nativeItemReading() async -> NativeItemReading? {
+        guard let avPlayer = currentAVPlayer, let item = avPlayer.currentItem else { return nil }
+        return await AVFoundationOffMain.read(item, on: NativeAVPlayerHost.offMainReadQueue) { item in
+            NativeItemReading(playhead: item.currentTime().seconds,
+                              loadedRangeCount: item.loadedTimeRanges.count,
+                              status: item.status.rawValue)
+        }
+    }
+
     /// AE#418 round 3: check a just-published VOD axis against AVPlayer's own account of the placement
     /// it describes, and let the session correct it when the base it composed onto was never carried.
     ///
@@ -102,6 +134,33 @@ extension AetherEngine {
     static let placementVerificationWaitSeconds = 30.0
     static let placementVerificationIntervalMS = 250
     static let placementVerificationSlowIntervalMS = 1000
+
+    /// AE#481: how long after a seek the landing's run is read for. The reading needs a run that
+    /// HOLDS the target, so it has to outlast the landing itself; three seconds covers a landing that
+    /// buffers on a shaped link (measured: the run holding the landing was there within 1.5 s on every
+    /// arm at 600 kbps / 300 ms) without keeping a sampler alive into the next seek.
+    static let landingAxisWaitSeconds = 3.0
+
+    /// AE#481: read what the run holding a seek landing carries, and correct the axis when the timeline
+    /// disagrees with the composition it inherited. Silent in every session whose landing stays inside
+    /// the run it was already playing, which is what a fast link produces.
+    func verifyAxisAtSeekLanding(session: HLSVideoEngine, landingItemSeconds: Double) {
+        landingAxisTask?.cancel()
+        landingAxisTask = Task { @MainActor [weak self, weak session] in
+            var waited = 0.0
+            while waited < Self.landingAxisWaitSeconds {
+                try? await Task.sleep(for: .milliseconds(Self.placementVerificationIntervalMS))
+                waited += Double(Self.placementVerificationIntervalMS) / 1000
+                guard !Task.isCancelled, let self, let session else { return }
+                let ranges = await self.avPlayerLoadedRanges()
+                guard !Task.isCancelled else { return }
+                // A publication is the end of it: the axis it wrote is the one every later reading
+                // composes onto, and sampling on would re-read what this just published.
+                if session.applyLandingAxisReading(
+                    landingItemSeconds: landingItemSeconds, ranges: ranges) { return }
+            }
+        }
+    }
 
     func verifyPlacementAgainstLoadedRanges(session: HLSVideoEngine) {
         placementVerificationTask?.cancel()
@@ -461,10 +520,16 @@ extension AetherEngine {
         softwareHost?.ioWindowDiagnostics ?? nativeVideoSession?.demuxer?.ioWindowDiagnostics
     }
 
-    /// Resident bytes in the loopback HLS segment cache. nil when no native session is active.
+    /// Compressed resident bytes: software packet spool or native loopback segment cache.
     var cachedBytes: Int64? {
+        if let bytes = softwareHost?.cachedVODBytes { return bytes }
         guard let bytes = nativeVideoSession?.segmentCacheTotalBytes else { return nil }
         return Int64(bytes)
+    }
+
+    /// Short metadata lock only; never reads the packet store from the main actor.
+    var softwarePacketCacheSnapshot: SoftwarePacketReadAhead.Snapshot? {
+        softwareHost?.vodPacketCacheSnapshot
     }
 
     /// Freshly stat-ed on-disk footprint of the segment cache. nil when no native session is active. Used by `aetherctl live --report-cache-bytes`.

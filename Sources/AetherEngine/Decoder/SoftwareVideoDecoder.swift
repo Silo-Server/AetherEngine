@@ -50,6 +50,12 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         set { skipLock.lock(); _skipUntilPTS = newValue; skipLock.unlock() }
     }
     private var _skipUntilPTS: CMTime?
+
+    /// AE#492: guarded by `lock`, the same one `flush()` and `decode(packet:epoch:)` take.
+    private var _feedEpoch: UInt64 = 0
+    var feedEpoch: UInt64 {
+        lock.lock(); defer { lock.unlock() }; return _feedEpoch
+    }
     private let skipLock = NSLock()
 
     /// Clear the skip threshold only if it is still the one we acted on.
@@ -71,6 +77,14 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// Deinterlacer selection + cadence from LoadOptions. Set by the host BEFORE `open`;
     /// applied to the filter there (mutating it mid-stream would need a graph rebuild).
     var deinterlaceConfig = DeinterlaceConfig()
+
+    /// AE#499: what the container declared about colour, captured at `open` before a single frame
+    /// exists. A decoded frame carries the VUI alone, and a remux whose VUI is empty would otherwise
+    /// reach `attachColorSpace` as an untagged picture, so an HDR10 file decoded in software lost its
+    /// PQ / BT.2020 attachments while the same file through the hardware decoder (which reads
+    /// `codecpar`) kept them. Written once in `open`, before the host can feed a packet, and read on
+    /// the decode thread afterwards, the same discipline `use10Bit` and the other open-time fields keep.
+    private var containerColor = ColorDescription.unspecified
 
     /// Deinterlaced frames dropped for carrying no PTS (see the drop site in decode()). Guarded by `lock`.
     private var droppedUntimestampedFields = 0
@@ -152,6 +166,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
         av_dict_free(&opts)
 
+        containerColor = ColorDescription(codecpar: codecpar)
         let bitsPerSample = codecpar.pointee.bits_per_raw_sample
         let isHDRTransfer = ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc)
         use10Bit = bitsPerSample > 8 || isHDRTransfer
@@ -196,8 +211,13 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// an error, and returning on it both dropped the packet and left the output queue full, so
     /// every subsequent send hit the same wall: video wedged permanently until a seek flushed
     /// the decoder, while audio kept playing.
-    func decode(packet: UnsafeMutablePointer<AVPacket>) {
+    func decode(packet: UnsafeMutablePointer<AVPacket>, epoch: UInt64? = nil) {
         lock.lock()
+        // AE#492: a packet decided on before a flush must not be sent after it. Checked here rather
+        // than at the caller because only this lock orders the two: `flush()` takes it to retire the
+        // epoch, so either the send happens first and the flush drops what it produced, or the flush
+        // happens first and the send never runs.
+        if let epoch, epoch != _feedEpoch { lock.unlock(); return }
         guard let ctx = codecContext else { lock.unlock(); return }
         var sendRet = avcodec_send_packet(ctx, packet)
         lock.unlock()
@@ -234,6 +254,10 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             guard codecContext != nil else { lock.unlock(); break }
             let ret = avcodec_receive_frame(ctx, f)
             guard ret >= 0 else { lock.unlock(); break }
+
+            // AE#499: fill the fields the VUI left open from the container's declaration BEFORE any
+            // consumer reads the frame, for the same reason the timestamp repair below runs here.
+            ColorDescription.backfill(frame: f, container: containerColor)
 
             // #407: repair the frame's own timestamp BEFORE anything reads it. A frame that reaches
             // the renderer with no PTS is unschedulable and gets dropped there, so every consumer
@@ -399,6 +423,9 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     func flush() {
         lock.lock()
         defer { lock.unlock() }
+        // AE#492: retires every packet a caller had already decided to send. Bumped under the lock,
+        // so a feed that has not reached `avcodec_send_packet` yet is refused from here on.
+        _feedEpoch &+= 1
         // Deinterlacer temporal references are stale across seeks; drop the graph (lazily rebuilt on next interlaced frame).
         deinterlacer.teardown()
         guard let ctx = codecContext else { return }

@@ -418,9 +418,30 @@ final class HLSLocalServer: @unchecked Sendable {
     /// When set (e.g. `aether-engine://engine/`), segment URIs in the playlist are absolute custom-scheme URLs routed through AVAssetResourceLoader. Nil emits relative URIs for the aetherctl HTTP workflow.
     private let subResourceBaseURL: URL?
 
-    init(provider: HLSSegmentProvider, subResourceBaseURL: URL? = nil) {
+    /// AE#495: fetches a remote origin on this server's behalf. Mounted when a host has set
+    /// `EngineTLS.serverTrustEvaluator`, so the https handshake happens where that answer is
+    /// read instead of inside AVPlayer's own networking.
+    let relay: HLSOriginRelay?
+
+    /// A relay-only server has no provider: nothing here produces segments, every byte comes
+    /// from the origin, and the master is whatever the origin served.
+    init(provider: HLSSegmentProvider? = nil, subResourceBaseURL: URL? = nil,
+         relay: HLSOriginRelay? = nil) {
         self.provider = provider
         self.subResourceBaseURL = subResourceBaseURL
+        self.relay = relay
+    }
+
+    /// Admits `origin` to the relay and returns the address standing in for it, for a player
+    /// pointed at the relay rather than at a provider's playlists. Nil before `start()` or with
+    /// no relay mounted.
+    func relayURL(for origin: URL) -> URL? {
+        guard let relay, relay.admit(origin) != nil else { return nil }
+        stateLock.lock()
+        let listeningPort = port
+        stateLock.unlock()
+        guard listeningPort > 0 else { return nil }
+        return HLSOriginRelay.localURL(for: origin, port: listeningPort, token: pathToken)
     }
 
     // MARK: - Lifecycle
@@ -727,6 +748,49 @@ final class HLSLocalServer: @unchecked Sendable {
             // Range / capability header that explains the 404. Revert with the
             // arrival-line promotion above once #50 is root-caused.
             EngineLog.emit("[HLSLocalServer] first request headers fd=\(fd): \(headers)", category: .hlsServer)  // #50 diag: .info, revert post-root-cause
+        }
+
+        if normalizedPath == HLSOriginRelay.route {
+            guard let relay else {
+                return send404(fd: fd, path: normalizedPath, reason: "no relay mounted")
+            }
+            stateLock.lock()
+            let listeningPort = port
+            stateLock.unlock()
+            let headerLines = Array(text.components(separatedBy: "\r\n").dropFirst())
+            // The media body is written from here as it arrives rather than after it has all
+            // landed: buffering a segment puts its whole download in front of the player's first
+            // byte and hands AVPlayer's throughput estimate a loopback burst to pick the next
+            // rendition from.
+            let sink = HLSOriginRelay.Sink(
+                head: { [weak self] status, contentType, contentRange, contentLength in
+                    guard let self else { return false }
+                    let header = Self.relayResponseHeader(
+                        status: status, contentType: contentType, contentRange: contentRange,
+                        contentLength: contentLength)
+                    EngineLog.emit(
+                        "[HLSLocalServer] -> \(status) relay stream bytes=\(contentLength) "
+                            + "type=\(contentType)", category: .hlsServer, level: .verbose)
+                    return self.writeAll(fd: fd, data: Data(header.utf8),
+                                         path: "\(normalizedPath) [header]")
+                },
+                body: { [weak self] chunk in
+                    guard let self else { return false }
+                    return self.writeAll(fd: fd, data: chunk, path: normalizedPath)
+                })
+            switch relay.respond(
+                query: query,
+                host: Self.requestHeader(named: "host", in: headerLines),
+                range: Self.requestHeader(named: "range", in: headerLines),
+                port: listeningPort, token: pathToken, sink: sink)
+            {
+            case nil:
+                return send404(fd: fd, path: normalizedPath, reason: "relay names no origin")
+            case .answer(let answer):
+                return sendRelay(fd: fd, path: normalizedPath, answer: answer)
+            case .streamed(let ok):
+                return ok
+            }
         }
 
         switch normalizedPath {
@@ -1064,6 +1128,72 @@ final class HLSLocalServer: @unchecked Sendable {
         }
         return (.segment, streamFileToSocket(fileURL: fileURL, socketFd: fd, path: path,
                                              expectedLength: fileSize))
+    }
+
+    static func requestHeader(named name: String, in lines: [String]) -> String? {
+        let wanted = name.lowercased() + ":"
+        for line in lines where line.lowercased().hasPrefix(wanted) {
+            return line.dropFirst(wanted.count).trimmingCharacters(in: .whitespaces)
+        }
+        return nil
+    }
+
+    /// Writes a relayed answer. Separate from `send200` because this is the only path that
+    /// passes a status through from somewhere else and the only one that answers 206, which
+    /// a ranged segment fetch upstream comes back as.
+    private func sendRelay(fd: Int32, path: String, answer: HLSOriginRelay.Response) -> Bool {
+        let header = Self.relayResponseHeader(
+            status: answer.status, contentType: answer.contentType,
+            contentRange: answer.contentRange, contentLength: answer.body.count)
+
+        EngineLog.emit(
+            "[HLSLocalServer] -> \(answer.status) relay bytes=\(answer.body.count) "
+                + "type=\(answer.contentType)", category: .hlsServer, level: .verbose)
+        guard writeAll(fd: fd, data: Data(header.utf8), path: "\(path) [header]") else {
+            return false
+        }
+        return answer.body.isEmpty ? true : writeAll(fd: fd, data: answer.body, path: path)
+    }
+
+    /// The response head for a relayed answer, whether it is written whole or streamed. One writer,
+    /// because a streamed answer states its length before the body exists and the two framings have
+    /// to agree.
+    static func relayResponseHeader(status: Int, contentType: String, contentRange: String?,
+                                    contentLength: Int) -> String {
+        var header = "HTTP/1.1 \(status) \(reasonPhrase(status))\r\n"
+        header += "Content-Length: \(contentLength)\r\n"
+        header += "Content-Type: \(headerValue(contentType))\r\n"
+        if let contentRange {
+            header += "Content-Range: \(headerValue(contentRange))\r\n"
+        }
+        header += "Accept-Ranges: bytes\r\n"
+        header += "Cache-Control: no-cache\r\n"
+        header += "Connection: keep-alive\r\n\r\n"
+        return header
+    }
+
+    /// A header value written from somewhere else, made safe to concatenate into a response.
+    ///
+    /// Every other writer here builds its values itself; the relay mirrors what an origin sent.
+    /// A CR or LF inside one of those ends the header early and the rest of the value is read as
+    /// the next header, or as the start of the body, so an origin could write a second response
+    /// into this one. Control characters go, and the value is bounded.
+    static func headerValue(_ raw: String) -> String {
+        let cleaned = raw.unicodeScalars.filter { $0.value >= 0x20 && $0.value != 0x7F }
+        return String(String.UnicodeScalarView(cleaned.prefix(512)))
+    }
+
+    static func reasonPhrase(_ status: Int) -> String {
+        switch status {
+        case 200: return "OK"
+        case 206: return "Partial Content"
+        case 400: return "Bad Request"
+        case 403: return "Forbidden"
+        case 404: return "Not Found"
+        case 416: return "Range Not Satisfiable"
+        case 502: return "Bad Gateway"
+        default: return "Status \(status)"
+        }
     }
 
     private func send404(fd: Int32, path: String, reason: String) -> Bool {

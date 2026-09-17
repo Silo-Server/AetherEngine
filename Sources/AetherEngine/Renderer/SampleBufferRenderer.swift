@@ -8,28 +8,20 @@ import CoreVideo
 /// Includes a small reorder buffer (4 frames) to handle B-frame decode
 /// order from VTDecompressionSession. Frames are sorted by PTS before
 /// being enqueued to the display layer in strict presentation order.
-/// Which display-layer flush operation a flush request maps to. Split out of SampleBufferRenderer.flush()
-/// as a pure value so the seek-holds-frame contract (issue #90) is testable without a live
-/// AVSampleBufferDisplayLayer.
-enum DisplayFlushOp: Equatable {
-    /// tvOS 18+/iOS 18+/macOS 15+: AVSampleBufferVideoRenderer.flush(removingDisplayedImage:).
-    case rendererFlush(removingDisplayedImage: Bool)
-    /// Legacy AVSampleBufferDisplayLayer.flushAndRemoveImage(), clears the visible frame.
-    case removeImage
-    /// Legacy AVSampleBufferDisplayLayer.flush(), keeps the last frame on screen (hold through seek).
-    case holdImage
-
-    static func resolve(removingDisplayedImage: Bool, modernRenderer: Bool) -> DisplayFlushOp {
-        if modernRenderer {
-            return .rendererFlush(removingDisplayedImage: removingDisplayedImage)
-        }
-        return removingDisplayedImage ? .removeImage : .holdImage
-    }
-}
-
 final class SampleBufferRenderer: @unchecked Sendable {
 
-    private(set) var displayLayer: AVSampleBufferDisplayLayer
+    let displayLayer: AVSampleBufferDisplayLayer
+
+    /// The layer's queue surface, taken once on the main actor at construction (#351). The 27 SDKs
+    /// isolate `AVSampleBufferDisplayLayer` to the main actor, `AVSampleBufferVideoRenderer` is not, so
+    /// the decode thread enqueues, flushes and reads status through this and never touches the layer.
+    /// A stored reference cannot drift from the layer: neither is ever replaced, HDR output flips
+    /// `preferredDynamicRange` on the same layer.
+    ///
+    /// tvOS 26+ fails the deprecated layer enqueue/flush/isReadyForMoreMediaData under an
+    /// AVSampleBufferRenderSynchronizer with FigVideoQueueRemote -12080 after the first enqueue, so
+    /// this renderer is the only queue target, and the one the synchronizer is given.
+    let videoRenderer: AVSampleBufferVideoRenderer
 
     /// SW-PiP Phase C: composites active subtitle cues into frames while PiP is active (the system
     /// window renders only this layer, the host overlay cannot reach it).
@@ -154,8 +146,17 @@ final class SampleBufferRenderer: @unchecked Sendable {
         if let settled { observer?(settled) }
     }
 
-    init() {
-        displayLayer = Self.makeDisplayLayer(isHDR: false)
+    /// #489: the gravity is a construction parameter, not something a caller assigns afterwards.
+    /// The engine holds the host app's picture mode across loads, and a layer that starts on the
+    /// default and is corrected a moment later shows one frame of the wrong fill.
+    ///
+    /// Main-actor isolated because the layer is (#351); the only production caller,
+    /// `SoftwarePlaybackHost`, already is.
+    @MainActor
+    init(videoGravity: AVLayerVideoGravity = .resizeAspect) {
+        let layer = Self.makeDisplayLayer(isHDR: false, gravity: videoGravity)
+        displayLayer = layer
+        videoRenderer = layer.sampleBufferRenderer
     }
 
     /// #303: what the display did with the frames, as the renderer itself counts them. Our own
@@ -199,24 +200,20 @@ final class SampleBufferRenderer: @unchecked Sendable {
                        minDeltaSeconds: minD, maxDeltaSeconds: maxD)
     }
 
-    /// nil where the metrics cannot be asked for: an OS predating the API, or the pre-tvOS-18 path
-    /// where the queue target is the display layer itself rather than an `AVSampleBufferVideoRenderer`.
+    /// nil only on visionOS 1.0: the metrics accessor arrived in tvOS/iOS 17.4, macOS 14.4 and visionOS
+    /// 1.1, and visionOS is the one platform whose package floor still sits below it.
     ///
-    /// #313: main-actor isolated, and reading through the completion-handler accessor rather than
-    /// the async one, because the two halves of that constraint come from different toolchains and
-    /// no single `await` on `videoPerformanceMetrics` satisfies both. An SDK that isolates the layer
-    /// to the main actor refuses to hand `sampleBufferRenderer` to any other domain; a toolchain
-    /// that imports the async accessor as `nonisolated` refuses to take that non-Sendable renderer
-    /// from the main actor. The completion form suspends without moving the renderer anywhere, so it
-    /// holds on both. Every caller is main-actor isolated already, so the annotation costs no hop.
+    /// #313: reads through the completion-handler accessor rather than the async one. A toolchain that
+    /// imports the async accessor as `nonisolated` refuses to take the non-Sendable renderer across an
+    /// actor boundary, and the completion form suspends without moving the renderer anywhere. Main-actor
+    /// isolated because every caller is, so the annotation costs no hop.
     ///
-    /// #344: the version list gates the metrics accessor (tvOS/iOS 17.4, macOS 14.4, visionOS 1.1),
-    /// not the renderer, which exists from visionOS 1.0. tvOS/iOS 18 and macOS 15 stay as they are:
-    /// below them `queueTarget` is the display layer, so there is no renderer to ask.
+    /// #344: visionOS has to be named. Falling through to `*` resolves it to the declared floor (1.0),
+    /// which is a compile error rather than a runtime nil.
     @MainActor
     func loadRenderMetrics() async -> RenderMetrics? {
-        guard #available(tvOS 18.0, iOS 18.0, macOS 15.0, visionOS 1.1, *) else { return nil }
-        let renderer = displayLayer.sampleBufferRenderer
+        guard #available(visionOS 1.1, *) else { return nil }
+        let renderer = videoRenderer
         return await withCheckedContinuation { (cont: CheckedContinuation<RenderMetrics?, Never>) in
             renderer.loadVideoPerformanceMetrics { m in
                 guard let m else { return cont.resume(returning: nil) }
@@ -230,33 +227,22 @@ final class SampleBufferRenderer: @unchecked Sendable {
 
     // MARK: - Queue rendering target
 
-    /// tvOS 18+ / iOS 18+ / macOS 15+: use AVSampleBufferVideoRenderer via displayLayer.sampleBufferRenderer. Calling the deprecated layer enqueue/flush/isReadyForMoreMediaData on tvOS 26+ with AVSampleBufferRenderSynchronizer fails with FigVideoQueueRemote -12080 after the first enqueue. Older OSes use the layer directly via AVQueuedSampleBufferRendering. visionOS is not named because it has the renderer from 1.0, which is the package floor, so the `*` arm is the renderer arm there and naming it would be a check that is always true.
-    var queueTarget: any AVQueuedSampleBufferRendering {
-        if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
-            return displayLayer.sampleBufferRenderer
-        }
-        return displayLayer
-    }
+    /// `videoRenderer` as the protocol the enqueue path has always called it through, so the per-frame
+    /// enqueue and back-pressure calls keep the dispatch they had.
+    var queueTarget: any AVQueuedSampleBufferRendering { videoRenderer }
 
-    /// Demux-loop back-pressure gate. Post-tvOS 18 split: reading the layer's own isReadyForMoreMediaData stays optimistically true even when the sampleBufferRenderer queue is full, causing FigVideoQueueRemote -12080 on over-enqueue.
+    /// Demux-loop back-pressure gate. Read from the renderer, never the layer: the layer's own
+    /// isReadyForMoreMediaData stays optimistically true even when the renderer queue is full, causing
+    /// FigVideoQueueRemote -12080 on over-enqueue.
     var isReadyForMoreMediaData: Bool {
         queueTarget.isReadyForMoreMediaData
     }
 
-    private var queueStatus: AVQueuedSampleBufferRenderingStatus {
-        if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
-            return displayLayer.sampleBufferRenderer.status
-        }
-        return displayLayer.status
-    }
+    private var queueStatus: AVQueuedSampleBufferRenderingStatus { videoRenderer.status }
 
-    private var queueError: Error? {
-        if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
-            return displayLayer.sampleBufferRenderer.error
-        }
-        return displayLayer.error
-    }
+    private var queueError: Error? { videoRenderer.error }
 
+    @MainActor
     private static func makeDisplayLayer(isHDR: Bool, gravity: AVLayerVideoGravity = .resizeAspect) -> AVSampleBufferDisplayLayer {
         let layer = AVSampleBufferDisplayLayer()
         layer.videoGravity = gravity
@@ -269,9 +255,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
             layer.preferredDynamicRange = isHDR ? .high : .standard
         } else {
             #if os(iOS) || os(macOS)
-            if #available(iOS 17.0, macOS 14.0, *) {
-                layer.wantsExtendedDynamicRangeContent = isHDR
-            }
+            layer.wantsExtendedDynamicRangeContent = isHDR
             #endif
         }
         return layer
@@ -283,9 +267,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
             displayLayer.preferredDynamicRange = isHDR ? .high : .standard
         } else {
             #if os(iOS) || os(macOS)
-            if #available(iOS 17.0, macOS 14.0, *) {
-                displayLayer.wantsExtendedDynamicRangeContent = isHDR
-            }
+            displayLayer.wantsExtendedDynamicRangeContent = isHDR
             #endif
         }
     }
@@ -376,18 +358,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
         cachedFormatKey = nil
         reorderLock.unlock()
 
-        let modern: Bool
-        if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) { modern = true } else { modern = false }
-        switch DisplayFlushOp.resolve(removingDisplayedImage: removingDisplayedImage, modernRenderer: modern) {
-        case .rendererFlush(let remove):
-            if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
-                displayLayer.sampleBufferRenderer.flush(removingDisplayedImage: remove) { }
-            }
-        case .removeImage:
-            displayLayer.flushAndRemoveImage()
-        case .holdImage:
-            displayLayer.flush()
-        }
+        videoRenderer.flush(removingDisplayedImage: removingDisplayedImage) { }
     }
 
     /// Send all buffered frames to the display layer (call at EOF).

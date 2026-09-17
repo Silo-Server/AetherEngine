@@ -26,7 +26,8 @@ enum HLSCarriageProbe {
     private static let sharedSession: URLSession = {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 10
-        return URLSession(configuration: configuration)
+        return URLSession(
+            configuration: configuration, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
     }()
 
     /// AE#296: what the playlist chain established, and whether a media byte is still needed to settle it.
