@@ -33,6 +33,14 @@ Twenty-one subcommands plus the bare-URL `serve` alias.
 
 Opens the demuxer, prints the codec / resolution / frame rate of the video track, the audio track list (codec, channels, language, Atmos flag), the subtitle track list, the parsed container metadata (`MediaMetadata`: title / artist / album / albumArtist + embedded cover art presence), then exits. No HLS server is started.
 
+`--detect-hdr10plus` and `--detect-atmos` add the opt-in detail passes of `AetherEngine.probe(url:detecting:)`, and both can be given at once (one open, one connection). HDR10+ is the interesting one to watch: the bare `probe` reads only what the container declares, and ST 2094-40 is declared nowhere, so a carrying source prints `format: hdr10` without the flag and `format: hdr10Plus` plus `HDR10+: ST 2094-40 metadata seen` with it. `not seen` means "not inside the scan budget", not "proven absent".
+
+```bash
+swift run aetherctl probe --detect-hdr10plus /path/to/hdr10plus.mkv
+```
+
+`Scripts/make-hdr10plus-fixture.py <dir>` builds a ~1 KB HEVC/PQ fixture that carries a real ST 2094-40 T.35 SEI (and prints it base64, which is how the two fixtures embedded in `HDR10PlusProbeIntegrationTests` were made). It verifies itself: it only emits the file when `ffprobe -show_frames` reports `HDR Dynamic Metadata SMPTE2094-40` on it, so the payload is one FFmpeg's own parser accepts rather than a byte pattern that resembles one.
+
 ## serve
 
 The original behavior. The CLI prints the loopback URL and parks until Ctrl-C; from another terminal you can:
@@ -55,6 +63,8 @@ open 'http://127.0.0.1:<port>/master.m3u8'   # macOS QuickTime
 `serve`, `validate` and `segverify` run the AE#532 record audit before they build the engine, the way a session runs it off its own probe: a Profile 5 record over a BT.2020 YCbCr PQ or HLG VUI has its first RPU read, and the route follows the RPU rather than the record (`AE#532: DV Profile 5 record contradicted by its own RPU`). Every other source is opened, found uncontradicted and left alone. To see both halves of the class on one file, serve it twice and diff: the default route now reads `CODECS="hvc1.2.4.LXX"` with a DV `SUPPLEMENTAL-CODECS` where it used to read `dvh1.05.LL`, and `--dv-base-layer` still overrides both.
 
 `--native-subs <index>` turns on the native WebVTT subtitle renditions (the `LoadOptions.prepareNativeSubtitles` path a full session uses): the engine calls `requestNativeSubtitleTrack()` before `start()`, then `attachAllNativeSubtitleStores()` after start. Every non-bitmap text track is served as a language-tagged `EXT-X-MEDIA:TYPE=SUBTITLES` rendition (`DEFAULT=NO,AUTOSELECT=NO`) in the master playlist, backed by a per-track `subs_N.m3u8` WebVTT media playlist. (An earlier design muxed `mov_text`/tx3g traks into the fMP4; in-band timed text is not HLS-conformant and AVPlayer rejected it, so the WebVTT rendition replaced it, see [formats.md › Native subtitle renditions](formats.md#native-subtitle-renditions-webvtt-for-pip-airplay-and-external-display).) The `<index>` value is legacy and now ignored, kept only for CLI compatibility: every non-bitmap track is always declared, and actual track selection happens via the host API in a full session, not from this flag. `curl` the `master.m3u8` (or open it in QuickTime) to verify the `SUBTITLES` group + `subs_N.m3u8` endpoints enumerate every language as a legible `AVMediaSelection` group. Omit the flag to reproduce the default behavior (no renditions, output identical to before).
+
+`--prewarm` / `--prewarm-bytes N` (AE#551, `play` only) warm the source before the load, the way a host warms the next episode, and print what was retained and how long it took. The load that follows adopts those bytes: its reads inside the warm head cost no request, and its data connection starts at the warm frontier instead of byte zero. Measure it against a REAL origin. On loopback the round trip it removes costs nothing to begin with, which is exactly the trap the #281 tail prefetch was built out of.
 
 `--throttle-kbps N` is a TEST-ONLY slow-CDN simulation: it caps source-IO delivery to N kbit/s. Set it below the stream bitrate to starve the producer below real-time and provoke AVPlayer rebuffers (for example the #92 open-GOP repro). Also available on `seektest` and `play`.
 
@@ -92,6 +102,30 @@ swift run aetherctl play --sidecar de=/tmp/de.srt --subs de <master.m3u8>   # de
 swift run aetherctl play --native-hls --trust-any-certificate <https master.m3u8>  # the AE#495 origin relay
 ```
 
+`--host-calls nativesubs,nativerender@N,subsoff@N,subson@N` drives the NATIVE SUBTITLE RENDITION path
+for VOD, which nothing here could do before (Sodalite#156). `serve --native-subs` stands the renditions
+up and `live --force-master` routes a channel behind them, but no VOD session loaded with
+`prepareNativeSubtitles`, so the half that matters was untestable: whether AVPlayer actually HOLDS a
+legible selection and whether the engine keeps feeding the one it holds. `nativesubs` sets the load
+option, `nativerender@N` makes the host call a player makes when the picture leaves its own layer
+(PiP, AirPlay, a wired display), and `subsoff@N` / `subson@N` are the viewer turning subtitles off and
+back on while it is away.
+
+The observable is a `LEGIBLE` line printed a tick AFTER each transition, never inside it: both calls
+finish on a detached task and the select waits on a cue pre-fill first, so an immediate read reports
+what the host ASKED for rather than what the item ended up with. It prints the selection AVPlayer
+holds next to the track the engine thinks is active, and those two coming apart is the defect class:
+
+```bash
+aetherctl play --subs ger --seconds 30 \
+  --host-calls nativesubs,nativerender@8,subsoff@14,subson@20 file://$PWD/subs.mkv
+```
+
+A healthy run reads `selected=German engineActive=2`, then `selected=none engineActive=nil` after the
+off, then `selected=German engineActive=2` after the on. `selected=German engineActive=nil` is a
+rendition nobody is filling any more, which on an AirPlay receiver is an empty caption box; and
+`selected=none engineActive=2` is subtitles that never came back.
+
 `--sidecar <lang>=<path-or-url>[,<lang>=<path>...]` fills `LoadOptions.externalSubtitles`, the load-time
 declaration a host makes. On a remote `m3u8` this is what makes the engine stand up its rewritten master
 (#316), so it is the way to see the whole chain from the CLI: the served `master.m3u8` body is logged, the
@@ -106,7 +140,7 @@ the same clock as `FIRSTFRAME`. The 1 Hz tick samples the phase, which is far to
 signal apart from the moment the rate rolls; a healthy native join is exactly two edges, `loading` at the
 load and `playing` at the roll (AE#440).
 
-`--subs <codec-or-lang>` matches against the track's libavcodec name or language and logs every overlay cue and cue trim as it lands. `--host-calls` replays host post-load behavior against the fresh session: `play`, `extractor` (`makeFrameExtractor`), `setrate` (`setRate(1.0)`), `ratehold` (set 1.5, pause at tick 3, resume at tick 5, then read the rate back off the transport itself: the #436 drill, and it fails the run if the resume came back at 1.0), `reloadlive` (reload the URL on the live path when the probe flags it live, the AetherPlayer Open URL flow), `seekback` (rewind 20 s into the DVR window at t=15, return to the live edge at t=30), `overlapseek` (the #292 seek-window drills below), `pausehold` (Sodalite#104: pause at t=10 and HOLD until ten seconds before the end, printing the playhead, the edge and the resident depth every second, which is how a session paused for longer than its own DVR window is measured without waiting out a real one: pair it with `--dvr-window 30` and `--seconds 90` and the ninety minute question becomes a ninety second run), and `pauseseek` (pause at t=12, seek at t=15 while paused, resume at t=20; with `--sw` the five paused ticks between landing and resume show what the `[SWDiag]` line reports while the pump is parked and has not heard of the seek, the AE#479 shape); this is how the pre-arming `setRate` wedge was isolated.
+`--subs <codec-or-lang>` matches against the track's libavcodec name or language and logs every overlay cue and cue trim as it lands. `--host-calls` replays host post-load behavior against the fresh session: `play`, `extractor` (`makeFrameExtractor`), `setrate` (`setRate(1.0)`), `pausestart` (Sodalite#104 round 4: `pause()` the instant load returns, before any frame exists, and `play()` at t=8; the shape of a host that holds a fresh load paused, and a software session used to answer it with eight ticks of `enq=+0 status=unknown r4d=n`, a black picture under a paused clock; now the `[SWHost] #104` lines show the first frame presented at a stopped clock and `startup 8/8 presenting` arrives while paused), `ratehold` (set 1.5, pause at tick 3, resume at tick 5, then read the rate back off the transport itself: the #436 drill, and it fails the run if the resume came back at 1.0), `reloadlive` (reload the URL on the live path when the probe flags it live, the AetherPlayer Open URL flow), `seekback` (rewind 20 s into the DVR window at t=15, return to the live edge at t=30), `overlapseek` (the #292 seek-window drills below), `pausehold` (Sodalite#104: pause at t=10 and HOLD until ten seconds before the end, printing the playhead, the edge and the resident depth every second, which is how a session paused for longer than its own DVR window is measured without waiting out a real one: pair it with `--dvr-window 30` and `--seconds 90` and the ninety minute question becomes a ninety second run), `still` (#544: asks for a scrub still at three aims, 20 s behind the playhead at t=15, 5 s behind at t=20 and at the edge at t=25, writing each to `/tmp/aetherctl-still-<tick>.png` and reporting hit or MISS with the decode time; pair it with `--sw --dvr-window N`, where the picture comes out of the DVR packet ring rather than a segment cache, and read the FILE as well as the count, because the bundled seed burns its own second into the frame so a still asked for 14.85 s showing `14` is the verdict that it decoded the right moment and not merely an image; exit 6 when nothing hit, 5 when the session ended before the first aim), `stallclock` (AE#549: stop the master clock at t=4 behind the host's back, the way an interrupted audio session does, then call a plain `play()` at t=7 and read whether the playhead moves again; the interruption itself cannot be staged on macOS, its outcome can, and without the `RendererClockResume` branch the run ends with the clock standing exactly where the stall left it, which is the field log's shape), and `pauseseek` (pause at t=12, seek at t=15 while paused, resume at t=20; with `--sw` the five paused ticks between landing and resume show what the `[SWDiag]` line reports while the pump is parked and has not heard of the seek, the AE#479 shape); this is how the pre-arming `setRate` wedge was isolated.
 
 `--seek-every N` seeks once every N ticks past tick 10, walking `--seek-pattern <abs,abs,...>` if one is given (a short backward hop otherwise), and `--seek-count K` stops after K seeks so a run can be a BURST and then play. Both halves are needed for anything about what a seek sequence leaves behind: the burst puts the store in the state under test, and only the playing half shows what the overlay carries through it. That pairing is what made AE#362's second mechanism reproducible (a hole between a restarted pump and the island the previous run left ahead of it, decoded across and then never re-read).
 
@@ -146,6 +180,13 @@ arms read as `The system does not trust the origin's certificate` without the fl
 
 `--teletext-page N` sets `LoadOptions.teletextPage` for the load, and `--switch-teletext-page <page|auto>[@ms]` changes it on a channel that is already playing (default +20 s, deliberately long: the switch has to land after `--subs` has a teletext track showing, else the run measures the load option it could already measure). The engine states what the change reached, `re-decoding N channel(s)` or `no active teletext track to re-decode`, so a page that does nothing is distinguishable from a page that never arrived. Real teletext needs a broadcast transport stream; there is no way to synthesise one with ffmpeg, so the CLI check covers the wiring and the gate, and the decode itself is confirmed against a live DVB channel (#364).
 
+`--preserve-ass-markup` sets `LoadOptions.preserveASSMarkup` for the load, so the cue log shows which codecs the flag reaches: an ASS track prints the raw nine-field event line (`0,0,Default,,0,0,0,,{\i1}line{\i0}`) and every other text codec prints extracted text, in the same session. libavcodec normalises SubRip, WebVTT and mov_text through `ff_ass_add_rect`, so all of them carry an ASS payload the engine could emit, and the codec gate is the only thing between a host and nine stray header fields. AE#587 reported the gate missing on the embedded path and could only be argued from the source, because no harness had ever set the flag. Fixture: mux an SRT and an ASS file into one container and select each in turn.
+
+```bash
+aetherctl play --preserve-ass-markup --subs eng --seconds 7 file://$PWD/ass-srt.mkv   # subrip: plain text
+aetherctl play --preserve-ass-markup --subs ger --seconds 7 file://$PWD/ass-srt.mkv   # ass: raw event lines
+```
+
 `--audio-delay <ms>` sets `LoadOptions.audioDelaySeconds` for the load, and `--switch-audio-delay <ms>[@ms]` calls `setAudioDelay(_:)` on a session that is already playing (default +20 s, same reason as the teletext switch). The runtime half is the interesting one: at load the offset is just a number handed to a muxer or a renderer, while mid-session it has to reach media the session has already committed to the previous value, and the two routes pay differently for that (a seek on `.software`, the session-preserving reload on `.loopback`). The engine states the delivered offset rather than the requested one: `[AudioOutput] AE#464 audio delay in effect: +200 ms (sample at 3.994s delivered at 4.194s)` on the software path, `[MP4SegmentMuxer] AE#464 cutting seg1+ with audio delay -150 ms` on the loopback one (AE#464).
 
 `--switch-audio-delay` presses that share a delay are delivered by ONE task in argument order with no
@@ -177,7 +218,9 @@ wrote `autoplay = false` onto a session that was playing.
 `--reload-applying autoplay=false` drives the third answer a correction can give, the one that is
 neither applied nor refused: before round 3 the field was named inside `#460: reload applying
 httpHeaders, autoplay` and then overwritten, now it gets `#460: autoplay not applied, the session
-owns it`. `--reload-applying-at 14990 --switch-audio-delay 150@15000` aims a press squarely into a
+owns it`. The run prints the returned partition next to it (`#460 outcome applied=[]
+sessionOwned=[autoplay] rebuilt=false`) and, since round 4, no rebuild follows: the session plays on
+without a `#361 startup` line, where it used to pay a full one for a field it decides itself. `--reload-applying-at 14990 --switch-audio-delay 150@15000` aims a press squarely into a
 rebuild window, where `videoRoute` is `.none` because there is no route to ask: that used to answer
 `this session's audio timestamps are not the engine's to move (route=none)` one line above the muxer
 cutting with the value, and now answers `set while the session is being rebuilt; the load in flight
@@ -219,6 +262,18 @@ where AVPlayer then PUT it. Per tick it appends `pic` (source seconds decoded fr
 `picItem` (AVPlayer's own `itemTimeForDisplay` for that frame), `axisErr` (their difference, 0 on an
 honest axis), `capErr` (the same error as a host placing a cue at `sourceTime` would make it) and
 `capFr`, that same error in frames.
+
+`--picture-origin S` (AE#534) tells it where the SOURCE's timeline starts, for a container whose
+timeline does not start at zero. The picture states a frame index, which an `-output_ts_offset`
+remux does not move, while `sourceTime` is on the container's own axis, so on a 600 s twin `capErr`
+reads about `-599.942` while everything is working correctly and the honest value is `+0.017`.
+`axisErr` needs no such lift, both of its terms are on the item axis. Measured on the pair:
+`tc-cues-lie.mkv` and `tc-cues-lie-600.mkv` at `--start-position 53` read `capErr +0.017` and
+`axisErr -9.000` alike once the origin is given, and the twin reads `-599.942` without it.
+
+Build the twin with `Scripts/timecode-fixture.sh <dir> 600`, which writes an offset copy of each
+fixture. The ORDER matters when the run also needs a lying Cues table: offset first, inject after,
+because a matroska remux regenerates Cues from the real keyframes and would undo the lie.
 
 The two errors do NOT have the same resolution, which is why `capFr` is printed. `axisErr`
 differences two frame-grid values read out of one `copyPixelBuffer` call, so it is a whole number of
@@ -331,9 +386,35 @@ round 11 documents on both sides of that thread.
 
 `--audio-stats` installs the engine audio tap and watches the decoded PCM itself: an `AGAP` line for every source-PTS discontinuity > 2 ms between consecutive buffers, and per-second `alead` (last decoded audio PTS minus the synchronizer clock) plus `abufs` (buffers delivered) appended to the telemetry. `alead` is the audio renderer's safety margin: on the SW live path the look-ahead pump holds it near `AudioLookaheadPolicy.targetLeadSeconds`; a collapse toward zero means the source or the feeder cannot keep real time (this is how the #107 audio-chopping report was diagnosed).
 
+`--record <path>` records the live source to a file from the connection the session already holds (AE#560), the same `AetherEngine.startRecording(to:)` a host calls. The output is MPEG-TS, a stream copy of the SOURCE packets taken before any audio bridging, so a bridged channel plays as FLAC and records as its original TrueHD or DTS. It is the arm that proves the tap sits on the right side of the bridge:
+
+```bash
+aetherctl play --live --live-ingest --seconds 60 --record /tmp/rec.ts <master.m3u8>
+ffprobe -v error -show_streams -select_streams a /tmp/rec.ts | grep codec_name   # NOT flac
+```
+
+Only `.loopback` and `.software` can record. On the remote-HLS bypass AVFoundation holds the source connection and the engine never sees a byte, so the run prints `RECORD refused: unsupportedRoute(remoteBypass)` and exits 3 rather than producing an empty file. A requested recording that produces no bytes, or that ends `.failed`, is also exit 3: a capability the flag asked for and did not deliver is a machine-checkable failure, not a green run somebody has to read the log for.
+
+Because a truncated MPEG-TS stays playable, the kill case is a real arm rather than an argument:
+
+```bash
+aetherctl play --live --live-ingest --seconds 120 --record /tmp/killed.ts <master.m3u8> &
+sleep 30; kill -9 %1
+ffprobe -v error -show_format /tmp/killed.ts    # readable, duration near 30 s
+```
+
 ## segverify
 
 Fetches `init.mp4` and then each media segment in turn from the loopback server and SW-decodes each segment **in isolation** (a fresh decoder per segment, no carried reference frames), reporting how many are independently decodable. A segment that yields `framesDecoded == 0` is not self-contained: its first sample is not an IRAP, so it depends on a predecessor, which is the open-GOP / B-frame boundary defect (#92). `--from N` / `--count K` bound the range (default 0 / 12), `--no-dv` forces the SDR route, `--dump <dir>` writes each fetched segment for offline inspection. Exit 0 when every tested segment is independent, 2 when any is not. This is the ground-truth verifier the #92 fix was validated against (ffmpeg's `hls` muxer scores every segment independent).
+
+`--dump` also feeds `Scripts/segment-spans.py`, which answers the neighbouring question: not whether each segment stands alone, but whether the run of them is contiguous. It prints `[tfdt, tfdt + sum(sample_duration)]` per track for every `moof` and flags any gap or overlap against the previous segment of the same track.
+
+```bash
+swift run aetherctl segverify --from 0 --count 12 --dump /tmp/segs <url>
+python3 Scripts/segment-spans.py /tmp/segs/segverify_seg{0..11}.mp4
+```
+
+A healthy run prints `contiguous` on every line. AE#561 is the counter-example it exists for: a reported session where seg7's video ran to 34.034 s while seg8 opened at 33.492 s, half a second of overlap. Segments grabbed bare with curl carry no `moov`, so prepend `init.mp4` before passing them in.
 
 ## dovitest
 
@@ -584,6 +665,36 @@ The seal line is where the whole derivation is now readable, once per session:
 ```
 
 **And this harness cannot reproduce the last term of it (AE#447 round 2).** After the four fixes above, the reporter's device still sealed at 3 while that same line printed `max EXTINF 2.000s`. A live EXTINF is `nextStart - startSeconds`, a difference of two accumulated item-axis doubles, so a strictly 2.000 s GOP whose first segment starts at 0.060 s yields the odd `2.0000000000000004`; `ceil` charges a whole second for it, and the seal takes the max over the window, so one such segment is enough (6 of his 80 were). The fixture here starts its first segment at exactly 0 and cuts at a binary-exact duration, so its differences are exactly 2.0 and five joins in a row sealed at 2. The case lives in `Issue447TargetDurationEvidenceTests` instead, built by accumulating the way the producer accumulates. Since **6.56.0** every term is taken at the resolution the playlist serves (`#EXTINF` is written with `%.3f`), so the seal line can be checked against itself: what it prints is what decided it.
+
+### Pricing the bounded start (AE#594)
+
+`fastZap`'s bounded start serves once two segments exist plus a clamped grace, and that window can be
+shallower than the holdback the same manifest advertises. `AETHER_BOUNDED_START_FLOOR=1` is a
+measurement arm, not a policy: it skips the bounded branch, so the wait ends at the full cushion or
+at the 30 s outer deadline. Both arms against an `hlsfixture` origin of pre-cut GOP-aligned segments,
+`play --live --fast-zap --seconds 45`, two passes per row (three for 6 s / A):
+
+| origin cut | arm | gate held | first manifest | first picture | `-16832` |
+|---|---|---|---|---|---|
+| 1 s | A (bounded) | 3.028 s | 2 segs / 2.000 s **<** 3 s holdback | 3.47 s | 0 |
+| 1 s | B (floored) | 3.068 s | 3 segs / 3.000 s >= 3 s holdback | 3.26 s | 0 |
+| 3 s | A | 8.252 s | 2 segs / 6.000 s **<** 9 s holdback | 9.64 s | 0 |
+| 3 s | B | 9.458 s | 3 segs / 9.000 s >= 9 s holdback | 9.65 s | 0 |
+| 6 s | A | 14.342 s | 2 segs / 12.000 s **<** 18 s holdback | 16.72 s | 0 |
+| 6 s | B | 18.597 s | 3 segs / 18.000 s >= 18 s holdback | 18.79 s | 0 |
+
+**The floor costs exactly one more segment minus the grace**, which is what the gate deltas say:
++0.04 s at a 1 s cut (grace 1.0 s covers the whole wait), +1.21 s at 3 s and +4.26 s at 6 s, where the
+grace clamps to 2.0 s. At the picture it is +0.00, +0.01 and +2.07 s. So the trade is real only at
+coarse cadences, and free at fine ones.
+
+**What this harness cannot price is the other half.** `-16832` never appeared, in any cadence, in
+either arm, across thirteen runs. Before reading that as "the shallow window is safe", note that the
+session here joins at the HEAD of the served window (`cur` starts at the window's first sample and
+advances 1x) rather than seeking to edge-minus-holdback, so the state the issue is about is never
+entered. The per-tick `edge=` and `behind=` are not usable as a check on that: `edge` stays pinned at
+its first value for the whole run and `behind` is derived from it, with or without `--dvr-window`.
+The stall half needs a field capture or an origin that reproduces the seek, not this table.
 
 ### The header-enforcing origin (AE#363)
 

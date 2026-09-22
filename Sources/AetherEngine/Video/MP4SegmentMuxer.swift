@@ -163,6 +163,17 @@ final class MP4SegmentMuxer {
     /// from codecpar alone, so they never wedge, and gating the #64 RAM-cap flush on them would needlessly
     /// weaken that memory bound. Latched at init from the audio codec_id.
     private let audioNeedsParsedPacketForMoov: Bool
+    /// Width of the video track's NAL length prefix (avcC / hvcC), nil when the track is not
+    /// length-prefixed at all. Latched at init: it is a property of the configuration record that
+    /// lands in the sample entry, and the AE#561 sanitizer walks every video sample with it.
+    private let videoNALLengthPrefixSize: Int?
+    /// AE#561 harness switch: the sanitizer removes the only shape that reproduces a segment Apple's
+    /// parser refuses, so the rung underneath it (the software-path escalation) would have nothing to
+    /// be measured against. Read once from the environment, never set in a shipped configuration.
+    static let nalChainSanitizerDisabled =
+        ProcessInfo.processInfo.environment["AETHER_DISABLE_NAL_SANITIZER"] != nil
+    /// How many video samples the AE#561 sanitizer has had to cut, over this muxer's life.
+    private var truncatedVideoSamples: Int = 0
 
     /// Only AC-3 / E-AC-3 / TrueHD build their mp4 sample entry from a parsed packet (dac3/dec3/dmlp),
     /// so only they can hit the "moov before audio parsed" wedge and need the #64-flush guard. Shared with
@@ -239,6 +250,24 @@ final class MP4SegmentMuxer {
         self.audioDelaySeconds = audioDelaySeconds
         self.audioNeedsParsedPacketForMoov =
             audio.map { Self.audioNeedsParsedPacketForMoov($0.codecpar.pointee.codec_id) } ?? false
+        // AE#561: the override, when there is one, is the record that reaches the sample entry. Both
+        // carry the same width (the #19 rebuild keeps the source header's first 22 bytes), so this
+        // only matters for a source whose own extradata is missing or Annex B.
+        if let override = video.extradataOverride {
+            self.videoNALLengthPrefixSize = override.withUnsafeBufferPointer {
+                NALUnitChain.lengthPrefixSize(
+                    codecID: video.codecpar.pointee.codec_id,
+                    extradata: $0.baseAddress,
+                    extradataSize: $0.count
+                )
+            }
+        } else {
+            self.videoNALLengthPrefixSize = NALUnitChain.lengthPrefixSize(
+                codecID: video.codecpar.pointee.codec_id,
+                extradata: UnsafePointer(video.codecpar.pointee.extradata),
+                extradataSize: Int(video.codecpar.pointee.extradata_size)
+            )
+        }
 
         let firstPath = Self.stagingPath(forSegmentIndex: initialSegmentIndex,
                                          in: sessionDir)
@@ -583,6 +612,38 @@ final class MP4SegmentMuxer {
                 flushPendingFragment()
                 fragmentWindowFirstVideoDts = dts
             }
+        }
+
+        // AE#561: a damaged source can carry a video sample whose NAL chain declares a unit that
+        // reaches past the end of the packet. Apple's fMP4 parser walks that chain by addition and
+        // answers the whole segment with -19602, which kills the session and every reload onto the
+        // same segment; libavcodec's own decoder answers such a packet by skipping the frame, which
+        // is why the file plays elsewhere. Cut the sample at its last complete NAL, which is what
+        // MKVToolNix writes when it remuxes one of these files.
+        if streamIndex == videoOutputStreamIndex,
+           !Self.nalChainSanitizerDisabled,
+           let lengthPrefixSize = videoNALLengthPrefixSize,
+           let data = packet.pointee.data,
+           packet.pointee.size > 0,
+           let complete = NALUnitChain.completeRunLength(
+               UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size)),
+               lengthPrefixSize: lengthPrefixSize
+           ) {
+            truncatedVideoSamples += 1
+            if truncatedVideoSamples <= 5 || truncatedVideoSamples % 100 == 0 {
+                EngineLog.emit(
+                    "[MP4SegmentMuxer] #561 video sample at dts=\(packet.pointee.dts) carries an "
+                    + "incomplete NAL chain: \(packet.pointee.size) bytes, \(complete) of them "
+                    + "complete; cut to the last whole unit (#\(truncatedVideoSamples) this muxer)",
+                    category: .session
+                )
+            }
+            if complete == 0 {
+                // Nothing in the sample survives the walk, so there is no picture to hand over.
+                av_packet_unref(packet)
+                return (0, .none)
+            }
+            av_shrink_packet(packet, Int32(complete))
         }
 
         // av_write_frame was tried as a leak hypothesis; no impact on 8 MB/s mallocMB growth

@@ -3,7 +3,7 @@ import Foundation
 // Phase D: selection-armed worker feeding a bitmap track's native WebVTT rendition with
 // OCR-recognized text cues, so PGS/DVB/DVD subtitles survive PiP / AirPlay / external display
 // on the native path. Packet source is the session SubtitlePacketStore (#112 harvest); decode
-// runs on the MainActor tick (overlay-drainer cost class), Vision runs in the detached task.
+// runs on the MainActor tick (overlay-drainer cost class), Vision runs on a dedicated thread.
 extension AetherEngine {
 
     /// Arm for the selected embedded bitmap track. The per-ordinal cursor survives re-arming.
@@ -18,18 +18,29 @@ extension AetherEngine {
             while !Task.isCancelled {
                 guard let self else { return }
                 let batch = await MainActor.run { [weak self] in
-                    self?.subtitleOCRCollectTick(ordinal: ordinal, streamIndex: streamIndex) ?? []
+                    guard !Task.isCancelled, let self else { return [SubtitleCue]() }
+                    let batch = self.subtitleOCRCollectTick(ordinal: ordinal, streamIndex: streamIndex)
+                    self.subtitleOCRBatchInFlight = !batch.isEmpty
+                    return batch
                 }
                 if !batch.isEmpty {
-                    SubtitleImageOCR.appendRecognized(cues: batch, language: language, to: store)
+                    await SubtitleImageOCR.appendRecognized(cues: batch, language: language, to: store)
+                    await MainActor.run {
+                        if !Task.isCancelled { self.subtitleOCRBatchInFlight = false }
+                    }
                 }
                 try? await Task.sleep(nanoseconds: AetherEngine.subtitleDrainTickNanoseconds)
             }
         }
     }
 
-    /// Track switch / deselect / teardown. Cursors and pending stay (see load/stop reset).
+    /// Completed coverage survives a re-arm; an abandoned batch must be collected again.
     func cancelSubtitleOCRWorker() {
+        if subtitleOCRBatchInFlight, let ordinal = subtitleOCRArmedOrdinal {
+            subtitleOCRCursors.removeValue(forKey: ordinal)
+            subtitleOCRPendingStates.removeValue(forKey: ordinal)
+        }
+        subtitleOCRBatchInFlight = false
         subtitleOCRArmedOrdinal = nil
         subtitleOCRWorkerTask?.cancel()
         subtitleOCRWorkerTask = nil
@@ -123,7 +134,7 @@ extension AetherEngine {
         subtitleOCRSidecarFillTask?.cancel()
         EngineLog.emit("[SubtitleOCR] sidecar fill starting: track=\(id) cues=\(cues.count)", category: .engine)
         subtitleOCRSidecarFillTask = Task.detached(priority: .utility) {
-            SubtitleImageOCR.appendRecognized(cues: cues, language: language, to: store)
+            await SubtitleImageOCR.appendRecognized(cues: cues, language: language, to: store)
             if !Task.isCancelled { store.markFinished() }
         }
     }

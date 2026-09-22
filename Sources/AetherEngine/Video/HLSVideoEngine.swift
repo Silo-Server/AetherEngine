@@ -663,6 +663,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// claimed it) or a source-declared plan (which aims below its IRAP by design, AE#268).
     var planBoundariesClaimRandomAccess = false
 
+    /// AE#561: the axis `segmentPlan`'s boundaries are stamped on, handed to every producer this
+    /// session builds so its cutter gate compares a packet on the plan's own axis. Set together with
+    /// `planBoundariesClaimRandomAccess`, because it is the same plan that makes it meaningful: only
+    /// the keyframe-aligned plan's boundaries ARE index entries. `.decode` for every other plan,
+    /// which is what the cutter compared before the axis existed.
+    var planBoundaryAxis: PlanBoundaryAxis = .decode
+
     /// Guards subsystem refs + `sessionEpoch`. Never held across waits or network I/O so
     /// `stop()` on the main thread is never blocked behind a restart's 5 s waitForFinish.
     let restartLock = NSLock()
@@ -1158,14 +1165,26 @@ public final class HLSVideoEngine: @unchecked Sendable {
             // a repaired stream and the container's own index have to describe one ladder.
             dem.decideCompositionOffsetRepair()
 
+            // AE#585: everything from here to the cursor reset in step 6 is index work, and it ends
+            // where it began. Without this bracket the prewarm's seek to the middle reads as
+            // playback moving away, the retained head is released, and playback's first read at
+            // offset zero re-fetches the bytes the open (or the warm) already paid for.
+            dem.beginIndexPass()
+
             // 2. Prewarm MKV Cues so libavformat's keyframe index is populated (1-2 byte-range reads).
             //    Bounded: a missing/out-of-bounds Cues index degrades into a multi-GB linear scan;
             //    abort past the deadline and fall back to the uniform-stride plan.
             //    #268: a segmented time-seekable source (HLS VOD ingest) has no index libavformat could
             //    load, and each reposition refetches a segment, so prewarming would buy the same
             //    uniform-stride plan for the price of two segment downloads at every session start.
-            if dem.timeSeekableReader != nil {
-                EngineLog.emit("[HLSVideoEngine] cue prewarm: skipped for a segmented source (no index to load, every reposition refetches a segment)")
+            if !Self.cuePrewarmMayRun(hasSegmentedReader: dem.timeSeekableReader != nil,
+                                      isSourceSeekable: dem.isSourceSeekable) {
+                EngineLog.emit(
+                    dem.timeSeekableReader != nil
+                        ? "[HLSVideoEngine] cue prewarm: skipped for a segmented source (no index to load, every reposition refetches a segment)"
+                        : "[HLSVideoEngine] cue prewarm: skipped for a forward-only source (the seek would be a linear read, "
+                          + "and the prefix it consumes is the producer's only pass)"
+                )
             } else {
                 let prewarmStart = DispatchTime.now()
                 let prewarmOK = dem.seekBounded(to: durationSeconds * 0.5, timeout: Self.cuePrewarmTimeout)
@@ -1219,6 +1238,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     sourceDurationSeconds: durationSeconds
                 )
                 planBoundariesClaimRandomAccess = true
+                // AE#561: these boundaries ARE this container's index entries, so they carry its
+                // stamping. Read from the demuxer that produced them, never from the URL or the
+                // host's metadata: on a remux session the delivered container is the one indexed.
+                planBoundaryAxis = PlanBoundaryAxis.forContainer(formatName: dem.containerFormatName)
                 let firstKeyframePts = keyframes.sorted().first ?? 0
                 self.firstKeyframePts = firstKeyframePts
                 let firstKeyframeSeconds = Double(firstKeyframePts) * Double(videoTimeBase.num) / Double(videoTimeBase.den)
@@ -1383,6 +1406,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         //    (no prewarm, forward-only feed).
         if !isLiveSession {
             dem.seek(to: 0)
+            dem.endIndexPass()      // AE#585: the next read that lands outside a span is playback's
         }
 
         // volumeAvailableCapacityForImportantUsage is unavailable on tvOS; the plain capacity key
@@ -1425,6 +1449,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // Keyed on the sample entry the route chose, not on the variant: a Profile 5 record served as
         // its base layer (`dolbyVisionHandling = .baseLayerOnly`) is plain hvc1 whose VUI the muxer
         // stream-copies as it stands.
+        // A record the engine synthesized from the RPU (AE#recordless) needs the repair most of all:
+        // its gate IS an unspecified VUI, which is the signal shape #19 was reported on, and a source
+        // is the same bytes whether the container recorded its profile or not. Measured on one
+        // bitstream in two containers, Dolby's P5 asset with and without its `dvcC`: with the record
+        // `init.mp4` is 883 B carrying `colr nclx` 9 / 16 / 9 full range, without it and without this
+        // override 864 B and no `colr` at all, which would be two deliveries of one picture.
         let p5ColorOverride: MP4SegmentMuxer.ColorOverride?
         if codecTagOverride == "dvh1" {
             let sourceRange = codecpar.pointee.color_range
@@ -1849,6 +1879,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 retentionBudgetBytes: retentionBudgetBytes
             ),
             allowsBoundedDegradedStart: liveJoinProfile == .fastZap,
+            boundedStartFloorsAtHoldback: LiveEdgePolicy.boundedStartFloorArmed,
             blockingReloadOverride: blockingReloadOverride,
             liveCadencePolicy: liveCadencePolicy,
             restartHandler: isLiveSession ? nil : { [weak self] idx in
@@ -2516,6 +2547,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             audioFallbackDurationPts: audioFallbackDurationPts,
             restartTargetVideoPts: videoTarget,
             boundaryClaimsRandomAccess: planBoundariesClaimRandomAccess,
+            planBoundaryAxis: planBoundaryAxis,
             closedCaptionStreamIndex: closedCaptionStreamIndexForSession,
             subtitleTapStreamIndices: Set(nativeSubtitleSourceStreamIndicesForSession.compactMap { $0 }),
             subtitlePacketStreamIndices: allEmbeddedSubtitleStreamIndices,   // #112 rework

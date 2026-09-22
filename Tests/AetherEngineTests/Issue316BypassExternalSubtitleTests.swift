@@ -180,14 +180,14 @@ struct Issue316BypassExternalSubtitleTests {
         let cues = engine.subtitleCues
 
         engine.setNativeSubtitleRendering(true)
-        #expect(engine.captureSubtitleSessionCarryover().injectedSubtitleRenderingRequested)
+        #expect(engine.captureSubtitleSessionCarryover().nativeSubtitleRenderingRequested)
         #expect(engine.sidecarASSHeader == header)
         #expect(engine.subtitleCues == cues)
         // Reloads defer media-selection work, but a newer surface request must
         // replace the captured intent before subtitle selection is restored.
         engine.sessionPreservingReloadInFlight = true
         engine.setNativeSubtitleRendering(false)
-        #expect(!engine.captureSubtitleSessionCarryover().injectedSubtitleRenderingRequested)
+        #expect(!engine.captureSubtitleSessionCarryover().nativeSubtitleRenderingRequested)
         #expect(engine.pendingNativeRenderingRequest == false)
         engine.sessionPreservingReloadInFlight = false
         engine.restoreSubtitleSelection(from: engine.captureSubtitleSessionCarryover(), resumeAnchor: nil)
@@ -196,11 +196,11 @@ struct Issue316BypassExternalSubtitleTests {
         #expect(engine.subtitleCues == cues)
 
         var carryover = engine.captureSubtitleSessionCarryover()
-        carryover.injectedSubtitleRenderingRequested = true
+        carryover.nativeSubtitleRenderingRequested = true
         let restored = try AetherEngine()
         defer { restored.stop(finalTeardown: true) }
         restored.applySubtitleSessionCarryoverRegistrations(carryover)
-        #expect(restored.injectedSubtitleRenderingRequested)
+        #expect(restored.nativeSubtitleRenderingRequested)
 
         engine.clearSubtitle()
         #expect(engine.activeSubtitleTrackIndex == nil)

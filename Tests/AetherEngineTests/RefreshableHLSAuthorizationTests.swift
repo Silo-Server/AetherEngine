@@ -171,7 +171,7 @@ struct RefreshableHLSAuthorizationTests {
 
     @Test("Authorized segment bytes stream before the origin finishes")
     func authorizedStreaming() async throws {
-        let upstream = try #require(await TricklingOrigin.start(slices: 2, pauseSeconds: 20))
+        let upstream = try #require(await TricklingOrigin(slices: 2, pauseSeconds: 20))
         defer { upstream.stop() }
         let relay = HLSOriginRelay(authorization: HTTPRequestAuthorization { _, _ in ["Authorization": "Bearer fresh"] })
         let server = HLSLocalServer(relay: relay)
@@ -415,7 +415,7 @@ private final class AuthorizationOrigin {
     private let process: Process
     private let directory: URL
     init() async throws {
-        let launched = try #require(await PythonOrigin.launchOffPool(prefix: "aether-auth-origin", script: Self.script))
+        let launched = try #require(await PythonOrigin.launch(prefix: "aether-auth-origin", script: Self.script))
         port = launched.port
         process = launched.process
         directory = launched.workDir

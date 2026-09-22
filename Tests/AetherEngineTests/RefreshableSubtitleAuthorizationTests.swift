@@ -74,7 +74,7 @@ struct RefreshableSubtitleAuthorizationTests {
     }
     @Test("Raw sidecar relay streams unknown-length bytes before the origin finishes")
     func unknownLengthStreaming() async throws {
-        let origin = try #require(await TricklingOrigin.start(slices: 2, pauseSeconds: 20, declaresLength: false))
+        let origin = try #require(await TricklingOrigin(slices: 2, pauseSeconds: 20, declaresLength: false))
         defer { origin.stop() }
         let relay = HLSOriginRelay(authorization: HTTPRequestAuthorization { _, _ in [:] }, rawResources: true)
         let server = HLSLocalServer(relay: relay)
@@ -146,7 +146,7 @@ struct RefreshableSubtitleAuthorizationTests {
 
     @Test("Raw sidecar framing completes and preserves bytes", arguments: [false, true])
     func rawBodyCompletes(declaresLength: Bool) async throws {
-        let origin = try #require(await TricklingOrigin.start(slices: 2, pauseSeconds: 0, declaresLength: declaresLength))
+        let origin = try #require(await TricklingOrigin(slices: 2, pauseSeconds: 0, declaresLength: declaresLength))
         defer { origin.stop() }
         let relay = HLSOriginRelay(authorization: HTTPRequestAuthorization { _, _ in [:] }, rawResources: true)
         let server = HLSLocalServer(relay: relay)
@@ -453,7 +453,7 @@ final class SubtitleAuthorizationOrigin {
     let directory: URL
     private let process: Process
     init() async throws {
-        let launched = try #require(await PythonOrigin.launchOffPool(prefix: "aether-subtitle-auth", script: Self.script))
+        let launched = try #require(await PythonOrigin.launch(prefix: "aether-subtitle-auth", script: Self.script))
         port = launched.port
         process = launched.process
         directory = launched.workDir

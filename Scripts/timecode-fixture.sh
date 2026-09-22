@@ -116,7 +116,7 @@
 # -3, 5 s gives -5, and a key under a second below one gives an axis AVPlayer THROWS AWAY at the
 # next seek (measured: -0.500 and -0.875 snap to 0, -1.000 and above survive).
 set -euo pipefail
-OUT_DIR="${1:?usage: timecode-fixture.sh <out-dir>}"
+OUT_DIR="${1:?usage: timecode-fixture.sh <out-dir> [offset-seconds]}"
 DUR=120
 FPS=24
 
@@ -168,3 +168,29 @@ ffmpeg -hide_banner -loglevel error -y \
   -c:a aac -b:a 128k -shortest \
   "$OUT_DIR/tc-bf1.mkv"
 echo "wrote $OUT_DIR/tc-bf1.mkv (same, has_b_frames=1)"
+
+# AE#534: the offset twin, when an origin is asked for.
+#
+# Every axis fixture in this repo starts at zero, and on a zero-origin source "this run carries no
+# placement offset" and "item time is source time here" are the same number, so only the first of
+# them is ever actually tested. A recording cut out of a longer one, or a TS remux, is not an exotic
+# case. The twin is one `-c copy` remux away, and the ORDER matters: offset FIRST, inject Cues after,
+# because a matroska remux regenerates Cues from the real keyframes and would undo the lie.
+#
+#   Scripts/timecode-fixture.sh /tmp/fx 600
+#   python3 Scripts/mkv-cue-fixture.py /tmp/fx/tc-drought-600.mkv /tmp/fx/tc-cues-lie-600.mkv \
+#       "$(python3 -c 'print(",".join(str(i) for i in range(601,720)))')"
+#   swift run aetherctl play --seconds 60 --start-position 673 --picture-probe --picture-origin 600 \
+#       --seek-every 12 --seek-count 1 --seek-pattern 680 file:///tmp/fx/tc-cues-lie-600.mkv
+#
+# `--picture-origin` is what keeps the verdict readable: the picture states a frame index, which the
+# offset does not move, so without it `capErr` reads about -599.983 where the honest value is -0.017.
+OFFSET="${2:-}"
+if [ -n "$OFFSET" ]; then
+  for base in tc-drought tc-bframes tc-bf1; do
+    ffmpeg -hide_banner -loglevel error -y \
+      -i "$OUT_DIR/$base.mkv" -c copy -output_ts_offset "$OFFSET" \
+      "$OUT_DIR/$base-$OFFSET.mkv"
+    echo "wrote $OUT_DIR/$base-$OFFSET.mkv (same picture, source timeline starts at ${OFFSET}s)"
+  done
+fi

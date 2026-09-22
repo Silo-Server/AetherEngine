@@ -33,6 +33,39 @@ For iterative work, open `Package.swift` in Xcode 26+ and pick the `AetherEngine
 
 The `aetherctl` command-line target is macOS-only (it uses `Foundation.Process`) and is excluded from the iOS / tvOS library build.
 
+## Writing tests
+
+The suite is large (3000 tests over 460 files) and cheap (the whole run is about a minute), so the
+question is never whether a behaviour deserves a test. Two conventions keep it from growing in the
+one direction that costs something, which is width.
+
+**A test file is named after the BEHAVIOUR, not after the issue that revealed it.** The issue number
+belongs in the test's name and in the comment that explains what it cost, where it is read by
+whoever hits the same thing again. Files named `Issue<N>…Tests.swift` made growth purely additive:
+a new report got a new file, because nobody could see from the outside whether the behaviour was
+already covered. That is how seek ended up spread over sixteen files, live over thirty-two, and how
+two pairs of files ended up testing the same concept under two issue numbers. Existing files are
+not worth renaming on their own; put a new test where the topic already lives.
+
+**Wait with `waitFor` from `Support/TestWaiting.swift`, never with a sleep or a private copy.** It
+carries two rules that cost three rounds of red CI to learn. A step that HAS to happen before the
+test can measure anything gets no deadline of its own, because any finite bound can be overrun by
+an oversubscribed machine, and the bound then decides what the test reports; the hang catcher is a
+`.timeLimit` trait, which reports a hang as one, with a name. And anything a test parks on its own
+gets a real thread (`Thread.detachNewThread`), never `DispatchQueue.global().async`: measured with
+192 pool workers blocked, which is what a full parallel run of this suite produces, the queue had
+not started the block after 35 seconds while a detached thread ran in 3 milliseconds.
+
+**A blocking syscall in a test is unreachable for the `.timeLimit` trait, so it may not sit on the
+test's own thread.** Cancellation in Swift is cooperative: a test parked in `read`, `accept` or
+`waitUntilExit` never observes it, the trait never reports, and the job dies at its own
+`timeout-minutes` with the log of the killed run discarded, so not even the test's name survives.
+Measured on this suite: a launch helper parked in `FileHandle.availableData` ran past a one minute
+limit for more than ten, and the only trace was the subprocess in the runner's orphan-process
+cleanup. Put the blocking call on its own thread, `await` its result, and give the cancellation
+handler whatever ends it (closing the handle, killing the subprocess).
+`Support/PythonOrigin.swift` is the worked example.
+
 ## Where playback bugs get fixed
 
 A bug that reproduces in a host app but traces back to decoding, demuxing, the audio bridge, or display routing gets fixed **in the engine**, not worked around in the host. If a change starts adding host-side compensation for engine behavior, that is a signal the fix belongs here instead. PRs that move logic in the right direction are very welcome.

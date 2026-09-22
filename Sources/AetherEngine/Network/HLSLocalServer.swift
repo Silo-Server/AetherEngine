@@ -403,15 +403,16 @@ final class HLSLocalServer: @unchecked Sendable {
 
     private let stateLock = NSLock()  // guards all mutable fields; never held across blocking syscalls
 
-    private let acceptQueue = DispatchQueue(
-        label: "com.aetherengine.hls.accept",
-        qos: .userInitiated
-    )
-    private let workQueue = DispatchQueue(
-        label: "com.aetherengine.hls.work",
-        qos: .userInitiated,
-        attributes: .concurrent
-    )
+    /// The accept loop and every connection handler run on threads this server owns, not on
+    /// dispatch queues. Both block by design: accept sits in a syscall for the server's whole life,
+    /// and a handler blocks in `UpstreamPump` while the origin feeds it. A queue hands that work a
+    /// GLOBAL POOL worker, and the pool hands out a worker only once one is free, so a process
+    /// whose pool workers are all in a blocking wait leaves a connection unserved for as long as
+    /// that lasts: the client then reads a dead server. Measured with 192 pool workers blocked, a
+    /// `DispatchQueue.global().async` block had not started after 35 s while a detached thread ran
+    /// in 3 ms. Same reason the pump owns its thread since AE#286.
+    private static let maxConcurrentConnections = 32
+    private var liveConnectionThreads = 0
 
     // MARK: - Init
 
@@ -515,9 +516,10 @@ final class HLSLocalServer: @unchecked Sendable {
         EngineLog.emit("[HLSLocalServer] Listening on port \(assignedPort)",
                        category: .hlsServer)
 
-        acceptQueue.async { [weak self] in
-            self?.acceptLoop()
-        }
+        let accepter = Thread { [weak self] in self?.acceptLoop() }
+        accepter.name = "com.aetherengine.hls.accept"
+        accepter.qualityOfService = .userInitiated
+        accepter.start()
     }
 
     func stop() {
@@ -532,7 +534,13 @@ final class HLSLocalServer: @unchecked Sendable {
         mediaPlaylistBuildCount = 0
         let clients = clientFds
         clientFds.removeAll()
+        let closingPort = port
         stateLock.unlock()
+        // AE#597: the one line that says a listener went away. Without it a log cannot tell a
+        // server that was released from one that outlived its session on a port of its own.
+        EngineLog.emit(
+            "[HLSLocalServer] stop: port \(closingPort) released, \(clients.count) connection(s) "
+            + "shut down", category: .hlsServer)
 
         // shutdown() BEFORE close() on the listen fd: close releases the fd number while the accept loop may have captured it; a new session could recycle that number and the dying loop would accept on the new session's socket. shutdown() wakes the blocked accept without releasing the number.
         if fdToClose >= 0 {
@@ -592,15 +600,39 @@ final class HLSLocalServer: @unchecked Sendable {
                            socklen_t(MemoryLayout<timeval>.size))
 
             stateLock.lock()
-            clientFds.insert(clientFd)
+            // A thread per connection has no ceiling of its own, where the pool's 64 workers were
+            // one. AVPlayer keeps a handful open, so anything near this number is a client that
+            // has stopped making sense and gets the socket closed rather than a thread.
+            let atCapacity = liveConnectionThreads >= Self.maxConcurrentConnections
+            if !atCapacity {
+                liveConnectionThreads += 1
+                clientFds.insert(clientFd)
+            }
             stateLock.unlock()
+
+            if atCapacity {
+                EngineLog.emit(
+                    "[HLSLocalServer] refusing fd=\(clientFd): "
+                    + "\(Self.maxConcurrentConnections) connections already open",
+                    category: .hlsServer)
+                close(clientFd)
+                continue
+            }
 
             EngineLog.emit("[HLSLocalServer] conn opened fd=\(clientFd)",
                            category: .hlsServer, level: .verbose)
 
-            workQueue.async { [weak self] in
+            let worker = Thread { [weak self] in
+                defer {
+                    self?.stateLock.lock()
+                    self?.liveConnectionThreads -= 1
+                    self?.stateLock.unlock()
+                }
                 self?.handleConnection(clientFd)
             }
+            worker.name = "com.aetherengine.hls.conn.\(clientFd)"
+            worker.qualityOfService = .userInitiated
+            worker.start()
         }
     }
 

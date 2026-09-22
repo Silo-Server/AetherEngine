@@ -132,6 +132,32 @@ struct Issue408BoundaryRandomAccessTests {
             maxAttempts: HLSSegmentProducer.gateBackoffStepsSeconds.count))
     }
 
+    /// AE#561: the reorder term pays for a boundary stamped in DECODE time being judged by
+    /// presentation time. A Matroska Cue is already a presentation time, so a correctly indexed
+    /// keyframe presents exactly at its boundary and the term would only let a genuinely late open
+    /// escape its re-aim. The floor still stands, because a Cue can be approximate without being
+    /// skewed.
+    @Test("a presentation-stamped plan pays no reorder term, and re-aims where a decode-stamped one would not")
+    func presentationAxisDropsTheReorderTerm() {
+        let decodeTicks = HLSSegmentProducer.boundaryOpenToleranceTicks(
+            reorderFrames: 16, frameDurationPts: 42, floorTicks: 500, planAxis: .decode)
+        let presentationTicks = HLSSegmentProducer.boundaryOpenToleranceTicks(
+            reorderFrames: 16, frameDurationPts: 42, floorTicks: 500, planAxis: .presentation)
+        #expect(decodeTicks == 16 * 42 + 42)
+        #expect(presentationTicks == 500)
+
+        // A keyframe presenting 0.6 s past the boundary: inside the decode-stamped tolerance, which
+        // cannot tell it from the reorder skew, and outside the presentation-stamped one, where the
+        // whole 0.6 s is a real gap the segment would otherwise carry under the boundary's name.
+        let late = Self.boundary + 600
+        #expect(!HLSSegmentProducer.shouldReanchorBeforeOpening(
+            keyframePts: late, boundaryPts: Self.boundary, toleranceTicks: decodeTicks,
+            attemptsUsed: 0, maxAttempts: HLSSegmentProducer.gateBackoffStepsSeconds.count))
+        #expect(HLSSegmentProducer.shouldReanchorBeforeOpening(
+            keyframePts: late, boundaryPts: Self.boundary, toleranceTicks: presentationTicks,
+            attemptsUsed: 0, maxAttempts: HLSSegmentProducer.gateBackoffStepsSeconds.count))
+    }
+
     @Test("a stream without reorder keeps the floor")
     func noReorderKeepsFloor() {
         #expect(HLSSegmentProducer.boundaryOpenToleranceTicks(

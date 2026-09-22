@@ -24,6 +24,16 @@ final class DocumentedConstantsTests: XCTestCase {
         assertDocumented("**20 second** deadline", try documentation())
     }
 
+    func testItemDiagnosticBoundsMatchDocumentation() throws {
+        let docs = try documentation()
+        XCTAssertEqual(ItemDiagnosticReadPool.maximumConcurrentReads, 2)
+        XCTAssertEqual(AVPlayerItemDiagnostics.maximumPendingRetirements, 1)
+        XCTAssertEqual(AVPlayerItemDiagnostics.accessLogLimit, 5)
+        assertDocumented("**two concurrent diagnostic reads**", docs)
+        assertDocumented("**one pending retirement\nread**", docs)
+        assertDocumented("five entries per item", docs)
+    }
+
     func testPartialCompositionHoldBoundsMatchDocumentation() throws {
         let docs = try documentation()
         XCTAssertEqual(H264PartialCompositionRepair.maximumReorderDepth, 16)
@@ -121,6 +131,17 @@ final class DocumentedConstantsTests: XCTestCase {
     }
 
     // MARK: - Probe budgets
+
+    func testWholeProbeDefaultsMatchDocumentation() throws {
+        let docs = try documentation()
+        let limits = ProbeLimits()
+        XCTAssertEqual(limits.maxInputBytes, 8 * 1024 * 1024)
+        XCTAssertEqual(limits.maxPackets, 128)
+        XCTAssertEqual(limits.maxPacketBytes, 2 * 1024 * 1024)
+        XCTAssertEqual(limits.timeBudget, 5)
+        assertDocumented("`maxInputBytes` (8 MiB), `maxPackets` (128)", docs)
+        assertDocumented("`maxPacketBytes` (2 MiB), `timeBudget` (5 s)", docs)
+    }
 
     /// docs/api.md states the defaults a host overrides with `probesize` / `maxAnalyzeDuration`.
     func testProbeBudgetDefaultsAreWhatTheDocsSay() throws {
@@ -235,6 +256,36 @@ final class DocumentedConstantsTests: XCTestCase {
         let engineSource = try sourceFile("Sources/AetherEngine/AetherEngine.swift")
         XCTAssertTrue(engineSource.contains("Both paths are pitch-preserving"),
                       "setRate's own documentation must keep saying which paths correct pitch")
+    }
+
+    // MARK: - The version the engine reports about itself (AetherPlayer#7)
+
+    /// `AetherEngine.version` is the number a host puts in its About panel and in the header of the
+    /// log a reporter attaches, so a stale one does not read as stale: it reads as a fact about the
+    /// build under discussion, and an analysis then runs against the wrong engine. Nothing in the
+    /// compiler knows that 7.2.0 stopped being true.
+    ///
+    /// A release already rewrites three statements of the same number, so the constant is pinned to
+    /// all three. A forgotten bump is a red test here rather than a log line that lies.
+    func testReportedVersionMatchesEveryPublishedStatementOfIt() throws {
+        assertDocumented(#"from: "\#(AetherEngine.version)""#, try documentation())
+
+        let examples = try sourceFile("Examples/README.md")
+        XCTAssertTrue(examples.contains("starting from `\(AetherEngine.version)`"), """
+            Examples/README.md no longer says "starting from `\(AetherEngine.version)`".
+            The dependency step an adopter follows has to name the version the engine reports.
+            """)
+
+        let newestRelease = try sourceFile("CHANGELOG.md")
+            .split(separator: "\n")
+            .first { $0.hasPrefix("## [") && !$0.hasPrefix("## [Unreleased]") }
+            .map { $0.drop { $0 != "[" }.dropFirst().prefix { $0 != "]" } }
+            .map(String.init)
+        XCTAssertEqual(newestRelease, AetherEngine.version, """
+            AetherEngine.version says \(AetherEngine.version), the newest CHANGELOG entry says \
+            \(newestRelease ?? "nothing"). Both move in the release prep commit, together with the \
+            README install snippets.
+            """)
     }
 
     /// The docs corpus is README + docs/; a claim living in a source docstring is read straight.

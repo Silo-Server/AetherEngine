@@ -453,6 +453,22 @@ struct Issue440LiveJoinRollTests {
         #expect(paused.contains("no decision was taken"))
     }
 
+    /// The reporter's rejoin at 6.81.0: the #446 swap reuses a player that is still `.playing`, so the
+    /// fresh item's first status edge is that carried `.playing`, 1 ms after the load and long before the
+    /// item is ready. Read as a roll, it spent the one-shot silently, and the `ToMinimizeStalls` hold
+    /// that followed 15 ms later reached no decision and no line.
+    @Test("a playing status carried onto an item that is not ready yet does not spend the one-shot")
+    func carriedPlayingDoesNotSpend() {
+        #expect(!NativeAVPlayerHost.playingSpendsLiveJoinOneShot(itemIsReadyToPlay: false))
+    }
+
+    /// The reason the spend exists stays intact: once the item's own rate has rolled, every later hold
+    /// is a mid-stream rebuffer and keeps AVPlayer's stall policy.
+    @Test("a playing status on a ready item is the roll, and spends it")
+    func realRollSpends() {
+        #expect(NativeAVPlayerHost.playingSpendsLiveJoinOneShot(itemIsReadyToPlay: true))
+    }
+
     // MARK: - What `ahead 0.00s` was hiding (AE#447 follow-up)
 
     /// An item that has placed NOTHING is the state a wedged join is in, and it read exactly like the

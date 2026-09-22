@@ -37,11 +37,22 @@ final class PictureProbe: @unchecked Sendable {
     private var attachedItem: AVPlayerItem?
     private(set) var attachCount = 0
 
-    init(blocks: Int = 12, blockPitch: Int = 52, blockCenter: Int = 25, frameRate: Double = 24) {
+    /// AE#534: where the SOURCE's timeline starts, when it does not start at zero.
+    ///
+    /// The picture states a frame index, which an `-output_ts_offset` remux does not move, while the
+    /// engine's `sourceTime` is on the container's own axis. On a 600 s twin the two are six hundred
+    /// seconds apart while everything is working correctly, and `capErr` reads `-599.983` where the
+    /// honest reading is `-0.017`. Told the origin, the verdict compares like with like again, and a
+    /// run on an offset source can be read by the same rule as a run on a zero-origin one.
+    let sourceOrigin: Double
+
+    init(blocks: Int = 12, blockPitch: Int = 52, blockCenter: Int = 25, frameRate: Double = 24,
+         sourceOrigin: Double = 0) {
         self.blocks = blocks
         self.blockPitch = blockPitch
         self.blockCenter = blockCenter
         self.frameRate = frameRate
+        self.sourceOrigin = sourceOrigin
     }
 
     /// The item is swapped in place on a reload, and an output belongs to one item, so re-attach on
