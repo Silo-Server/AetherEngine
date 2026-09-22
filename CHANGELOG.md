@@ -23,6 +23,7 @@ the public-API contract.
 
 ### Fixed
 
+- The software-decoder progress regression now warms the frame-thread pipeline before measuring sustained output, avoiding a false failure on hosts with more decoder threads than its former fixed allowance. Production decoding and thread selection are unchanged.
 - Authorized native HLS uses the engine relay from the initial load, without forwarding origin credentials to the loopback asset. Optional subtitle playlist preparation shares the authorizer and has a bounded deadline across redirects and refreshes.
 - Static-header HLS redirects apply the shared credential policy, including Emby and MediaBrowser token headers, before contacting another origin.
 - Session option corrections recognize `httpRequestAuthorization` and external subtitle provider replacements by identity.

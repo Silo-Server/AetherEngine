@@ -47,6 +47,12 @@ already covered. That is how seek ended up spread over sixteen files, live over 
 two pairs of files ended up testing the same concept under two issue numbers. Existing files are
 not worth renaming on their own; put a new test where the topic already lives.
 
+**Decoder progress tests must account for frame-thread buffering.** A fixed allowance for pending
+frames can fail on hosts with more decoder threads. `Issue220SoftwareDecoderDrainTests` warms the
+default threaded decoder with enough fixture input for the host processor count, then checks that
+another complete pass delivers one frame per new packet. Replayed passes keep continuous timestamps
+and do not flush the decoder. This preserves threaded progress coverage across different host sizes.
+
 **Wait with `waitFor` from `Support/TestWaiting.swift`, never with a sleep or a private copy.** It
 carries two rules that cost three rounds of red CI to learn. A step that HAS to happen before the
 test can measure anything gets no deadline of its own, because any finite bound can be overrun by

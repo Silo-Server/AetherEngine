@@ -13,7 +13,7 @@ import AetherLibavutil
 ///
 /// The wedge state itself is only reachable through decoder-internal threading, so it is the
 /// disposition rule that is pinned here, plus a real decode over a fixture proving the split
-/// into send + `drainDecodedFrames` still delivers every frame.
+/// into send + `drainDecodedFrames` sustains one output frame per input packet once warm.
 struct Issue220SoftwareDecoderDrainTests {
 
     // MARK: - Send disposition
@@ -38,9 +38,10 @@ struct Issue220SoftwareDecoderDrainTests {
 
     // MARK: - Real decode
 
-    /// Regression guard for the send/drain split: 40 IDR+P packets, no B-frames, so the decoder
-    /// owes a frame per packet minus whatever its own thread pipeline still holds at the end.
-    @Test("every packet of a progressive fixture still reaches the frame handler")
+    /// Regression guard for the send/drain split: IDR+P packets, no B-frames. Frame threading
+    /// delays output by the thread pipeline depth, which scales with the host processor count.
+    /// Warm that pipeline before measuring another full pass, without flushing the decoder.
+    @Test("a warmed progressive decoder keeps producing one frame per packet (#220)")
     func decodesFixtureFrames() throws {
         let data = try #require(Data(base64Encoded: Self.fixtureBase64,
                                      options: .ignoreUnknownCharacters))
@@ -55,21 +56,32 @@ struct Issue220SoftwareDecoderDrainTests {
         try decoder.open(stream: stream) { _, _, _ in counter.increment() }
         defer { decoder.close() }
 
-        var packets = 0
-        while let pkt = try? demuxer.readPacket() {
-            if pkt.pointee.stream_index == videoIndex {
-                packets += 1
-                decoder.decode(packet: pkt)
+        let packetsPerPass = 40
+        let warmupPasses = (ProcessInfo.processInfo.activeProcessorCount + packetsPerPass - 1)
+            / packetsPerPass
+        let passDuration = av_rescale_q(4, AVRational(num: 1, den: 1), stream.pointee.time_base)
+        for pass in 0...warmupPasses {
+            if pass > 0 { try #require(demuxer.seek(to: 0)) }
+            let framesBeforePass = counter.value
+            var packets = 0
+            while let pkt = try demuxer.readPacket() {
+                var ownedPacket: UnsafeMutablePointer<AVPacket>? = pkt
+                defer { trackedPacketFree(&ownedPacket) }
+                if pkt.pointee.stream_index == videoIndex {
+                    packets += 1
+                    // Each pass begins at an IDR. Keep its timestamps continuous across replays
+                    // while leaving the decoder's in-flight frames intact.
+                    pkt.pointee.pts += Int64(pass) * passDuration
+                    pkt.pointee.dts += Int64(pass) * passDuration
+                    decoder.decode(packet: pkt)
+                }
             }
-            var p: UnsafeMutablePointer<AVPacket>? = pkt
-            trackedPacketFree(&p)
+            try #require(packets == packetsPerPass)
+            if pass == warmupPasses {
+                #expect(counter.value - framesBeforePass == packetsPerPass,
+                        "a warmed decoder must keep up with every new packet")
+            }
         }
-
-        #expect(packets == 40)
-        // Frame threading holds a bounded number of frames back until flush; the guard is that
-        // the drain runs at all and keeps up, not the exact pipeline depth.
-        #expect(counter.value > 0)
-        #expect(counter.value >= packets - 16)
     }
 
     private final class FrameCounter: @unchecked Sendable {
