@@ -148,6 +148,30 @@ valid; wait for refresh when a credential has expired or was rejected. Never pla
 URLs. The engine owns Range, routing and HTTP framing headers. Authorization waits are bounded;
 stopping the load cancels pending work and ignores late resolver results.
 
+**Redirect credential scope includes the scheme.** Validate the destination's scheme, host and
+effective port before obtaining credentials, as well as any session/path restrictions the host
+requires. Checking only the hostname allows an HTTPS-to-HTTP downgrade on the same host. An
+explicitly configured HTTP server is a separate host policy decision; it does not authorize an
+HTTPS session to downgrade.
+
+Each redirect asks the resolver for a new set of headers. The engine does not replay the previous
+provider result, and `RedirectHeaderPolicy`'s static-header credential stripping does not filter
+this new result. Throw to reject an out-of-scope destination before its request is sent; refusal
+does not fall back to static headers. Returning `[:]` instead permits a request without application
+headers, so use it only when anonymous access to that destination is intended. A provider that
+returns a bearer for every URL **can send that bearer over cleartext HTTP**, including after an
+HTTPS redirect. The engine currently permits that provider decision; per-destination authorization
+is not a blanket transport downgrade ban.
+
+For example, Silo Apple's reviewed integration checks exact origin before requesting credentials
+in both its [media and subtitle/font providers](https://github.com/Silo-Server/silo-apple/blob/cf4a2d1ef35c5222885d1cb082b85336c8d920e3/iosApp/iosApp/Screens/Player/PlaybackMediaAuthorization.swift).
+Its [origin comparison](https://github.com/Silo-Server/silo-apple/blob/cf4a2d1ef35c5222885d1cb082b85336c8d920e3/iosApp/iosApp/Screens/Player/StreamRequest.swift#L294-L309)
+includes scheme, host and effective port, and its [scope tests](https://github.com/Silo-Server/silo-apple/blob/cf4a2d1ef35c5222885d1cb082b85336c8d920e3/iosApp/Tests/PlaybackMediaAuthorizationTests.swift)
+reject downgraded media and subtitle URLs. Therefore the permissive-provider scenario does not
+establish a credential leak through those Silo providers. Other integrations must enforce their
+own scope. The engine's live TLS tests cover provider refusal, anonymous redirects, static-header
+stripping and the permissive-provider limitation.
+
 `LoadOptions.httpRequestAuthorization` covers native HLS media and its master/variant playlist
 preparation. Direct media AVIO, live ingest and audio taps retain static headers.
 
