@@ -3,7 +3,7 @@ import Foundation
 import Testing
 @testable import AetherEngine
 
-@Suite("Refreshable subtitle and resource authorization")
+@Suite("Refreshable subtitle and resource authorization", .timeLimit(.minutes(3)))
 struct RefreshableSubtitleAuthorizationTests {
     @Test("Registered ASS reselect, secondary and native stores resolve rotated credentials")
     @MainActor func registeredTrackSurvivesRotation() async throws {
@@ -311,8 +311,7 @@ struct RefreshableSubtitleAuthorizationTests {
                     httpRequestAuthorization: provider)
             } else { _ = try await provider.data(from: url, maximumBytes: 1024) }
         }
-        for _ in 0..<400 where !(await gate.entered) { try await Task.sleep(for: .milliseconds(5)) }
-        #expect(await gate.entered)
+        try await waitFor { await gate.entered }
         let start = Date()
         task.cancel()
         await #expect(throws: (any Error).self) { try await task.value }
@@ -329,7 +328,7 @@ struct RefreshableSubtitleAuthorizationTests {
         let provider = HTTPRequestAuthorization { _, _ in ["Authorization": "Bearer old"] }
         let url = origin.url("/slow")
         let task = Task { try await provider.data(from: url, maximumBytes: 1024) }
-        for _ in 0..<400 where origin.requests.isEmpty { try await Task.sleep(for: .milliseconds(5)) }
+        try await waitFor { !origin.requests.isEmpty }
         #expect(origin.requests.count == 1)
         let start = Date()
         task.cancel()

@@ -3,7 +3,7 @@ import Testing
 @testable import AetherEngine
 
 #if os(macOS)
-@Suite("Refreshable native HLS authorization")
+@Suite("Refreshable native HLS authorization", .timeLimit(.minutes(3)))
 struct RefreshableHLSAuthorizationTests {
     @MainActor
     @Test("Native HLS authorization forces a relay and strips origin headers from the asset")
@@ -84,8 +84,7 @@ struct RefreshableHLSAuthorizationTests {
                 options: LoadOptions(httpRequestAuthorization: HTTPRequestAuthorization { _, _ in await gate.wait() },
                                      nativeRemoteHLS: true, autoplay: false))
         }
-        for _ in 0..<200 where !(await gate.entered) { try await Task.sleep(for: .milliseconds(5)) }
-        #expect(await gate.entered)
+        try await waitFor { await gate.entered }
         let start = Date()
         engine.stop()
         var canceled = false
@@ -321,8 +320,7 @@ struct RefreshableHLSAuthorizationTests {
         defer { server.stop(); relay.stop() }
         let entry = try #require(server.relayURL(for: origin.url("/media")))
         let fetch = Task { try await URLSession.shared.data(from: entry) }
-        for _ in 0..<200 where !(await gate.entered) { try await Task.sleep(for: .milliseconds(5)) }
-        #expect(await gate.entered)
+        try await waitFor { await gate.entered }
         let start = Date()
         relay.stop()
         let (_, response) = try await fetch.value
