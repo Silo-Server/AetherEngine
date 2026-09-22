@@ -71,9 +71,105 @@ public enum DolbyVisionRecordAudit {
         return (rpu == 7 || rpu == 8) ? rpu : nil
     }
 
+    // MARK: - A record the container never wrote
+
+    /// Whether a stream with NO Dolby Vision record is worth reading for one. The mirror image of
+    /// `recordIsContradicted`: some Matroska releases are Profile 5 (IPT-PQ-c2, no base layer) with the
+    /// `BlockAdditionMapping` dropped, and with nothing else declaring HDR either, so the source loads as
+    /// plain SDR and the IPT picture is decoded as YCbCr (violet / green).
+    ///
+    /// The pairing is narrow on purpose, so the audit stays free for everything else: HEVC, no record,
+    /// 10-bit 4:2:0, and a VUI that says nothing at all (transfer, matrix and primaries all unspecified).
+    /// A file that names any colour description is a file whose author described it, and the RPU is not
+    /// consulted. Ordinary SDR and HDR10 remuxes all carry a description and never reach a packet read.
+    static func recordlessProfile5IsCandidate(
+        codecID: AVCodecID,
+        hasRecord: Bool,
+        pixelFormat: Int32,
+        colorTransfer: AVColorTransferCharacteristic,
+        colorMatrix: AVColorSpace,
+        colorPrimaries: AVColorPrimaries
+    ) -> Bool {
+        guard codecID == AV_CODEC_ID_HEVC, !hasRecord,
+              pixelFormat == AV_PIX_FMT_YUV420P10LE.rawValue else { return false }
+        return colorTransfer == AVCOL_TRC_UNSPECIFIED
+            && colorMatrix == AVCOL_SPC_UNSPECIFIED
+            && colorPrimaries == AVCOL_PRI_UNSPECIFIED
+    }
+
+    /// Whether the RPU proves a recordless candidate is Profile 5. Anything else, including an RPU that
+    /// could not be read, is no evidence and leaves the source as it was.
+    static func rpuProvesProfile5(_ rpu: Int?) -> Bool { rpu == 5 }
+
+    /// Append the record a Profile 5 container would have carried to `codecpar`, through the same
+    /// `coded_side_data` list a demuxed record lives in, so every reader of it (`dvConfig`, the route
+    /// policy, the segment muxer's `dvcC`) sees a genuine Profile 5 record. Profile 5, level 6 (the level
+    /// the route defaults to when a record carries none), RPU present, no enhancement layer, base layer
+    /// present, signal compatibility 0. Returns false if the allocation failed.
+    @discardableResult
+    static func synthesizeProfile5Record(_ codecpar: UnsafeMutablePointer<AVCodecParameters>) -> Bool {
+        let size = MemoryLayout<AVDOVIDecoderConfigurationRecord>.size
+        guard let item = av_packet_side_data_new(
+            &codecpar.pointee.coded_side_data, &codecpar.pointee.nb_coded_side_data,
+            AV_PKT_DATA_DOVI_CONF, size, 0),
+              let raw = item.pointee.data else { return false }
+        memset(raw, 0, size)
+        raw.withMemoryRebound(to: AVDOVIDecoderConfigurationRecord.self, capacity: 1) { rec in
+            rec.pointee.dv_version_major = 1
+            rec.pointee.dv_version_minor = 0
+            rec.pointee.dv_profile = 5
+            rec.pointee.dv_level = 6
+            rec.pointee.rpu_present_flag = 1
+            rec.pointee.el_present_flag = 0
+            rec.pointee.bl_present_flag = 1
+            rec.pointee.dv_bl_signal_compatibility_id = 0
+        }
+        return true
+    }
+
+    /// Run the recordless audit on a freshly probed video stream: when it is a candidate, read the first
+    /// RPU from a second open of `url` and add the Profile 5 record if it says so. Called by the demuxer
+    /// at the end of its own probe, so the load, the HLS producer's own open and every rebuild see the
+    /// same stream and none of them needs the verdict carried to it. A failed read is no evidence.
+    @discardableResult
+    static func addRecordIfProfile5(
+        codecpar: UnsafeMutablePointer<AVCodecParameters>, url: URL, extraHeaders: [String: String]
+    ) -> Bool {
+        let hasRecord = (0..<Int(codecpar.pointee.nb_coded_side_data)).contains {
+            codecpar.pointee.coded_side_data?[$0].type == AV_PKT_DATA_DOVI_CONF
+        }
+        guard recordlessProfile5IsCandidate(
+            codecID: codecpar.pointee.codec_id, hasRecord: hasRecord,
+            pixelFormat: codecpar.pointee.format,
+            colorTransfer: codecpar.pointee.color_trc, colorMatrix: codecpar.pointee.color_space,
+            colorPrimaries: codecpar.pointee.color_primaries) else { return false }
+        let rpu = rpuProfileOfSource(
+            url: url, extraHeaders: extraHeaders, packetBudget: recordlessPacketBudget)
+        guard rpuProvesProfile5(rpu), synthesizeProfile5Record(codecpar) else {
+            EngineLog.emit(
+                "[AetherEngine] AE#recordless: untagged 10-bit HEVC with no DV record, RPU "
+                + (rpu.map { "reads profile \($0)" } ?? "could not be read") + "; left as it was",
+                category: .engine)
+            return false
+        }
+        EngineLog.emit(
+            "[AetherEngine] AE#recordless: DV profile 5 from the first RPU, container has no record",
+            category: .engine)
+        return true
+    }
+
     /// How many video packets to walk before giving up. Every frame of a Dolby Vision source carries an
     /// RPU, so the answer is in the first one; the slack is for a container whose head is audio.
     private static let auditPacketBudget = 16
+
+    /// The same for the recordless gate, where the slack is paid by the wrong sources. #532 reads packets
+    /// only for a record its own VUI already contradicts, which is a source that is broken either way;
+    /// the recordless gate is met by every untagged 10-bit HEVC, and an SDR encode with no colour
+    /// description is a common shape that walks the whole budget to learn nothing. Measured against an
+    /// origin at 150 ms latency and 1 MB/s on a 30 MB untagged 10-bit SDR Matroska: `probe` costs 0.50 s
+    /// without the audit, 2.75 s at a budget of 16 and about 1.2 s at 2. A Profile 5 answers in the first
+    /// video packet, so four is slack and not budget.
+    private static let recordlessPacketBudget = 4
 
     /// Open the source a second time and read what its first RPU says. nil when the source cannot be
     /// opened, carries no video, or holds no parseable RPU in its first frames, which all mean the same
@@ -83,7 +179,9 @@ public enum DolbyVisionRecordAudit {
     /// handed to the software path as it stands and packets taken out of it here would be packets that
     /// path never sees. The audit is gated on `recordIsContradicted`, so this cost is paid by the one
     /// class of source that is already broken without it, and by no other.
-    static func rpuProfileOfSource(url: URL, extraHeaders: [String: String]) -> Int? {
+    static func rpuProfileOfSource(
+        url: URL, extraHeaders: [String: String], packetBudget: Int = auditPacketBudget
+    ) -> Int? {
         let demuxer = Demuxer()
         defer { demuxer.close() }
         do {
@@ -102,7 +200,7 @@ public enum DolbyVisionRecordAudit {
             size: Int(codecpar?.pointee.extradata_size ?? 0))
 
         var walked = 0
-        while walked < auditPacketBudget {
+        while walked < packetBudget {
             guard let packet = (try? demuxer.readPacket()) ?? nil else { return nil }
             defer {
                 av_packet_unref(packet)

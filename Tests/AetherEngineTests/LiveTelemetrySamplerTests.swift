@@ -24,11 +24,6 @@ struct LiveTelemetrySamplerTests {
     /// runner the main actor is scheduled tens of seconds late (100 ms of hops took ~100 s on
     /// 2026-09-10), so any cap here is a cap on SCHEDULING and turns a correct behavior into a
     /// failure. The suite's `.timeLimit` bounds the genuine hang instead, and reports it as one.
-    private func waitUntil(_ condition: @MainActor () -> Bool) async throws {
-        while !condition() {
-            try await Task.sleep(for: .milliseconds(20))
-        }
-    }
 
     @Test("a stalled AVFoundation read must not block the main actor")
     func stalledReadKeepsMainActorResponsive() async throws {
@@ -47,7 +42,7 @@ struct LiveTelemetrySamplerTests {
         // Main-actor work that must proceed while the read is stalled.
         for _ in 0..<5 { try await Task.sleep(for: .milliseconds(20)) }
         release.signal()
-        try await waitUntil { engine.diagnostics.liveTelemetry != nil }
+        try await waitFor { engine.diagnostics.liveTelemetry != nil }
         #expect(engine.diagnostics.liveTelemetry?.forwardBufferSeconds == 12.0)
         sampler.stop()
     }
@@ -64,7 +59,7 @@ struct LiveTelemetrySamplerTests {
             )
         })
         sampler.start()
-        try await waitUntil { engine.diagnostics.liveTelemetry != nil }
+        try await waitFor { engine.diagnostics.liveTelemetry != nil }
         let snapshot = engine.diagnostics.liveTelemetry
         #expect(snapshot?.droppedFrameCount == 7)
         #expect(snapshot?.networkThroughputMbps == 42.0)
@@ -91,7 +86,7 @@ struct LiveTelemetrySamplerTests {
             return NativeAVFReadings(forwardBufferSeconds: 12.0)
         })
         sampler.start()
-        try await waitUntil { entered.get() }
+        try await waitFor { entered.get() }
         // Reload seam: the engine swaps in a new player while the old item's read is in flight.
         engine.currentAVPlayer = AVPlayer(playerItem: AVPlayerItem(url: URL(fileURLWithPath: "/nonexistent-134b.mp4")))
         release.signal()
@@ -116,7 +111,7 @@ struct LiveTelemetrySamplerTests {
             return NativeAVFReadings(forwardBufferSeconds: 12.0)
         })
         sampler.start()
-        try await waitUntil { entered.get() }
+        try await waitFor { entered.get() }
         sampler.stop()
         release.signal()
         // The cancelled tick resumes after stop(); give it time to (incorrectly) publish.
@@ -129,7 +124,7 @@ struct LiveTelemetrySamplerTests {
         let engine = try makeNativeEngine()
         let sampler = LiveTelemetrySampler(engine: engine)
         sampler.start()
-        try await waitUntil { engine.diagnostics.liveTelemetry != nil }
+        try await waitFor { engine.diagnostics.liveTelemetry != nil }
         // Idle player: no access log, no loaded ranges.
         #expect(engine.diagnostics.liveTelemetry?.droppedFrameCount == nil)
         #expect(engine.diagnostics.liveTelemetry?.forwardBufferSeconds == nil)

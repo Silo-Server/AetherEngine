@@ -84,18 +84,41 @@ struct SoftwarePacketCoverage: Sendable {
         guard seconds.isFinite, timeBaseNumerator > 0, timeBaseDenominator > 0 else { return nil }
         let numerator = Double(timeBaseNumerator)
         let denominator = Double(timeBaseDenominator)
-        for range in ranges {
+        // AE#592: a binary search, not a walk. `frontier(containing:)` beside this one already
+        // searched; this seconds-facing twin scanned, and it is called on every produced packet
+        // for video and audio both (SoftwarePacketReadAhead's backpressure check). Measured over
+        // the 4096-range cap, one query cost 326 us walking and grows linearly with the island
+        // count, which is the shape of a session that is cheap early and expensive later.
+        //
+        // The ranges are sorted and disjoint and the conversion is monotonic, so the first range
+        // whose END lies past the clock is the only candidate; the clock is then either inside it
+        // or in the gap before it. The exactness guard stays fail-closed on every range this
+        // examines. It needs no wider reach: lossiness is monotonic in sorted ranges, so a lossy
+        // range earlier than the answer would have to sit before a finite clock it cannot precede.
+        func endSeconds(_ index: Int) -> Double? {
+            let range = ranges[index]
             // Extremely large timestamps can lose an entire tick in Double. Fail closed instead
             // of silently merging a precision-sized gap in this seconds-facing convenience API.
             guard Int64(exactly: Double(range.lowerBound)) == range.lowerBound,
                   Int64(exactly: Double(range.upperBound)) == range.upperBound else { return nil }
-            let start = Double(range.lowerBound) * numerator / denominator
             let end = Double(range.upperBound) * numerator / denominator
-            guard start.isFinite, end.isFinite, start < end else { return nil }
-            if seconds < start { return nil }
-            if seconds < end { return end }
+            guard end.isFinite else { return nil }
+            return end
         }
-        return nil
+
+        var lower = 0
+        var upper = ranges.count
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2
+            guard let end = endSeconds(middle) else { return nil }
+            if end <= seconds { lower = middle + 1 } else { upper = middle }
+        }
+        guard lower < ranges.count, let end = endSeconds(lower) else { return nil }
+        let range = ranges[lower]
+        let start = Double(range.lowerBound) * numerator / denominator
+        guard start.isFinite, start < end else { return nil }
+        guard seconds >= start else { return nil }
+        return end
     }
 
     /// Drops intervals wholly behind the supplied presentation tick while retaining the entire

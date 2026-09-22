@@ -3,9 +3,24 @@ import CoreGraphics
 
 extension AetherEngine {
 
-    /// Frame from the DVR segment cache at `atSessionSeconds` (seekableLiveRange axis). No network: converts session time to raw output via seam history, then decodes locally. nil when no native live session, time outside resident window, or decode fails.
+    /// Frame from the live DVR window at `atSessionSeconds` (seekableLiveRange axis), decoded
+    /// locally with no network.
+    ///
+    /// Two sessions can answer, and both read a buffer the session already holds rather than opening
+    /// a second connection (a live source is forward-only, so a second demuxer could not seek it).
+    /// A native session decodes from its DVR segment cache after converting session time to raw
+    /// output via seam history. A software session has no such cache, so it decodes out of its own
+    /// packet ring (#544), which is the same buffer the scrubber seeks within. nil when neither is
+    /// live, when the time is outside the resident window, or when the decode fails.
     public func liveScrubThumbnail(atSessionSeconds seconds: Double, maxWidth: Int = 320) async -> CGImage? {
-        guard isLive, let session = nativeVideoSession else { return nil }
+        guard isLive else { return nil }
+        guard let session = nativeVideoSession else {
+            guard let host = softwareHost else { return nil }
+            let gen = loadGeneration
+            let image = await host.liveScrubStill(atSessionSeconds: seconds, maxWidth: maxWidth)
+            // A zap between the request and the frame would hand the new channel the old one's picture.
+            return loadGeneration == gen ? image : nil
+        }
         // seekableLiveRange is output-time + seam shift; segment table and tfdt live on raw output. Resolve newest seam (inverts $currentTime fold).
         let outputSeconds: Double
         outputSeconds = presentationAxis.itemSeconds(forSourceSeconds: seconds)
@@ -503,11 +518,17 @@ extension AetherEngine {
         Task { @MainActor [weak self] in
             guard let self else { return }
             let ahead = await self.avPlayerBufferAheadSeconds()
+            let generation = self.nativeHost?.itemGeneration ?? -1
             guard ahead < Self.liveThinRunwaySeconds else {
+                // This item has held the floor, so a thin reading on it from here on is a decay.
+                self.liveRunwayHealthyGeneration = generation
                 self.liveThinRunwayNoted = false
                 return
             }
-            guard !self.liveThinRunwayNoted else { return }
+            guard Self.reportsThinLiveRunway(itemGeneration: generation,
+                                             healthyGeneration: self.liveRunwayHealthyGeneration,
+                                             alreadyNoted: self.liveThinRunwayNoted)
+            else { return }
             self.liveThinRunwayNoted = true
             EngineLog.emit(
                 "[AetherEngine] #524 the client is running thin: it holds "
@@ -522,6 +543,30 @@ extension AetherEngine {
     /// AE#524: under this much fetched content a live client is one late delivery from a stall.
     /// Measured on a healthy session: the sawtooth bottoms out around 3 s.
     static let liveThinRunwaySeconds: Double = 2.0
+
+    /// AE#524 round 2: whether a thin reading is a session decaying, or an item that has not fetched yet.
+    ///
+    /// The line was born from a session that decayed: 57 s of healthy fetching, then a deficit that
+    /// accumulated until the runway was gone. A fresh mount reads identically and means the opposite.
+    /// Reported from the field on AE#440, 17 ms after a load: `0.00s of fetched runway, playhead 0.00s
+    /// against a seekable edge of 0.00s`, a non-measurement in the shape of a measurement.
+    ///
+    /// Time since load does not separate the two, because an in-place swap (#446 rejoin) mounts an
+    /// empty item on a session whose playhead and edge are real and holds nothing for about 190 ms.
+    /// The ITEM separates them: a thin reading counts once the item being measured has been seen
+    /// holding the floor, and health does not travel across a swap.
+    ///
+    /// A join that never reaches the floor therefore never reports here, and that is the intent: it
+    /// never had a runway to run thin on, and the join's own lines and `playbackStalled` describe it.
+    /// This line answers one question, whether a session that was healthy is decaying.
+    nonisolated static func reportsThinLiveRunway(
+        itemGeneration: Int,
+        healthyGeneration: Int?,
+        alreadyNoted: Bool
+    ) -> Bool {
+        guard let healthyGeneration, healthyGeneration == itemGeneration else { return false }
+        return !alreadyNoted
+    }
 
     /// AE#446 round 4: who asked for a seek. The two differ in exactly two places, both about a live
     /// session that advertises no DVR window: whether the seek is refused outright, and whether its

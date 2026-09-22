@@ -81,6 +81,12 @@ struct DemuxerOpenProfile: Sendable {
     /// distinguished them. Defaults to the pump, since every other path builds its profile explicitly.
     var readerLabel: String = "pump"
 
+    /// Whether a probe of an untagged 10-bit HEVC source may read its first RPU to find a Dolby Vision
+    /// Profile 5 the container never recorded (`DolbyVisionRecordAudit.addRecordIfProfile5`). On for every
+    /// playback open, so the probe, the HLS producer's own open and every rebuild agree; off for the
+    /// disposable still extractor.
+    var auditsRecordlessDolbyVision: Bool = true
+
     /// A copy of `self` under a different reader name, for two call sites that share a profile.
     func withReaderLabel(_ label: String) -> DemuxerOpenProfile {
         var copy = self
@@ -106,7 +112,8 @@ struct DemuxerOpenProfile: Sendable {
         avioRequestTimeout: 8,
         avioMaxRetries: 1,
         skipStreamInfo: false,
-        readerLabel: "extract"
+        readerLabel: "extract",
+        auditsRecordlessDolbyVision: false
     )
 
     /// A copy of `self` with only the open-time probe budget overridden (#68).
@@ -220,6 +227,10 @@ public final class Demuxer: @unchecked Sendable {
 
     private var avioProvider: AVIOProvider?
     private var openProfile: DemuxerOpenProfile = .playback
+
+    /// The URL and headers this demuxer was opened from, kept for the recordless Dolby Vision audit's
+    /// second open. nil for a custom reader (no second open to give) and for a live source.
+    private var auditSource: (url: URL, headers: [String: String])?
 
     /// #409: rewrites the timestamps of an MP4 whose writer dropped the composition-offset table.
     /// Lives here rather than in a playback host so that every consumer of this demuxer (the fMP4
@@ -417,6 +428,7 @@ public final class Demuxer: @unchecked Sendable {
     ///   - isLive: Suppresses EOF synthesis and surfaces terminal error on reconnect cap.
     func open(url: URL, extraHeaders: [String: String] = [:], profile: DemuxerOpenProfile = .playback, isLive: Bool = false, selectTitleID: Int? = nil) throws {
         self.openProfile = profile
+        self.auditSource = isLive ? nil : (url, extraHeaders)
         let isHTTP = url.scheme == "http" || url.scheme == "https"
 
         if isHTTP {
@@ -427,6 +439,7 @@ public final class Demuxer: @unchecked Sendable {
             if url.isFileURL, let fileReader = FileIOReader(url: url),
                let discInfo = try DiscReader.wrap(fileReader, selectTitleID: selectTitleID, cacheKey: url.absoluteString) {
                 adoptDiscInfo(discInfo)
+                auditSource = nil
                 let bridge = CustomIOReaderBridge(reader: discInfo.reader)
                 let inputFormat = av_find_input_format(discInfo.formatHint)
                 try openWithProvider(bridge, inputFormat: inputFormat, isLive: isLive)
@@ -469,6 +482,7 @@ public final class Demuxer: @unchecked Sendable {
     /// `discImageProbeEnabled`.
     func open(reader: IOReader, formatHint: String? = nil, profile: DemuxerOpenProfile = .playback, isLive: Bool = false, selectTitleID: Int? = nil, discCacheKey: String? = nil) throws {
         self.openProfile = profile
+        self.auditSource = nil
         if reader.discImageProbeEnabled,
            let discInfo = try DiscReader.wrap(reader, selectTitleID: selectTitleID, cacheKey: discCacheKey) {
             adoptDiscInfo(discInfo)
@@ -497,6 +511,7 @@ public final class Demuxer: @unchecked Sendable {
            let discReader = HTTPDiscIOReader(url: url, extraHeaders: extraHeaders) {
             if let discInfo = try DiscReader.wrap(discReader, selectTitleID: selectTitleID, cacheKey: url.absoluteString) {
                 adoptDiscInfo(discInfo)
+                auditSource = nil
                 let bridge = CustomIOReaderBridge(reader: discInfo.reader)
                 let inputFormat = av_find_input_format(discInfo.formatHint)
                 try openWithProvider(bridge, inputFormat: inputFormat, isLive: false)
@@ -619,11 +634,27 @@ public final class Demuxer: @unchecked Sendable {
         avioProvider?.markOpenPhaseFinished()
     }
 
+    /// AE#585: bracket the host's bounded index pass (the cue prewarm and the cursor reset that
+    /// follows it), so a provider holding cold-start state does not release it to a read that is
+    /// index work and is followed immediately by a read at the position it started from.
+    func beginIndexPass() { avioProvider?.beginIndexPass() }
+
+    /// AE#585: ends the bracket above. Safe to call without a matching `beginIndexPass`.
+    func endIndexPass() { avioProvider?.endIndexPass() }
+
     /// Default 5 MB/5s budgets miss sparse PGS/DVB tracks on 10-20 GB Blu-ray rips.
     /// 50 MB/60 s ensures codec params are populated without noticeably slowing open.
     private func applyProbeBudget(_ ctx: UnsafeMutablePointer<AVFormatContext>) {
         ctx.pointee.probesize = openProfile.probesize
         ctx.pointee.max_analyze_duration = openProfile.maxAnalyzeDuration
+        if let probeControl {
+            ctx.pointee.interrupt_callback = AVIOInterruptCB(
+                callback: { opaque in
+                    guard let opaque else { return 0 }
+                    return Unmanaged<ProbeControl>.fromOpaque(opaque).takeUnretainedValue().isStopped ? 1 : 0
+                },
+                opaque: Unmanaged.passUnretained(probeControl).toOpaque())
+        }
     }
 
     /// Demuxer fflags applied to every avformat_open_input.
@@ -691,6 +722,13 @@ public final class Demuxer: @unchecked Sendable {
         }
         logStreams(ctx)
         armGeneratedPTSSuppression(ctx)
+        if openProfile.auditsRecordlessDolbyVision, let source = auditSource {
+            let idx = av_find_best_stream(ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0)
+            if idx >= 0, let codecpar = ctx.pointee.streams[Int(idx)]?.pointee.codecpar {
+                DolbyVisionRecordAudit.addRecordIfProfile5(
+                    codecpar: codecpar, url: source.url, extraHeaders: source.headers)
+            }
+        }
     }
 
     /// An audio stream this build can never resolve, named so a report can say why a source came up
@@ -1435,9 +1473,17 @@ public final class Demuxer: @unchecked Sendable {
     /// The read itself. Caller holds `accessLock`.
     private func readPacketLocked() throws -> UnsafeMutablePointer<AVPacket>? {
         guard let ctx = formatContext else { return nil }
+        try probeControl?.willReadPacket()
         var packet: UnsafeMutablePointer<AVPacket>? = trackedPacketAlloc()
         guard packet != nil else { return nil }
         let ret = av_read_frame(ctx, packet)
+        do {
+            try probeControl?.check()
+            if ret >= 0, let packet { try probeControl?.receivedPacket(packet) }
+        } catch {
+            trackedPacketFree(&packet)
+            throw error
+        }
         if ret < 0 {
             trackedPacketFree(&packet)
             let isEOF = (ret == FFmpegErr.eof)
@@ -1676,6 +1722,7 @@ public final class Demuxer: @unchecked Sendable {
         accessLock.lock()
         defer { accessLock.unlock() }
         guard let ctx = formatContext else { return false }
+        guard probeControl?.isStopped != true else { return false }
         // #409: the read position moves, so the repair drops its picture-order anchor and
         // re-anchors on the next keyframe (a seek always lands on one).
         compositionRepair?.noteSeek()
@@ -1711,7 +1758,7 @@ public final class Demuxer: @unchecked Sendable {
         // matroska may return success with a partial index after abort; deadline flag
         // is authoritative, not ret.
         let capped = avioProvider?.readDeadlineFired ?? false
-        return ret >= 0 && !capped
+        return ret >= 0 && !capped && probeControl?.isStopped != true
     }
 
     /// How an off-actor reposition ended (#254). Named to mirror `SeekEvent.Outcome` so the engine's
@@ -1971,6 +2018,9 @@ public final class Demuxer: @unchecked Sendable {
     func markClosed() {
         avioProvider?.markClosed()
     }
+
+    /// Static metadata probes only. Strong ownership outlives the native interrupt callback.
+    var probeControl: ProbeControl?
 
     func close() {
         avioProvider?.markClosed()  // unblocks av_read_frame (tvOS suspends threads in background)
