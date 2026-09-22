@@ -7,7 +7,7 @@ import Testing
 struct RefreshableSubtitleAuthorizationTests {
     @Test("Registered ASS reselect, secondary and native stores resolve rotated credentials")
     @MainActor func registeredTrackSurvivesRotation() async throws {
-        let origin = try SubtitleAuthorizationOrigin()
+        let origin = try await SubtitleAuthorizationOrigin()
         defer { origin.stop() }
         let state = SubtitleAuthorizationState()
         let provider = HTTPRequestAuthorization { url, rejected in await state.resolve(url, rejected: rejected) }
@@ -63,7 +63,7 @@ struct RefreshableSubtitleAuthorizationTests {
 
     @Test("A raw bounded resource retries a changed bearer and retains exact bytes")
     func boundedResource() async throws {
-        let origin = try SubtitleAuthorizationOrigin()
+        let origin = try await SubtitleAuthorizationOrigin()
         defer { origin.stop() }
         try origin.setExpectedToken("fresh")
         let state = SubtitleAuthorizationState()
@@ -74,7 +74,7 @@ struct RefreshableSubtitleAuthorizationTests {
     }
     @Test("Raw sidecar relay streams unknown-length bytes before the origin finishes")
     func unknownLengthStreaming() async throws {
-        let origin = try #require(TricklingOrigin(slices: 2, pauseSeconds: 20, declaresLength: false))
+        let origin = try #require(await TricklingOrigin.start(slices: 2, pauseSeconds: 20, declaresLength: false))
         defer { origin.stop() }
         let relay = HLSOriginRelay(authorization: HTTPRequestAuthorization { _, _ in [:] }, rawResources: true)
         let server = HLSLocalServer(relay: relay)
@@ -96,7 +96,7 @@ struct RefreshableSubtitleAuthorizationTests {
 
     @Test("Encoded sidecar response lengths describe the delivered decoded bytes")
     func compressedSidecar() async throws {
-        let origin = try SubtitleAuthorizationOrigin()
+        let origin = try await SubtitleAuthorizationOrigin()
         defer { origin.stop() }
         let provider = HTTPRequestAuthorization { _, _ in ["Authorization": "Bearer old"] }
         let url = origin.url("/compressed.ass")
@@ -117,7 +117,7 @@ struct RefreshableSubtitleAuthorizationTests {
 
     @Test("Rejected speculative suffix ranges preserve authorized sidecar decoding")
     func suffixRangeFallback() async throws {
-        let origin = try SubtitleAuthorizationOrigin()
+        let origin = try await SubtitleAuthorizationOrigin()
         defer { origin.stop() }
         let provider = HTTPRequestAuthorization { _, _ in ["Authorization": "Bearer old"] }
         let result = try await SubtitleDecoder.decodeFile(url: origin.url("/no-suffix.ass"),
@@ -129,7 +129,7 @@ struct RefreshableSubtitleAuthorizationTests {
 
     @Test("Terminal sidecar refusal does not wait for a stalled error body", arguments: ["/slow403", "/slow401"])
     func terminalRefusal(path: String) async throws {
-        let origin = try SubtitleAuthorizationOrigin()
+        let origin = try await SubtitleAuthorizationOrigin()
         defer { origin.stop() }
         let state = SubtitleAuthorizationState()
         let provider = HTTPRequestAuthorization { url, rejected in await state.resolve(url, rejected: rejected) }
@@ -146,7 +146,7 @@ struct RefreshableSubtitleAuthorizationTests {
 
     @Test("Raw sidecar framing completes and preserves bytes", arguments: [false, true])
     func rawBodyCompletes(declaresLength: Bool) async throws {
-        let origin = try #require(TricklingOrigin(slices: 2, pauseSeconds: 0, declaresLength: declaresLength))
+        let origin = try #require(await TricklingOrigin.start(slices: 2, pauseSeconds: 0, declaresLength: declaresLength))
         defer { origin.stop() }
         let relay = HLSOriginRelay(authorization: HTTPRequestAuthorization { _, _ in [:] }, rawResources: true)
         let server = HLSLocalServer(relay: relay)
@@ -161,7 +161,7 @@ struct RefreshableSubtitleAuthorizationTests {
     @Test("Later authorization refusal cannot publish a partial subtitle as complete")
     func lateAuthorizationRefusal() async throws {
         try await MultiSubtitleContainerFixture.withFixture { fixture in
-            let origin = try SubtitleAuthorizationOrigin()
+            let origin = try await SubtitleAuthorizationOrigin()
             defer { origin.stop() }
             var data = try Data(contentsOf: fixture)
             let segment = try #require(data.range(of: Data([0x18, 0x53, 0x80, 0x67])))
@@ -190,7 +190,7 @@ struct RefreshableSubtitleAuthorizationTests {
 
     @Test("Resource cap rejects both declared and chunked oversized bodies", arguments: ["/large", "/chunked"])
     func resourceLimit(path: String) async throws {
-        let origin = try SubtitleAuthorizationOrigin()
+        let origin = try await SubtitleAuthorizationOrigin()
         defer { origin.stop() }
         let provider = HTTPRequestAuthorization { _, _ in ["Authorization": "Bearer old"] }
         await #expect(throws: (any Error).self) {
@@ -201,7 +201,7 @@ struct RefreshableSubtitleAuthorizationTests {
 
     @Test("The resource limit admits exactly the cap")
     func exactResourceLimit() async throws {
-        let origin = try SubtitleAuthorizationOrigin()
+        let origin = try await SubtitleAuthorizationOrigin()
         defer { origin.stop() }
         let provider = HTTPRequestAuthorization { _, _ in ["Authorization": "Bearer old"] }
         #expect(try await provider.data(from: origin.url("/large"), maximumBytes: 65536).count == 65536)
@@ -220,7 +220,7 @@ struct RefreshableSubtitleAuthorizationTests {
 
     @Test("Resource and decoder redirects cannot escape the credential scope", arguments: [false, true])
     func refusedRedirect(decoding: Bool) async throws {
-        let origin = try SubtitleAuthorizationOrigin()
+        let origin = try await SubtitleAuthorizationOrigin()
         defer { origin.stop() }
         let provider = HTTPRequestAuthorization { url, _ in
             guard url.host == "127.0.0.1" else { throw URLError(.userAuthenticationRequired) }
@@ -238,7 +238,7 @@ struct RefreshableSubtitleAuthorizationTests {
 
     @Test("Scope refusal happens before sending any request", arguments: [false, true])
     func refusedScope(decoding: Bool) async throws {
-        let origin = try SubtitleAuthorizationOrigin()
+        let origin = try await SubtitleAuthorizationOrigin()
         defer { origin.stop() }
         let provider = HTTPRequestAuthorization { _, _ in throw URLError(.userAuthenticationRequired) }
         await #expect(throws: (any Error).self) {
@@ -252,7 +252,7 @@ struct RefreshableSubtitleAuthorizationTests {
 
     @Test("Unchanged bearer does not retry a resource 401")
     func unchangedBearer() async throws {
-        let origin = try SubtitleAuthorizationOrigin()
+        let origin = try await SubtitleAuthorizationOrigin()
         defer { origin.stop() }
         try origin.setExpectedToken("fresh")
         let provider = HTTPRequestAuthorization { _, rejected in
@@ -266,7 +266,7 @@ struct RefreshableSubtitleAuthorizationTests {
 
     @Test("A second rejected bearer ends the resource request")
     func secondRejection() async throws {
-        let origin = try SubtitleAuthorizationOrigin()
+        let origin = try await SubtitleAuthorizationOrigin()
         defer { origin.stop() }
         try origin.setExpectedToken("unavailable")
         let state = SubtitleAuthorizationState()
@@ -280,7 +280,7 @@ struct RefreshableSubtitleAuthorizationTests {
 
     @Test("Decoder probes and range reads can refresh a rejected bearer")
     func decoderRefresh() async throws {
-        let origin = try SubtitleAuthorizationOrigin()
+        let origin = try await SubtitleAuthorizationOrigin()
         defer { origin.stop() }
         try origin.setExpectedToken("fresh")
         let state = SubtitleAuthorizationState()
@@ -300,7 +300,7 @@ struct RefreshableSubtitleAuthorizationTests {
 
     @Test("Cancellation wakes an uncooperative authorizer and discards its late answer", arguments: [false, true])
     func cancelAuthorizer(decoding: Bool) async throws {
-        let origin = try SubtitleAuthorizationOrigin()
+        let origin = try await SubtitleAuthorizationOrigin()
         defer { origin.stop() }
         let gate = SubtitleAuthorizationGate()
         let provider = HTTPRequestAuthorization { _, _ in await gate.wait() }
@@ -324,7 +324,7 @@ struct RefreshableSubtitleAuthorizationTests {
 
     @Test("Cancellation stops a resource whose response has not arrived")
     func cancelTransfer() async throws {
-        let origin = try SubtitleAuthorizationOrigin()
+        let origin = try await SubtitleAuthorizationOrigin()
         defer { origin.stop() }
         let provider = HTTPRequestAuthorization { _, _ in ["Authorization": "Bearer old"] }
         let url = origin.url("/slow")
@@ -339,7 +339,7 @@ struct RefreshableSubtitleAuthorizationTests {
 
     @Test("A whole-transfer deadline stops a trickling resource")
     func transferDeadline() async throws {
-        let origin = try SubtitleAuthorizationOrigin()
+        let origin = try await SubtitleAuthorizationOrigin()
         defer { origin.stop() }
         let provider = HTTPRequestAuthorization { _, _ in ["Authorization": "Bearer old"] }
         // A short injected deadline exercises the same transport path as the public API;
@@ -386,7 +386,7 @@ struct RefreshableSubtitleAuthorizationTests {
     @Test("Authorized multistream fill and individual fallback preserve requested indexes")
     func multiStreamFill() async throws {
         try await MultiSubtitleContainerFixture.withFixture { fixture in
-            let origin = try SubtitleAuthorizationOrigin()
+            let origin = try await SubtitleAuthorizationOrigin()
             defer { origin.stop() }
             try FileManager.default.copyItem(at: fixture, to: origin.directory.appendingPathComponent("container.mkv"))
             let provider = HTTPRequestAuthorization { _, _ in ["Authorization": "Bearer old"] }
@@ -452,8 +452,8 @@ final class SubtitleAuthorizationOrigin {
     let port: UInt16
     let directory: URL
     private let process: Process
-    init() throws {
-        let launched = try #require(PythonOrigin.launch(prefix: "aether-subtitle-auth", script: Self.script))
+    init() async throws {
+        let launched = try #require(await PythonOrigin.launchOffPool(prefix: "aether-subtitle-auth", script: Self.script))
         port = launched.port
         process = launched.process
         directory = launched.workDir

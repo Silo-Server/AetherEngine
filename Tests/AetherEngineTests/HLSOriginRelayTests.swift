@@ -399,6 +399,18 @@ struct HLSOriginRelayAddressingTests {
             workDir = launched.workDir
         }
 
+        /// Starts the origin without blocking a cooperative thread; see `PythonOrigin.launchOffPool`.
+        static func start(slices: Int = 8, pauseSeconds: Double = 0.05, declaresLength: Bool = true) async
+            -> TricklingOrigin?
+        {
+            await withCheckedContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    continuation.resume(returning: TricklingOrigin(
+                        slices: slices, pauseSeconds: pauseSeconds, declaresLength: declaresLength))
+                }
+            }
+        }
+
         func stop() {
             process.terminate()
             try? FileManager.default.removeItem(at: workDir)
@@ -451,6 +463,19 @@ struct HLSOriginRelayAddressingTests {
     /// Python, and waits for its "READY <port>" line. The two origins below differ only in what
     /// they serve, so the launch is written once.
     enum PythonOrigin {
+        /// `launch` on a dispatch thread. Its READY wait blocks; many interpreters starting on the
+        /// cooperative pool in a parallel run starve async work other tests wait on with a budget,
+        /// such as request-authorization resolvers.
+        static func launchOffPool(prefix: String, script: String, files: [String: String] = [:]) async
+            -> (process: Process, port: UInt16, workDir: URL)?
+        {
+            await withCheckedContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    continuation.resume(returning: launch(prefix: prefix, script: script, files: files))
+                }
+            }
+        }
+
         static func launch(prefix: String, script: String, files: [String: String] = [:])
             -> (process: Process, port: UInt16, workDir: URL)?
         {

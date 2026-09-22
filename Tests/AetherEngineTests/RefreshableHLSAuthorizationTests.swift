@@ -35,7 +35,7 @@ struct RefreshableHLSAuthorizationTests {
 
     @Test("Subtitle preflight authorizes redirects and variants through the same transport")
     func authorizedSubtitlePreflight() async throws {
-        let origin = try AuthorizationOrigin()
+        let origin = try await AuthorizationOrigin()
         defer { origin.stop() }
         let track = RemoteHLSSubtitleProvider.Track(externalID: 100_000,
             source: ExternalSubtitleTrack(url: URL(fileURLWithPath: "/missing/subtitle.srt"), name: "English"))
@@ -52,7 +52,7 @@ struct RefreshableHLSAuthorizationTests {
 
     @Test("Optional subtitle refusal keeps the required authorizing relay")
     func refusedSubtitlePreflightRetainsAuthorization() async throws {
-        let origin = try AuthorizationOrigin()
+        let origin = try await AuthorizationOrigin()
         defer { origin.stop() }
         let track = RemoteHLSSubtitleProvider.Track(externalID: 100_000,
             source: ExternalSubtitleTrack(url: URL(fileURLWithPath: "/missing/subtitle.srt"), name: "English"))
@@ -72,7 +72,7 @@ struct RefreshableHLSAuthorizationTests {
     @MainActor
     @Test("Stopping a native load cancels pending subtitle authorization")
     func stoppingPreflight() async throws {
-        let origin = try AuthorizationOrigin()
+        let origin = try await AuthorizationOrigin()
         defer { origin.stop() }
         let gate = AuthorizationGate()
         let engine = try AetherEngine()
@@ -99,7 +99,7 @@ struct RefreshableHLSAuthorizationTests {
 
     @Test("Optional subtitle preflight retains its short network budget")
     func subtitlePreflightNetworkBudget() async throws {
-        let origin = try AuthorizationOrigin()
+        let origin = try await AuthorizationOrigin()
         defer { origin.stop() }
         let track = RemoteHLSSubtitleProvider.Track(externalID: 100_000,
             source: ExternalSubtitleTrack(url: URL(fileURLWithPath: "/missing/subtitle.srt"), name: "English"))
@@ -114,7 +114,7 @@ struct RefreshableHLSAuthorizationTests {
 
     @Test("Subtitle preflight has one deadline across a delayed redirect chain")
     func subtitlePreflightRedirectBudget() async throws {
-        let origin = try AuthorizationOrigin()
+        let origin = try await AuthorizationOrigin()
         defer { origin.stop() }
         let track = RemoteHLSSubtitleProvider.Track(externalID: 100_000,
             source: ExternalSubtitleTrack(url: URL(fileURLWithPath: "/missing/subtitle.srt"), name: "English"))
@@ -141,7 +141,7 @@ struct RefreshableHLSAuthorizationTests {
 
     @Test("A playlist-discovered origin does not inherit credentials")
     func refusedDiscoveredOrigin() async throws {
-        let origin = try AuthorizationOrigin()
+        let origin = try await AuthorizationOrigin()
         defer { origin.stop() }
         let relay = HLSOriginRelay(authorization: HTTPRequestAuthorization { url, _ in
             guard url.host == "127.0.0.1" else { throw URLError(.userAuthenticationRequired) }
@@ -171,7 +171,7 @@ struct RefreshableHLSAuthorizationTests {
 
     @Test("Authorized segment bytes stream before the origin finishes")
     func authorizedStreaming() async throws {
-        let upstream = try #require(TricklingOrigin(slices: 2, pauseSeconds: 20))
+        let upstream = try #require(await TricklingOrigin.start(slices: 2, pauseSeconds: 20))
         defer { upstream.stop() }
         let relay = HLSOriginRelay(authorization: HTTPRequestAuthorization { _, _ in ["Authorization": "Bearer fresh"] })
         let server = HLSLocalServer(relay: relay)
@@ -194,7 +194,7 @@ struct RefreshableHLSAuthorizationTests {
     @Test("Every fetch uses the current complete application headers")
     func credentialsChangeBetweenRequests() async throws {
         let state = AuthorizationState()
-        let origin = try AuthorizationOrigin()
+        let origin = try await AuthorizationOrigin()
         defer { origin.stop() }
         let relay = HLSOriginRelay(authorization: HTTPRequestAuthorization { url, rejected in
             await state.resolve(url, rejected: rejected)
@@ -253,7 +253,7 @@ struct RefreshableHLSAuthorizationTests {
 
     @Test("A redirect destination must authorize independently and may refuse")
     func refusedRedirect() async throws {
-        let origin = try AuthorizationOrigin()
+        let origin = try await AuthorizationOrigin()
         defer { origin.stop() }
         let relay = HLSOriginRelay(authorization: HTTPRequestAuthorization { url, _ in
             guard url.host == "127.0.0.1" else { throw URLError(.userAuthenticationRequired) }
@@ -271,7 +271,7 @@ struct RefreshableHLSAuthorizationTests {
     @Test("Static redirects preserve same-origin credentials and strip foreign credentials",
           arguments: ["/redirect", "/foreign"])
     func staticRedirectCredentialScope(path: String) async throws {
-        let origin = try AuthorizationOrigin()
+        let origin = try await AuthorizationOrigin()
         defer { origin.stop() }
         let headers = ["Authorization": "Bearer private", "Proxy-Authorization": "private",
                        "Cookie": "private", "x-Emby-Token": "private",
@@ -295,7 +295,7 @@ struct RefreshableHLSAuthorizationTests {
 
     @Test("An authorized redirect uses new headers and the final playlist base")
     func authorizedRedirect() async throws {
-        let origin = try AuthorizationOrigin()
+        let origin = try await AuthorizationOrigin()
         defer { origin.stop() }
         let relay = HLSOriginRelay(authorization: HTTPRequestAuthorization { url, _ in
             await MainActor.run { ["Authorization": "Bearer \(url.path)"] }
@@ -312,7 +312,7 @@ struct RefreshableHLSAuthorizationTests {
 
     @Test("Stopping wakes a pending resolver and prevents its late result from sending")
     func cancellationDuringAuthorization() async throws {
-        let origin = try AuthorizationOrigin()
+        let origin = try await AuthorizationOrigin()
         defer { origin.stop() }
         let gate = AuthorizationGate()
         let relay = HLSOriginRelay(authorization: HTTPRequestAuthorization { _, _ in await gate.wait() })
@@ -335,7 +335,7 @@ struct RefreshableHLSAuthorizationTests {
 
     @Test("An uncooperative resolver cannot outlive its request budget")
     func authorizationTimeout() async throws {
-        let origin = try AuthorizationOrigin()
+        let origin = try await AuthorizationOrigin()
         defer { origin.stop() }
         let gate = AuthorizationGate()
         let relay = HLSOriginRelay(authorization: HTTPRequestAuthorization { _, _ in await gate.wait() }, authorizationTimeout: 0.1)
@@ -353,7 +353,7 @@ struct RefreshableHLSAuthorizationTests {
 
     private func exercise(_ path: String, state: AuthorizationState) async throws
         -> (status: Int, body: String, contentRange: String?, requests: [[String: String]]) {
-        let origin = try AuthorizationOrigin()
+        let origin = try await AuthorizationOrigin()
         defer { origin.stop() }
         let relay = HLSOriginRelay(authorization: HTTPRequestAuthorization { url, rejected in
             await state.resolve(url, rejected: rejected)
@@ -371,7 +371,7 @@ struct RefreshableHLSAuthorizationTests {
 
     @Test("Redirected playlists resolve relative segments against the final URL")
     func redirectedPlaylistBase() async throws {
-        let origin = try AuthorizationOrigin()
+        let origin = try await AuthorizationOrigin()
         defer { origin.stop() }
         let relay = HLSOriginRelay()
         let server = HLSLocalServer(relay: relay)
@@ -414,8 +414,8 @@ private final class AuthorizationOrigin {
     let port: UInt16
     private let process: Process
     private let directory: URL
-    init() throws {
-        let launched = try #require(PythonOrigin.launch(prefix: "aether-auth-origin", script: Self.script))
+    init() async throws {
+        let launched = try #require(await PythonOrigin.launchOffPool(prefix: "aether-auth-origin", script: Self.script))
         port = launched.port
         process = launched.process
         directory = launched.workDir
