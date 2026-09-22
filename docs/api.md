@@ -138,6 +138,9 @@ resolver receives the headers actually sent to that destination; a changed `Auth
 permits one retry before any rejected response reaches AVPlayer. The native asset receives no
 origin headers, and failure to start the required relay fails the load.
 
+Adding, replacing, or removing the resolver through `reloadAtCurrentPosition(applying:)` rebuilds
+the session. Token rotation uses the existing resolver and retains the active item.
+
 The host must validate every destination against its credential scope, preserve account/profile
 ownership, and share refresh work with its API client. Playlist discovery grants no credential
 authority. Return current credentials without waiting for a proactive refresh while they remain

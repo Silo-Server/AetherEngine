@@ -100,6 +100,23 @@ struct Issue460SessionOptionCorrectionTests {
         proposed.httpHeaders["Authorization"] = "Bearer fresh"
         #expect(SessionOptionCorrection.changedFields(from: base, to: proposed) == ["httpHeaders"])
     }
+
+    @Test("authorization provider corrections are permitted and reported by identity")
+    func authorizationProviderCorrection() {
+        let first = HTTPRequestAuthorization { _, _ in [:] }
+        let second = HTTPRequestAuthorization { _, _ in [:] }
+        let absent = LoadOptions()
+        let original = LoadOptions(httpRequestAuthorization: first)
+        let replacement = LoadOptions(httpRequestAuthorization: second)
+        for (current, proposed) in [(absent, original), (original, replacement), (original, absent)] {
+            #expect(SessionOptionCorrection.refusedFields(from: current, to: proposed).isEmpty)
+            #expect(SessionOptionCorrection.changedFields(from: current, to: proposed)
+                    == ["httpRequestAuthorization"])
+        }
+        var sameProvider = original
+        sameProvider.autoplay.toggle()
+        #expect(SessionOptionCorrection.changedFields(from: original, to: sameProvider) == ["autoplay"])
+    }
 }
 
 @MainActor
