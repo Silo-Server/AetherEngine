@@ -22,6 +22,7 @@ the public-API contract.
 - Authorized native HLS uses the engine relay from the initial load, without forwarding origin credentials to the loopback asset. Optional subtitle playlist preparation shares the authorizer and has a bounded deadline across redirects and refreshes.
 - Static-header HLS redirects apply the shared credential policy, including Emby and MediaBrowser token headers, before contacting another origin.
 - Session option corrections recognize `httpRequestAuthorization` and external subtitle provider replacements by identity.
+- Sidecar decoding runs on a dispatch worker instead of a cooperative-pool thread, so concurrent authorized decodes cannot starve the async resolvers their requests wait on.
 - Native subtitle renditions wait for complete extraction instead of caching a partial whole-track response. While extraction is pending, the local server returns a retryable HTTP 503.
 - External subtitles can declare `nativeTimelineOffsetSeconds` for media reanchored upstream. Native HLS/PiP/AirPlay renditions use the adjusted timeline while host overlay cues retain source timestamps.
 
