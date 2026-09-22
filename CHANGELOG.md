@@ -12,10 +12,11 @@ the public-API contract.
 
 ### Changed
 
-- CI runs the HLS and subtitle/resource authorization suites in a separate test process so unrelated blocking tests cannot delay their resolvers. All tests and existing deadlines remain enforced.
+- CI runs the HLS, subtitle/resource authorization and live TLS suites in a separate test process so unrelated blocking tests cannot delay their resolvers. The live TLS suite also runs separately from the TLS policy unit tests that set the same process-global evaluator. All tests and existing deadlines remain enforced.
 
 ### Added
 
+- Live HTTPS-to-HTTP redirect tests and authorization-scope documentation distinguish provider refusal, anonymous redirects, static-header stripping and the cleartext risk of a permissive provider. The documented Silo Apple integration rejects downgraded destinations before obtaining credentials; runtime transport policy is unchanged.
 - `ExternalSubtitleTrack.httpRequestAuthorization` supplies refreshable headers for primary/secondary sidecars and native subtitle stores without changing registered track IDs or rendition mappings. Authorized container decoding retains AVIO streaming and range access.
 - `HTTPRequestAuthorization.data(from:maximumBytes:)` fetches raw auxiliary resources such as font bundles with a caller-supplied byte limit and a whole-transfer deadline, reusing the relay's redirect, authorization, retry, cancellation and TLS policy.
 

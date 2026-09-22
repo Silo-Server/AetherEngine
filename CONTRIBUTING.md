@@ -17,14 +17,15 @@ swift build
 swift test
 ```
 
-CI runs `RefreshableHLSAuthorizationTests` and `RefreshableSubtitleAuthorizationTests`
-in a separate process because their short deadlines require responsive async resolvers.
-Blocking work elsewhere in the suite can delay those resolvers on smaller runners.
+CI runs `RefreshableHLSAuthorizationTests`, `RefreshableSubtitleAuthorizationTests` and
+`EngineTLSHandshakeTests` in a separate process because their short deadlines require responsive
+async resolvers. Blocking work elsewhere in the suite can delay those resolvers on smaller runners.
+This also keeps the live TLS suite's process-global trust evaluator separate from `EngineTLSTests`.
 The two commands below cover the entire test suite, keeping the existing deadlines
 and parallel execution within each group:
 
 ```bash
-AUTHORIZATION_TEST_SUITES='RefreshableHLSAuthorizationTests|RefreshableSubtitleAuthorizationTests'
+AUTHORIZATION_TEST_SUITES='RefreshableHLSAuthorizationTests|RefreshableSubtitleAuthorizationTests|EngineTLSHandshakeTests'
 swift test --skip "$AUTHORIZATION_TEST_SUITES"
 swift test --skip-build --filter "$AUTHORIZATION_TEST_SUITES"
 ```
