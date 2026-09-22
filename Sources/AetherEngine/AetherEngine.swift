@@ -1960,7 +1960,7 @@ public final class AetherEngine: ObservableObject {
     var nativeSubtitleTrackTable: [NativeSubtitleTrackEntry] = []
 
     /// #266: one pass over one container, filling every native store whose external track points at
-    /// it. Tracks that share a URL and headers collapse into a single job, so a container holding
+    /// it. Tracks that share a URL, headers and authorization provider collapse into a single job, so a container holding
     /// several subtitle streams is fetched once rather than once per registered track.
     struct ExternalSubtitleFillJob: Sendable {
         struct Target: Sendable {
@@ -1970,6 +1970,7 @@ public final class AetherEngine: ObservableObject {
         }
         let url: URL
         let headers: [String: String]
+        var httpRequestAuthorization: HTTPRequestAuthorization? = nil
         let targets: [Target]
     }
 

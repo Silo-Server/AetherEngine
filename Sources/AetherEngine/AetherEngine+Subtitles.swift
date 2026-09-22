@@ -175,6 +175,7 @@ extension AetherEngine {
             activeSecondaryEmbeddedSubtitleStreamIndex = -1
             activeSecondaryExternalSubtitleTrackID = index
             startSecondarySidecarDecode(url: external.url, httpHeaders: external.httpHeaders,
+                                        httpRequestAuthorization: external.httpRequestAuthorization,
                                         sourceStreamIndex: external.sourceStreamIndex)
             return
         }
@@ -1341,6 +1342,7 @@ extension AetherEngine {
             return
         }
         startSidecarDecode(url: track.url, httpHeaders: track.httpHeaders, externalTrackID: id,
+                           httpRequestAuthorization: track.httpRequestAuthorization,
                            sourceStreamIndex: track.sourceStreamIndex)
     }
 
@@ -1381,7 +1383,7 @@ extension AetherEngine {
     /// blank .vtt.
     nonisolated static func runExternalSubtitleFill(job: ExternalSubtitleFillJob) async {
         if let results = try? await SubtitleDecoder.decodeFile(
-            url: job.url, httpHeaders: job.headers,
+            url: job.url, httpHeaders: job.headers, httpRequestAuthorization: job.httpRequestAuthorization,
             sourceStreamIndices: job.targets.map(\.streamIndex)
         ) {
             for (target, result) in zip(job.targets, results) {
@@ -1398,7 +1400,8 @@ extension AetherEngine {
         for target in job.targets {
             if Task.isCancelled { return }
             guard let result = try? await SubtitleDecoder.decodeFile(
-                url: job.url, httpHeaders: job.headers, sourceStreamIndex: target.streamIndex
+                url: job.url, httpHeaders: job.headers, httpRequestAuthorization: job.httpRequestAuthorization,
+                sourceStreamIndex: target.streamIndex
             ) else {
                 EngineLog.emit("[AetherEngine] external native store fill failed: \(job.url.lastPathComponent) stream=\(target.streamIndex.map(String.init) ?? "auto")", category: .engine)
                 continue
@@ -1428,6 +1431,7 @@ extension AetherEngine {
     /// tap-fed selection stops forwarding into the sidecar's cues (latent pre-#88 bug: the tap
     /// forward-guard matched the stale index and kept appending).
     func startSidecarDecode(url: URL, httpHeaders: [String: String]?, externalTrackID: Int?,
+                            httpRequestAuthorization: HTTPRequestAuthorization? = nil,
                             sourceStreamIndex: Int32? = nil) {
         deselectInjectedSubtitleForOverlay()
         cancelSidecarTask()
@@ -1459,7 +1463,7 @@ extension AetherEngine {
             let result: SidecarDecodeResult
             do {
                 result = try await SubtitleDecoder.decodeFile(
-                    url: url, httpHeaders: effectiveHeaders,
+                    url: url, httpHeaders: effectiveHeaders, httpRequestAuthorization: httpRequestAuthorization,
                     preserveASSMarkup: preserveASS,
                     sourceStreamIndex: sourceStreamIndex
                 )
@@ -1511,6 +1515,7 @@ extension AetherEngine {
 
     /// Shared secondary sidecar-decode start (#88): the pre-#88 selectSecondarySidecarSubtitle body.
     func startSecondarySidecarDecode(url: URL, httpHeaders: [String: String]?,
+                                     httpRequestAuthorization: HTTPRequestAuthorization? = nil,
                                      sourceStreamIndex: Int32? = nil) {
         loadedSecondarySidecarURL = url
         isSecondarySubtitleActive = true
@@ -1524,7 +1529,8 @@ extension AetherEngine {
             do {
                 // Secondary is plain text only (never drives libass, mirroring embedded secondary #47).
                 result = try await SubtitleDecoder.decodeFile(
-                    url: url, httpHeaders: effectiveHeaders, sourceStreamIndex: sourceStreamIndex)
+                    url: url, httpHeaders: effectiveHeaders, httpRequestAuthorization: httpRequestAuthorization,
+                    sourceStreamIndex: sourceStreamIndex)
             } catch {
                 EngineLog.emit("[AetherEngine] secondary sidecar decode failed: \(error)", category: .engine)
                 await MainActor.run {
@@ -2110,7 +2116,9 @@ extension AetherEngine {
         struct Key: Hashable {
             let url: URL
             let headers: [String: String]
+            let authorizationID: ObjectIdentifier?
         }
+        var authorizationsByKey: [Key: HTTPRequestAuthorization] = [:]
         var order: [Key] = []
         var targetsByKey: [Key: [ExternalSubtitleFillJob.Target]] = [:]
         for (ordinal, entry) in table.enumerated() {
@@ -2120,13 +2128,17 @@ extension AetherEngine {
                   let track = registry[extID], ordinal < stores.count else { continue }
             stores[ordinal].setExternalTimelineOffsetSeconds(track.nativeTimelineOffsetSeconds)
             guard !entry.needsOCR else { continue }
-            let key = Key(url: track.url, headers: track.httpHeaders ?? defaultHeaders)
+            let key = Key(url: track.url, headers: track.httpHeaders ?? defaultHeaders,
+                          authorizationID: track.httpRequestAuthorization.map(ObjectIdentifier.init))
+            authorizationsByKey[key] = track.httpRequestAuthorization
             if targetsByKey[key] == nil { order.append(key) }
             targetsByKey[key, default: []].append(
                 .init(streamIndex: track.sourceStreamIndex, store: stores[ordinal]))
         }
         return order.map {
-            ExternalSubtitleFillJob(url: $0.url, headers: $0.headers, targets: targetsByKey[$0] ?? [])
+            ExternalSubtitleFillJob(url: $0.url, headers: $0.headers,
+                                    httpRequestAuthorization: authorizationsByKey[$0],
+                                    targets: targetsByKey[$0] ?? [])
         }
     }
 

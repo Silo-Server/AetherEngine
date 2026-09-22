@@ -1,10 +1,11 @@
 import Foundation
 
-/// Supplies the complete application headers for each engine-owned native HLS request.
+/// Supplies the complete application headers for engine-owned HTTP requests.
 ///
 /// Set `LoadOptions.httpRequestAuthorization` to keep a native HLS item playing as credentials
-/// change. This currently covers the native HLS relay and its playlist preflight only; direct
-/// AVIO, live ingest, and external subtitle downloads still use their existing static headers.
+/// change. Set `ExternalSubtitleTrack.httpRequestAuthorization` separately for sidecar requests;
+/// `data(from:maximumBytes:)` fetches bounded auxiliary resources with the same transport policy.
+/// Direct media AVIO and live ingest still use their existing static headers.
 /// The resolver must independently validate every URL, including redirects and playlist-discovered
 /// origins. Discovery grants no credential authority. Credentials must never be placed in URLs.
 ///
@@ -18,6 +19,20 @@ public final class HTTPRequestAuthorization: Sendable, Equatable {
     let resolver: Resolver
 
     public init(resolver: @escaping Resolver) { self.resolver = resolver }
+
+    /// Fetch raw HTTP(S) bytes with the relay's authorization, redirect, retry and TLS policy.
+    /// Rejects non-success responses and bodies exceeding `maximumBytes`, including unknown lengths.
+    /// The entire transfer is bounded by 20 seconds; cancellation stops pending authorization and I/O.
+    /// No static headers are inherited and playlist-looking bodies are returned without rewriting.
+    public func data(from url: URL, maximumBytes: Int) async throws -> Data {
+        let relay = HLSOriginRelay(authorization: self,
+            resourceTimeout: Self.resourceTransferTimeout,
+            deadline: Date().addingTimeInterval(Self.resourceTransferTimeout))
+        defer { relay.stop() }
+        return try await relay.fetchData(url, maximumBytes: maximumBytes)
+    }
+
+    static let resourceTransferTimeout: TimeInterval = 20
 
     public static func == (lhs: HTTPRequestAuthorization, rhs: HTTPRequestAuthorization) -> Bool {
         lhs === rhs

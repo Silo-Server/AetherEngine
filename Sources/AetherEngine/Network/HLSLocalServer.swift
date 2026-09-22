@@ -762,9 +762,11 @@ final class HLSLocalServer: @unchecked Sendable {
             // landed: buffering a segment puts its whole download in front of the player's first
             // byte and hands AVPlayer's throughput estimate a loopback burst to pick the next
             // rendition from.
+            let chunkedHeader = EarlyHeaderState()
             let sink = HLSOriginRelay.Sink(
                 head: { [weak self] status, contentType, contentRange, contentLength in
                     guard let self else { return false }
+                    if contentLength < 0 { _ = chunkedHeader.markSentOnce() }
                     let header = Self.relayResponseHeader(
                         status: status, contentType: contentType, contentRange: contentRange,
                         contentLength: contentLength)
@@ -776,6 +778,11 @@ final class HLSLocalServer: @unchecked Sendable {
                 },
                 body: { [weak self] chunk in
                     guard let self else { return false }
+                    if chunkedHeader.wasSent {
+                        return self.writeAll(fd: fd, data: Self.chunkFrameHeader(size: chunk.count), path: normalizedPath)
+                            && self.writeAll(fd: fd, data: chunk, path: normalizedPath)
+                            && self.writeAll(fd: fd, data: Self.chunkFrameTrailer, path: normalizedPath)
+                    }
                     return self.writeAll(fd: fd, data: chunk, path: normalizedPath)
                 })
             switch relay.respond(
@@ -789,6 +796,9 @@ final class HLSLocalServer: @unchecked Sendable {
             case .answer(let answer):
                 return sendRelay(fd: fd, path: normalizedPath, answer: answer)
             case .streamed(let ok):
+                if ok && chunkedHeader.wasSent {
+                    return writeAll(fd: fd, data: Self.chunkedFinal, path: normalizedPath)
+                }
                 return ok
             }
         }
@@ -1161,7 +1171,9 @@ final class HLSLocalServer: @unchecked Sendable {
     static func relayResponseHeader(status: Int, contentType: String, contentRange: String?,
                                     contentLength: Int) -> String {
         var header = "HTTP/1.1 \(status) \(reasonPhrase(status))\r\n"
-        header += "Content-Length: \(contentLength)\r\n"
+        header += contentLength < 0
+            ? "Transfer-Encoding: chunked\r\n"
+            : "Content-Length: \(contentLength)\r\n"
         header += "Content-Type: \(headerValue(contentType))\r\n"
         if let contentRange {
             header += "Content-Range: \(headerValue(contentRange))\r\n"

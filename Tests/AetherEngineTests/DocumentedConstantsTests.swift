@@ -19,6 +19,11 @@ import AetherLibavcodec
 @MainActor
 final class DocumentedConstantsTests: XCTestCase {
 
+    func testAuthorizedResourceDeadlineMatchesDocumentation() throws {
+        XCTAssertEqual(HTTPRequestAuthorization.resourceTransferTimeout, 20)
+        assertDocumented("**20 second** deadline", try documentation())
+    }
+
     func testPartialCompositionHoldBoundsMatchDocumentation() throws {
         let docs = try documentation()
         XCTAssertEqual(H264PartialCompositionRepair.maximumReorderDepth, 16)

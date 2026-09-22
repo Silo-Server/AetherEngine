@@ -12,13 +12,16 @@ the public-API contract.
 
 ### Added
 
+- `ExternalSubtitleTrack.httpRequestAuthorization` supplies refreshable headers for primary/secondary sidecars and native subtitle stores without changing registered track IDs or rendition mappings. Authorized container decoding retains AVIO streaming and range access.
+- `HTTPRequestAuthorization.data(from:maximumBytes:)` fetches raw auxiliary resources such as font bundles with a caller-supplied byte limit and a whole-transfer deadline, reusing the relay's redirect, authorization, retry, cancellation and TLS policy.
+
 - `LoadOptions.httpRequestAuthorization` accepts an async `HTTPRequestAuthorization` resolver for native HLS. The engine resolves headers before requests and redirects, and retries a rejected request once when the bearer changes, preserving the active player item across token rotation.
 
 ### Fixed
 
 - Authorized native HLS uses the engine relay from the initial load, without forwarding origin credentials to the loopback asset. Optional subtitle playlist preparation shares the authorizer and has a bounded deadline across redirects and refreshes.
 - Static-header HLS redirects apply the shared credential policy, including Emby and MediaBrowser token headers, before contacting another origin.
-- Session option corrections recognize `httpRequestAuthorization` and report resolver replacements by provider identity.
+- Session option corrections recognize `httpRequestAuthorization` and external subtitle provider replacements by identity.
 - Native subtitle renditions wait for complete extraction instead of caching a partial whole-track response. While extraction is pending, the local server returns a retryable HTTP 503.
 - External subtitles can declare `nativeTimelineOffsetSeconds` for media reanchored upstream. Native HLS/PiP/AirPlay renditions use the adjusted timeline while host overlay cues retain source timestamps.
 

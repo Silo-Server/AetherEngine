@@ -297,6 +297,12 @@ enum SessionOptionCorrection {
                 }
                 continue
             }
+            // The track array also contains identity-based providers; reflection erases those
+            // identities and can describe different subtitle authorization scopes identically.
+            if label == "externalSubtitles" {
+                if current.externalSubtitles != proposed.externalSubtitles { changed.append(label) }
+                continue
+            }
             if describe(lhs.value) != describe(rhs.value) { changed.append(label) }
         }
         return changed

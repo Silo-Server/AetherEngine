@@ -47,11 +47,13 @@ enum SubtitleDecoder {
     static func decodeFile(
         url: URL,
         httpHeaders: [String: String] = [:],
+        httpRequestAuthorization: HTTPRequestAuthorization? = nil,
         preserveASSMarkup: Bool = false,
         sourceStreamIndex: Int32? = nil
     ) async throws -> SidecarDecodeResult {
         let results = try await decode(
-            url: url, httpHeaders: httpHeaders, preserveASSMarkup: preserveASSMarkup,
+            url: url, httpHeaders: httpHeaders, httpRequestAuthorization: httpRequestAuthorization,
+            preserveASSMarkup: preserveASSMarkup,
             requested: sourceStreamIndex.map { [$0] }
         )
         guard let only = results.first else { throw SubtitleDecoderError.noSubtitleStream }
@@ -66,12 +68,14 @@ enum SubtitleDecoder {
     static func decodeFile(
         url: URL,
         httpHeaders: [String: String] = [:],
+        httpRequestAuthorization: HTTPRequestAuthorization? = nil,
         preserveASSMarkup: Bool = false,
         sourceStreamIndices: [Int32?]
     ) async throws -> [SidecarDecodeResult] {
         guard !sourceStreamIndices.isEmpty else { return [] }
         return try await decode(
-            url: url, httpHeaders: httpHeaders, preserveASSMarkup: preserveASSMarkup,
+            url: url, httpHeaders: httpHeaders, httpRequestAuthorization: httpRequestAuthorization,
+            preserveASSMarkup: preserveASSMarkup,
             requested: sourceStreamIndices
         )
     }
@@ -80,6 +84,7 @@ enum SubtitleDecoder {
     private static func decode(
         url: URL,
         httpHeaders: [String: String],
+        httpRequestAuthorization: HTTPRequestAuthorization?,
         preserveASSMarkup: Bool,
         requested: [Int32?]?
     ) async throws -> [SidecarDecodeResult] {
@@ -88,10 +93,32 @@ enum SubtitleDecoder {
         let token = CancelFlag()
         return try await withTaskCancellationHandler {
             try await Task.detached(priority: .userInitiated) {
-                try decodeFileSync(
-                    url: url, httpHeaders: httpHeaders,
+                if token.isCancelled { throw CancellationError() }
+                // Preserve AVIO's streaming/range access to subtitle containers. Only the relay
+                // sees origin credentials, including requests made by a seek or probe.
+                var relay: HLSOriginRelay?
+                var server: HLSLocalServer?
+                defer { relay?.stop(); server?.stop() }
+                var decodeURL = url
+                if let httpRequestAuthorization {
+                    let transport = HLSOriginRelay(authorization: httpRequestAuthorization,
+                        rawResources: true, onRequestFailure: { [weak token] in token?.cancel() })
+                    relay = transport
+                    let localServer = HLSLocalServer(relay: transport)
+                    server = localServer
+                    try localServer.start()
+                    token.register(relay: transport, server: localServer)
+                    guard let localURL = localServer.relayURL(for: url) else {
+                        throw URLError(.unsupportedURL)
+                    }
+                    decodeURL = localURL
+                }
+                let result = try decodeFileSync(
+                    url: decodeURL, httpHeaders: httpRequestAuthorization == nil ? httpHeaders : [:],
                     preserveASSMarkup: preserveASSMarkup, requested: requested, cancel: token
                 )
+                if token.isCancelled { throw CancellationError() }
+                return result
             }.value
         } onCancel: {
             token.cancel()
@@ -103,13 +130,28 @@ enum SubtitleDecoder {
         private let lock = NSLock()
         private var cancelled = false
         private var reader: AVIOReader?
+        private var relay: HLSOriginRelay?
+        private var server: HLSLocalServer?
 
         func cancel() {
             lock.lock()
             cancelled = true
             let r = reader
+            let transport = relay
+            let localServer = server
             lock.unlock()
+            transport?.stop()
             r?.markClosed()
+            localServer?.stop()
+        }
+
+        func register(relay: HLSOriginRelay, server: HLSLocalServer) {
+            lock.lock()
+            let wasCancelled = cancelled
+            self.relay = relay
+            self.server = server
+            lock.unlock()
+            if wasCancelled { relay.stop(); server.stop() }
         }
 
         var isCancelled: Bool {

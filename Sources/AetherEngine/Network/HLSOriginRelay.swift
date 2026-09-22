@@ -61,6 +61,11 @@ final class HLSOriginRelay: @unchecked Sendable {
 
     private let authorization: HTTPRequestAuthorization?
     private let authorizationTimeout: TimeInterval
+    /// Sidecar containers are opaque, including playlist-looking URLs. Unknown-length responses
+    /// use chunked framing on the local server instead of collecting a whole container.
+    private let rawResources: Bool
+    private let onRequestFailure: (@Sendable () -> Void)?
+    private var reportedRequestFailure = false
     /// Optional whole-preflight deadline, shared across master/variant reads, redirects and refreshes.
     /// Media relays have no lifetime deadline. Expiry wakes both network pumps and host callbacks.
     private let deadline: Date?
@@ -70,7 +75,10 @@ final class HLSOriginRelay: @unchecked Sendable {
     private var pumps: [UUID: UpstreamPump] = [:]
 
     init(authorization: HTTPRequestAuthorization? = nil, authorizationTimeout: TimeInterval = 10,
-         resourceTimeout: TimeInterval = 120, deadline: Date? = nil) {
+         resourceTimeout: TimeInterval = 120, deadline: Date? = nil, rawResources: Bool = false,
+         onRequestFailure: (@Sendable () -> Void)? = nil) {
+        self.rawResources = rawResources
+        self.onRequestFailure = onRequestFailure
         self.authorization = authorization
         self.authorizationTimeout = authorizationTimeout
         self.deadline = deadline
@@ -106,6 +114,17 @@ final class HLSOriginRelay: @unchecked Sendable {
         waits.forEach { $0.cancel() }
         activePumps.forEach { $0.abandon() }
         session.invalidateAndCancel()
+    }
+
+    /// A raw decoder must not treat a refused later range as EOF and publish partial cues.
+    /// Notify once, on the relay worker after request teardown, with no relay locks held. The
+    /// owner may cancel its reader and stop this relay from the callback.
+    private func reportRequestFailure() {
+        stateLock.lock()
+        let notify = !reportedRequestFailure
+        reportedRequestFailure = true
+        stateLock.unlock()
+        if notify { onRequestFailure?() }
     }
 
     // MARK: - Whether a relay is wanted at all
@@ -301,7 +320,7 @@ final class HLSOriginRelay: @unchecked Sendable {
             // in the one word the player can act on, that the resource is gone. The playlist test is
             // asked again here rather than inferred from the hold, because a body of unstated length
             // is held too and a chunked segment is not text to rewrite.
-            guard (200..<300).contains(fetched.status),
+            guard !rawResources, (200..<300).contains(fetched.status),
                 Self.looksLikePlaylist(url: fetched.url, contentType: fetched.contentType)
             else {
                 return .answer(
@@ -368,7 +387,7 @@ final class HLSOriginRelay: @unchecked Sendable {
     /// asked freely on this one, and a 429 answered to the player would never arm the pacer that
     /// the reader and the subtitle prefetcher already read.
     private func fetch(origin: URL, headers: [String: String], range: String?, sink: Sink,
-                       forceHold: Bool = false) -> Upstream {
+                       forceHold: Bool = false, maximumBytes: Int? = nil) -> Upstream {
         var url = origin
         var staticHeaders = headers
         var retryHeaders: [String: String]?
@@ -379,7 +398,7 @@ final class HLSOriginRelay: @unchecked Sendable {
             do {
                 if let retryHeaders { resolved = retryHeaders }
                 else { resolved = try authorize(url, rejectedHeaders: nil, fallback: staticHeaders) }
-            } catch { return .failed }
+            } catch { reportRequestFailure(); return .failed }
             retryHeaders = nil
             var request = URLRequest(url: url)
             for (key, value) in resolved {
@@ -389,12 +408,28 @@ final class HLSOriginRelay: @unchecked Sendable {
                 request.setValue(value, forHTTPHeaderField: key)
             }
             if let range { request.setValue(range, forHTTPHeaderField: "Range") }
-            switch transfer(request, sink: sink, forceHold: forceHold,
+            switch transfer(request, sink: sink, forceHold: forceHold, maximumBytes: maximumBytes,
                             interceptChallenge: authorization != nil && !challenged) {
-            case .complete(let result): return result
+            case .complete(let result):
+                switch result {
+                case .failed: reportRequestFailure()
+                case .held(let response) where !(200..<300).contains(response.status):
+                    // AVIO treats rejection of a speculative suffix range as a supported
+                    // negotiation result and continues on its ordinary data connection.
+                    if response.status != 416 || range?.hasPrefix("bytes=-") != true {
+                        reportRequestFailure()
+                    }
+                default: break
+                }
+                // A failed socket write can be an intentional AVIO seek/prefetch cancellation;
+                // it does not mean the origin refused the resource.
+                return result
             case .redirect(let destination):
                 redirects += 1
-                guard redirects <= 10, Self.originKey(for: destination) != nil else { return .failed }
+                guard redirects <= 10, Self.originKey(for: destination) != nil else {
+                    reportRequestFailure()
+                    return .failed
+                }
                 OriginRequestBudget.shared.noteRedirect(from: url, to: destination)
                 staticHeaders = RedirectHeaderPolicy.headersToReplay(
                     extraHeaders: staticHeaders, originalURL: url, redirectURL: destination)
@@ -404,8 +439,12 @@ final class HLSOriginRelay: @unchecked Sendable {
                 let respondingURL = response.url ?? url
                 let fresh: [String: String]
                 do { fresh = try authorize(respondingURL, rejectedHeaders: sentHeaders, fallback: [:]) }
-                catch { return .held(Fetched(url: respondingURL, status: 401, body: Data(), contentType: nil, contentRange: nil)) }
+                catch {
+                    reportRequestFailure()
+                    return .held(Fetched(url: respondingURL, status: 401, body: Data(), contentType: nil, contentRange: nil))
+                }
                 guard Self.authorizationValue(fresh) != Self.authorizationValue(sentHeaders) else {
+                    reportRequestFailure()
                     return .held(Fetched(url: respondingURL, status: 401, body: Data(), contentType: nil, contentRange: nil))
                 }
                 url = respondingURL
@@ -467,13 +506,36 @@ final class HLSOriginRelay: @unchecked Sendable {
         } onCancel: { self.stop() }
     }
 
+    /// Raw resources share the relay transport but never enter playlist rewriting. The pump
+    /// enforces the cap before accumulating bytes, including unknown or misleading lengths.
+    func fetchData(_ url: URL, maximumBytes: Int) async throws -> Data {
+        guard Self.originKey(for: url) != nil else { throw URLError(.unsupportedURL) }
+        guard maximumBytes >= 0 else { throw URLError(.dataLengthExceedsMaximum) }
+        let body: Data = try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async { [self] in
+                    let sink = Sink(head: { _, _, _, _ in false }, body: { _ in false })
+                    switch fetch(origin: url, headers: [:], range: nil, sink: sink,
+                                 forceHold: true, maximumBytes: maximumBytes) {
+                    case .held(let fetched) where (200..<300).contains(fetched.status):
+                        continuation.resume(returning: fetched.body)
+                    default: continuation.resume(throwing: URLError(.badServerResponse))
+                    }
+                }
+            }
+        } onCancel: { self.stop() }
+        try Task.checkCancellation()
+        return body
+    }
+
     private enum Transfer {
         case complete(Upstream)
         case redirect(URL)
         case challenge(HTTPURLResponse, [String: String])
     }
 
-    private func transfer(_ request: URLRequest, sink: Sink, forceHold: Bool,
+    private func transfer(_ request: URLRequest, sink: Sink, forceHold: Bool, maximumBytes: Int?,
                           interceptChallenge: Bool) -> Transfer {
         guard let origin = request.url else { return .complete(.failed) }
         let slotWait = remainingBudget(upTo: Self.slotWaitSeconds)
@@ -482,7 +544,7 @@ final class HLSOriginRelay: @unchecked Sendable {
             for: origin, label: "relay", timeout: slotWait)
         defer { OriginRequestBudget.shared.release(ticket) }
 
-        let pump = UpstreamPump()
+        let pump = UpstreamPump(maximumBytes: maximumBytes)
         let id = UUID()
         stateLock.lock()
         guard !stopped, remainingBudget(upTo: 1) > 0 else {
@@ -520,12 +582,18 @@ final class HLSOriginRelay: @unchecked Sendable {
                 for: http.url ?? origin, status: http.statusCode,
                 retryAfter: http.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init))
         }
+        // Raw sidecars and bounded resources need successful bytes only, never an error page.
+        // In particular, a terminal 401/403 must not wait for an unbounded or stalled error body.
+        if (rawResources || maximumBytes != nil) && !(200..<300).contains(http.statusCode) {
+            return .complete(.held(Fetched(url: http.url ?? origin, status: http.statusCode,
+                                           body: Data(), contentType: nil, contentRange: nil)))
+        }
         let contentType = http.value(forHTTPHeaderField: "Content-Type")
         let contentRange = http.value(forHTTPHeaderField: "Content-Range")
         let declaredLength = http.expectedContentLength
-        let mustHold = forceHold || declaredLength < 0
-            || !(200..<300).contains(http.statusCode)
-            || Self.looksLikePlaylist(url: http.url ?? origin, contentType: contentType)
+        let mustHold = forceHold || !(200..<300).contains(http.statusCode)
+            || (!rawResources && (declaredLength < 0
+                || Self.looksLikePlaylist(url: http.url ?? origin, contentType: contentType)))
         if mustHold {
             let body = pump.awaitWholeBody()
             if let error = pump.awaitFailure() {
@@ -649,6 +717,10 @@ private final class UpstreamPump: NSObject, URLSessionDataDelegate, @unchecked S
     private var finished = false
     private var failure: Error?
     private var consumerGaveUp = false
+    private let maximumBytes: Int?
+    private var receivedBytes = 0
+
+    init(maximumBytes: Int? = nil) { self.maximumBytes = maximumBytes }
 
     // MARK: - Consumer, on the server's worker thread
 
@@ -727,16 +799,29 @@ private final class UpstreamPump: NSObject, URLSessionDataDelegate, @unchecked S
         }
         condition.lock()
         head = http
+        let tooLarge = maximumBytes.map { http.expectedContentLength > Int64($0) } ?? false
+        if tooLarge {
+            failure = URLError(.dataLengthExceedsMaximum)
+            finished = true
+            consumerGaveUp = true
+        }
         condition.broadcast()
         condition.unlock()
-        completionHandler(.allow)
+        completionHandler(tooLarge ? .cancel : .allow)
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         condition.lock()
         while pending.count >= Self.highWaterBytes && !consumerGaveUp { condition.wait() }
+        if let maximumBytes, data.count > maximumBytes - receivedBytes {
+            failure = URLError(.dataLengthExceedsMaximum)
+            finished = true
+            consumerGaveUp = true
+            condition.broadcast()
+        }
         let abandoned = consumerGaveUp
         if !abandoned {
+            if maximumBytes != nil { receivedBytes += data.count }
             pending.append(data)
             condition.broadcast()
         }
@@ -746,7 +831,7 @@ private final class UpstreamPump: NSObject, URLSessionDataDelegate, @unchecked S
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         condition.lock()
-        failure = error
+        if failure == nil { failure = error }
         finished = true
         condition.broadcast()
         condition.unlock()

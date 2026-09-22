@@ -148,9 +148,34 @@ valid; wait for refresh when a credential has expired or was rejected. Never pla
 URLs. The engine owns Range, routing and HTTP framing headers. Authorization waits are bounded;
 stopping the load cancels pending work and ignores late resolver results.
 
-This contract covers native HLS media and its master/variant playlist preparation. Direct AVIO,
-live ingest, audio taps and external subtitle downloads keep their existing static headers. Hosts
-must not advertise refresh support for those routes based on this option alone.
+`LoadOptions.httpRequestAuthorization` covers native HLS media and its master/variant playlist
+preparation. Direct media AVIO, live ingest and audio taps retain static headers.
+
+For external subtitles, set `ExternalSubtitleTrack.httpRequestAuthorization` on each registered
+track. This is independent of the media provider, so the host can restrict subtitle credentials
+to a different scope. Primary selection, reselection, secondary selection, native rendition store
+filling and its per-stream retries all use that provider. Bitmap sidecar OCR consumes the same
+authorized decode. The provider replaces both track and load-time static headers; refusal never
+falls back to those headers. A nil provider retains static behavior. Token changes do not require
+removing tracks or replacing the media item: registered IDs, native stores and rendition mappings,
+source stream indexes, timeline offsets and session carryover retain their existing relationships.
+Tracks share a container fetch only when their URL, static headers and provider identity match.
+Authorized sidecars keep streaming and range access through AVIO and the relay, including chunked
+responses of unknown length, without first downloading an entire container into a temporary file
+or in-memory buffer. Subtitle bytes are opaque even when their URL looks like a playlist. A scope
+refusal or terminal HTTP rejection aborts the decoder; partially decoded cues cannot finish a native
+store. Error bodies are rejected at their headers. Canceling a decode stops its relay, pending
+resolver and upstream requests. The one-shot sidecar selection methods remain static;
+register a track to use refreshable authorization.
+
+For auxiliary resources such as font bundles, call
+`HTTPRequestAuthorization.data(from:maximumBytes:)`. It returns raw HTTP(S) bytes with the same
+redirect authorization, changed-bearer retry and `EngineTLS` policy. It rejects unsupported URL
+schemes, non-success responses and bodies exceeding the nonnegative caller-supplied cap, including
+unknown or misleading content lengths. Raw bytes are never playlist-rewritten. The whole transfer,
+including authorization and redirects, has a **20 second** deadline. Cancellation stops pending
+network and authorization work and ignores late resolver answers. The transport runs off the main
+actor and cooperative executor; it inherits no static headers.
 
 ### Correcting a `LoadOption` without restarting the item
 
@@ -798,7 +823,7 @@ All flags default to safe values; the table is the full set. Depth for the media
 | `SubtitleTextRun` | `text`, `color`, `isBold`, `isItalic`, `isUnderlined`, `isStruckThrough`, `fontName`, `fontSize`, `isStyled`. |
 | `SubtitleTextPlacement` | `alignment` (numpad), `position` (a [0, 1] anchor). |
 | `SubtitleImage` | `cgImage`, `position`, `canvasSize`, `isForced`. |
-| `ExternalSubtitleTrack` | `url`, `name`, `language`, `isForced`, `isHearingImpaired`, `isDefault`, `httpHeaders` (nil forwards `LoadOptions.httpHeaders`), `formatHint` for URLs whose path hides the format, and `sourceStreamIndex` for a container holding several subtitle streams. That index addresses the container at `url`, not the played media. `nativeTimelineOffsetSeconds` declares source seconds removed upstream from the played media; it defaults to zero and affects native subtitle renditions, not host overlay timestamps. |
+| `ExternalSubtitleTrack` | `url`, `name`, `language`, `isForced`, `isHearingImpaired`, `isDefault`, `httpHeaders` (nil forwards `LoadOptions.httpHeaders`), `httpRequestAuthorization` (optional per-track refreshable provider, replacing static headers), `formatHint` for URLs whose path hides the format, and `sourceStreamIndex` for a container holding several subtitle streams. That index addresses the container at `url`, not the played media. `nativeTimelineOffsetSeconds` declares source seconds removed upstream from the played media; it defaults to zero and affects native subtitle renditions, not host overlay timestamps. |
 | `NativeSubtitleTrack` | `ordinal`, `language`, `displayName`, plus `sameLanguageRank(of:in:)` for disambiguating same-language options (eng Full against eng SDH). |
 | `TitleInfo` | `id` (0-based, longest first, id 0 is the main feature and the key for `selectTitle`), `name`, `durationSeconds`, `chapterCount`. |
 | `ChapterInfo` | `id`, `name`, `startSeconds`, `durationSeconds`. The two publishers differ in axis: `discChapters` are title-relative and seeked through `selectChapter(id:)`, `mediaChapters` carry content timestamps a host passes straight to `seek(to:)` and `selectChapter` no-ops for them. |
