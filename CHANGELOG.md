@@ -10,6 +10,10 @@ the public-API contract.
 
 ## [Unreleased]
 
+### Changed
+
+- CI runs the HLS and subtitle/resource authorization suites in a separate test process so unrelated blocking tests cannot delay their resolvers. All tests and existing deadlines remain enforced.
+
 ### Added
 
 - `ExternalSubtitleTrack.httpRequestAuthorization` supplies refreshable headers for primary/secondary sidecars and native subtitle stores without changing registered track IDs or rendition mappings. Authorized container decoding retains AVIO streaming and range access.
