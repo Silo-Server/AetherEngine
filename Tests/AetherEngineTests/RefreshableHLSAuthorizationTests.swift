@@ -268,6 +268,31 @@ struct RefreshableHLSAuthorizationTests {
         #expect(origin.requests.count == 1)
     }
 
+    @Test("Static redirects preserve same-origin credentials and strip foreign credentials",
+          arguments: ["/redirect", "/foreign"])
+    func staticRedirectCredentialScope(path: String) async throws {
+        let origin = try AuthorizationOrigin()
+        defer { origin.stop() }
+        let headers = ["Authorization": "Bearer private", "Proxy-Authorization": "private",
+                       "Cookie": "private", "x-Emby-Token": "private",
+                       "X-Emby-Authorization": "private", "X-MediaBrowser-Token": "private",
+                       "User-Agent": "SyntheticPlayer", "X-Transport": "preserved"]
+        let relay = HLSOriginRelay()
+        relay.admit(origin.url(path), httpHeaders: headers)
+        let server = HLSLocalServer(relay: relay)
+        try server.start()
+        defer { server.stop(); relay.stop() }
+        let entry = try #require(server.relayURL(for: origin.url(path)))
+        let (_, response) = try await URLSession.shared.data(from: entry)
+        #expect((response as? HTTPURLResponse)?.statusCode == 200)
+        #expect(origin.requests.count == 2)
+        let redirected = try #require(origin.requests.last)
+        for (name, value) in headers {
+            let preserved = path == "/redirect" || name == "User-Agent" || name == "X-Transport"
+            #expect(redirected[name.lowercased()] == (preserved ? value : nil))
+        }
+    }
+
     @Test("An authorized redirect uses new headers and the final playlist base")
     func authorizedRedirect() async throws {
         let origin = try AuthorizationOrigin()

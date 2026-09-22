@@ -396,11 +396,8 @@ final class HLSOriginRelay: @unchecked Sendable {
                 redirects += 1
                 guard redirects <= 10, Self.originKey(for: destination) != nil else { return .failed }
                 OriginRequestBudget.shared.noteRedirect(from: url, to: destination)
-                if Self.originKey(for: url) != Self.originKey(for: destination) {
-                    staticHeaders = staticHeaders.filter {
-                        !["authorization", "cookie", "proxy-authorization"].contains($0.key.lowercased())
-                    }
-                }
+                staticHeaders = RedirectHeaderPolicy.headersToReplay(
+                    extraHeaders: staticHeaders, originalURL: url, redirectURL: destination)
                 url = destination
             case .challenge(let response, let sentHeaders):
                 challenged = true
