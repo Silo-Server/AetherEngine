@@ -124,6 +124,59 @@ iOS 26's Automatic Subtitles (show when muted, on skip back, on a language misma
 
 Read `audioTapHasDeliverySource` synchronously after installing: false means the stream will finish without yielding (no session, a video-only source, a backend with no tap path), which is the moment to fail loudly rather than await an empty stream.
 
+### Rotating native HLS credentials without replacing the item
+
+For native HLS, set `LoadOptions.httpRequestAuthorization` to an `HTTPRequestAuthorization`
+created with `init(resolver:)`. Its `Resolver` is an async, sendable closure receiving the
+destination URL and optional rejected request headers, and returning the complete application
+headers. The returned headers replace `httpHeaders` for that request. Provider equality compares
+instance identity.
+
+The engine mounts its HLS relay from the initial load and asks the resolver before each upstream
+request and redirect. A nil rejected-header dictionary denotes a new request. After a 401, the
+resolver receives the headers actually sent to that destination; a changed `Authorization` value
+permits one retry before any rejected response reaches AVPlayer. The native asset receives no
+origin headers, and failure to start the required relay fails the load.
+
+Adding, replacing, or removing the resolver through `reloadAtCurrentPosition(applying:)` rebuilds
+the session. Token rotation uses the existing resolver and retains the active item.
+
+The host must validate every destination against its credential scope, preserve account/profile
+ownership, and share refresh work with its API client. Playlist discovery grants no credential
+authority. Return current credentials without waiting for a proactive refresh while they remain
+valid; wait for refresh when a credential has expired or was rejected. Never place credentials in
+URLs. The engine owns Range, routing and HTTP framing headers. Authorization waits are bounded;
+stopping the load cancels pending work and ignores late resolver results.
+
+`LoadOptions.httpRequestAuthorization` covers native HLS media and its master/variant playlist
+preparation. Direct media AVIO, live ingest and audio taps retain static headers.
+
+For external subtitles, set `ExternalSubtitleTrack.httpRequestAuthorization` on each registered
+track. This is independent of the media provider, so the host can restrict subtitle credentials
+to a different scope. Primary selection, reselection, secondary selection, native rendition store
+filling and its per-stream retries all use that provider. Bitmap sidecar OCR consumes the same
+authorized decode. The provider replaces both track and load-time static headers; refusal never
+falls back to those headers. A nil provider retains static behavior. Token changes do not require
+removing tracks or replacing the media item: registered IDs, native stores and rendition mappings,
+source stream indexes, timeline offsets and session carryover retain their existing relationships.
+Tracks share a container fetch only when their URL, static headers and provider identity match.
+Authorized sidecars keep streaming and range access through AVIO and the relay, including chunked
+responses of unknown length, without first downloading an entire container into a temporary file
+or in-memory buffer. Subtitle bytes are opaque even when their URL looks like a playlist. A scope
+refusal or terminal HTTP rejection aborts the decoder; partially decoded cues cannot finish a native
+store. Error bodies are rejected at their headers. Canceling a decode stops its relay, pending
+resolver and upstream requests. The one-shot sidecar selection methods remain static;
+register a track to use refreshable authorization.
+
+For auxiliary resources such as font bundles, call
+`HTTPRequestAuthorization.data(from:maximumBytes:)`. It returns raw HTTP(S) bytes with the same
+redirect authorization, changed-bearer retry and `EngineTLS` policy. It rejects unsupported URL
+schemes, non-success responses and bodies exceeding the nonnegative caller-supplied cap, including
+unknown or misleading content lengths. Raw bytes are never playlist-rewritten. The whole transfer,
+including authorization and redirects, has a **20 second** deadline. Cancellation stops pending
+network and authorization work and ignores late resolver answers. The transport runs off the main
+actor and cooperative executor; it inherits no static headers.
+
 ### Correcting a `LoadOption` without restarting the item
 
 `reloadAtCurrentPosition(applying:)` is the session-preserving rebuild with the options it replays
@@ -895,7 +948,8 @@ All flags default to safe values; the table is the full set. Depth for the media
 
 | Option | Default | What it does |
 | --- | --- | --- |
-| `httpHeaders` | empty | Extra headers on every probe, range and segment fetch. On `nativeRemoteHLS` they ride into the `AVURLAsset`, so header-enforcing IPTV origins work. Forwarded to sidecar subtitle fetches unless overridden. |
+| `httpHeaders` | empty | Static headers on probes, range and segment fetches. On direct `nativeRemoteHLS` loads they ride into the `AVURLAsset`; when relayed they stay on upstream requests. Forwarded to sidecar subtitle fetches unless overridden. |
+| `httpRequestAuthorization` | nil | An `HTTPRequestAuthorization` resolver for native HLS requests and playlist preparation. Forces the engine relay, replaces static application headers per request, and supports a bounded changed-bearer retry after 401. See [the credential contract](#rotating-native-hls-credentials-without-replacing-the-item). |
 | `isLive` | false | Treat the source as live. Set it explicitly; duration-based auto-detection is too noisy. |
 | `dvrWindowSeconds` | nil | Timeshift window. nil means live-only and `seek` is a no-op. |
 | `liveJoinProfile` | `.standard` | A `LiveJoinProfile`. `.fastZap` collapses TARGETDURATION to the source GOP so an IPTV join costs seconds instead of a full holdback. |
@@ -947,7 +1001,7 @@ All flags default to safe values; the table is the full set. Depth for the media
 | `SubtitleTextRun` | `text`, `color`, `isBold`, `isItalic`, `isUnderlined`, `isStruckThrough`, `fontName`, `fontSize`, `isStyled`. |
 | `SubtitleTextPlacement` | `alignment` (numpad), `position` (a [0, 1] anchor). |
 | `SubtitleImage` | `cgImage`, `position`, `canvasSize`, `isForced`. |
-| `ExternalSubtitleTrack` | `url`, `name`, `language`, `isForced`, `isHearingImpaired`, `isDefault`, `httpHeaders` (nil forwards `LoadOptions.httpHeaders`), `formatHint` for URLs whose path hides the format, and `sourceStreamIndex` for a container holding several subtitle streams. That index addresses the container at `url`, not the played media. `nativeTimelineOffsetSeconds` declares source seconds removed upstream from the played media; it defaults to zero and affects native subtitle renditions, not host overlay timestamps. |
+| `ExternalSubtitleTrack` | `url`, `name`, `language`, `isForced`, `isHearingImpaired`, `isDefault`, `httpHeaders` (nil forwards `LoadOptions.httpHeaders`), `httpRequestAuthorization` (optional per-track refreshable provider, replacing static headers), `formatHint` for URLs whose path hides the format, and `sourceStreamIndex` for a container holding several subtitle streams. That index addresses the container at `url`, not the played media. `nativeTimelineOffsetSeconds` declares source seconds removed upstream from the played media; it defaults to zero and affects native subtitle renditions, not host overlay timestamps. |
 | `NativeSubtitleTrack` | `ordinal`, `language`, `displayName`, plus `sameLanguageRank(of:in:)` for disambiguating same-language options (eng Full against eng SDH). |
 | `RecordingState` | `.idle`, `.recording(RecordingProgress)`, `.ended(RecordingEndReason)`, `.failed(RecordingFailure)`. What the session's live recording is doing. |
 | `RecordingProgress` | `url`, `startedAt`, `bytesWritten`, `durationSeconds`. Republished at 1 Hz while recording. |

@@ -47,11 +47,13 @@ enum SubtitleDecoder {
     static func decodeFile(
         url: URL,
         httpHeaders: [String: String] = [:],
+        httpRequestAuthorization: HTTPRequestAuthorization? = nil,
         preserveASSMarkup: Bool = false,
         sourceStreamIndex: Int32? = nil
     ) async throws -> SidecarDecodeResult {
         let results = try await decode(
-            url: url, httpHeaders: httpHeaders, preserveASSMarkup: preserveASSMarkup,
+            url: url, httpHeaders: httpHeaders, httpRequestAuthorization: httpRequestAuthorization,
+            preserveASSMarkup: preserveASSMarkup,
             requested: sourceStreamIndex.map { [$0] }
         )
         guard let only = results.first else { throw SubtitleDecoderError.noSubtitleStream }
@@ -66,12 +68,14 @@ enum SubtitleDecoder {
     static func decodeFile(
         url: URL,
         httpHeaders: [String: String] = [:],
+        httpRequestAuthorization: HTTPRequestAuthorization? = nil,
         preserveASSMarkup: Bool = false,
         sourceStreamIndices: [Int32?]
     ) async throws -> [SidecarDecodeResult] {
         guard !sourceStreamIndices.isEmpty else { return [] }
         return try await decode(
-            url: url, httpHeaders: httpHeaders, preserveASSMarkup: preserveASSMarkup,
+            url: url, httpHeaders: httpHeaders, httpRequestAuthorization: httpRequestAuthorization,
+            preserveASSMarkup: preserveASSMarkup,
             requested: sourceStreamIndices
         )
     }
@@ -80,36 +84,95 @@ enum SubtitleDecoder {
     private static func decode(
         url: URL,
         httpHeaders: [String: String],
+        httpRequestAuthorization: HTTPRequestAuthorization?,
         preserveASSMarkup: Bool,
         requested: [Int32?]?
     ) async throws -> [SidecarDecodeResult] {
-        // Task.cancel() does NOT propagate into detached tasks (isCancelled inside always false).
-        // Bridge cancellation explicitly via CancelFlag so the decode loop + AVIO reader abort promptly.
+        // Task cancellation does not reach the dispatched decode. Bridge it explicitly via
+        // CancelFlag so the decode loop + AVIO reader abort promptly.
         let token = CancelFlag()
         return try await withTaskCancellationHandler {
-            try await Task.detached(priority: .userInitiated) {
-                try decodeFileSync(
-                    url: url, httpHeaders: httpHeaders,
-                    preserveASSMarkup: preserveASSMarkup, requested: requested, cancel: token
-                )
-            }.value
+            // The decode blocks on AVIO reads, and an authorized read waits for the host's async
+            // resolver, which needs a cooperative thread. Decoding on that pool lets concurrent
+            // decodes starve their own resolvers until the authorization timeout.
+            try await withCheckedThrowingContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    continuation.resume(with: Result {
+                        try decodeBlocking(
+                            url: url, httpHeaders: httpHeaders,
+                            httpRequestAuthorization: httpRequestAuthorization,
+                            preserveASSMarkup: preserveASSMarkup, requested: requested, token: token)
+                    })
+                }
+            }
         } onCancel: {
             token.cancel()
         }
     }
 
-    /// Thread-safe cancellation token for the detached decode task; also aborts any registered AVIO reader.
+    private static func decodeBlocking(
+        url: URL,
+        httpHeaders: [String: String],
+        httpRequestAuthorization: HTTPRequestAuthorization?,
+        preserveASSMarkup: Bool,
+        requested: [Int32?]?,
+        token: CancelFlag
+    ) throws -> [SidecarDecodeResult] {
+        if token.isCancelled { throw CancellationError() }
+        // Preserve AVIO's streaming/range access to subtitle containers. Only the relay
+        // sees origin credentials, including requests made by a seek or probe.
+        var relay: HLSOriginRelay?
+        var server: HLSLocalServer?
+        defer { relay?.stop(); server?.stop() }
+        var decodeURL = url
+        if let httpRequestAuthorization {
+            let transport = HLSOriginRelay(authorization: httpRequestAuthorization,
+                rawResources: true, onRequestFailure: { [weak token] in token?.cancel() })
+            relay = transport
+            let localServer = HLSLocalServer(relay: transport)
+            server = localServer
+            try localServer.start()
+            token.register(relay: transport, server: localServer)
+            guard let localURL = localServer.relayURL(for: url) else {
+                throw URLError(.unsupportedURL)
+            }
+            decodeURL = localURL
+        }
+        let result = try decodeFileSync(
+            url: decodeURL, httpHeaders: httpRequestAuthorization == nil ? httpHeaders : [:],
+            preserveASSMarkup: preserveASSMarkup, requested: requested, cancel: token
+        )
+        if token.isCancelled { throw CancellationError() }
+        return result
+    }
+
+    /// Thread-safe cancellation token for the dispatched decode; also aborts any registered AVIO reader.
     private final class CancelFlag: @unchecked Sendable {
         private let lock = NSLock()
         private var cancelled = false
         private var reader: AVIOReader?
+        private var relay: HLSOriginRelay?
+        private var server: HLSLocalServer?
 
         func cancel() {
             lock.lock()
             cancelled = true
             let r = reader
+            let transport = relay
+            let localServer = server
             lock.unlock()
+            transport?.stop()
             r?.markClosed()
+            localServer?.stop()
+        }
+
+        func register(relay: HLSOriginRelay, server: HLSLocalServer) {
+            lock.lock()
+            let wasCancelled = cancelled
+            self.relay = relay
+            self.server = server
+            lock.unlock()
+            if wasCancelled { relay.stop(); server.stop() }
         }
 
         var isCancelled: Bool {

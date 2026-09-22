@@ -16,6 +16,11 @@ public struct ExternalSubtitleTrack: Sendable, Equatable {
     public var isDefault: Bool
     /// nil forwards `LoadOptions.httpHeaders` (same auth as the media).
     public var httpHeaders: [String: String]?
+    /// Complete headers resolved before every HTTP request and redirect, including reselection,
+    /// secondary decoding and native store fill. Overrides track/load static headers when present.
+    /// Nil keeps static behavior; it does not inherit `LoadOptions.httpRequestAuthorization`.
+    /// Provider equality is identity; rotating its credentials leaves this track registered.
+    public var httpRequestAuthorization: HTTPRequestAuthorization?
     /// File-extension override ("srt", "ass", "vtt", "ssa") for URLs whose path hides the format.
     public var formatHint: String?
     /// Absolute `AVStream` index of the subtitle stream to decode inside the container at `url`
@@ -34,7 +39,8 @@ public struct ExternalSubtitleTrack: Sendable, Equatable {
 
     public init(url: URL, name: String? = nil, language: String? = nil,
                 isForced: Bool = false, isHearingImpaired: Bool = false, isDefault: Bool = false,
-                httpHeaders: [String: String]? = nil, formatHint: String? = nil,
+                httpHeaders: [String: String]? = nil,
+                httpRequestAuthorization: HTTPRequestAuthorization? = nil, formatHint: String? = nil,
                 sourceStreamIndex: Int32? = nil, nativeTimelineOffsetSeconds: Double = 0) {
         self.nativeTimelineOffsetSeconds = nativeTimelineOffsetSeconds.isFinite ? nativeTimelineOffsetSeconds : 0
         self.sourceStreamIndex = sourceStreamIndex
@@ -45,6 +51,7 @@ public struct ExternalSubtitleTrack: Sendable, Equatable {
         self.isHearingImpaired = isHearingImpaired
         self.isDefault = isDefault
         self.httpHeaders = httpHeaders
+        self.httpRequestAuthorization = httpRequestAuthorization
         self.formatHint = formatHint
     }
 

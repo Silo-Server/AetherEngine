@@ -406,6 +406,10 @@ public struct LoadOptions: Sendable, Equatable {
     public var suppressDisplayCriteria: Bool
     /// Extra HTTP headers for HEAD probe, Range chunks, side-demuxer fetches. On the loopback paths they are NOT forwarded to AVPlayer (it hits the local server); on `nativeRemoteHLS` they ride into the AVURLAsset so header-enforcing origins (IPTV Referer / User-Agent / Authorization) work (#119). Forwarded to `selectSidecarSubtitle` by default; pass explicit headers to override (#32). Default empty.
     public var httpHeaders: [String: String]
+    /// Refreshable complete headers for native HLS relay requests and playlist preflight. Forces
+    /// engine-owned transport from the initial load. Does not apply to AVIO, live ingest, or external
+    /// subtitle downloads. On supported requests this replaces `httpHeaders`; default nil.
+    public var httpRequestAuthorization: HTTPRequestAuthorization?
 
     /// Diagnostic lever: force dvh1 codec tags + master playlist regardless of display capability. OFF by default: non-DV displays route DV through the media playlist (no master) so AVPlayer auto-tonemaps the HEVC base layer (only path that avoids AVFoundationErrorDomain -11868 on tvOS 26). AetherEngine#4.
     public var keepDvh1TagWithoutDV: Bool
@@ -845,6 +849,7 @@ public struct LoadOptions: Sendable, Equatable {
         omitCriteriaColorExtensions: Bool = false,
         suppressDisplayCriteria: Bool = false,
         httpHeaders: [String: String] = [:],
+        httpRequestAuthorization: HTTPRequestAuthorization? = nil,
         keepDvh1TagWithoutDV: Bool = false,
         forceDolbyVisionOnNonDVDisplay: Bool = false,
         dolbyVisionHandling: DolbyVisionHandling = .automatic,
@@ -887,6 +892,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
         self.httpHeaders = httpHeaders
+        self.httpRequestAuthorization = httpRequestAuthorization
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
         self.forceDolbyVisionOnNonDVDisplay = forceDolbyVisionOnNonDVDisplay
         self.dolbyVisionHandling = dolbyVisionHandling

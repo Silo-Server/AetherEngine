@@ -17,6 +17,18 @@ swift build
 swift test
 ```
 
+CI runs `RefreshableHLSAuthorizationTests` and `RefreshableSubtitleAuthorizationTests`
+in a separate process because their short deadlines require responsive async resolvers.
+Blocking work elsewhere in the suite can delay those resolvers on smaller runners.
+The two commands below cover the entire test suite, keeping the existing deadlines
+and parallel execution within each group:
+
+```bash
+AUTHORIZATION_TEST_SUITES='RefreshableHLSAuthorizationTests|RefreshableSubtitleAuthorizationTests'
+swift test --skip "$AUTHORIZATION_TEST_SUITES"
+swift test --skip-build --filter "$AUTHORIZATION_TEST_SUITES"
+```
+
 For iterative work, open `Package.swift` in Xcode 26+ and pick the `AetherEngine` scheme. `FFmpegBuild` is a transitive dependency that supplies the bundled FFmpeg / dav1d binaries; you do not build it yourself.
 
 The `aetherctl` command-line target is macOS-only (it uses `Foundation.Process`) and is excluded from the iOS / tvOS library build.

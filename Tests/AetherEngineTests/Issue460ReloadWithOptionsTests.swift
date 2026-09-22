@@ -100,6 +100,36 @@ struct Issue460SessionOptionCorrectionTests {
         proposed.httpHeaders["Authorization"] = "Bearer fresh"
         #expect(SessionOptionCorrection.changedFields(from: base, to: proposed) == ["httpHeaders"])
     }
+
+    @Test("external subtitle provider replacements are reported by identity")
+    func subtitleAuthorizationProviderCorrection() {
+        let first = HTTPRequestAuthorization { _, _ in [:] }
+        let second = HTTPRequestAuthorization { _, _ in [:] }
+        let url = URL(string: "https://example.test/subtitle.ass")!
+        let original = LoadOptions(externalSubtitles: [ExternalSubtitleTrack(url: url, httpRequestAuthorization: first)])
+        var replacement = original
+        replacement.externalSubtitles[0].httpRequestAuthorization = second
+        #expect(original != replacement)
+        #expect(SessionOptionCorrection.changedFields(from: original, to: replacement) == ["externalSubtitles"])
+        #expect(SessionOptionCorrection.changedFields(from: original, to: original).isEmpty)
+    }
+
+    @Test("authorization provider corrections are permitted and reported by identity")
+    func authorizationProviderCorrection() {
+        let first = HTTPRequestAuthorization { _, _ in [:] }
+        let second = HTTPRequestAuthorization { _, _ in [:] }
+        let absent = LoadOptions()
+        let original = LoadOptions(httpRequestAuthorization: first)
+        let replacement = LoadOptions(httpRequestAuthorization: second)
+        for (current, proposed) in [(absent, original), (original, replacement), (original, absent)] {
+            #expect(SessionOptionCorrection.refusedFields(from: current, to: proposed).isEmpty)
+            #expect(SessionOptionCorrection.changedFields(from: current, to: proposed)
+                    == ["httpRequestAuthorization"])
+        }
+        var sameProvider = original
+        sameProvider.autoplay.toggle()
+        #expect(SessionOptionCorrection.changedFields(from: original, to: sameProvider) == ["autoplay"])
+    }
 }
 
 @MainActor

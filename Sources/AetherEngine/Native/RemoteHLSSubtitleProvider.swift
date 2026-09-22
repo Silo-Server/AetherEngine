@@ -109,7 +109,7 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
         return fillTask
     }
 
-    /// One job per (url, headers) pair, in first-appearance order. Mirrors
+    /// One job per (url, headers, authorization identity) group, in first-appearance order. Mirrors
     /// `AetherEngine.externalSubtitleFillJobs`, which keys off the loopback's rendition table.
     static func fillJobs(tracks: [Track],
                          stores: [NativeSubtitleCueStore],
@@ -117,18 +117,23 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
         struct Key: Hashable {
             let url: URL
             let headers: [String: String]
+            let authorizationID: ObjectIdentifier?
         }
+        var authorizationsByKey: [Key: HTTPRequestAuthorization] = [:]
         var order: [Key] = []
         var targetsByKey: [Key: [AetherEngine.ExternalSubtitleFillJob.Target]] = [:]
         for (ordinal, track) in tracks.enumerated() where ordinal < stores.count {
             stores[ordinal].setExternalTimelineOffsetSeconds(track.source.nativeTimelineOffsetSeconds)
-            let key = Key(url: track.source.url, headers: track.source.httpHeaders ?? defaultHeaders)
+            let key = Key(url: track.source.url, headers: track.source.httpHeaders ?? defaultHeaders,
+                          authorizationID: track.source.httpRequestAuthorization.map(ObjectIdentifier.init))
+            authorizationsByKey[key] = track.source.httpRequestAuthorization
             if targetsByKey[key] == nil { order.append(key) }
             targetsByKey[key, default: []].append(
                 .init(streamIndex: track.source.sourceStreamIndex, store: stores[ordinal]))
         }
         return order.map {
             AetherEngine.ExternalSubtitleFillJob(url: $0.url, headers: $0.headers,
+                                                 httpRequestAuthorization: authorizationsByKey[$0],
                                                  targets: targetsByKey[$0] ?? [])
         }
     }

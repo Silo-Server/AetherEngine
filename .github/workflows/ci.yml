@@ -16,6 +16,8 @@ jobs:
     name: swift test (macOS)
     runs-on: macos-15
     timeout-minutes: 30
+    env:
+      AUTHORIZATION_TEST_SUITES: 'RefreshableHLSAuthorizationTests|RefreshableSubtitleAuthorizationTests'
     steps:
       - uses: actions/checkout@v4
 
@@ -38,7 +40,15 @@ jobs:
       # SIGPIPE from a test origin server (see the SO_NOSIGPIPE note in Issue177IngestPrefetchTests),
       # so nothing hangs and no time limit would have caught it.
       - name: swift test
-        run: swift test
+        id: swift-tests
+        run: swift test --skip "$AUTHORIZATION_TEST_SUITES"
+
+      # These suites assert short authorization deadlines. Run them in a separate process
+      # so blocking work in the broader suite cannot starve their async resolvers.
+      # The shared filter partitions all tests without changing their deadlines or parallelism.
+      - name: Authorization deadline regressions
+        if: ${{ !cancelled() && steps.swift-tests.outcome != 'skipped' }}
+        run: swift test --skip-build --filter "$AUTHORIZATION_TEST_SUITES"
 
       - name: Software VOD packet-cache regressions
         run: |

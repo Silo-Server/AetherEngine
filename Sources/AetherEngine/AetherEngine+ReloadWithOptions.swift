@@ -368,7 +368,18 @@ enum SessionOptionCorrection {
         for (lhs, rhs) in zip(Mirror(reflecting: current).children,
                               Mirror(reflecting: proposed).children) {
             guard let label = lhs.label else { continue }
-            if describe(lhs.value) != describe(rhs.value) { changed.append(label) }
+            let differs: Bool
+            switch label {
+            // Authorization providers compare by identity, which reflection erases: a description
+            // names only the type, so two scopes, alone or inside tracks, describe identically.
+            case "httpRequestAuthorization":
+                differs = current.httpRequestAuthorization != proposed.httpRequestAuthorization
+            case "externalSubtitles":
+                differs = current.externalSubtitles != proposed.externalSubtitles
+            default:
+                differs = describe(lhs.value) != describe(rhs.value)
+            }
+            if differs { changed.append(label) }
         }
         return changed
     }
@@ -388,7 +399,7 @@ enum SessionOptionCorrection {
     /// right for a tuning lever and wrong for an identity one, so the choice has to be made
     /// deliberately. Update this list and, if the field names the session, `loadIdentityFields`.
     static let knownFields: [String] = [
-        "omitCriteriaColorExtensions", "suppressDisplayCriteria", "httpHeaders",
+        "omitCriteriaColorExtensions", "suppressDisplayCriteria", "httpHeaders", "httpRequestAuthorization",
         "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling", "matchContentEnabled",
         "panelIsInHDRMode", "attemptsHDRMasterOnUnprovenPanel", "panelPresentsDolbyVision",
         "audioBridgeMode", "isLive", "audioOnly",
