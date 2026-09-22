@@ -496,17 +496,10 @@ extension AetherEngine {
         //
         // AE#495: a host that answered the trust evaluator needs the media on a session the engine
         // owns, and the same stand-in does that. With sidecars it mounts a relay behind the
-        // rewritten master, without them the relay stands alone.
-        let standInURL = try await prepareRemoteHLSStandIn(
-            originURL: url, options: options, expectedGeneration: bypassGeneration)
-        let playbackURL: URL
-        if let standInURL { playbackURL = standInURL }
-        else {
-            guard options.httpRequestAuthorization == nil else {
-                throw RemoteHLSSubtitleProxy.Refusal.serverUnavailable("required authorization relay is unavailable")
-            }
-            playbackURL = url
-        }
+        // rewritten master, without them the relay stands alone. A required authorization relay
+        // that cannot start throws rather than returning nil.
+        let playbackURL = try await prepareRemoteHLSStandIn(
+            originURL: url, options: options, expectedGeneration: bypassGeneration) ?? url
         // With a relay in front, the item AVPlayer fails is a loopback 502 and the refused handshake
         // happened out of its sight, so the classification has to be able to ask the side that made it.
         if let relay = remoteHLSSubtitleProxy?.server.relay {

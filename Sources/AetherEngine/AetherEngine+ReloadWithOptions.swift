@@ -368,20 +368,18 @@ enum SessionOptionCorrection {
         for (lhs, rhs) in zip(Mirror(reflecting: current).children,
                               Mirror(reflecting: proposed).children) {
             guard let label = lhs.label else { continue }
-            // Providers compare by identity; their text descriptions only name the type.
-            if label == "httpRequestAuthorization" {
-                if current.httpRequestAuthorization != proposed.httpRequestAuthorization {
-                    changed.append(label)
-                }
-                continue
+            let differs: Bool
+            switch label {
+            // Authorization providers compare by identity, which reflection erases: a description
+            // names only the type, so two scopes, alone or inside tracks, describe identically.
+            case "httpRequestAuthorization":
+                differs = current.httpRequestAuthorization != proposed.httpRequestAuthorization
+            case "externalSubtitles":
+                differs = current.externalSubtitles != proposed.externalSubtitles
+            default:
+                differs = describe(lhs.value) != describe(rhs.value)
             }
-            // The track array also contains identity-based providers; reflection erases those
-            // identities and can describe different subtitle authorization scopes identically.
-            if label == "externalSubtitles" {
-                if current.externalSubtitles != proposed.externalSubtitles { changed.append(label) }
-                continue
-            }
-            if describe(lhs.value) != describe(rhs.value) { changed.append(label) }
+            if differs { changed.append(label) }
         }
         return changed
     }
