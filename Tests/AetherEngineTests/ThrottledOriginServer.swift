@@ -34,7 +34,15 @@ final class ThrottledOriginServer: @unchecked Sendable {
 
     let port: UInt16
     private let listenFD: Int32
-    private let totalSize: Int64
+    /// #551: a var only so a test can make the origin's stated total CHANGE between two requests,
+    /// which is the one shape that proves the reader rechecks a warm's size against the connection
+    /// that is actually serving it. Every other test leaves it at its init value.
+    private var totalSize: Int64
+    /// #551: answer a finite range with everything from its start to the end of the source, i.e.
+    /// serve WIDER than asked. Non-conforming, and a real shape: an edge that rounds a range up to
+    /// its own chunk boundary does this. Default off keeps every existing test on the historical
+    /// behaviour.
+    private let ignoreRangeEnd: Bool
     private let chunkBytes: Int
     private let throttleUs: useconds_t
     private let firstByteDelayUs: @Sendable (_ isSuffix: Bool) -> useconds_t
@@ -49,6 +57,9 @@ final class ThrottledOriginServer: @unchecked Sendable {
     private var _requestedRanges: [(start: Int64, end: Int64?)] = []
     private var _requestLog: [(path: String, start: Int64, end: Int64?)] = []
     private var _rangeHeaderPresent: [Bool] = []
+    /// #551 round 2: the headers each request arrived with, lowercased names. A credential that
+    /// must not reach a target is only provably absent at the target.
+    private var _requestHeaders: [[String: String]] = []
     private var _inflight = 0
     private var _peakInflight = 0
     private var _refusedForConcurrency = 0
@@ -65,6 +76,11 @@ final class ThrottledOriginServer: @unchecked Sendable {
     var refusedForConcurrency: Int {
         lock.lock(); defer { lock.unlock() }
         return _refusedForConcurrency
+    }
+
+    /// #551 only: restate the source's size for every request from here on.
+    func setTotalSize(_ size: Int64) {
+        lock.lock(); totalSize = size; lock.unlock()
     }
 
     var bytesWritten: Int64 {
@@ -91,6 +107,12 @@ final class ThrottledOriginServer: @unchecked Sendable {
         return _requestLog
     }
 
+    /// #551 round 2: every request's headers, in `requestLog` order, names lowercased.
+    var requestHeaders: [[String: String]] {
+        lock.lock(); defer { lock.unlock() }
+        return _requestHeaders
+    }
+
     /// Whether each logged request carried a Range header at all. A range-less GET is logged in
     /// `requestLog` as (start 0, end nil), indistinguishable from `bytes=0-`; the sequential-origin
     /// reader's whole contract is that it never sends Range, so its tests assert on THIS.
@@ -110,9 +132,11 @@ final class ThrottledOriginServer: @unchecked Sendable {
     /// winning its race in the field. `isSuffix` is true for the `bytes=-n` form.
     init?(totalSize: Int64, chunkBytes: Int = 256 * 1024, throttleUs: useconds_t = 5000,
           refuseAboveConcurrency: Int? = nil,
+          ignoreRangeEnd: Bool = false,
           firstByteDelayUs: @escaping @Sendable (_ isSuffix: Bool) -> useconds_t = { _ in 0 },
           respond: @escaping @Sendable (_ requestIndex: Int, _ offset: Int64, _ path: String) -> Directive = { _, _, _ in .serve206 }) {
         self.totalSize = totalSize
+        self.ignoreRangeEnd = ignoreRangeEnd
         self.chunkBytes = chunkBytes
         self.throttleUs = throttleUs
         self.refuseAboveConcurrency = refuseAboveConcurrency
@@ -248,6 +272,7 @@ final class ThrottledOriginServer: @unchecked Sendable {
         _requestedRanges.append((offset, rangeEnd))
         _requestLog.append((path, offset, rangeEnd))
         _rangeHeaderPresent.append(hadRangeHeader)
+        _requestHeaders.append(Self.parseHeaders(request))
         let requestIndex = _requestLog.count - 1
         // #388: in flight from the moment this origin has a request to answer until its body is
         // written. A request parked in `readRequestHeader` on a kept-alive socket is not one.
@@ -306,7 +331,7 @@ final class ThrottledOriginServer: @unchecked Sendable {
             pendingDelay -= slice
         }
 
-        let last = rangeEnd ?? (totalSize - 1)
+        let last = (ignoreRangeEnd ? nil : rangeEnd) ?? (totalSize - 1)
         let remaining = last - offset + 1
         // Keep-alive, not close: a bounded range that tears the socket down would make every
         // refill a fresh connection and would hide exactly the pooling question under test.
@@ -350,6 +375,18 @@ final class ThrottledOriginServer: @unchecked Sendable {
             if throttleUs > 0 { usleep(throttleUs) }
         }
         return true
+    }
+
+    private static func parseHeaders(_ request: String) -> [String: String] {
+        var headers: [String: String] = [:]
+        for line in request.components(separatedBy: "\r\n").dropFirst() {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let name = line[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+            let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            guard !name.isEmpty else { continue }
+            headers[name] = value
+        }
+        return headers
     }
 
     private func readRequestHeader(_ fd: Int32) -> String? {

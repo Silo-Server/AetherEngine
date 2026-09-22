@@ -30,6 +30,69 @@ final class AudioOutput: @unchecked Sendable {
         // Rate changes ride the synchronizer timebase, and this renderer's algorithm is what decides
         // whether they keep pitch (#434). Pinned here, while the timebase is still stopped.
         AudioRatePolicy.apply(to: renderer)
+        observeAutomaticFlush()
+    }
+
+    deinit {
+        if let automaticFlushObserver {
+            NotificationCenter.default.removeObserver(automaticFlushObserver)
+        }
+    }
+
+    /// The synchronizer's rate. A stopped clock and a running clock whose timebase has stalled read
+    /// differently here and nowhere else, which is the whole reason AE#549 needs it (see
+    /// `RendererClockResume`).
+    var rate: Float {
+        synchronizer.rate
+    }
+
+    /// AE#549: how often this renderer has flushed itself, for the diagnostic line.
+    var automaticFlushCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _automaticFlushCount
+    }
+
+    private var automaticFlushObserver: NSObjectProtocol?
+    private var _automaticFlushCount = 0
+
+    /// AE#549: the renderer throws its queue away when the route changes under it, and posts the
+    /// timestamp of the first sample it dropped. Nothing in the engine observed that, so the lead
+    /// that was discarded was neither re-fed nor mentioned anywhere.
+    ///
+    /// Two things happen here, both out of the header's own guidance. The second flush is its stated
+    /// best practice: the notification arrives on an arbitrary thread, so a buffer enqueued
+    /// concurrently with it survives, and a survivor sits in the queue stamped far ahead of the
+    /// timebase, muting the session for as long as it takes the clock to reach it. Re-feeding from
+    /// the timebase is deliberately NOT attempted: the demuxer stands at the audio lead by then and
+    /// the sources this happens to are exactly the ones that cannot seek backwards, so the honest
+    /// outcome is a gap of up to that lead, and then sync as before.
+    ///
+    /// The line is also the witness the field log lacked. Across an automatic flush the timebase
+    /// keeps RUNNING at its rate, so a session that froze did not freeze because of this, and only a
+    /// log carrying both can tell the two apart.
+    private func observeAutomaticFlush() {
+        automaticFlushObserver = NotificationCenter.default.addObserver(
+            forName: .AVSampleBufferAudioRendererWasFlushedAutomatically,
+            object: renderer,
+            queue: nil
+        ) { [weak self] note in
+            guard let self else { return }
+            let flushedFrom = (note.userInfo?[AVSampleBufferAudioRendererFlushTimeKey] as? NSValue)?
+                .timeValue.seconds
+            lock.lock()
+            _automaticFlushCount += 1
+            let count = _automaticFlushCount
+            renderer.flush()
+            lock.unlock()
+            EngineLog.emit(
+                "[AudioOutput] AE#549 renderer flushed itself (#\(count)): "
+                + "dropped from \(flushedFrom.map { String(format: "%.3f", $0) } ?? "unknown")s, "
+                + "clock at \(String(format: "%.3f", currentTimeSeconds))s rate=\(rate); "
+                + "audio returns once the feed reaches the clock",
+                category: .swPlayback
+            )
+        }
     }
 
     /// Add the video renderer to the synchronizer for automatic A/V sync + frame pacing. The display layer's

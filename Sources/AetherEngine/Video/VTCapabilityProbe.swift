@@ -17,6 +17,30 @@ enum VTCapabilityProbe {
         return supported
     }()
 
+    /// What the per-format hardware probe could establish. The two consumers read an unclassifiable
+    /// format in OPPOSITE directions, which is why this is three-valued rather than a Bool:
+    /// - the routing gate (`canHardwareDecode`) keeps the native path, because AVPlayer's decoder reads
+    ///   in-band parameter sets and Annex-B carriage that the probe cannot see from the config record;
+    /// - `SoftwarePlaybackHost` must pick libavcodec, because `HardwareVideoDecoder` builds its format
+    ///   description from the hvcC alone, so every unclassifiable class is one it can never open
+    ///   (AE#461: a decode-path correction onto software failed `sessionCreationFailed(-4)` there).
+    enum HardwareDecodeVerdict: Equatable {
+        /// A hardware session was built from this exact config record.
+        case supported
+        /// The config record was complete and VideoToolbox refused a hardware session for it.
+        case unsupported
+        /// Nothing in the config record to judge (no extradata, Annex-B extradata, in-band parameter
+        /// sets, format-description build failure).
+        case unclassifiable(reason: String)
+
+        /// Routing gate: only a proven refusal leaves the native path, so a probe gap never forces software.
+        var keepsNativeRoute: Bool { self != .unsupported }
+
+        /// Software host: only a proven hardware session may be served by `HardwareVideoDecoder`, which has
+        /// no software fallback.
+        var opensHardwareDecoder: Bool { self == .supported }
+    }
+
     /// True when VideoToolbox can build a HARDWARE-accelerated decompression session for this exact
     /// H.264 / HEVC format (profile + chroma + bit depth encoded in the avcC / hvcC config). AV1's coarse
     /// `av1Available` gate has no per-format analogue because H.264 / HEVC decodability is profile-specific:
@@ -25,36 +49,50 @@ enum VTCapabilityProbe {
     /// HW decoder), so the item reaches readyToPlay then renders nothing (issue #2, DrHurt Intel Mac mini).
     /// Callers route `false` to the SoftwarePlaybackHost (libavcodec), which decodes these profiles fine.
     ///
-    /// Returns `true` (keep the native path) whenever the format can't be classified (no extradata, Annex-B
-    /// extradata, in-band parameter sets, format-description build failure), so a probe gap never wrongly
-    /// forces the software path.
-    /// The throwaway session is invalidated immediately; the whole probe costs well under a millisecond and
-    /// runs once per load.
+    /// Returns `true` (keep the native path) whenever the format can't be classified, so a probe gap never
+    /// wrongly forces the software path. Not the question `SoftwarePlaybackHost` asks, see
+    /// `HardwareDecodeVerdict`.
     static func canHardwareDecode(codecpar: UnsafePointer<AVCodecParameters>) -> Bool {
+        hardwareDecodeVerdict(codecpar: codecpar).keepsNativeRoute
+    }
+
+    /// The throwaway session is invalidated immediately; the whole probe costs well under a millisecond and
+    /// runs once per consult.
+    static func hardwareDecodeVerdict(codecpar: UnsafePointer<AVCodecParameters>) -> HardwareDecodeVerdict {
         let codecID = codecpar.pointee.codec_id
         let vtCodecType: CMVideoCodecType
         let atomKey: String
         switch codecID {
         case AV_CODEC_ID_H264: vtCodecType = kCMVideoCodecType_H264; atomKey = "avcC"
         case AV_CODEC_ID_HEVC: vtCodecType = kCMVideoCodecType_HEVC; atomKey = "hvcC"
-        default: return true  // only H.264 / HEVC use this gate; other codecs route via their own policy
+        default: return .unclassifiable(reason: "codec outside the H.264 / HEVC gate")
+        }
+
+        func unclassifiable(_ reason: String) -> HardwareDecodeVerdict {
+            EngineLog.emit(
+                "[VTProbe] hardwareDecodeVerdict codec=\(codecID.rawValue) "
+                + "\(codecpar.pointee.width)x\(codecpar.pointee.height) -> unclassifiable (\(reason))",
+                category: .engine
+            )
+            return .unclassifiable(reason: reason)
         }
 
         guard let extradata = codecpar.pointee.extradata, codecpar.pointee.extradata_size > 0 else {
-            return true  // nothing to classify; don't force software off a missing config
+            return unclassifiable("no extradata")
         }
         // avcC / hvcC config records start with a configurationVersion byte (0x01). Annex-B extradata starts
-        // with a 0x00 00 (00) 01 start code and can't seed the atom-based format description, so keep native.
-        if extradata.pointee == 0x00 { return true }
+        // with a 0x00 00 (00) 01 start code and can't seed the atom-based format description.
+        if extradata.pointee == 0x00 { return unclassifiable("Annex-B extradata") }
 
         let configBytes = Array(UnsafeBufferPointer(
             start: extradata, count: Int(codecpar.pointee.extradata_size)))
         // In-band parameter sets (`hev1` / `avc1` with an empty config record, what
         // `MP4Box ...:xps_inband` and the common Dolby-Vision MP4 recipes write): the record parses, so
         // CMVideoFormatDescriptionCreate succeeds, but VideoToolbox has no SPS to configure a decoder and
-        // fails the session with -4. That says nothing about hardware support, so keep the native path and
-        // let the decoder pick the parameter sets out of the stream (AetherPlayer#2).
-        guard configRecordCarriesParameterSets(configBytes, codecID: codecID) else { return true }
+        // fails the session with -4. That says nothing about hardware support (AetherPlayer#2).
+        guard configRecordCarriesParameterSets(configBytes, codecID: codecID) else {
+            return unclassifiable("in-band parameter sets")
+        }
 
         let configData = Data(configBytes)
         var formatDescription: CMVideoFormatDescription?
@@ -70,7 +108,9 @@ enum VTCapabilityProbe {
             extensions: extensions,
             formatDescriptionOut: &formatDescription
         )
-        guard fdStatus == noErr, let formatDesc = formatDescription else { return true }
+        guard fdStatus == noErr, let formatDesc = formatDescription else {
+            return unclassifiable("format description failed, status=\(fdStatus)")
+        }
 
         // Require hardware, matching HardwareVideoDecoder's session spec: a format VT can only software-decode
         // is exactly what we want to hand to libavcodec instead (predictable path, no black screen).
@@ -93,7 +133,7 @@ enum VTCapabilityProbe {
             + "\(codecpar.pointee.width)x\(codecpar.pointee.height) -> \(ok) (status=\(status))",
             category: .engine
         )
-        return ok
+        return ok ? .supported : .unsupported
     }
 
     /// True when the avcC / hvcC config record actually carries out-of-band parameter sets, i.e. enough

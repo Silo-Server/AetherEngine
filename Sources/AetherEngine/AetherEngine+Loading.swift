@@ -682,6 +682,7 @@ extension AetherEngine {
         dolbyVisionRPUProfile: Int? = nil,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
+        sessionDisplayCaps: DisplayCapabilities,
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         isLive: Bool = false,
         dvrWindowSeconds: Double? = nil,
@@ -733,11 +734,11 @@ extension AetherEngine {
         } else {
             ingestReopenFactory = nil
         }
-        // AE#493: the same session table the format clamp used in `load`, so the label and the served
-        // route answer to one display. The host's Dolby Vision assertion is part of it on the platforms
-        // that have no per-mode capability API to read.
-        let sessionDisplayCaps = Self.displayCapabilities
-            .assertingDolbyVision(loadedOptions.panelPresentsDolbyVision)
+        // AE#493 / AE#535: the session table arrives as a parameter because it has to be the ONE the
+        // caller composed. This line used to re-read `Self.displayCapabilities`, and the comment above it
+        // claimed it was the table the format clamp had used; two reads of a property that answers at call
+        // time are not one table. Measured 203 ms apart on a device, they disagreed, and an HDR10+ title
+        // whose load had read `dv=true` was served media-direct with its master withheld.
         let session = HLSVideoEngine(
             url: url,
             sourceHTTPHeaders: sourceHTTPHeaders,
@@ -948,6 +949,11 @@ extension AetherEngine {
                 )
                 // AE#446 round 3: a #446 outage hold is waiting on this read; it has to stop saying so.
                 self.noteLiveSourceGivenUp()
+                // AE#560: a reset can bring back different codecs, different parameter sets or a
+                // different program, and writing that into streams declared from the old source
+                // produces a file that is unplayable or silently wrong past the seam. The recording
+                // ends here; the host has the event and starts part two if it wants one.
+                self.endRecordingIfRunning(reason: .sourceReset)
                 self.liveSourceReset.send()
             }
         }
@@ -983,13 +989,15 @@ extension AetherEngine {
         // Sodalite#32: AVKit reliably renders only the FIRST native subtitle rendition (ordinal 0 / subs_0);
         // device-confirmed that a programmatic selection of a later rendition is fetched then dropped after one
         // segment. So move the preferred-language track to ordinal 0 and have the host select ordinal 0.
-        if !loadedOptions.nativeSubtitlePreferredLanguages.isEmpty {
-            for pref in loadedOptions.nativeSubtitlePreferredLanguages {
-                if let idx = textTracks.firstIndex(where: { AetherEngine.languageMatches($0.language, pref) }) {
-                    if idx != 0 { textTracks.insert(textTracks.remove(at: idx), at: 0) }
-                    break
-                }
-            }
+        // #590: the same BCP-47 ranking the overlay path uses, so an inline pick and the native
+        // rendition cannot disagree about which zh-Hant track was meant.
+        if let idx = AetherEngine.bestLanguageMatchIndex(
+            languages: textTracks.map(\.language),
+            preferredLanguages: loadedOptions.nativeSubtitlePreferredLanguages,
+            kind: .subtitle,
+            secondaryRank: { AetherEngine.subtitlePickRank(textTracks[$0]) }
+        ), idx != 0 {
+            textTracks.insert(textTracks.remove(at: idx), at: 0)
         }
         nativeSubtitleTrackTable = textTracks.map { track in
             NativeSubtitleTrackEntry(sourceStreamIndex: track.isExternal ? nil : track.id,
@@ -1046,13 +1054,11 @@ extension AetherEngine {
             // DEFAULT=YES one, because a host-selected legible track only renders if it is the group default
             // (AVKit hides a non-default selection as mute-only). Resolved here, before start() builds the
             // master, so the default is correct on AVKit's first fetch; the host selects this same ordinal.
-            var defaultOrdinal = 0
-            for pref in loadedOptions.nativeSubtitlePreferredLanguages {
-                if let idx = nativeSubtitleTrackTable.firstIndex(where: { AetherEngine.languageMatches($0.language, pref) }) {
-                    defaultOrdinal = idx
-                    break
-                }
-            }
+            let defaultOrdinal = AetherEngine.bestLanguageMatchIndex(
+                languages: nativeSubtitleTrackTable.map(\.language),
+                preferredLanguages: loadedOptions.nativeSubtitlePreferredLanguages,
+                kind: .subtitle
+            ) ?? 0
             session.nativeSubtitleDefaultOrdinal = defaultOrdinal
             nativeSubtitleDefaultOrdinal = defaultOrdinal
             // #98: bridge the in-band CEA-608 track into a native rendition. Its cues come from the
@@ -1545,8 +1551,19 @@ extension AetherEngine {
                     guard self.itemDeathReviveGate.admit(position: position) else {
                         EngineLog.emit(
                             "[AetherEngine] #93 item death (failedToPlayToEndTime) at "
-                            + "\(String(format: "%.2f", position))s; revive budget exhausted, giving up",
+                            + "\(String(format: "%.2f", position))s; revive budget exhausted",
                             category: .engine)
+                        // AE#561: a frozen position across three reloads is the reload answering the
+                        // same bytes three times. Offer the source to the engine's own decoder before
+                        // the session is left dead.
+                        await self.escalateToSoftwarePath(
+                            SoftwarePathEscalation.Request(
+                                domain: SoftwarePathEscalation.mediaErrorDomain,
+                                code: 0,
+                                message: "item death at a frozen position, revive budget exhausted",
+                                positionSeconds: position.isFinite ? max(0, position) : 0
+                            )
+                        )
                         return
                     }
                     EngineLog.emit(
@@ -1565,6 +1582,28 @@ extension AetherEngine {
             .compactMap { $0 }
             .sink { [weak self] rejection in
                 Task { @MainActor [weak self] in self?.fallBackToMediaPlaylist(rejection) }
+            }
+            .store(in: &nativeCancellables)
+
+        // AE#561: the last rung. Every recovery above reloads the same item against the same bytes,
+        // which is no answer to a segment AVPlayer refuses on its merits. The engine's own decoder
+        // reads the demuxer directly and answers a sample Apple's parser rejects by skipping one
+        // frame, so it is offered the session before the failure is made terminal. Once per session,
+        // and only for a verdict on the MEDIA (see SoftwarePathEscalation).
+        let escalationBudget = softwarePathEscalationBudget
+        let escalationPreferred = loadedOptions.preferredDecodePath
+        let escalationRemoteHLS = loadedOptions.nativeRemoteHLS
+        host.softwarePathAvailability = {
+            SoftwarePathEscalation.Availability(
+                alreadyEscalated: escalationBudget.isSpent,
+                preferredDecodePath: escalationPreferred,
+                nativeRemoteHLS: escalationRemoteHLS
+            )
+        }
+        host.$pendingSoftwarePathEscalation
+            .compactMap { $0 }
+            .sink { [weak self] request in
+                Task { @MainActor [weak self] in await self?.escalateToSoftwarePath(request) }
             }
             .store(in: &nativeCancellables)
 
@@ -1607,15 +1646,21 @@ extension AetherEngine {
                       // report the same two channels.
                       audioIsAtmosStreamCopy: nativeVideoSession?.audioIsAtmosStreamCopy == true))
         forceNativeLegibleDeselectedUntilHostSelects()
+        // AE#458: what AVFoundation makes of the audio rendition this load just served, which is the
+        // half of the exchange no log has ever carried.
+        logAudibleReadback(host: host)
     }
 
     /// Activate AVAudioSession for renderer paths (SoftwarePlaybackHost, audio hosts) that have no AVPlayerViewController. Native path deliberately skips this: AVKit activates per playback so tvOS can auto-negotiate the HDMI route (issue #24).
+    ///
+    /// Called once per load, and again when an interruption ends on a renderer path (AE#549): these
+    /// paths own the session, so nobody else hands it back to them.
     ///
     /// The session calls run off the main actor and the load awaits them, so the session is active before the
     /// host that plays into it is built, as before. `setActive(true)` is an XPC round trip to mediaserverd, and
     /// iOS/tvOS 27 flag it as a hang risk on the main thread (AE#538): the same reasoning that moved `setCategory` off-main
     /// in #114 and the teardown deactivation in #215. Only the track lookup, which reads published state, stays here.
-    private func activateRendererAudioSession(audioSourceStreamIndex: Int32? = nil) async {
+    func activateRendererAudioSession(audioSourceStreamIndex: Int32? = nil) async {
         #if os(iOS) || os(tvOS)
         // Resolve the active audio track's channel count from the already-published track list.
         // so the HDMI / AirPlay link negotiates at the correct channel count.
@@ -2011,6 +2056,28 @@ extension AetherEngine {
             EngineLog.emit("[AetherEngine] reload superseded before start; ignored", category: .engine)
             return nil
         }
+        // #227 round 2: this is a session-preserving rebuild exactly like `reloadAtCurrentPosition`'s
+        // URL branch, and it tears down the very item the external-playback KVO watches, so it has to
+        // hold the same edge. #227 put the hold on that one branch only, which left the three rebuilds
+        // that come through here (the audio pick, the disc-title pick, and that function's own
+        // custom-source branch) acting on an edge that describes a teardown rather than a route.
+        //
+        // Measured on an AirPlay route, device log 2026-09-19: the unheld `false` cleared
+        // `airPlayActive` BEFORE `loadNative` read it, so the audio switch rebuilt the session on
+        // 127.0.0.1, which a receiver cannot reach (the Apple TV never requested that port at all),
+        // the receiver re-engaged, and the true edge paid for a SECOND full rebuild to get back onto
+        // the LAN URL. One pick, two session rebuilds, the first one dead on arrival.
+        let wasPreservingSession = sessionPreservingReloadInFlight
+        sessionPreservingReloadInFlight = true
+        defer {
+            // Restored rather than cleared, and the reconcile belongs to the OUTERMOST rebuild alone:
+            // a nested one that reconciled would start a reload inside the teardown of the rebuild
+            // still running, which is #227's loop entered from the inside instead of from the KVO.
+            sessionPreservingReloadInFlight = wasPreservingSession
+            if AetherEngine.rebuildOwnsHeldExternalPlaybackEdge(wasAlreadyRebuilding: wasPreservingSession) {
+                reconcileExternalPlaybackAfterReload()
+            }
+        }
         // Disc title to reopen with: an explicit override (selectTitle on a custom disc) wins, else the title
         // already playing so an audio switch / background-resume doesn't silently revert to the main title (#67).
         let titleToReopen = discTitleIDOverride ?? activeDiscTitleID
@@ -2218,6 +2285,39 @@ extension AetherEngine {
                 // swapped item, which happens inside loadNative. Arm before it, or the gate below is again
                 // reading a flag for a switch whose notifications it was not registered for.
                 if loadedOptions.suppressDisplayCriteria { displayCriteria.armSwitchObservation() }
+                let reloadRoutingPanelHDR = Self.reloadRoutesAsHDRPanel(
+                    hostAsserts: loadedOptions.panelIsInHDRMode,
+                    criteriaReadoutAtLoad: sessionPanelHDRReadout,
+                    attemptWhenUnproven: loadedOptions.attemptsHDRMasterOnUnprovenPanel,
+                    isLive: loadedOptions.isLive,
+                    displayEligibleForHDR: sessionDisplayEligibleForHDR,
+                    panelRefusedHDRMaster: Self.panelRefusedHDRMaster)
+                if reloadRoutingPanelHDR != loadedOptions.panelIsInHDRMode {
+                    EngineLog.emit(
+                        "[DisplayCriteria] AE#541 reload routes on the load's panel answer: panelIsHDR="
+                        + "\(reloadRoutingPanelHDR) (hostAsserts=\(loadedOptions.panelIsInHDRMode) readoutAtLoad="
+                        + (sessionPanelHDRReadout.map { "\($0)" } ?? "suppressed")
+                        + " eligible=\(sessionDisplayEligibleForHDR) refusedLatch=\(Self.panelRefusedHDRMaster))",
+                        category: .session)
+                }
+                let reloadDisplayCaps = Self.reloadDisplayCapabilities(
+                    observedAtLoad: sessionObservedDisplayCaps,
+                    hostAssertsDolbyVision: loadedOptions.panelPresentsDolbyVision,
+                    readNow: { Self.displayCapabilities })
+                // Read a second time for the log alone, never for the route: this is the one place the
+                // revoked answer can be SEEN, and without the line a rebuild that kept its HDR route looks
+                // the same as one that never met the window.
+                let displayCapsNow = Self.displayCapabilities
+                    .assertingDolbyVision(loadedOptions.panelPresentsDolbyVision)
+                if displayCapsNow != reloadDisplayCaps {
+                    EngineLog.emit(
+                        "[DisplayCapabilities] AE#535 rebuild routes on the load's table: hdr="
+                        + "\(reloadDisplayCaps.supportsHDR) hdr10=\(reloadDisplayCaps.supportsHDR10) "
+                        + "hlg=\(reloadDisplayCaps.supportsHLG) dv=\(reloadDisplayCaps.supportsDolbyVision) "
+                        + "(reading now: hdr=\(displayCapsNow.supportsHDR) hdr10=\(displayCapsNow.supportsHDR10) "
+                        + "hlg=\(displayCapsNow.supportsHLG) dv=\(displayCapsNow.supportsDolbyVision))",
+                        category: .session)
+                }
                 try await loadNative(
                     url: url,
                     sourceHTTPHeaders: loadedOptions.httpHeaders,
@@ -2232,7 +2332,9 @@ extension AetherEngine {
                     // changed and the probe that could answer it is gone.
                     dolbyVisionRPUProfile: sourceDolbyVisionRPUProfile,
                     matchContentEnabled: loadedOptions.matchContentEnabled,
-                    panelIsInHDRMode: loadedOptions.panelIsInHDRMode,
+                    panelIsInHDRMode: reloadRoutingPanelHDR,
+                    // AE#535: the load's table, for the same reason as the panel answer above.
+                    sessionDisplayCaps: reloadDisplayCaps,
                     audioBridgeMode: loadedOptions.audioBridgeMode,
                     // isLive required: without it the reload rebuilds as VOD and HLSVideoEngine fails "cannot build segment plan" (device repro: KiKA).
                     isLive: loadedOptions.isLive,

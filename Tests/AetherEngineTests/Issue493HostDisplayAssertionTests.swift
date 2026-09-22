@@ -221,7 +221,9 @@ struct Issue493HostDisplayAssertionTests {
 
     /// The two grades where it still does, so "the claim changes nothing" cannot quietly become the rule:
     /// P7 needs the per-packet RPU conversion to 8.1 and its supplemental, and the AV1 DV record is read
-    /// only on a display that takes it, so a non-DV display gets plain `av01` rather than `dav1`.
+    /// only on a display that takes it, so a non-DV display gets the base layer with no supplemental and
+    /// no Dolby Vision variant at all. Since #547 both AV1 branches carry the same `av01` sample entry,
+    /// the base layer's own; what the claim moves there is the supplemental entry beside it.
     @Test("AE#493: P7 and AV1 Dolby Vision are still packaged by the claim")
     func assertionStillMovesTheGatedGrades() throws {
         let p7Asserted = try Self.route(profile: 7, compat: 0, dvDisplay: true)
@@ -232,7 +234,10 @@ struct Issue493HostDisplayAssertionTests {
 
         let av1Asserted = try Self.route(codecID: AV_CODEC_ID_AV1, profile: 10, compat: 1, dvDisplay: true)
         let av1Control = try Self.route(codecID: AV_CODEC_ID_AV1, profile: 10, compat: 1, dvDisplay: false)
-        #expect(av1Asserted.codecTagOverride == "dav1")
+        #expect(Self.packaging(av1Asserted) != Self.packaging(av1Control))
+        #expect(av1Asserted.codecTagOverride == "av01")
         #expect(av1Control.codecTagOverride == "av01")
+        #expect(av1Asserted.supplementalCodecs == "dav1.10.06/db1p")
+        #expect(av1Control.supplementalCodecs == nil)
     }
 }

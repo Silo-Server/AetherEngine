@@ -214,4 +214,33 @@ struct Issue416LandingGroundTests {
         let resolved = gate.resolveHeld(trimAt: 240, playhead: playhead)
         #expect(resolved.map(\.id) == [1])
     }
+
+    // MARK: - The axis the anchor is stated on (#107 round 2)
+
+    /// The pump reports its progress from `sourceTime`, so its anchor has to be stated on the
+    /// source axis too. A session-axis anchor on a mid-stream-joined source opens the run far
+    /// below every note that follows it, and `noteReach` (unlike `noteProgress`) has no
+    /// unannounced-advance guard to break the run there: one reach note then stretches it over
+    /// the whole offset and the ledger covers ground nobody read.
+    @Test("an anchor stated on the wrong axis covers the whole offset")
+    func sessionAxisAnchorSwallowsTheOffset() {
+        let sessionZero = 24_514.545
+        var coverage = SubtitleHarvestCoverage()
+        coverage.noteAnchor(.pump, at: 35.29)                       // session axis: the defect
+        coverage.noteReach(.pump, through: 35.29 + sessionZero)     // source axis: the pump's note
+        #expect(coverage.covers(from: 200, through: 20_000))
+    }
+
+    @Test("carried onto the source axis, the anchor sits where the pump's notes do")
+    func sourceAxisAnchorClaimsOnlyWhatWasRead() {
+        let sessionZero = 24_514.545
+        var coverage = SubtitleHarvestCoverage()
+        let anchor = SWClockAnchorPolicy.sourceSeconds(forSession: 35.29,
+                                                       sessionZeroSeconds: sessionZero)
+        coverage.noteAnchor(.pump, at: anchor)
+        coverage.noteReach(.pump, through: anchor + 1.5)
+        #expect(coverage.covers(from: anchor, through: anchor + 1.5))
+        #expect(!coverage.covers(from: 200, through: 20_000))
+        #expect(!coverage.covers(from: anchor - 10, through: anchor))
+    }
 }

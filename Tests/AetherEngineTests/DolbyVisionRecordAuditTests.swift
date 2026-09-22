@@ -315,6 +315,79 @@ struct DolbyVisionRecordAuditTests {
     func verdictForGenuineSource() throws {
         #expect(DolbyVisionRecordAudit.rpuCorrection(url: genuineProfile5FixtureURL()) == nil)
     }
+
+    // MARK: - A Profile 5 the container never recorded
+
+    private static func candidate(
+        codec: AVCodecID = AV_CODEC_ID_HEVC, hasRecord: Bool = false,
+        pixelFormat: AVPixelFormat = AV_PIX_FMT_YUV420P10LE,
+        trc: AVColorTransferCharacteristic = AVCOL_TRC_UNSPECIFIED,
+        matrix: AVColorSpace = AVCOL_SPC_UNSPECIFIED,
+        primaries: AVColorPrimaries = AVCOL_PRI_UNSPECIFIED
+    ) -> Bool {
+        DolbyVisionRecordAudit.recordlessProfile5IsCandidate(
+            codecID: codec, hasRecord: hasRecord, pixelFormat: pixelFormat.rawValue,
+            colorTransfer: trc, colorMatrix: matrix, colorPrimaries: primaries)
+    }
+
+    @Test("untagged 10-bit HEVC with no record is worth reading")
+    func untaggedTenBitHEVCIsACandidate() {
+        #expect(Self.candidate())
+    }
+
+    @Test("a source that has a record is never a candidate")
+    func recordedSourceIsNotACandidate() {
+        #expect(!Self.candidate(hasRecord: true))
+    }
+
+    @Test("a source that names any colour description is never a candidate")
+    func describedSourceIsNotACandidate() {
+        #expect(!Self.candidate(trc: AVCOL_TRC_SMPTE2084))
+        #expect(!Self.candidate(trc: AVCOL_TRC_BT709))
+        #expect(!Self.candidate(matrix: AVCOL_SPC_BT2020_NCL))
+        #expect(!Self.candidate(matrix: AVCOL_SPC_BT709))
+        #expect(!Self.candidate(primaries: AVCOL_PRI_BT2020))
+    }
+
+    @Test("8-bit and non-HEVC sources are never candidates")
+    func otherFormatsAreNotCandidates() {
+        #expect(!Self.candidate(pixelFormat: AV_PIX_FMT_YUV420P))
+        #expect(!Self.candidate(pixelFormat: AV_PIX_FMT_YUV420P12LE))
+        #expect(!Self.candidate(codec: AV_CODEC_ID_H264))
+        #expect(!Self.candidate(codec: AV_CODEC_ID_AV1))
+    }
+
+    @Test("only an RPU that reads profile 5 proves it")
+    func onlyProfile5IsProof() {
+        #expect(DolbyVisionRecordAudit.rpuProvesProfile5(5))
+        #expect(!DolbyVisionRecordAudit.rpuProvesProfile5(8))
+        #expect(!DolbyVisionRecordAudit.rpuProvesProfile5(7))
+        #expect(!DolbyVisionRecordAudit.rpuProvesProfile5(nil))
+    }
+
+    @Test("a real Profile 5 RPU proves a candidate, a Profile 8.1 RPU does not")
+    func realRPUsDecideTheCandidate() {
+        let five = Self.avccPacket([Self.hevcNAL(type: 1, payload: [0xAA]), Self.bytes(Self.genuineProfile5RPU)])
+        let eight = Self.avccPacket([Self.hevcNAL(type: 1, payload: [0xAA]), Self.bytes(Self.realProfile81RPU)])
+        defer { Self.free(five); Self.free(eight) }
+        #expect(DolbyVisionRecordAudit.rpuProvesProfile5(DolbyVisionRecordAudit.rpuProfile(five)))
+        #expect(!DolbyVisionRecordAudit.rpuProvesProfile5(DolbyVisionRecordAudit.rpuProfile(eight)))
+    }
+
+    @Test("the synthesized record reads back as Profile 5, compatibility 0, level 6")
+    func synthesizedRecordIsAGenuineProfile5() throws {
+        let par = try #require(avcodec_parameters_alloc())
+        defer { var p: UnsafeMutablePointer<AVCodecParameters>? = par; avcodec_parameters_free(&p) }
+        #expect(DolbyVisionRecordAudit.synthesizeProfile5Record(par))
+        let item = try #require(par.pointee.coded_side_data)
+        #expect(par.pointee.nb_coded_side_data == 1)
+        #expect(item[0].type == AV_PKT_DATA_DOVI_CONF)
+        let rec = item[0].data!.withMemoryRebound(to: AVDOVIDecoderConfigurationRecord.self, capacity: 1) { $0.pointee }
+        #expect(rec.dv_version_major == 1 && rec.dv_version_minor == 0)
+        #expect(rec.dv_profile == 5 && rec.dv_level == 6)
+        #expect(rec.rpu_present_flag == 1 && rec.el_present_flag == 0 && rec.bl_present_flag == 1)
+        #expect(rec.dv_bl_signal_compatibility_id == 0)
+    }
 }
 
 // MARK: - Fixtures

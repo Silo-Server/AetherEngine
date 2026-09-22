@@ -118,6 +118,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// side index can alias main video index). Owned by HLSVideoEngine.
     private let sideAudioDemuxer: Demuxer?
 
+    /// AE#560: the live recording sink, read on the pump thread for every source packet. It gets
+    /// its own lock rather than sharing `restartLock`: the tap is on the hot path and must never
+    /// contend with a restart.
+    fileprivate let recordingSinkLock = NSLock()
+    fileprivate var recordingSink: LiveRecordingSink?
+
     /// One-packet lookahead per source for the dual-demuxer pull-merge (yields lower-DTS first).
     private var mergeMainLookahead: UnsafeMutablePointer<AVPacket>?
     private var mergeSideLookahead: UnsafeMutablePointer<AVPacket>?
@@ -467,6 +473,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// uniform grid never claimed it, and a source-declared plan deliberately aims BELOW the segment's
     /// IRAP (AE#268), so neither may be re-anchored for opening past its target.
     private let boundaryClaimsRandomAccess: Bool
+
+    /// AE#561: the axis `segmentBoundaries` are stamped on, so the cutter gate compares like with
+    /// like. Decode for a mov/mp4 index, presentation for Matroska Cues; see `PlanBoundaryAxis`.
+    private let planBoundaryAxis: PlanBoundaryAxis
 
     /// AE#408: the gate target actually in force. Starts at `restartTargetVideoPts` and moves BACK when
     /// the boundary turns out not to be openable, so the segment covers its own advertised start
@@ -856,11 +866,23 @@ final class HLSSegmentProducer: @unchecked Sendable {
     }
 
     /// AE#169 round 3 pure decision: whether a video packet opens the restart scan-forward gate.
-    /// The gate target is a plan-boundary PTS (`segmentPlan[baseIndex].startPts`), so the packet
-    /// is judged by presentation time. Comparing DTS dropped the exact IRAP the restart seeked
-    /// for (a keyframe's DTS sits a reorder delay below its own PTS; same defect class as the #92
-    /// cutter fix): mid-file the next IRAP rescued the miss one GOP late, but at the file tail no
-    /// later IRAP exists, so the unbounded VOD gate starved to EOF with zero packets written.
+    /// The gate target is a plan boundary (`segmentPlan[baseIndex].startPts`), and the packet is
+    /// judged by presentation time. Comparing DTS dropped the exact IRAP the restart seeked for (a
+    /// keyframe's DTS sits a reorder delay below its own PTS; same defect class as the #92 cutter
+    /// fix): mid-file the next IRAP rescued the miss one GOP late, but at the file tail no later
+    /// IRAP exists, so the unbounded VOD gate starved to EOF with zero packets written.
+    ///
+    /// AE#561 deliberately did NOT make this axis-matched the way the cutter gate is, and the
+    /// reason is that the two answer different questions. The cutter decides which segment a packet
+    /// belongs to, where being wrong by a composition offset costs a segment its IRAP, and it can
+    /// afford exactness because it sees every packet. This gate decides where production STARTS
+    /// after a seek, and being wrong in the strict direction costs the whole restart: the reported
+    /// geometry (target 2878501, the anchor IRAP at dts 2878495 and pts 2878620) has the boundary
+    /// falling BETWEEN that keyframe's two timestamps, so it matches neither axis and only the
+    /// lenient comparison admits it. Since `pts >= dts` holds for any conforming stream, judging
+    /// presentation time is the most permissive reading and cannot starve on a skew in either
+    /// direction. What the axis buys here is knowing how much of the resulting overshoot is real,
+    /// which is what `boundaryOpenToleranceTicks` spends it on.
     static func videoGateTargetSatisfied(pts: Int64, dts: Int64, targetPts: Int64) -> Bool {
         if targetPts == Int64.min { return true }
         let ts = pts != Int64.min ? pts : dts
@@ -891,16 +913,24 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     /// AE#408: how far past the boundary a sync sample may present before it is worth going back for.
     ///
-    /// A container index entry is a DECODE timestamp while the gate judges presentation time
-    /// (AE#169 round 3), so even a perfectly formed index puts the keyframe's PTS a reorder delay
-    /// above the boundary it was indexed at. Charging that skew a second seek would re-aim on every
-    /// restart of a B-pyramid encode, so the tolerance covers the stream's own declared depth plus a
-    /// frame, and never falls below the floor.
+    /// The gate judges presentation time (AE#169 round 3), so where the plan's boundaries are DECODE
+    /// timestamps even a perfectly formed index puts the keyframe's PTS a reorder delay above the
+    /// boundary it was indexed at. Charging that skew a second seek would re-aim on every restart of
+    /// a B-pyramid encode, so the tolerance covers the stream's own declared depth plus a frame, and
+    /// never falls below the floor.
+    ///
+    /// AE#561: that reorder term pays for an AXIS MISMATCH, not for anything the stream does. A plan
+    /// whose boundaries are PRESENTATION timestamps (Matroska Cues) has no such skew, a correctly
+    /// indexed keyframe presents exactly at its boundary, and the term would only widen the window in
+    /// which a genuinely late open escapes its re-aim. On that axis the tolerance is the floor, which
+    /// sharpens the decision on the very container AE#408 was reported against. The floor still
+    /// absorbs an index that is approximate rather than skewed, which Matroska Cues frequently are.
     static func boundaryOpenToleranceTicks(
-        reorderFrames: Int32, frameDurationPts: Int64, floorTicks: Int64
+        reorderFrames: Int32, frameDurationPts: Int64, floorTicks: Int64,
+        planAxis: PlanBoundaryAxis = .decode
     ) -> Int64 {
         let frame = Swift.max(0, frameDurationPts)
-        let reorder = Int64(Swift.max(0, reorderFrames)) &* frame
+        let reorder = planAxis == .decode ? Int64(Swift.max(0, reorderFrames)) &* frame : 0
         return Swift.max(floorTicks, reorder &+ frame)
     }
 
@@ -1358,6 +1388,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         audioFallbackDurationPts: Int64 = 0,
         restartTargetVideoPts: Int64 = Int64.min,
         boundaryClaimsRandomAccess: Bool = false,
+        planBoundaryAxis: PlanBoundaryAxis = .decode,
         closedCaptionStreamIndex: Int32 = -1,
         subtitleTapStreamIndices: Set<Int32> = [],
         subtitlePacketStreamIndices: Set<Int32> = [],
@@ -1434,6 +1465,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         self.audioFallbackDurationPts = audioFallbackDurationPts
         self.restartTargetVideoPts = restartTargetVideoPts
         self.boundaryClaimsRandomAccess = boundaryClaimsRandomAccess
+        self.planBoundaryAxis = planBoundaryAxis
         self.effectiveGateTargetPts = restartTargetVideoPts
         self.gateProvenEmptyFromPts = restartTargetVideoPts
         // Audio target set dynamically once video gate opens (rescaled to audio TB).
@@ -2619,7 +2651,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// 1 s), because rrgomes' trace shows exactly that read waiting 19-46 s client-side while a
     /// fresh side reader overtakes it in 300 ms.
     private func readNextSourcePacket() throws -> (packet: UnsafeMutablePointer<AVPacket>, origin: PacketOrigin)? {
-        guard !pumpFirstReadLogged else { return try readNextSourcePacketMerged() }
+        guard !pumpFirstReadLogged else { return try readNextSourcePacketMergedTapped() }
         pumpFirstReadLogged = true
         let t0 = DispatchTime.now()
         defer {
@@ -2629,7 +2661,21 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 category: .session, level: ms > 1000 ? .info : .verbose
             )
         }
-        return try readNextSourcePacketMerged()
+        return try readNextSourcePacketMergedTapped()
+    }
+
+    /// AE#560: the one place every source packet of this route passes through on its way to the
+    /// pump, main demuxer and side-audio demuxer already merged into global decode order. The
+    /// recording tap sits here rather than on `Demuxer.readPacket` for exactly that reason: a
+    /// packed AAC audio rendition in live HLS rides a SIDE demuxer, and a tap on the main one
+    /// alone would record those channels silently without audio.
+    ///
+    /// It is also upstream of `bridge.feed`, so the recording carries the source's own audio codec
+    /// while playback listens to the bridged rendition.
+    private func readNextSourcePacketMergedTapped() throws -> (packet: UnsafeMutablePointer<AVPacket>, origin: PacketOrigin)? {
+        let read = try readNextSourcePacketMerged()
+        if let read { tapForRecording(read.packet) }
+        return read
     }
 
     private func readNextSourcePacketMerged() throws -> (packet: UnsafeMutablePointer<AVPacket>, origin: PacketOrigin)? {
@@ -3454,7 +3500,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                toleranceTicks: Self.boundaryOpenToleranceTicks(
                                    reorderFrames: videoConfig.codecpar.pointee.video_delay,
                                    frameDurationPts: videoFallbackDurationPts,
-                                   floorTicks: Int64(Self.boundaryOpenToleranceSeconds / sourceVideoTbSeconds)),
+                                   floorTicks: Int64(Self.boundaryOpenToleranceSeconds / sourceVideoTbSeconds),
+                                   planAxis: planBoundaryAxis),
                                attemptsUsed: gateBackoffAttempts,
                                maxAttempts: Self.gateBackoffStepsSeconds.count),
                            reanchorGateBelowBoundary(reason: "its first sync sample presents "
@@ -3807,17 +3854,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     // at the IRAP that reaches its plan boundary, so the IRAP is the segment's first sample
                     // and its open-GOP RASL leading pictures stay with it (#92). Routing by DTS against PTS
                     // boundaries used to drop the IRAP (dts < pts) into the previous segment.
-                    // #358: the VOD plan's boundaries are the mov/mp4 index's sync-sample timestamps,
-                    // which are DECODE times, so the gate compares decode times too. Comparing the
-                    // presentation time against them let a keyframe reach boundaries beyond its own
-                    // by its composition offset (3 s on the field report's remux), consuming plan
-                    // indices that then never opened a segment. Keyframe gating is unchanged, so
-                    // #92 holds: the IRAP is still the segment's first sample and its RASL pictures
-                    // still follow it in decode order.
+                    // #358 / AE#561: the VOD plan's boundaries ARE the container's index entries, and
+                    // what an entry's timestamp means depends on the container: decode times from a
+                    // mov/mp4 sample table, presentation times from a Matroska Cue. The gate compares
+                    // on the plan's own axis (`PlanBoundaryAxis`), because either mismatch costs a
+                    // segment its IRAP: a presentation packet against decode boundaries let a keyframe
+                    // reach boundaries beyond its own (#358), a decode packet against presentation
+                    // boundaries let no keyframe reach its own at all (AE#561). Keyframe gating itself
+                    // is unchanged, so #92 holds: the IRAP is the segment's first sample and its
+                    // open-GOP RASL pictures still follow it in decode order.
                     let thisVideoSeg = isLive
                         ? liveVideoSegmentIndex(pts: packet.pointee.pts, isKeyframe: isVideoKeyframe)
-                        : vodCutter.index(pts: packet.pointee.dts != Int64.min
-                                               ? packet.pointee.dts : packet.pointee.pts,
+                        : vodCutter.index(pts: planBoundaryAxis.timestamp(dts: packet.pointee.dts,
+                                                                          pts: packet.pointee.pts),
                                           isKeyframe: isVideoKeyframe)
                     if thisVideoSeg != pumpQoSLastSeg {
                         pumpQoSLastSeg = thisVideoSeg
@@ -3887,8 +3936,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             if !isLive, (prev.pointee.flags & AV_PKT_FLAG_KEY) != 0 {
                                 let openIdx = muxer.currentSegmentIndex
                                 if firstSyncItemPtsBySegment[openIdx] == nil {
+                                    // AE#561: measured against a plan boundary, so stamped on the
+                                    // plan's axis. On the wrong one the reach is off by the frame's
+                                    // composition offset, which is the distance this very number
+                                    // exists to report.
                                     firstSyncItemPtsBySegment[openIdx] =
-                                        prev.pointee.dts != Int64.min ? prev.pointee.dts : prev.pointee.pts
+                                        planBoundaryAxis.timestamp(dts: prev.pointee.dts,
+                                                                   pts: prev.pointee.pts)
                                 }
                             }
                             finalizeAndWriteVideo(prev, nextDts: packet.pointee.dts, muxer: muxer)
@@ -4181,18 +4235,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
         packet.pointee.stream_index = muxer.videoOutputStreamIndex
 
-        if !hdr10PlusDetected, let data = packet.pointee.data {
-            let size = Int(packet.pointee.size)
-            if size >= 6 {
-                let needle: [UInt8] = [0xB5, 0x00, 0x3C, 0x00, 0x01, 0x04]
-                let found = needle.withUnsafeBufferPointer { n -> Bool in
-                    memmem(data, size, n.baseAddress, n.count) != nil
-                }
-                if found {
-                    hdr10PlusDetected = true
-                    onFirstHDR10PlusDetected?()
-                }
-            }
+        if !hdr10PlusDetected, HDR10PlusMetadataScan.packetCarriesHDR10Plus(
+            packet, codecParameters: videoConfig.codecpar, framing: a53NALFraming
+        ) {
+            hdr10PlusDetected = true
+            onFirstHDR10PlusDetected?()
         }
 
         // #131: A53 caption extraction rides the same per-packet spot as the HDR10+ scan: decode
@@ -4331,5 +4378,71 @@ enum DualSourceMergeOrder {
         let mainUs = av_rescale_q(mainTicks, mainTimeBase, micro)
         let sideUs = av_rescale_q(sideTicks, sideTimeBase, micro)
         return sideUs < mainUs
+    }
+}
+
+// MARK: - Live recording (AE#560)
+
+extension HLSSegmentProducer: LiveRecordingHost {
+
+    func recordingStreamDescriptors() -> [RecordingStreamDescriptor] {
+        var out: [RecordingStreamDescriptor] = []
+
+        let videoIndex = demuxer.videoStreamIndex
+        if videoIndex >= 0, let stream = demuxer.stream(at: videoIndex) {
+            out.append(RecordingStreamDescriptor(
+                sourceStreamIndex: videoIndex,
+                timeBaseNum: stream.pointee.time_base.num,
+                timeBaseDen: stream.pointee.time_base.den,
+                codecParameters: stream.pointee.codecpar,
+                isVideo: true))
+        }
+
+        // The audio source is the SIDE demuxer when one is open (a packed audio rendition), and the
+        // main demuxer otherwise. Reading the wrong one is how this feature would ship silent.
+        let audioSource = sideAudioDemuxer ?? demuxer
+        let audioIndex = audioSource.audioStreamIndex
+        if audioIndex >= 0, let stream = audioSource.stream(at: audioIndex) {
+            // A side demuxer numbers its streams independently, so it can hand back the same index
+            // the main demuxer already used for video. The writer maps packets by source index, so
+            // a collision would route audio into the video stream. Refuse instead.
+            if audioIndex == videoIndex, sideAudioDemuxer != nil {
+                EngineLog.emit(
+                    "[HLSSegmentProducer] recording refused: the side audio demuxer reuses source "
+                    + "stream index \(audioIndex), which the video stream already holds",
+                    category: .session
+                )
+                return []
+            }
+            out.append(RecordingStreamDescriptor(
+                sourceStreamIndex: audioIndex,
+                timeBaseNum: stream.pointee.time_base.num,
+                timeBaseDen: stream.pointee.time_base.den,
+                codecParameters: stream.pointee.codecpar,
+                isVideo: false))
+        }
+        return out
+    }
+
+    func setRecordingSink(_ sink: LiveRecordingSink?) {
+        recordingSinkLock.lock()
+        recordingSink = sink
+        recordingSinkLock.unlock()
+    }
+
+    /// Pump thread. Non-blocking by the sink's contract.
+    func tapForRecording(_ packet: UnsafeMutablePointer<AVPacket>) {
+        recordingSinkLock.lock()
+        let sink = recordingSink
+        recordingSinkLock.unlock()
+        guard let sink, let data = packet.pointee.data, packet.pointee.size > 0 else { return }
+        sink.accept(
+            packetBytes: UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size)),
+            sourceStreamIndex: packet.pointee.stream_index,
+            pts: packet.pointee.pts,
+            dts: packet.pointee.dts,
+            duration: packet.pointee.duration,
+            isKeyframe: (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
+        )
     }
 }

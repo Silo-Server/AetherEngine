@@ -11,6 +11,10 @@ public protocol IOReader: AnyObject, Sendable {
     func close()
 
     /// Unblock a pending `read` so teardown does not hang. Network readers cancel the in-flight request; memory/file readers can leave this as the default no-op. For readers the engine may reload: unblock only, do not invalidate.
+    /// Controlled metadata probes also call this concurrently on cancellation/deadline, including during
+    /// open and `seek`. Implementations with blocking I/O must promptly interrupt those operations and
+    /// handle cancellation racing their start. A no-op implementation cannot provide an interruptible
+    /// deadline; the synchronous probe still waits for the reader to return before releasing its state.
     func cancel()
 
     /// Return an independent reader with its own cursor over the same source for concurrent access (side demuxer, scrub previews). Return nil for one-shot streams; the engine skips that feature. The returned reader is owned and closed by the engine.

@@ -44,8 +44,15 @@ final class EmbeddedSubtitleDecoder {
     private let sourceVideoWidth: Int32
     private let sourceVideoHeight: Int32
 
-    /// When true and codec is ASS/SSA, cues carry the raw libavcodec event line (AetherEngine#30 styled rendering).
-    private let preserveASSMarkup: Bool
+    /// `LoadOptions.preserveASSMarkup` ALREADY GATED on this stream's codec: true only for ASS/SSA,
+    /// where cues then carry the raw libavcodec event line (AetherEngine#30 styled rendering).
+    ///
+    /// AE#587: named for the answer rather than the option because the gate is set in `init` and read
+    /// a hundred lines below, and a property carrying the option's own name reads at the emit site as
+    /// if no gate existed at all. libavcodec normalises SubRip, WebVTT and mov_text through
+    /// `ff_ass_add_rect` too, so every text codec has an ASS payload to emit and only the codec tells
+    /// them apart.
+    private let emitsRawASSLines: Bool
 
     /// #107: explicit teletext page override (nil = libzvbi `subtitle` auto-detect).
     private let teletextPage: Int?
@@ -93,7 +100,8 @@ final class EmbeddedSubtitleDecoder {
         self.codecContext = ctx
         self.sourceVideoWidth = sourceVideoWidth
         self.sourceVideoHeight = sourceVideoHeight
-        self.preserveASSMarkup = preserveASSMarkup
+        // The documented "only affects ASS / SSA codecs" gate, matching SubtitleDecoder's sidecar path.
+        self.emitsRawASSLines = preserveASSMarkup
             && (id == AV_CODEC_ID_ASS || id == AV_CODEC_ID_SSA)
         self.teletextPage = teletextPage
 
@@ -211,7 +219,9 @@ final class EmbeddedSubtitleDecoder {
                         bodies.append(parsed.body)
                         placement = placement ?? parsed.placement
                     }
-                } else if preserveASSMarkup, let raw = SubtitleRectText.rawASSLine(for: rect) {
+                } else if emitsRawASSLines, let raw = SubtitleRectText.rawASSLine(for: rect) {
+                    // ASS/SSA only; every other text codec falls through to the extraction below
+                    // (AE#587, gate in init).
                     textLines.append(raw)
                 } else if let assLine = SubtitleRectText.rawASSLine(for: rect),
                           let parsed = SubtitleRectText.styledBody(fromASSEventLine: assLine,

@@ -32,6 +32,7 @@ final class PublicAPIDocumentationTests: XCTestCase {
     private static let hostFacingTypeFiles = [
         "PlayerState.swift",
         "PlaybackErrorInfo.swift",
+        "ProbeControl.swift",
         "PlaybackClock.swift",
         "SeekEvent.swift",
         "StartupProgress.swift",
@@ -53,6 +54,7 @@ final class PublicAPIDocumentationTests: XCTestCase {
         "Diagnostics/EngineLog.swift",
         "Network/EngineTLS.swift",
         "FrameExtractor/FrameExtractor.swift",
+        "Recording/RecordingState.swift",
     ]
 
     /// Public, and deliberately undocumented as host API. Each entry is a claim that an adopter

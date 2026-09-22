@@ -252,3 +252,63 @@ struct Issue464SessionOwnedFieldTests {
         #expect(split.sessionOwned.isEmpty)
     }
 }
+
+/// AE#464 round 4 (cmcpherson274, measured at 7.1.3): the third answer was in the log and nowhere
+/// else. `reloadAtCurrentPosition(applying:)` returned `Void`, threw only for a refusal, and ran the
+/// full teardown for a field the rebuild decides for itself, so a host wrapper reported `done` for a
+/// correction that changed nothing and paid a visible restart for it (202 ms and a second native
+/// host on his rig). The answer is now returned rather than logged at, and it costs no rebuild.
+@MainActor
+struct Issue464SessionOwnedCorrectionOutcomeTests {
+
+    private func seededEngine(autoplay: Bool) throws -> AetherEngine {
+        let engine = try AetherEngine()
+        var seeded = LoadOptions()
+        seeded.autoplay = autoplay
+        engine.setLoadedOptionsForTesting(seeded)
+        engine.loadedURL = URL(string: "https://s/movie.mkv")!
+        return engine
+    }
+
+    @Test("a correction the session owns comes back without a rebuild")
+    func sessionOwnedCorrectionSkipsTheRebuild() async throws {
+        let engine = try seededEngine(autoplay: true)
+        let outcome = try await engine.reloadAtCurrentPosition { $0.autoplay = false }
+        #expect(outcome.applied.isEmpty)
+        #expect(outcome.sessionOwned == ["autoplay"])
+        #expect(outcome.rebuilt == false)
+    }
+
+    @Test("the session keeps its own value, the same answer the rebuild gave")
+    func sessionOwnedCorrectionInstallsNothing() async throws {
+        // The reload writes `sessionRebuildResumesPlaying` over the mount flag before it replays the
+        // options, so a correction to `autoplay` never outlived the call. Installing it on the
+        // short-circuit alone would make the field mean one thing travelling by itself and another
+        // with a header riding along.
+        let engine = try seededEngine(autoplay: true)
+        _ = try await engine.reloadAtCurrentPosition { $0.autoplay = false }
+        #expect(engine.loadedOptions.autoplay == true)
+    }
+
+    @Test("a refusal is still a refusal, not a session-owned no-op")
+    func refusalWinsOverTheShortCircuit() async throws {
+        // Both answers are reachable from one call, and the order matters: a correction naming an
+        // identity field AND a session-owned one has to throw rather than return quietly.
+        let engine = try seededEngine(autoplay: true)
+        await #expect(throws: AetherEngineError.self) {
+            try await engine.reloadAtCurrentPosition {
+                $0.autoplay = false
+                $0.isLive = true
+            }
+        }
+    }
+
+    @Test("the outcome carries the partition the log names")
+    func outcomeMirrorsThePartition() {
+        let outcome = SessionOptionCorrectionOutcome(
+            applied: ["httpHeaders"], sessionOwned: ["autoplay"], rebuilt: true)
+        #expect(outcome.applied == ["httpHeaders"])
+        #expect(outcome.sessionOwned == ["autoplay"])
+        #expect(outcome.rebuilt)
+    }
+}
