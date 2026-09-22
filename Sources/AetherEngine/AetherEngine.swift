@@ -2023,9 +2023,11 @@ public final class AetherEngine: ObservableObject {
     var nativeLegibleDeselectPinBurst = NativeLegibleDeselectPin()
 
     /// #316: the loopback origin standing in front of a remote HLS master to carry the host's declared
-    /// sidecars as legible renditions. Nil whenever the bypass plays the origin URL directly, which is
-    /// every live source, every source without declared sidecars, and every refused rewrite.
+    /// sidecars as legible renditions, or relays requests for TLS and refreshable authorization.
+    /// Nil when neither subtitles nor a relay require an engine-owned loopback origin.
     var remoteHLSSubtitleProxy: RemoteHLSSubtitleProxy.Prepared?
+    /// Cancelable while subtitle playlist preflight is suspended in a host authorizer.
+    var remoteHLSPreparationTask: Task<RemoteHLSSubtitleProxy.Prepared?, Never>?
 
     /// #316: external track id -> the NAME its injected rendition carries in the served master. Selecting
     /// one of these must drive AVMediaSelection, not the sidecar overlay, or the two draw on top of
@@ -6391,6 +6393,9 @@ public final class AetherEngine: ObservableObject {
     func stopInternal(resetDisplayCriteria: Bool = true, keepNativeHost: Bool = false, keepCustomReader: Bool = false, keepCurrentItem: Bool = false, finalTeardown: Bool = false) {
         // Bump generation to invalidate in-flight load() checkpoints.
         loadGeneration &+= 1
+        remoteHLSPreparationTask?.cancel()
+        remoteHLSPreparationTask = nil
+        remoteHLSSubtitleProxy?.server.relay?.stop()
         resumeAfterInterruption = false
         #if os(iOS) || os(tvOS)
         // A deactivation still queued from a previous teardown must not land on this session (#215).

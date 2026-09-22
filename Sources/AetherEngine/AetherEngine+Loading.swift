@@ -497,8 +497,16 @@ extension AetherEngine {
         // AE#495: a host that answered the trust evaluator needs the media on a session the engine
         // owns, and the same stand-in does that. With sidecars it mounts a relay behind the
         // rewritten master, without them the relay stands alone.
-        let playbackURL = await prepareRemoteHLSStandIn(
-            originURL: url, options: options, expectedGeneration: bypassGeneration) ?? url
+        let standInURL = try await prepareRemoteHLSStandIn(
+            originURL: url, options: options, expectedGeneration: bypassGeneration)
+        let playbackURL: URL
+        if let standInURL { playbackURL = standInURL }
+        else {
+            guard options.httpRequestAuthorization == nil else {
+                throw RemoteHLSSubtitleProxy.Refusal.serverUnavailable("required authorization relay is unavailable")
+            }
+            playbackURL = url
+        }
         // With a relay in front, the item AVPlayer fails is a loopback 502 and the refused handshake
         // happened out of its sight, so the classification has to be able to ask the side that made it.
         if let relay = remoteHLSSubtitleProxy?.server.relay {
@@ -507,7 +515,8 @@ extension AetherEngine {
 
         // Jellyfin HLS URLs carry auth (ApiKey / PlaySessionId / LiveStreamId) as query params, but
         // generic live HLS origins (IPTV / Stremio add-on channels) enforce per-stream Referer /
-        // User-Agent / Authorization headers, so LoadOptions.httpHeaders rides into the AVURLAsset (#119).
+        // User-Agent / Authorization headers. Direct origins carry those on the asset (#119); when
+        // relayed, only the engine's upstream request carries them. Loopback must never receive them.
         // forwardBufferDuration: 0 = system-adaptive; the 4 s VOD floor caused a 3-4 s black screen on live startup.
         // AE#158: consume-and-reset, mirroring the loopback callsite, so the bypass honours a PiP or
         // host-requested handover instead of dropping the item to nil across the swap.
@@ -529,7 +538,7 @@ extension AetherEngine {
                       // This lean path has no live-reopen / readiness watchdog; let AVPlayer's "gave up"
                       // signal surface a dead upstream (segment 404 / token expiry) so the host can retune.
                       surfaceEndFailures: true,
-                      httpHeaders: options.httpHeaders,
+                      httpHeaders: remoteHLSSubtitleProxy?.server.relay == nil ? options.httpHeaders : [:],
                       // #168 follow-up: live-only (VOD remote HLS is the AE#154 reroute target; ingesting
                       // it back would ping-pong), and hosts can opt out via LoadOptions.
                       armIngestFallback: RemoteHLSIngestFallback.shouldArm(
@@ -555,8 +564,8 @@ extension AetherEngine {
     }
 
     /// Stand a loopback origin in front of the remote master and return the URL AVPlayer should open.
-    /// Nil means "play the origin directly", which is the answer for a live source, and for a session
-    /// with neither text sidecars to inject (#316) nor a trust evaluator to honor (AE#495).
+    /// Nil permits direct playback when neither subtitles, TLS, nor refreshable authorization needs
+    /// a stand-in. A supplied authorizer requires the relay; failed admission throws.
     ///
     /// Bitmap sidecars (`.sup`) are excluded: WebVTT is a text rendition, and promising one for a PGS file
     /// would serve an empty `.vtt` that AVPlayer never re-fetches. Those keep the overlay (and Phase D OCR).
@@ -573,7 +582,8 @@ extension AetherEngine {
     @MainActor
     private func prepareRemoteHLSStandIn(originURL: URL,
                                          options: LoadOptions,
-                                         expectedGeneration: UInt64) async -> URL? {
+                                         expectedGeneration: UInt64) async throws -> URL? {
+        let requiresAuthorizationRelay = options.httpRequestAuthorization != nil
         let mayNeedRelay = EngineTLS.serverTrustEvaluator != nil
             && originURL.scheme?.lowercased() == "https"
         let tracks = options.isLive
@@ -583,20 +593,35 @@ extension AetherEngine {
                 .sorted { $0.key < $1.key }
                 .map { RemoteHLSSubtitleProvider.Track(externalID: $0.key, source: $0.value) }
         // Nothing to stand in for, so the origin is never asked.
-        guard !tracks.isEmpty || mayNeedRelay else { return nil }
-        let needsRelay = mayNeedRelay
-            ? await HLSOriginRelay.systemTrustRefuses(originURL, headers: options.httpHeaders)
-            : false
+        guard !tracks.isEmpty || mayNeedRelay || requiresAuthorizationRelay else { return nil }
+        let needsRelay: Bool
+        if requiresAuthorizationRelay { needsRelay = true }
+        else if mayNeedRelay {
+            needsRelay = await HLSOriginRelay.systemTrustRefuses(originURL, headers: options.httpHeaders)
+        } else { needsRelay = false }
         guard !options.isLive || needsRelay else { return nil }
         guard !tracks.isEmpty || needsRelay else { return nil }
 
-        guard let prepared = await RemoteHLSSubtitleProxy.prepare(
-            originURL: originURL, tracks: tracks, httpHeaders: options.httpHeaders,
-            needsRelay: needsRelay) else { return nil }
-        // The playlist fetches suspend; a load()/stop() can have superseded this session meanwhile, and a
-        // proxy nobody owns would keep its socket and decode task for the rest of the process.
-        guard loadGeneration == expectedGeneration else {
-            prepared.tearDown()
+        try Task.checkCancellation()
+        guard loadGeneration == expectedGeneration else { throw CancellationError() }
+        let preparation = Task {
+            await RemoteHLSSubtitleProxy.prepare(
+                originURL: originURL, tracks: tracks, httpHeaders: options.httpHeaders,
+                needsRelay: needsRelay, httpRequestAuthorization: options.httpRequestAuthorization)
+        }
+        remoteHLSPreparationTask = preparation
+        let result = await withTaskCancellationHandler {
+            await preparation.value
+        } onCancel: { preparation.cancel() }
+        if loadGeneration == expectedGeneration { remoteHLSPreparationTask = nil }
+        guard !Task.isCancelled, loadGeneration == expectedGeneration else {
+            result?.tearDown()
+            throw CancellationError()
+        }
+        guard let prepared = result else {
+            if requiresAuthorizationRelay {
+                throw RemoteHLSSubtitleProxy.Refusal.serverUnavailable("required authorization relay could not start")
+            }
             return nil
         }
         remoteHLSSubtitleProxy = prepared

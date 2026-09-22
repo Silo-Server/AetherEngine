@@ -124,6 +124,31 @@ iOS 26's Automatic Subtitles (show when muted, on skip back, on a language misma
 
 Read `audioTapHasDeliverySource` synchronously after installing: false means the stream will finish without yielding (no session, a video-only source, a backend with no tap path), which is the moment to fail loudly rather than await an empty stream.
 
+### Rotating native HLS credentials without replacing the item
+
+For native HLS, set `LoadOptions.httpRequestAuthorization` to an `HTTPRequestAuthorization`
+created with `init(resolver:)`. Its `Resolver` is an async, sendable closure receiving the
+destination URL and optional rejected request headers, and returning the complete application
+headers. The returned headers replace `httpHeaders` for that request. Provider equality compares
+instance identity.
+
+The engine mounts its HLS relay from the initial load and asks the resolver before each upstream
+request and redirect. A nil rejected-header dictionary denotes a new request. After a 401, the
+resolver receives the headers actually sent to that destination; a changed `Authorization` value
+permits one retry before any rejected response reaches AVPlayer. The native asset receives no
+origin headers, and failure to start the required relay fails the load.
+
+The host must validate every destination against its credential scope, preserve account/profile
+ownership, and share refresh work with its API client. Playlist discovery grants no credential
+authority. Return current credentials without waiting for a proactive refresh while they remain
+valid; wait for refresh when a credential has expired or was rejected. Never place credentials in
+URLs. The engine owns Range, routing and HTTP framing headers. Authorization waits are bounded;
+stopping the load cancels pending work and ignores late resolver results.
+
+This contract covers native HLS media and its master/variant playlist preparation. Direct AVIO,
+live ingest, audio taps and external subtitle downloads keep their existing static headers. Hosts
+must not advertise refresh support for those routes based on this option alone.
+
 ### Correcting a `LoadOption` without restarting the item
 
 `reloadAtCurrentPosition(applying:)` is the session-preserving rebuild with the options it replays
@@ -717,7 +742,8 @@ All flags default to safe values; the table is the full set. Depth for the media
 
 | Option | Default | What it does |
 | --- | --- | --- |
-| `httpHeaders` | empty | Extra headers on every probe, range and segment fetch. On `nativeRemoteHLS` they ride into the `AVURLAsset`, so header-enforcing IPTV origins work. Forwarded to sidecar subtitle fetches unless overridden. |
+| `httpHeaders` | empty | Static headers on probes, range and segment fetches. On direct `nativeRemoteHLS` loads they ride into the `AVURLAsset`; when relayed they stay on upstream requests. Forwarded to sidecar subtitle fetches unless overridden. |
+| `httpRequestAuthorization` | nil | An `HTTPRequestAuthorization` resolver for native HLS requests and playlist preparation. Forces the engine relay, replaces static application headers per request, and supports a bounded changed-bearer retry after 401. See [the credential contract](#rotating-native-hls-credentials-without-replacing-the-item). |
 | `isLive` | false | Treat the source as live. Set it explicitly; duration-based auto-detection is too noisy. |
 | `dvrWindowSeconds` | nil | Timeshift window. nil means live-only and `seek` is a no-op. |
 | `liveJoinProfile` | `.standard` | A `LiveJoinProfile`. `.fastZap` collapses TARGETDURATION to the source GOP so an IPTV join costs seconds instead of a full holdback. |

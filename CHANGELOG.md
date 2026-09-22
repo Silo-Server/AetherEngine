@@ -10,8 +10,13 @@ the public-API contract.
 
 ## [Unreleased]
 
+### Added
+
+- `LoadOptions.httpRequestAuthorization` accepts an async `HTTPRequestAuthorization` resolver for native HLS. The engine resolves headers before requests and redirects, and retries a rejected request once when the bearer changes, preserving the active player item across token rotation.
+
 ### Fixed
 
+- Authorized native HLS uses the engine relay from the initial load, without forwarding origin credentials to the loopback asset. Optional subtitle playlist preparation shares the authorizer and has a bounded deadline across redirects and refreshes.
 - Native subtitle renditions wait for complete extraction instead of caching a partial whole-track response. While extraction is pending, the local server returns a retryable HTTP 503.
 - External subtitles can declare `nativeTimelineOffsetSeconds` for media reanchored upstream. Native HLS/PiP/AirPlay renditions use the adjusted timeline while host overlay cues retain source timestamps.
 

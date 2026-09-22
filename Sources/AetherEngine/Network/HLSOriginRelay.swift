@@ -59,17 +59,52 @@ final class HLSOriginRelay: @unchecked Sendable {
     /// invalidated.
     private let session: URLSession
 
-    init() {
+    private let authorization: HTTPRequestAuthorization?
+    private let authorizationTimeout: TimeInterval
+    /// Optional whole-preflight deadline, shared across master/variant reads, redirects and refreshes.
+    /// Media relays have no lifetime deadline. Expiry wakes both network pumps and host callbacks.
+    private let deadline: Date?
+    private var deadlineWorkItem: DispatchWorkItem?
+    private var stopped = false
+    private var authorizationWaits: [UUID: HTTPAuthorizationWait] = [:]
+    private var pumps: [UUID: UpstreamPump] = [:]
+
+    init(authorization: HTTPRequestAuthorization? = nil, authorizationTimeout: TimeInterval = 10,
+         resourceTimeout: TimeInterval = 120, deadline: Date? = nil) {
+        self.authorization = authorization
+        self.authorizationTimeout = authorizationTimeout
+        self.deadline = deadline
         let config = URLSessionConfiguration.ephemeral
         config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         config.urlCache = nil
-        config.timeoutIntervalForRequest = 30
-        config.timeoutIntervalForResource = 120
+        if authorization != nil {
+            config.httpShouldSetCookies = false
+            config.httpCookieStorage = nil
+            config.urlCredentialStorage = nil
+        }
+        config.timeoutIntervalForRequest = min(30, resourceTimeout / 2)
+        config.timeoutIntervalForResource = resourceTimeout
         session = URLSession(
             configuration: config, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
+        if let deadline {
+            let expiry = DispatchWorkItem { [weak self] in self?.stop() }
+            deadlineWorkItem = expiry
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(
+                deadline: .now() + max(0, deadline.timeIntervalSinceNow), execute: expiry)
+        }
     }
 
     func stop() {
+        stateLock.lock()
+        stopped = true
+        let expiry = deadlineWorkItem
+        deadlineWorkItem = nil
+        let waits = Array(authorizationWaits.values)
+        let activePumps = Array(pumps.values)
+        stateLock.unlock()
+        expiry?.cancel()
+        waits.forEach { $0.cancel() }
+        activePumps.forEach { $0.abandon() }
         session.invalidateAndCancel()
     }
 
@@ -137,7 +172,8 @@ final class HLSOriginRelay: @unchecked Sendable {
 
     /// scheme://host:port for `url`, which is the granularity the allow list works at.
     static func originKey(for url: URL) -> String? {
-        guard let scheme = url.scheme?.lowercased(), let host = url.host?.lowercased() else {
+        guard let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              let host = url.host?.lowercased() else {
             return nil
         }
         if let port = url.port { return "\(scheme)://\(host):\(port)" }
@@ -266,7 +302,7 @@ final class HLSOriginRelay: @unchecked Sendable {
             // asked again here rather than inferred from the hold, because a body of unstated length
             // is held too and a chunked segment is not text to rewrite.
             guard (200..<300).contains(fetched.status),
-                Self.looksLikePlaylist(url: origin, contentType: fetched.contentType)
+                Self.looksLikePlaylist(url: fetched.url, contentType: fetched.contentType)
             else {
                 return .answer(
                     Response(
@@ -275,7 +311,7 @@ final class HLSOriginRelay: @unchecked Sendable {
                         contentRange: fetched.contentRange))
             }
             let rewritten = rewritePlaylist(
-                String(decoding: fetched.body, as: UTF8.self), relativeTo: origin,
+                String(decoding: fetched.body, as: UTF8.self), relativeTo: fetched.url,
                 authority: Self.rewriteAuthority(host: host), port: port, token: token)
             // A rewritten body has a different length than the range that produced it, so the
             // partial framing cannot survive. Playlists are small and nothing ranges them.
@@ -297,6 +333,7 @@ final class HLSOriginRelay: @unchecked Sendable {
     // MARK: - Upstream
 
     private struct Fetched {
+        let url: URL
         let status: Int
         let body: Data
         let contentType: String?
@@ -330,75 +367,185 @@ final class HLSOriginRelay: @unchecked Sendable {
     /// engine makes. Without that, an origin metering the reader would be paced on one path and
     /// asked freely on this one, and a 429 answered to the player would never arm the pacer that
     /// the reader and the subtitle prefetcher already read.
-    private func fetch(origin: URL, headers: [String: String], range: String?, sink: Sink)
-        -> Upstream
-    {
-        var request = URLRequest(url: origin)
-        for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
-        // Forwarded verbatim rather than parsed and rebuilt: the remote HLS path leans on byte
-        // ranges, and normalising or coalescing one here would quietly undo the sizing the
-        // caller asked for. What comes back is relayed with the same framing.
-        if let range { request.setValue(range, forHTTPHeaderField: "Range") }
+    private func fetch(origin: URL, headers: [String: String], range: String?, sink: Sink,
+                       forceHold: Bool = false) -> Upstream {
+        var url = origin
+        var staticHeaders = headers
+        var retryHeaders: [String: String]?
+        var challenged = false
+        var redirects = 0
+        while true {
+            let resolved: [String: String]
+            do {
+                if let retryHeaders { resolved = retryHeaders }
+                else { resolved = try authorize(url, rejectedHeaders: nil, fallback: staticHeaders) }
+            } catch { return .failed }
+            retryHeaders = nil
+            var request = URLRequest(url: url)
+            for (key, value) in resolved {
+                // Header ownership is independent of case. The application cannot change byte
+                // selection, routing, or framing by returning a header dictionary.
+                if authorization != nil && Self.transportHeaders.contains(key.lowercased()) { continue }
+                request.setValue(value, forHTTPHeaderField: key)
+            }
+            if let range { request.setValue(range, forHTTPHeaderField: "Range") }
+            switch transfer(request, sink: sink, forceHold: forceHold,
+                            interceptChallenge: authorization != nil && !challenged) {
+            case .complete(let result): return result
+            case .redirect(let destination):
+                redirects += 1
+                guard redirects <= 10, Self.originKey(for: destination) != nil else { return .failed }
+                OriginRequestBudget.shared.noteRedirect(from: url, to: destination)
+                if Self.originKey(for: url) != Self.originKey(for: destination) {
+                    staticHeaders = staticHeaders.filter {
+                        !["authorization", "cookie", "proxy-authorization"].contains($0.key.lowercased())
+                    }
+                }
+                url = destination
+            case .challenge(let response, let sentHeaders):
+                challenged = true
+                let respondingURL = response.url ?? url
+                let fresh: [String: String]
+                do { fresh = try authorize(respondingURL, rejectedHeaders: sentHeaders, fallback: [:]) }
+                catch { return .held(Fetched(url: respondingURL, status: 401, body: Data(), contentType: nil, contentRange: nil)) }
+                guard Self.authorizationValue(fresh) != Self.authorizationValue(sentHeaders) else {
+                    return .held(Fetched(url: respondingURL, status: 401, body: Data(), contentType: nil, contentRange: nil))
+                }
+                url = respondingURL
+                retryHeaders = fresh
+            }
+        }
+    }
 
+    private static let transportHeaders: Set<String> = [
+        "range", "host", "content-length", "transfer-encoding", "connection", "trailer", "te", "upgrade"
+    ]
+
+    private static func authorizationValue(_ headers: [String: String]) -> String? {
+        headers.first { $0.key.caseInsensitiveCompare("Authorization") == .orderedSame }?.value
+    }
+
+    private func remainingBudget(upTo maximum: TimeInterval) -> TimeInterval {
+        guard let deadline else { return maximum }
+        return max(0, min(maximum, deadline.timeIntervalSinceNow))
+    }
+
+    private func authorize(_ url: URL, rejectedHeaders: [String: String]?,
+                           fallback: [String: String]) throws -> [String: String] {
+        let timeout = remainingBudget(upTo: authorizationTimeout)
+        guard timeout > 0 else { throw URLError(.timedOut) }
+        let wait = HTTPAuthorizationWait()
+        let id = UUID()
+        stateLock.lock()
+        guard !stopped else { stateLock.unlock(); throw CancellationError() }
+        authorizationWaits[id] = wait
+        stateLock.unlock()
+        defer {
+            stateLock.lock()
+            authorizationWaits.removeValue(forKey: id)
+            stateLock.unlock()
+        }
+        guard let authorization else { return fallback }
+        return try wait.resolve(authorization, url: url, rejectedHeaders: rejectedHeaders,
+                                timeout: timeout)
+    }
+
+    /// Playlist preflight shares exactly the relay's redirect, challenge and authorization contract.
+    /// Dispatching the synchronous pump keeps the caller's actor and cooperative executor free.
+    func fetchPlaylist(_ url: URL, headers: [String: String]) async throws -> (String, URL) {
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async { [self] in
+                    let sink = Sink(head: { _, _, _, _ in false }, body: { _ in false })
+                    switch fetch(origin: url, headers: headers, range: nil, sink: sink, forceHold: true) {
+                    case .held(let fetched) where (200..<300).contains(fetched.status):
+                        if let body = String(data: fetched.body, encoding: .utf8) {
+                            continuation.resume(returning: (body, fetched.url))
+                        } else { continuation.resume(throwing: URLError(.cannotDecodeContentData)) }
+                    default: continuation.resume(throwing: URLError(.badServerResponse))
+                    }
+                }
+            }
+        } onCancel: { self.stop() }
+    }
+
+    private enum Transfer {
+        case complete(Upstream)
+        case redirect(URL)
+        case challenge(HTTPURLResponse, [String: String])
+    }
+
+    private func transfer(_ request: URLRequest, sink: Sink, forceHold: Bool,
+                          interceptChallenge: Bool) -> Transfer {
+        guard let origin = request.url else { return .complete(.failed) }
+        let slotWait = remainingBudget(upTo: Self.slotWaitSeconds)
+        guard slotWait > 0 else { return .complete(.failed) }
         let ticket = OriginRequestBudget.shared.acquire(
-            for: origin, label: "relay", timeout: Self.slotWaitSeconds)
+            for: origin, label: "relay", timeout: slotWait)
         defer { OriginRequestBudget.shared.release(ticket) }
 
         let pump = UpstreamPump()
+        let id = UUID()
+        stateLock.lock()
+        guard !stopped, remainingBudget(upTo: 1) > 0 else {
+            stateLock.unlock()
+            return .complete(.failed)
+        }
         let task = session.dataTask(with: request)
         task.delegate = pump
+        pumps[id] = pump
         task.resume()
-        // abandon before cancel: a body parked at the high-water mark is waiting on a consumer, and
-        // cancelling the task does not wake it.
-        defer { pump.abandon(); task.cancel() }
-
+        stateLock.unlock()
+        defer {
+            pump.abandon()
+            task.cancel()
+            stateLock.lock()
+            pumps.removeValue(forKey: id)
+            stateLock.unlock()
+        }
         guard let http = pump.awaitHead() else {
             note(failure: pump.awaitFailure(), origin: origin)
-            return .failed
+            return .complete(.failed)
         }
-        // #388: a portal that redirects to the host serving the bytes is one origin as far
-        // as requests are concerned, so the chain is folded rather than book-kept per hop.
-        if let finalURL = http.url, finalURL != origin {
-            OriginRequestBudget.shared.noteRedirect(from: origin, to: finalURL)
+        if [301, 302, 303, 307, 308].contains(http.statusCode),
+           let location = http.value(forHTTPHeaderField: "Location"),
+           let destination = URL(string: location, relativeTo: http.url ?? origin)?.absoluteURL {
+            return .redirect(destination)
+        }
+        if interceptChallenge && http.statusCode == 401 {
+            // The transfer is abandoned and canceled by defer before the host is asked. Neither
+            // response head nor rejected body has reached the player's loopback connection.
+            return .challenge(http, task.currentRequest?.allHTTPHeaderFields ?? request.allHTTPHeaderFields ?? [:])
         }
         if Self.refusalStatuses.contains(http.statusCode) {
             OriginRequestBudget.shared.noteRefusal(
                 for: http.url ?? origin, status: http.statusCode,
                 retryAfter: http.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init))
         }
-
         let contentType = http.value(forHTTPHeaderField: "Content-Type")
         let contentRange = http.value(forHTTPHeaderField: "Content-Range")
-        // A length the origin did not state cannot be framed for the player without buffering the
-        // body to measure it, and a playlist has to be read whole to be rewritten at all.
         let declaredLength = http.expectedContentLength
-        let mustHold = declaredLength < 0
+        let mustHold = forceHold || declaredLength < 0
             || !(200..<300).contains(http.statusCode)
-            || Self.looksLikePlaylist(url: origin, contentType: contentType)
-        guard !mustHold else {
+            || Self.looksLikePlaylist(url: http.url ?? origin, contentType: contentType)
+        if mustHold {
             let body = pump.awaitWholeBody()
             if let error = pump.awaitFailure() {
-                // A playlist read halfway is not a playlist, and the framing of a held answer is its
-                // own length, so there is nothing here worth passing on.
                 note(failure: error, origin: origin)
-                return .failed
+                return .complete(.failed)
             }
-            return .held(
-                Fetched(status: http.statusCode, body: body, contentType: contentType,
-                        contentRange: contentRange))
+            return .complete(.held(Fetched(url: http.url ?? origin, status: http.statusCode,
+                                           body: body, contentType: contentType, contentRange: contentRange)))
         }
-
         guard sink.head(http.statusCode, contentType ?? "application/octet-stream", contentRange,
-                        Int(declaredLength))
-        else { return .streamed(ok: false) }
+                        Int(declaredLength)) else { return .complete(.streamed(ok: false)) }
         let written = pump.drain(into: sink.body)
-        // A transport error after the head is already out leaves the body short of the length that
-        // was promised, so the answer cannot be finished; the server closes the connection on false.
         if let error = pump.awaitFailure() {
             note(failure: error, origin: origin)
-            return .streamed(ok: false)
+            return .complete(.streamed(ok: false))
         }
-        return .streamed(ok: written)
+        return .complete(.streamed(ok: written))
     }
 
     /// Remembers a lost handshake and says so. Everything else is one line and no state: a relay
@@ -555,6 +702,10 @@ private final class UpstreamPump: NSObject, URLSessionDataDelegate, @unchecked S
     func abandon() {
         condition.lock()
         consumerGaveUp = true
+        if !finished {
+            failure = CancellationError()
+            finished = true
+        }
         condition.broadcast()
         condition.unlock()
     }
@@ -602,6 +753,14 @@ private final class UpstreamPump: NSObject, URLSessionDataDelegate, @unchecked S
         finished = true
         condition.broadcast()
         condition.unlock()
+    }
+
+    // Redirects are followed on the socket worker, after fresh authorization for the destination.
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
     }
 
     /// A task delegate answers for its own task, and a relay fetch is the one place the trust

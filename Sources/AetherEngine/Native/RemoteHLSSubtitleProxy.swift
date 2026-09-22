@@ -1,6 +1,6 @@
 import Foundation
 
-/// Stands a loopback origin in front of a remote HLS master, for either of two reasons.
+/// Stands a loopback origin in front of a remote HLS master for subtitles, TLS, or authorization.
 ///
 /// #316: host-declared sidecars can only be declared as legible renditions through a playlist, so the
 /// engine writes a master of its own, without moving a single media byte off the origin.
@@ -9,7 +9,10 @@ import Foundation
 /// certificate inside its own networking, so the media has to move onto a session the engine owns. An
 /// `HLSOriginRelay` mounted on the same server does that.
 ///
-/// They compose. With both, the master carries the injected renditions AND its variants come back
+/// A refreshable `HTTPRequestAuthorization` also requires the relay: every upstream request must
+/// consult the host, including requests AVPlayer would otherwise make with frozen asset headers.
+///
+/// These compose. With subtitles and a relay, the master carries the injected renditions AND its variants come back
 /// through the relay, so a self-signed origin with sidecars gets both rather than choosing. With only
 /// the relay there are no tracks and no provider, and the player is pointed straight at the relay.
 ///
@@ -52,13 +55,16 @@ enum RemoteHLSSubtitleProxy {
     static func prepare(originURL: URL,
                         tracks: [RemoteHLSSubtitleProvider.Track],
                         httpHeaders: [String: String],
-                        needsRelay: Bool) async -> Prepared? {
+                        needsRelay: Bool,
+                        httpRequestAuthorization: HTTPRequestAuthorization? = nil) async -> Prepared? {
+        let needsRelay = needsRelay || httpRequestAuthorization != nil
+        guard !Task.isCancelled else { return nil }
         guard !tracks.isEmpty || needsRelay else { return nil }
         if !tracks.isEmpty {
             do {
                 let prepared = try await build(
                     originURL: originURL, tracks: tracks, httpHeaders: httpHeaders,
-                    needsRelay: needsRelay)
+                    needsRelay: needsRelay, httpRequestAuthorization: httpRequestAuthorization)
                 EngineLog.emit(
                     "[AetherEngine] #316: serving \(tracks.count) external subtitle rendition(s) over a "
                     + "rewritten master at \(prepared.masterURL.absoluteString), media "
@@ -72,22 +78,23 @@ enum RemoteHLSSubtitleProxy {
                     category: .engine)
             }
         }
-        guard needsRelay else { return nil }
-        return relayOnly(originURL: originURL, httpHeaders: httpHeaders)
+        guard needsRelay, !Task.isCancelled else { return nil }
+        return relayOnly(originURL: originURL, httpHeaders: httpHeaders,
+                         httpRequestAuthorization: httpRequestAuthorization)
     }
 
     /// The AE#495 half with nothing to inject: no provider, no playlist reads, and the player is
     /// pointed at the relay's own address for the origin.
-    private static func relayOnly(originURL: URL, httpHeaders: [String: String]) -> Prepared? {
-        let relay = HLSOriginRelay()
+    private static func relayOnly(originURL: URL, httpHeaders: [String: String],
+                                  httpRequestAuthorization: HTTPRequestAuthorization?) -> Prepared? {
+        let relay = HLSOriginRelay(authorization: httpRequestAuthorization)
         relay.admit(originURL, httpHeaders: httpHeaders)
         let server = HLSLocalServer(relay: relay)
         do {
             try server.start()
         } catch {
             EngineLog.emit(
-                "[AetherEngine] AE#495: relay did not start (\(error)). AVPlayer goes to the origin, "
-                + "which needs a certificate the system trusts", category: .engine)
+                "[AetherEngine] remote HLS relay did not start (\(error))", category: .engine)
             relay.stop()
             return nil
         }
@@ -118,15 +125,23 @@ enum RemoteHLSSubtitleProxy {
     private static func build(originURL: URL,
                               tracks: [RemoteHLSSubtitleProvider.Track],
                               httpHeaders: [String: String],
-                              needsRelay: Bool) async throws -> Prepared {
+                              needsRelay: Bool,
+                              httpRequestAuthorization: HTTPRequestAuthorization?) async throws -> Prepared {
         let session = makeSession()
         defer { session.finishTasksAndInvalidate() }
+        let preflightRelay = httpRequestAuthorization.map {
+            HLSOriginRelay(authorization: $0, authorizationTimeout: budgetSeconds,
+                           resourceTimeout: budgetSeconds,
+                           deadline: Date().addingTimeInterval(budgetSeconds))
+        }
+        defer { preflightRelay?.stop() }
 
-        let (body, finalURL) = try await fetchPlaylist(originURL, session: session, headers: httpHeaders)
+        let (body, finalURL) = try await fetchPlaylist(originURL, session: session, headers: httpHeaders, relay: preflightRelay)
         let parsed = try parse(body, at: finalURL)
         let duration = try await programDuration(of: parsed, at: finalURL,
-                                                 session: session, headers: httpHeaders)
+                                                 session: session, headers: httpHeaders, relay: preflightRelay)
 
+        try Task.checkCancellation()
         let master = try RemoteHLSMasterRewrite.rewrite(
             originPlaylist: body,
             originURL: finalURL,
@@ -135,7 +150,7 @@ enum RemoteHLSSubtitleProxy {
         let provider = RemoteHLSSubtitleProvider(tracks: tracks, masterBody: master,
                                                  programDuration: duration,
                                                  defaultHeaders: httpHeaders)
-        let relay: HLSOriginRelay? = needsRelay ? HLSOriginRelay() : nil
+        let relay: HLSOriginRelay? = needsRelay ? HLSOriginRelay(authorization: httpRequestAuthorization) : nil
         relay?.admit(finalURL, httpHeaders: httpHeaders)
         let server = HLSLocalServer(provider: provider, relay: relay)
         do {
@@ -179,7 +194,9 @@ enum RemoteHLSSubtitleProxy {
     /// against the latter, so a redirecting origin (Plex's transcode handoff) still rewrites correctly.
     private static func fetchPlaylist(_ url: URL,
                                       session: URLSession,
-                                      headers: [String: String]) async throws -> (String, URL) {
+                                      headers: [String: String],
+                                      relay: HLSOriginRelay?) async throws -> (String, URL) {
+        if let relay { return try await relay.fetchPlaylist(url, headers: headers) }
         var request = URLRequest(url: url)
         for (field, value) in headers { request.setValue(value, forHTTPHeaderField: field) }
         let data: Data
@@ -211,7 +228,8 @@ enum RemoteHLSSubtitleProxy {
     private static func programDuration(of playlist: HLSPlaylist,
                                         at url: URL,
                                         session: URLSession,
-                                        headers: [String: String]) async throws -> Double {
+                                        headers: [String: String],
+                                        relay: HLSOriginRelay?) async throws -> Double {
         switch playlist {
         case .media(let media):
             guard media.hasEndList else { throw Refusal.notVOD }
@@ -221,7 +239,7 @@ enum RemoteHLSSubtitleProxy {
                   let variantURL = HLSPlaylistParser.resolve(uri: variant.uri, against: url) else {
                 throw Refusal.unusablePlaylist("master declares no resolvable variant")
             }
-            let (body, finalURL) = try await fetchPlaylist(variantURL, session: session, headers: headers)
+            let (body, finalURL) = try await fetchPlaylist(variantURL, session: session, headers: headers, relay: relay)
             guard case .media(let media) = try parse(body, at: finalURL) else {
                 throw Refusal.unusablePlaylist("variant is not a media playlist")
             }
