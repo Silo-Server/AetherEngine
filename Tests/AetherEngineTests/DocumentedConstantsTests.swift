@@ -224,6 +224,17 @@ final class DocumentedConstantsTests: XCTestCase {
     // MARK: - External subtitle ids
 
     /// A host tells its own tracks from the engine's by this base, and docs/api.md prints the number.
+    /// formats.md "TrueHD Atmos (object rendering)" and the CHANGELOG quote the APAC rate.
+    func testAPACBedRateIsWhatTheDocsSay() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        XCTAssertEqual(SpatialAudioBridge.bitRatePerChannel, 320_000,
+                       "docs/formats.md quotes 320 kbps per bed channel")
+        XCTAssertEqual(APACSampleEntry.codecsString(channelCount: 12), "apac.31.03",
+                       "docs/formats.md and cli.md quote apac.31.03 for up to 12 channels")
+        XCTAssertEqual(APACSampleEntry.codecsString(channelCount: 16), "apac.31.04",
+                       "docs/formats.md and cli.md quote apac.31.04 for 16 channels")
+    }
+
     func testExternalSubtitleTrackIDBaseIsDocumented() throws {
         let docs = try documentation()
         XCTAssertEqual(AetherEngine.externalSubtitleTrackIDBase, 100_000)

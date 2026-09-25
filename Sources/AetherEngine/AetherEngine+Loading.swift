@@ -770,6 +770,7 @@ extension AetherEngine {
             panelIsInHDRMode: panelIsInHDRMode,
             audioSourceStreamIndexOverride: audioSourceStreamIndex,
             audioBridgeMode: audioBridgeMode,
+            objectAudioRendering: loadedOptions.objectAudioRendering,
             isLiveSession: isLive,
             dvrWindowSeconds: dvrWindowSeconds,
             // AE#195/#208: the session resolves the cut target and enables the bounded first-manifest
