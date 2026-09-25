@@ -246,6 +246,18 @@ extension HLSVideoEngine {
             )
         }
 
+        // TrueHD Atmos with object rendering requested: tried before the channel bridges, which it
+        // falls back to on any failure (see buildSpatialAudioProducerIfEligible).
+        if !forcedDrop, let audioStream = sourceAudioStream, sourceAudioStreamIndex >= 0,
+           let prod = buildSpatialAudioProducerIfEligible(
+               audioStream: audioStream,
+               sourceAudioStreamIndex: sourceAudioStreamIndex,
+               sourceCodecLabel: sourceCodecLabel,
+               audioHLSCodecs: &audioHLSCodecs,
+               audioLanguage: audioLanguage) {
+            return prod
+        }
+
         if !forcedDrop, let audioStream = sourceAudioStream, sourceAudioStreamIndex >= 0 {
             // #165: cascade across bridge encoders. The encoder the configured mode resolves to for this
             // source can be absent from the FFmpeg build (custom builds without --enable-encoder=eac3);

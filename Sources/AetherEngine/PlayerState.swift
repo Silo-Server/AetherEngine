@@ -523,6 +523,11 @@ public struct LoadOptions: Sendable, Equatable {
     /// - `.lossless`: FLAC up to 7.1. Needs a sink that accepts multichannel LPCM (Denon / Marantz / NAD AVRs); stereo-only routes silently downmix.
     public var audioBridgeMode: AudioBridgeMode
 
+    /// TrueHD Atmos delivery. `.off` (default) keeps `audioBridgeMode`'s 7.1 channel decode;
+    /// `.apac(layout)` renders the Atmos objects into `layout` and delivers Apple Positional Audio,
+    /// which reaches an Atmos receiver as Dolby MAT with its heights. See `ObjectAudioRendering`.
+    public var objectAudioRendering: ObjectAudioRendering
+
     /// Treat the source as a live stream. `seek(to:)` becomes a no-op; `isLive` surface reflects this for host UIs. Set explicitly: auto-detection from `probe.durationSeconds == 0` is too noisy (VOD MKVs with broken duration headers). Default `false`.
     public var isLive: Bool
 
@@ -858,6 +863,7 @@ public struct LoadOptions: Sendable, Equatable {
         attemptsHDRMasterOnUnprovenPanel: Bool = true,
         panelPresentsDolbyVision: Bool = false,
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
+        objectAudioRendering: ObjectAudioRendering = .off,
         isLive: Bool = false,
         audioOnly: Bool = false,
         dvrWindowSeconds: Double? = nil,
@@ -901,6 +907,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.attemptsHDRMasterOnUnprovenPanel = attemptsHDRMasterOnUnprovenPanel
         self.panelPresentsDolbyVision = panelPresentsDolbyVision
         self.audioBridgeMode = audioBridgeMode
+        self.objectAudioRendering = objectAudioRendering
         self.isLive = isLive
         self.audioOnly = audioOnly
         self.dvrWindowSeconds = dvrWindowSeconds

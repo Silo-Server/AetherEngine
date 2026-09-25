@@ -1,5 +1,5 @@
 {
-  "originHash" : "43b1111cdbc7f385ee9cadbc2fd271c5628d74bdd29d478d1a8594670811fddc",
+  "originHash" : "72b666c842f7117ec649c4d1dd1b310cf6f2a819a0e59b4ad5cd97a3e913f6b1",
   "pins" : [
     {
       "identity" : "ffmpegbuild",
@@ -17,6 +17,15 @@
       "state" : {
         "revision" : "0d7cce1d6836a30d13a3a2326e50a153af53f014",
         "version" : "2.1.0"
+      }
+    },
+    {
+      "identity" : "siloobjectaudio",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/Silo-Server/SiloObjectAudio",
+      "state" : {
+        "revision" : "645b91c072fafb60146151fd5127f8ff0ca38b6f",
+        "version" : "1.0.0"
       }
     },
     {

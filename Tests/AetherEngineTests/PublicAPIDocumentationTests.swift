@@ -42,6 +42,8 @@ final class PublicAPIDocumentationTests: XCTestCase {
         "View/AetherPlayerView.swift",
         "IO/IOReader.swift",
         "IO/HLSIngest/HLSIngestError.swift",
+        "Audio/Spatial/ObjectAudioRendering.swift",
+        "Audio/Spatial/SpatialSpeakerLayout.swift",
         "Subtitles/ExternalSubtitleTrack.swift",
         "Subtitles/NativeSubtitleCueStore.swift",
         "Disc/DiscMetadata.swift",

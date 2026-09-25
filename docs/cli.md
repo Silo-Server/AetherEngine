@@ -70,6 +70,8 @@ open 'http://127.0.0.1:<port>/master.m3u8'   # macOS QuickTime
 
 `--start-position S` starts the session at S seconds, the resume anchor a host passes to `load(url:startPosition:)`. Also available on `play`.
 
+`--atmos-bed <layout>` is `LoadOptions.objectAudioRendering = .apac(layout)` (`5.1.2`, `5.1.4`, `7.1.2`, `7.1.4` or `9.1.6`): a TrueHD Atmos track is rendered into that bed and served as APAC, so the master reads `CODECS="…,apac.31.03"` (up to 12 channels) or `apac.31.04` (16) and the log carries `TrueHD Atmos: objects rendered into …`. `--audio-index <n>` serves source stream `n`, as a host's audio picker would; without it the engine prefers an E-AC-3 JOC track when the file has one. Dolby's Unfold demo: `serve --atmos-bed 7.1.4 --audio-index 1 dolby-unfold-lossless.m2ts`.
+
 `--audio-delay <ms>` parks the server with the AE#464 audio offset already in its muxer, which is how the DELIVERED offset is measured rather than argued about: fetch the media playlist and walk its segments, then read the first audio and video packet timestamps out of `init.mp4` + a segment with `ffprobe -show_entries packet=stream_index,pts_time`. On a 30 fps H.264 + AAC fixture the source's own alignment is +21.8 ms, `--audio-delay 200` reads +221.8 ms and `--audio-delay -150` reads -128.2 ms, i.e. exactly the offset asked for, with the video timestamp unchanged in every arm.
 
 ## validate

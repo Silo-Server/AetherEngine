@@ -93,14 +93,20 @@ final class MP4SegmentMuxer {
     struct AudioConfig {
         let codecpar: UnsafePointer<AVCodecParameters>
         let timeBase: AVRational
+        /// A complete sample entry box that replaces the one movenc writes for this track in the
+        /// init segment. Set for APAC, which movenc cannot write: the track is muxed as a stand-in
+        /// codec and its entry swapped here (see `APACSampleEntry`).
+        let soundSampleEntryOverride: Data?
         /// AE#458: ISO 639-2/T for the track's `mdhd`. Nil writes nothing, leaving movenc's `und`.
         let language: String?
 
         init(codecpar: UnsafePointer<AVCodecParameters>,
              timeBase: AVRational,
+             soundSampleEntryOverride: Data? = nil,
              language: String? = nil) {
             self.codecpar = codecpar
             self.timeBase = timeBase
+            self.soundSampleEntryOverride = soundSampleEntryOverride
             self.language = language
         }
     }
@@ -280,8 +286,21 @@ final class MP4SegmentMuxer {
         counter.fd = firstFd
         self.byteCounter = counter
 
+        let sampleEntryOverride = audio?.soundSampleEntryOverride
         self.splitter = FragmentSplitter(
             onHeaderComplete: { initBytes in
+                var initBytes = initBytes
+                if let entry = sampleEntryOverride {
+                    if let replaced = APACSampleEntry.replacingSoundSampleEntry(in: initBytes, with: entry) {
+                        initBytes = replaced
+                    } else {
+                        EngineLog.emit(
+                            "[MP4SegmentMuxer] ERROR: audio sample entry override could not be installed "
+                            + "(no sound track in the \(initBytes.count) B init); AVPlayer will read the stand-in",
+                            category: .session
+                        )
+                    }
+                }
                 // AE#187 defense-in-depth: strip a zero-sample video `sdtp` from the fragmented init before
                 // forwarding it. The pinned FFmpegBuild (n8.1.2) never writes it, so this is a no-op there;
                 // it neutralizes the box only for a consumer that links an older FFmpeg (a -force_load'ed
