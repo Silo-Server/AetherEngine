@@ -1067,6 +1067,10 @@ public struct SoftwareDecodeProbeResult: Sendable {
     /// container that withheld its PTS and had one invented from decode order produces a sawtooth,
     /// which is the one shape no packet-level or renderer-level counter can see.
     public let frameTimesSeconds: [Double]
+    /// AE#654: the colour tags the first picture reached the display layer with, as
+    /// `primaries / transfer / matrix` in CoreVideo's names, `-` for a missing one. An untagged source
+    /// reads `ITU_R_709_2` in all three here, the same as VideoToolbox's own output for it.
+    public let firstFrameColor: String?
 
     public init(
         codecName: String,
@@ -1082,9 +1086,11 @@ public struct SoftwareDecodeProbeResult: Sendable {
         firstFrameWidth: Int,
         firstFrameHeight: Int,
         firstError: String?,
-        frameTimesSeconds: [Double] = []
+        frameTimesSeconds: [Double] = [],
+        firstFrameColor: String? = nil
     ) {
         self.frameTimesSeconds = frameTimesSeconds
+        self.firstFrameColor = firstFrameColor
         self.codecName = codecName
         self.codecID = codecID
         self.width = width

@@ -78,7 +78,7 @@ open 'http://127.0.0.1:<port>/master.m3u8'   # macOS QuickTime
 
 ## swdecode
 
-Opens `SoftwareVideoDecoder` for the source's video stream, feeds up to N packets (default 100, override with `--frames N`), and reports counters plus first-frame metadata (pixel format, dimensions). Tests the SW-pipeline decode path end-to-end without needing a render layer. Useful for legacy codecs (MPEG-4 Part 2, MPEG-2, VC-1) and AV1 / VP9 on platforms where the native AVPlayer path doesn't accept them. Verdict distinguishes three failure modes:
+Opens `SoftwareVideoDecoder` for the source's video stream, feeds up to N packets (default 100, override with `--frames N`), and reports counters plus first-frame metadata (pixel format, dimensions, and `firstFrameColor`, the colour tags the picture reaches the display layer with, AE#654). Tests the SW-pipeline decode path end-to-end without needing a render layer. Useful for legacy codecs (MPEG-4 Part 2, MPEG-2, VC-1) and AV1 / VP9 on platforms where the native AVPlayer path doesn't accept them. Verdict distinguishes three failure modes:
 
 - decoder open failed (FFmpegBuild gate or malformed extradata)
 - decoder opened but no frames produced (pixel-format conversion, no IDR in window)

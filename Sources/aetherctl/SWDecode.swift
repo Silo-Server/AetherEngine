@@ -30,6 +30,9 @@ func runSWDecode(url: URL, maxPackets: Int) -> Int32 {
     if let fmt = result.firstFramePixelFormat {
         print("First frame pixfmt:   \(fmt)")
         print("First frame size:     \(result.firstFrameWidth)x\(result.firstFrameHeight)")
+        if let color = result.firstFrameColor {
+            print("First frame color:    \(color)")
+        }
     } else {
         print("First frame:          (none decoded)")
     }
