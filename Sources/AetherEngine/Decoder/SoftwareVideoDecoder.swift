@@ -638,20 +638,13 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     // MARK: - Color Space Metadata
 
     /// Map FFmpeg color metadata to CVPixelBuffer attachments for correct HDR10 rendering (BT.2020 + PQ).
+    /// Every field is written, a gap included (AE#654): VideoToolbox never hands the display layer an
+    /// untagged buffer, and neither may this decoder.
     private func attachColorSpace(from frame: UnsafeMutablePointer<AVFrame>, to pb: CVPixelBuffer) {
-        let primaries = ColorAttachments.primaries(frame.pointee.color_primaries)
-        let transfer = ColorAttachments.transfer(frame.pointee.color_trc)
-        let matrix = ColorAttachments.matrix(frame.pointee.colorspace)
-
-        if let primaries {
-            CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, primaries, .shouldPropagate)
-        }
-        if let transfer {
-            CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, transfer, .shouldPropagate)
-        }
-        if let matrix {
-            CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, matrix, .shouldPropagate)
-        }
+        let tags = ColorAttachments.presented(ColorDescription(frame: frame))
+        CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, tags.primaries, .shouldPropagate)
+        CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, tags.transfer, .shouldPropagate)
+        CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, tags.matrix, .shouldPropagate)
     }
 
     // MARK: - Pixel Aspect Ratio (anamorphic SD)

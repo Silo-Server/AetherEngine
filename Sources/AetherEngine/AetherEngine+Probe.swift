@@ -419,6 +419,7 @@ extension AetherEngine {
             var firstFramePixelFormat: String?
             var firstFrameWidth: Int = 0
             var firstFrameHeight: Int = 0
+            var firstFrameColor: String?
             /// #407: in decoder output order, i.e. presentation order. Capped so a long run stays a
             /// diagnostic rather than an allocation.
             var frameTimesSeconds: [Double] = []
@@ -444,6 +445,12 @@ extension AetherEngine {
                     accum.firstFramePixelFormat = "\(fourCC) (0x\(String(pfType, radix: 16)))"
                     accum.firstFrameWidth = CVPixelBufferGetWidth(pixelBuffer)
                     accum.firstFrameHeight = CVPixelBufferGetHeight(pixelBuffer)
+                    accum.firstFrameColor = [
+                        kCVImageBufferColorPrimariesKey,
+                        kCVImageBufferTransferFunctionKey,
+                        kCVImageBufferYCbCrMatrixKey,
+                    ].map { (CVBufferCopyAttachment(pixelBuffer, $0, nil) as? String) ?? "-" }
+                        .joined(separator: " / ")
                 }
             }
         } catch {
@@ -504,7 +511,8 @@ extension AetherEngine {
             firstFrameWidth: accum.firstFrameWidth,
             firstFrameHeight: accum.firstFrameHeight,
             firstError: firstError,
-            frameTimesSeconds: accum.frameTimesSeconds
+            frameTimesSeconds: accum.frameTimesSeconds,
+            firstFrameColor: accum.firstFrameColor
         )
     }
 
