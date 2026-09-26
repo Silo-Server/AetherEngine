@@ -12,6 +12,32 @@ the public-API contract.
 
 _Nothing yet._
 
+## [7.19.0] - 2026-09-26
+
+### Fixed
+
+- **A software-decoded picture carries the colour tags VideoToolbox would give it (AE#654).** The
+  software decoder attached a tag only where the frame declared one and CoreVideo had a mapping, so
+  an untagged source reached the display layer with no primaries, transfer or matrix, while the same
+  file through VideoToolbox arrives tagged BT.709. It now fills the gaps the way VideoToolbox does,
+  measured on its output: nothing declared means BT.709 in all three at any size and codec, and a
+  lone BT.601 matrix gets SMPTE-C primaries. Affects the software route (MPEG-4 ASP, MPEG-2, VC-1,
+  VP9, AV1 without hardware decode). `ColorDescription` keeps its gaps, so the HDR gate and the
+  tone mapper still see an untagged stream as untagged.
+- **Tagged SD sources keep their tags on the software path.** `ColorAttachments` had no mapping for
+  BT.601 matrices, SMPTE-C or EBU 3213 primaries, so a correctly tagged PAL or NTSC source lost all
+  three. Added with DCI-P3, SMPTE 240M, sRGB and linear transfer.
+- **A `FrameExtractor` still is converted with the picture's own matrix and range.** The SDR still
+  path never called `sws_setColorspaceDetails`, so every still went through swscale's BT.601
+  default and a range read from the pixel format alone: HD colour bars were up to 33 levels off, and
+  a 10-bit full-range picture (no `yuvj` variant exists) was read as limited. The matrix now follows
+  the rule the displayed buffer is tagged by, so an untagged still resolves exactly as playback.
+
+### Added
+
+- **`SoftwareDecodeProbeResult.firstFrameColor`**: the colour tags the first picture reaches the
+  display layer with, as `primaries / transfer / matrix`. Printed by `aetherctl swdecode`.
+
 ## [7.18.2] - 2026-09-26
 
 ### Fixed
