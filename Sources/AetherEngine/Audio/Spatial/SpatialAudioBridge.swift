@@ -59,7 +59,8 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     /// `originFrame`: the source PTS of the first packet pushed since the last reset.
     /// `encoderStartFrame`: where the first frame handed to the encoder since the reset sits.
     /// `encoderFramesIn`: frames handed to the encoder since the reset; `packetsOut`: packets it
-    /// has returned. Packet k covers frames [k·1024 − leadingFrames, +1024) of encoder input.
+    /// has returned. Packet k covers frames [k·1024 − leadingFrames, +1024) of encoder input and is
+    /// stamped `encoderStartFrame + k·1024`; see `emit`.
     private var originFrame: Int64?
     private var encoderStartFrame: Int64?
     private var encoderFramesIn: Int64 = 0
@@ -286,18 +287,21 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         emit(packets, into: &results)
     }
 
-    /// Stamp encoder packets onto the output timeline and wrap them for the muxer. The encoder's
-    /// priming packets precede the first input frame; they carry no content and would sit before
-    /// the anchor (below zero at the head of the file), so they are dropped. Every APAC packet the
-    /// encoder produces is independently decodable, so the first kept packet decodes on its own.
+    /// Stamp encoder packets onto the output timeline and wrap them for the muxer. Packet k is
+    /// stamped `encoderStartFrame + k·1024`, the encoder's priming packets included, because
+    /// AVFoundation presents an APAC packet's audio `leadingFrames` (2048) before its timestamp: it
+    /// counts the priming as part of the stream, the way AVAssetWriter writes it. So the priming
+    /// packets take the anchor's timestamp, their output falls before it and is never heard, and the
+    /// first content frame plays on the source position. Dropping them and stamping the first
+    /// content packet on the anchor played every session 2048 frames (42.7 ms) ahead of the video,
+    /// at load and after every seek (AVPlayer over HLS on macOS 27, with 5.1 APAC since macOS rejects
+    /// 7.1.4, against an ALAC reference; AVAssetReader shows the same 2048 frames for 7.1.4).
     private func emit(_ packets: [APACEncoder.Packet], into results: inout [UnsafeMutablePointer<AVPacket>]) {
         let frames = Int64(APACEncoder.framesPerPacket)
-        let leading = Int64(encoder.leadingFrames)
         for packet in packets {
             let k = packetsOut
             packetsOut += 1
-            let contentStart = k * frames - leading
-            guard contentStart + frames > 0, let start = encoderStartFrame else { continue }
+            guard let start = encoderStartFrame else { continue }
             guard let avpkt = trackedPacketAlloc() else { continue }
             guard av_new_packet(avpkt, Int32(packet.data.count)) >= 0 else {
                 var p: UnsafeMutablePointer<AVPacket>? = avpkt
@@ -307,7 +311,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
             packet.data.withUnsafeBytes { raw in
                 avpkt.pointee.data.update(from: raw.bindMemory(to: UInt8.self).baseAddress!, count: packet.data.count)
             }
-            let pts = start + max(contentStart, 0)
+            let pts = start + k * frames
             avpkt.pointee.pts = pts
             avpkt.pointee.dts = pts
             avpkt.pointee.duration = frames

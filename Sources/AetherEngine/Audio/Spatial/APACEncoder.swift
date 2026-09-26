@@ -13,7 +13,9 @@ import Foundation
 ///
 /// Facts about the encoder this relies on, all measured on macOS 27 and the tvOS 27 simulator:
 /// - packets are 1024 frames;
-/// - the encoder primes 2048 frames (`primeInfo.leadingFrames`), which the caller trims;
+/// - the encoder primes 2048 frames (`primeInfo.leadingFrames`). AVFoundation removes them on
+///   playback by presenting each packet's audio 2048 frames before its timestamp, so the caller
+///   keeps the priming packets and stamps them from the anchor;
 /// - with the converter's defaults every packet is independently decodable (an Audio Sync Packet),
 ///   which is what lets any fMP4 fragment, and so any HLS segment, start on one (HLS authoring 7.9);
 /// - the magic cookie IS the complete `dapa` box the sample entry carries;

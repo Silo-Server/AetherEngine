@@ -101,6 +101,7 @@ struct TrueHDAtmosSampleTests {
               + "\(bytes * 8 / Int(seconds) / 1000) kbps, \(String(format: "%.1f", seconds / elapsed))x realtime (debug build)")
         #expect(pts.first == Int64(0))
         #expect(zip(pts, pts.dropFirst()).allSatisfy { $1 - $0 == 1024 })
-        #expect(pts.count == Int((1_298_000.0 / 1024).rounded(.up)))
+        // Two packets of encoder priming, then the sample's 1,298,000 frames.
+        #expect(pts.count == 2 + Int((1_298_000.0 / 1024).rounded(.up)))
     }
 }
