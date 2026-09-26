@@ -109,9 +109,11 @@ public enum AudioDelivery: String, Sendable, Equatable, CaseIterable {
     /// The source's audio bitstream is muxed into fMP4 unchanged: Atmos, DTS-HD and every other
     /// bitstream reach the renderer exactly as authored.
     case streamCopy
-    /// The audio is decoded and re-encoded (FLAC or E-AC-3) for the fMP4 pipeline, because its codec
-    /// is not fMP4-legal or AVPlayer rejects it there. Lossless for the bed channels; object metadata
-    /// in a TrueHD-MAT or JOC bitstream does not survive the PCM intermediate.
+    /// The audio is decoded and re-encoded for the fMP4 pipeline, because its codec is not fMP4-legal
+    /// or AVPlayer rejects it there: to FLAC (lossless bed channels) or E-AC-3, where object metadata
+    /// in a TrueHD-MAT or JOC bitstream does not survive the PCM intermediate, or, under
+    /// `LoadOptions.objectAudioRendering`, to lossy APAC with the TrueHD Atmos objects rendered into
+    /// the speaker bed.
     case bridged
     /// libavcodec decodes the audio and the engine renders it itself (the software path and the
     /// software audio-only host).
