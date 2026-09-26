@@ -229,8 +229,12 @@ final class DocumentedConstantsTests: XCTestCase {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
         XCTAssertEqual(SpatialAudioBridge.bitRatePerChannel, 320_000,
                        "docs/formats.md quotes 320 kbps per bed channel")
+        XCTAssertEqual(APACSampleEntry.codecsString(channelCount: 8), "apac.31.02",
+                       "docs/formats.md and cli.md quote apac.31.02 for 5.1.2")
+        XCTAssertEqual(APACSampleEntry.codecsString(channelCount: 10), "apac.31.03",
+                       "docs/formats.md and cli.md quote apac.31.03 for 10 channels")
         XCTAssertEqual(APACSampleEntry.codecsString(channelCount: 12), "apac.31.03",
-                       "docs/formats.md and cli.md quote apac.31.03 for up to 12 channels")
+                       "docs/formats.md and cli.md quote apac.31.03 for 12 channels")
         XCTAssertEqual(APACSampleEntry.codecsString(channelCount: 16), "apac.31.04",
                        "docs/formats.md and cli.md quote apac.31.04 for 16 channels")
     }
