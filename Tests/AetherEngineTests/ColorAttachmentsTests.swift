@@ -53,4 +53,15 @@ struct ColorAttachmentsTests {
             transfer: kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ,
             matrix: kCVImageBufferYCbCrMatrix_ITU_R_2020))
     }
+
+    @Test("A still's colour space is the one CoreVideo manages the displayed buffer in")
+    func stillColorSpaceFollowsPlayback() throws {
+        let untagged = try #require(ColorAttachments.colorSpace(for: ColorAttachments.presented(.unspecified)))
+        #expect(untagged.name as String? == "kCGColorSpaceCoreMedia709")
+        let sd = ColorAttachments.presented(described(AVCOL_PRI_SMPTE170M, AVCOL_TRC_SMPTE170M, AVCOL_SPC_SMPTE170M))
+        let sdSpace = try #require(ColorAttachments.colorSpace(for: sd))
+        #expect(sdSpace != untagged)
+        let sdr2020 = ColorAttachments.presented(described(AVCOL_PRI_BT2020, AVCOL_TRC_BT2020_10, AVCOL_SPC_BT2020_NCL))
+        #expect(ColorAttachments.colorSpace(for: sdr2020) != nil)
+    }
 }
