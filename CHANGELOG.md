@@ -10,7 +10,13 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **A `FrameExtractor` still carries the colour space playback shows the picture in.** SDR stills
+  were tagged sRGB while their pixels are in the source's own primaries and video transfer. They now
+  carry the space CoreVideo builds from the tags the displayed buffer carries
+  (`kCGColorSpaceCoreMedia709` for BT.709). Against VideoToolbox's own conversion of the same frame,
+  max channel error 9 -> 2 on BT.709, 52 -> 2 on NTSC SMPTE-C, 57 -> 2 on SDR BT.2020.
 
 ## [7.19.0] - 2026-09-26
 
