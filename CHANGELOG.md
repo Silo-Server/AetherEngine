@@ -10,6 +10,10 @@ the public-API contract.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [7.20.0] - 2026-09-27
+
 ### Added
 
 - **`airPlayPictureStaysLocal`.** iOS publishes true while a wireless AirPlay receiver holds the audio
