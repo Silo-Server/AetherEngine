@@ -12,6 +12,17 @@ the public-API contract.
 
 _Nothing yet._
 
+## [7.20.1] - 2026-09-27
+
+### Fixed
+
+- **An in-place load on a reused native host no longer publishes a pause at the seam.** The host
+  stopped observing `timeControlStatus` before pausing the outgoing item, so it kept publishing
+  `.playing`; the next load replayed that on subscribe, treated the transport as already rolled, and
+  let its own pre-roll `.paused` through as a real pause (`loading, playing, paused, playing` within a
+  millisecond). A host raising its transport on an external pause showed it over every
+  auto-advanced episode. `aetherctl play --host-calls reloadnext` reproduces the seam (#661).
+
 ## [7.20.0] - 2026-09-27
 
 ### Added
