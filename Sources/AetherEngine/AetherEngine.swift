@@ -631,7 +631,36 @@ public final class AetherEngine: ObservableObject {
     /// Exposed for diagnostic overlays; hosts should not branch on it. Branch on `videoRoute` instead,
     /// which also separates the two native pipelines (#321).
     @Published public internal(set) var playbackBackend: PlaybackBackend = .none {
-        didSet { recomputeVideoRoute(); recomputeAudioDelivery() }
+        didSet { recomputeVideoRoute(); recomputeAudioDelivery(); recomputeAirPlayPictureStaysLocal() }
+    }
+
+    /// True while a wireless AirPlay receiver holds the audio route and the session's picture cannot
+    /// follow it, so the receiver plays the sound and the picture stays on this device.
+    ///
+    /// That is the software host (VP9, AV1 without a hardware decoder, deinterlaced MPEG-2 / VC-1 /
+    /// H.264, a host's `preferredDecodePath = .software`): it draws into an `AVSampleBufferDisplayLayer`,
+    /// and only its `AVSampleBufferAudioRenderer` follows the route. Nothing fails, so without this a host
+    /// has no way to tell the viewer why the TV shows no picture. iOS only; false everywhere else, and
+    /// false on the native paths, where AVPlayer hands the receiver the stream.
+    @Published public internal(set) var airPlayPictureStaysLocal = false
+
+    nonisolated static func airPlayPictureStaysLocal(backend: PlaybackBackend,
+                                                     wirelessAirPlayRoute: Bool) -> Bool {
+        wirelessAirPlayRoute && backend == .software
+    }
+
+    /// Idempotent, and logged on each change, so a report shows when the receiver lost the picture.
+    func recomputeAirPlayPictureStaysLocal() {
+        let next = Self.airPlayPictureStaysLocal(backend: playbackBackend,
+                                                 wirelessAirPlayRoute: Self.isWirelessAirPlayRoute())
+        guard airPlayPictureStaysLocal != next else { return }
+        airPlayPictureStaysLocal = next
+        EngineLog.emit(
+            next
+                ? "[AirPlay] wireless receiver holds the audio route, but the software path draws the "
+                  + "picture on this device: the receiver plays sound only"
+                : "[AirPlay] picture and audio route agree again",
+            category: .engine)
     }
 
     /// Pipeline actually serving this session (#321), including the reroutes the host never asked for.
@@ -4659,6 +4688,27 @@ public final class AetherEngine: ObservableObject {
         // (device trace: a 720p50 timeshift archive played clean on the native path and visibly
         // stuttered on the software one). Declared-interlaced archives still route software via
         // the field-order policy above - the #232 refute probe cannot run without a rewind.
+        if probeOpened, VideoRoutingPolicy.promotesForwardOnlySourceToSequential(
+            isSourceSeekable: probe.isSourceSeekable,
+            isLive: options.isLive,
+            declaredSequential: options.sequentialOrigin,
+            isCustomSource: isCustomSource,
+            routedSoftware: useSoftwarePath,
+            preferred: options.preferredDecodePath,
+            containerDurationSeconds: probe.duration
+        ) {
+            // Written into loadedOptions as well, so every rebuild of this session (AirPlay LAN swap,
+            // audio switch, background return) reopens it as the sequential origin it turned out to be.
+            options.sequentialOrigin = true
+            options.declaredDurationSeconds = probe.duration
+            loadedOptions.sequentialOrigin = true
+            loadedOptions.declaredDurationSeconds = probe.duration
+            EngineLog.emit(
+                "[AetherEngine] forward-only source with a container duration of "
+                + "\(String(format: "%.1f", probe.duration))s: serving it as a sequential origin",
+                category: .engine
+            )
+        }
         if !probe.isSourceSeekable && !options.isLive {
             if options.sequentialOrigin {
                 if !useSoftwarePath {
@@ -6304,10 +6354,36 @@ public final class AetherEngine: ObservableObject {
               AirPlayPlaylistDecision.routeChangeNeedsReload(
                 isRemoteHLSBypass: loadedOptions.nativeRemoteHLS,
                 bypassServesLoopbackOrigin: remoteHLSSubtitleProxy != nil) else { return }
+        if swapsItemForAirPlayEdge() { return }
         EngineLog.emit("[AirPlay] external playback \(wantAirPlay ? "active (wireless) -> LAN reload" : "ended -> loopback reload")"
                        + (loadedOptions.nativeRemoteHLS ? " (remote-HLS bypass on its #316 subtitle origin)" : ""),
                        category: .engine)
         Task { try? await reloadAtCurrentPosition() }
+    }
+
+    /// A sequential origin crosses an AirPlay edge by swapping the item, not by rebuilding the session.
+    /// A rebuild reopens the source, and such a source can only be read again from byte 0: the reload
+    /// resumed at 0 instead of the playhead and then sat seeking while the producer re-read the prefix.
+    /// Nothing about the session has to change for the hop anyway. The server already listens on every
+    /// interface and keeps every segment it cut, so only the address AVPlayer is handed differs (the LAN
+    /// IP and the receiver's playlist, or the loopback again when the receiver lets go).
+    @MainActor
+    private func swapsItemForAirPlayEdge() -> Bool {
+        guard loadedOptions.sequentialOrigin, !loadedOptions.isLive, !loadedOptions.nativeRemoteHLS,
+              let host = nativeHost, let session = nativeVideoSession,
+              let loopback = session.servingMasterPlaylist
+                ? session.masterPlaylistURL : session.mediaPlaylistURL else { return false }
+        let position = currentTime
+        let served = airPlayAdjustedPlayback(url: loopback, session: session)
+        nativeSubtitleRenditionsServed = served.subtitleRenditionsServed
+        EngineLog.emit(
+            "[AirPlay] external playback \(airPlayActive ? "active (wireless)" : "ended") on a sequential "
+            + "origin -> item swap to \(served.url.absoluteString) at \(String(format: "%.2f", position))s "
+            + "(the source cannot be reopened past byte 0)",
+            category: .engine)
+        host.swapItem(url: served.url, startPosition: position)
+        armAirPlayProgressWatchdog(gen: loadGeneration, position: position)
+        return true
     }
 
     /// Re-read external playback after a session-preserving reload and act on it if it really changed (#227).
@@ -7103,6 +7179,16 @@ public final class AetherEngine: ObservableObject {
             }
             lifecycleObservers.append(observer)
         }
+
+        #if os(iOS)
+        let routeObserver = nc.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: AVAudioSession.sharedInstance(), queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.recomputeAirPlayPictureStaysLocal() }
+        }
+        lifecycleObservers.append(routeObserver)
+        #endif
 
         // Foreign-session interruption handling (Sodalite device-verify 2026-07-15): a live-camera
         // PiP re-claims the audio session on every play() and the system pauses AVPlayer ~10ms after
