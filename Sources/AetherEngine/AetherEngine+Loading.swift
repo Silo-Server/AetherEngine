@@ -1843,6 +1843,12 @@ extension AetherEngine {
         host.onFirstHDR10PlusDetected = { [weak self] in
             Task { @MainActor in self?.handleHDR10PlusDetected() }
         }
+        host.onDecodedVideoFormat = { [weak self, weak host] format in
+            Task { @MainActor in
+                guard let self, let host, self.softwareHost === host else { return }
+                self.decodedVideoFormat = format
+            }
+        }
         // SW host provides session-relative edge on each tick; publishLiveWindow is a no-op when liveWindow is nil.
         host.onLiveEdge = { [weak self] edge in
             self?.publishLiveWindow(edgeSessionTime: edge)

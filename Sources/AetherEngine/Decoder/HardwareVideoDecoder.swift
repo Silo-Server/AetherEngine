@@ -25,6 +25,11 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// mirror SoftwareVideoDecoder.extractHDR10PlusBytes). Flag kept so host wiring stays identical to SW path.
     var onFirstHDR10PlusDetected: (@Sendable () -> Void)?
     var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)?
+    var onDecodedFormat: (@Sendable (DecodedVideoFormat) -> Void)?
+    private var streamColor = ColorDescription.unspecified
+    private var streamCodecID = AV_CODEC_ID_NONE
+    private var streamProfile = AV_PROFILE_UNKNOWN
+    private var reportedPixelBufferType: OSType = 0
 
     /// Skip pre-seek RASL frames to avoid the "fast forward" effect; decoded for reference but not delivered.
     /// Guarded by `skipLock` not `lock`: close() holds `lock` across VTDecompressionSessionWaitForAsynchronousFrames,
@@ -162,6 +167,9 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let isHDRTransfer = ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc)
         let use10Bit = bitsPerSample > 8 || isHDRTransfer
 
+        streamColor = ColorDescription(codecpar: codecpar)
+        streamCodecID = codecpar.pointee.codec_id
+        streamProfile = codecpar.pointee.profile
         self.colorPrimaries = ColorAttachments.primaries(codecpar.pointee.color_primaries)
         self.colorTransfer = ColorAttachments.transfer(codecpar.pointee.color_trc)
         self.colorMatrix = ColorAttachments.matrix(codecpar.pointee.color_space)
@@ -413,7 +421,25 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             CVBufferRemoveAttachment(imageBuffer, kCVImageBufferPixelAspectRatioKey)
         }
 
+        reportDecodedFormat(imageBuffer)
         onFrame?(imageBuffer, pts, nil)
+    }
+
+    /// VideoToolbox decodes straight into the display buffer, so the buffer IS the decoded picture; its
+    /// colour is what this decoder attached, which is the stream's declaration.
+    private func reportDecodedFormat(_ buffer: CVImageBuffer) {
+        guard let onDecodedFormat else { return }
+        let type = CVPixelBufferGetPixelFormatType(buffer)
+        guard type != reportedPixelBufferType else { return }
+        reportedPixelBufferType = type
+        onDecodedFormat(DecodedVideoFormat(
+            frame: VideoStreamFormat(
+                pixelFormat: DecodedVideoFormat.libavPixelFormat(forPixelBufferType: type),
+                declaredBitDepth: 0,
+                color: streamColor,
+                codecID: streamCodecID,
+                profile: streamProfile),
+            pixelBufferFormat: DecodedVideoFormat.fourCC(type)))
     }
 }
 

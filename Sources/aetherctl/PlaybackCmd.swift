@@ -527,6 +527,17 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         }
         .store(in: &cancellables)
 
+    // AE#658: what the engine's own decoder produced; silent on the native path, where AVPlayer decodes.
+    engine.$decodedVideoFormat
+        .compactMap { $0 }
+        .removeDuplicates()
+        .sink { d in
+            print("  DECODED \(d.frame.pixelFormat ?? "?") depth=\(d.frame.bitDepth.map(String.init) ?? "?") "
+                  + "primaries=\(d.frame.colorPrimaries ?? "-") transfer=\(d.frame.transfer ?? "-") "
+                  + "matrix=\(d.frame.matrix ?? "-") range=\(d.frame.range ?? "-") -> \(d.pixelBufferLabel)")
+        }
+        .store(in: &cancellables)
+
     let options = LoadOptions(
         suppressDisplayCriteria: true,
         httpHeaders: httpHeaders,

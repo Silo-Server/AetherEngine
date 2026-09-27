@@ -29,6 +29,11 @@ func runProbe(url: URL, detecting: ProbeDetail = []) -> Int32 {
     print("Duration:    \(duration)s")
     print("Video:       codec=\(codec) resolution=\(res) fps=\(rate)")
     print("  format:    \(probe.videoFormat)")
+    if let f = probe.videoStreamFormat {
+        print("  pixels:    \(f.pixelFormat ?? "-") depth=\(f.bitDepth.map { "\($0)-bit" } ?? "-") profile=\(f.profile ?? "-")")
+        print("  colour:    primaries=\(f.colorPrimariesLabel ?? "-") transfer=\(f.transferLabel ?? "-") "
+              + "matrix=\(f.matrixLabel ?? "-") range=\(f.rangeLabel ?? "-")")
+    }
     if probe.isDolbyVision {
         print("  HDR/DV:    Dolby Vision signaled")
     }
@@ -47,6 +52,8 @@ func runProbe(url: URL, detecting: ProbeDetail = []) -> Int32 {
             let atmos = track.isAtmos ? " [Atmos]" : ""
             let def = track.isDefault ? " (default)" : ""
             print("  [\(track.id)] codec=\(track.codec) channels=\(track.channels) lang=\(lang)\(atmos)\(def)")
+            print("       rate=\(track.sampleRate) Hz bits=\(track.bitsPerSample) fmt=\(track.sampleFormat ?? "-") "
+                  + "layout=\(track.channelLayout ?? "-") profile=\(track.profile ?? "-")")
             print("       title=\(track.name)")
         }
     }
