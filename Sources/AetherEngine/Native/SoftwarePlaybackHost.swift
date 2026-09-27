@@ -933,6 +933,7 @@ final class SoftwarePlaybackHost {
 
         // AudioOutput owns the AVSampleBufferRenderSynchronizer (master clock). Created unconditionally: video-only previously got no clock (frozen frame, currentTime=0). Layer attached in play() after the engine hangs it in the view hierarchy (attaching free-floating fails FigVideoQueueRemote -12080 on tvOS 26+).
         self.audioOutput = AudioOutput()
+        self.audioOutput?.volume = volume
         self.audioOutput?.setPresentationOffset(seconds: audioDelaySeconds)   // AE#464
 
         // Reset the live feeder state for the new session.
@@ -1620,9 +1621,9 @@ final class SoftwarePlaybackHost {
         isVideoReadyForDisplay = false
     }
 
-    var volume: Float {
-        get { audioOutput?.volume ?? 1.0 }
-        set { audioOutput?.volume = newValue }
+    /// #660: held here, not only on the output, because the engine sets it before `load()` builds one.
+    var volume: Float = 1.0 {
+        didSet { audioOutput?.volume = volume }
     }
 
     // MARK: - Demux loop
