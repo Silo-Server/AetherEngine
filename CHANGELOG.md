@@ -12,6 +12,20 @@ the public-API contract.
 
 _Nothing yet._
 
+## [7.21.0] - 2026-09-27
+
+### Added
+
+- **The stream format a stats panel needs, from the engine (#658).** `sourceVideoStreamFormat` (and
+  `SourceProbe.videoStreamFormat`) is a `VideoStreamFormat`: pixel format, bit depth, colour primaries,
+  transfer, matrix, range and profile in libav's names, with viewer labels alongside ("BT.2020",
+  "PQ (SMPTE ST 2084)", "Limited"). A field the stream leaves unspecified stays nil rather than reading
+  as BT.709. `decodedVideoFormat` is what the engine's own decoder produced and the CoreVideo buffer it
+  was displayed from ("P010 (x420)"), republished on change; it is nil on the native routes, where
+  AVPlayer decodes and no frame passes through the engine. `TrackInfo` gains `sampleRate`,
+  `bitsPerSample`, `sampleFormat`, `channelLayout` and `profile`, the last being where DTS:X and
+  TrueHD Atmos show up. `aetherctl probe` and `aetherctl play` print all of it.
+
 ## [7.20.1] - 2026-09-27
 
 ### Fixed
