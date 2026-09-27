@@ -12,6 +12,16 @@ the public-API contract.
 
 _Nothing yet._
 
+## [7.21.1] - 2026-09-27
+
+### Fixed
+
+- **A software session keeps the volume the host app set.** The engine applies its stored volume to a
+  new host before `load()`, and `SoftwarePlaybackHost` and `AudioPlaybackHost` forwarded that only to
+  the `AudioOutput` that `load()` builds later, so the write was dropped and every software session
+  started at full volume, with `volume` reading 1.0 until then. Both hosts now hold the volume and
+  hand it to each output they build (#660).
+
 ## [7.21.0] - 2026-09-27
 
 ### Added
