@@ -2119,6 +2119,10 @@ final class NativeAVPlayerHost {
         renderedTime = 0
         duration = 0
         rate = 0
+        // The observation was invalidated above, so the pause just issued is never published. Left at the
+        // outgoing item's `.playing`, the next session's sink reads a roll on subscribe and then publishes
+        // its own pre-roll `.paused` as a real pause (a host raises its transport on it).
+        timeControlStatus = .paused
         // The AVAudioSession is NOT released here. Teardown ordering is the engine's call, not the host's:
         // AetherEngine.stopInternal deactivates once every render path is quiesced (#215).
     }

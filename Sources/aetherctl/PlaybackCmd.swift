@@ -580,6 +580,14 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
                      failure.kind.rawValue))
     }
     defer { escalationSub.cancel() }
+    // `reloadnext`: every published state, because what a host reacts to at an episode seam is a
+    // transition that lasts a millisecond and never shows up in the once-a-second status line.
+    let stateTraceStart = Date()
+    let stateTrace = hostCalls.contains("reloadnext") ? engine.$state.sink { state in
+        print(String(format: "  STATE %@ t=%.3f", String(describing: state),
+                     Date().timeIntervalSince(stateTraceStart)))
+    } : nil
+    defer { stateTrace?.cancel() }
     // #311: installed BEFORE the load on purpose. The engine holds it and arms the host it builds,
     // which is the documented usage and the part a host would otherwise have to re-do per load.
     let frameProbe = frameTimes ? FrameTimeProbe() : nil
@@ -613,6 +621,13 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
             liveOptions.isLive = true
             liveOptions.dvrWindowSeconds = 1800
             try await engine.load(url: url, options: liveOptions)
+        }
+        // The host's episode seam: the next load on the same engine while the first is still playing,
+        // with no stop() in between, so the native host is reused.
+        if hostCalls.contains("reloadnext") {
+            try await Task.sleep(for: .seconds(4))
+            print("  HOSTCALL reload in place")
+            _ = try await engine.load(url: url, startPosition: startPosition, options: options)
         }
     } catch {
         print("LOAD FAILED: \(error)")
@@ -677,7 +692,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
             // exists (the foreground retune's hold-paused policy). Resumed at tick 8.
             print("  HOSTCALL pause() right after load")
             engine.pause()
-        case "reloadlive", "seekback", "overlapseek", "ratehold-tail", "pauseseek", "pausehold", "still", "stallclock", "pausereload", "playreload", "extplayreload":
+        case "reloadlive", "reloadnext", "seekback", "overlapseek", "ratehold-tail", "pauseseek", "pausehold", "still", "stallclock", "pausereload", "playreload", "extplayreload":
             break  // reloadlive handled at load time, seekback/overlapseek/pauseseek in the telemetry loop
         case "nativesubs":
             break  // Sodalite#156, read at load time into LoadOptions.prepareNativeSubtitles
@@ -685,7 +700,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
             || call.hasPrefix("subson") || call.hasPrefix("nativerender"):
             break  // #433 / Sodalite#156, all in the telemetry loop; `@N` picks the tick
         default:
-            print("  HOSTCALL unknown '\(call)' (use play,extractor,setrate,ratehold,pausestart,reloadlive,seekback,seekfar,overlapseek,pauseseek,pausehold,still,stallclock,pausereload,playreload,extplayreload,nativesubs,nativerender,subsoff,subson)")
+            print("  HOSTCALL unknown '\(call)' (use play,extractor,setrate,ratehold,pausestart,reloadlive,reloadnext,seekback,seekfar,overlapseek,pauseseek,pausehold,still,stallclock,pausereload,playreload,extplayreload,nativesubs,nativerender,subsoff,subson)")
         }
     }
     defer { if let frameExtractor { Task { await frameExtractor.shutdown() } } }

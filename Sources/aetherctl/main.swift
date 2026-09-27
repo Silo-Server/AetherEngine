@@ -79,7 +79,7 @@ func printUsage() {
                  [--drop-audio]
                  [--sequential-origin] [--declared-duration S]
              [--max-concurrent-requests N]
-                     [--audio-stats] [--host-calls play,extractor,setrate,pausestart,reloadlive,seekback,seekfar,pauseseek,pausereload,playreload,extplayreload] <url>
+                     [--audio-stats] [--host-calls play,extractor,setrate,pausestart,reloadlive,seekback,seekfar,pauseseek,pausereload,playreload,extplayreload,reloadnext] <url>
                      (full load+play session smoke test; --subs activates the first
                       matching embedded subtitle track and logs overlay cues;
                       --audio-stats taps decoded PCM and prints per-second audio lead
