@@ -21,6 +21,8 @@ protocol VideoDecodingPipeline: AnyObject, Sendable {
     /// Only the software decoder produces it; VideoToolbox surfaces no A53 side data (H.264/HEVC
     /// never route through the SW host, so nothing is missed there).
     var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)? { get set }
+    /// AE#658: the decoded format and its display buffer, reported on the first frame and on change.
+    var onDecodedFormat: (@Sendable (DecodedVideoFormat) -> Void)? { get set }
     var skipUntilPTS: CMTime? { get set }
 
     /// AE#492: the decoder's current feed epoch. A caller that decides a batch of packets is

@@ -995,6 +995,9 @@ public struct SourceProbe: Sendable {
     public let isDolbyVision: Bool
     /// Dolby Vision profile number (5, 7, 8, 10) read from the dvcC/dvvC configuration record; nil when not DV.
     public let dvProfile: Int?
+    /// AE#658: pixel format, bit depth, colour description and profile of the video stream; nil when
+    /// the source has no video.
+    public let videoStreamFormat: VideoStreamFormat?
     /// HDR10+ (ST 2094-40) dynamic metadata was SEEN in this source's video.
     ///
     /// Always `false` unless the probe was asked for `.hdr10Plus` (the container carries no such declaration,
@@ -1027,8 +1030,10 @@ public struct SourceProbe: Sendable {
         audioTracks: [TrackInfo],
         subtitleTracks: [TrackInfo],
         metadata: MediaMetadata = MediaMetadata(title: nil, artist: nil, album: nil, artworkData: nil),
-        isLive: Bool = false
+        isLive: Bool = false,
+        videoStreamFormat: VideoStreamFormat? = nil
     ) {
+        self.videoStreamFormat = videoStreamFormat
         self.url = url
         self.durationSeconds = durationSeconds
         self.videoFormat = videoFormat
@@ -1142,7 +1147,26 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
     /// track. Hosts can avoid presenting overlay controls that cannot affect it.
     public let isNativelyRenderedSubtitle: Bool
 
-    public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, bitrate: Int64 = 0, isDefault: Bool, isForced: Bool = false, isHearingImpaired: Bool = false, isCommentary: Bool = false, isAtmos: Bool = false, assHeader: String? = nil, isExternal: Bool = false, isNativelyRenderedSubtitle: Bool = false) {
+    /// AE#658, audio only: sample rate in Hz, 0 when undeclared.
+    public let sampleRate: Int
+    /// AE#658, audio only: bits per sample the stream carries (`bits_per_raw_sample`), 0 where the codec
+    /// has no fixed depth (AAC, AC-3, E-AC-3, Opus decode to float and have none to report).
+    public let bitsPerSample: Int
+    /// AE#658, audio only: the decoder's output sample format in libav's names ("fltp", "s32p", "s16"),
+    /// nil when the probe had no decoder for the stream.
+    public let sampleFormat: String?
+    /// AE#658, audio only: the channel layout as libav describes it ("stereo", "5.1(side)", "7.1").
+    public let channelLayout: String?
+    /// AE#658: codec profile as libavcodec names it ("LC", "DTS-HD MA + DTS:X", "Dolby TrueHD + Dolby Atmos"),
+    /// nil when undeclared. This is where DTS:X and TrueHD Atmos show up; `isAtmos` covers E-AC-3 JOC only.
+    public let profile: String?
+
+    public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, bitrate: Int64 = 0, isDefault: Bool, isForced: Bool = false, isHearingImpaired: Bool = false, isCommentary: Bool = false, isAtmos: Bool = false, assHeader: String? = nil, isExternal: Bool = false, isNativelyRenderedSubtitle: Bool = false, sampleRate: Int = 0, bitsPerSample: Int = 0, sampleFormat: String? = nil, channelLayout: String? = nil, profile: String? = nil) {
+        self.sampleRate = sampleRate
+        self.bitsPerSample = bitsPerSample
+        self.sampleFormat = sampleFormat
+        self.channelLayout = channelLayout
+        self.profile = profile
         self.id = id
         self.name = name
         self.codec = codec

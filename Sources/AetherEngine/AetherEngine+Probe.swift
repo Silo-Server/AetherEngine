@@ -317,6 +317,7 @@ extension AetherEngine {
         var width: Int32 = 0
         var height: Int32 = 0
         var dvProfileNum: Int? = nil
+        var streamFormat: VideoStreamFormat? = nil
         let videoIdx = demuxer.videoStreamIndex
         if videoIdx >= 0, let stream = demuxer.stream(at: videoIdx) {
             detectedFormat = Self.detectVideoFormat(stream: stream)
@@ -325,6 +326,7 @@ extension AetherEngine {
             width = stream.pointee.codecpar.pointee.width
             height = stream.pointee.codecpar.pointee.height
             dvProfileNum = Self.dvProfile(stream: stream)
+            streamFormat = VideoStreamFormat(codecpar: stream.pointee.codecpar)
         }
         let codecName: String? = {
             guard detectedCodecID != AV_CODEC_ID_NONE,
@@ -352,7 +354,8 @@ extension AetherEngine {
             audioTracks: demuxer.audioTrackInfos(),
             subtitleTracks: demuxer.subtitleTrackInfos(),
             metadata: demuxer.mediaMetadata(),
-            isLive: isLive
+            isLive: isLive,
+            videoStreamFormat: streamFormat
         )
     }
 

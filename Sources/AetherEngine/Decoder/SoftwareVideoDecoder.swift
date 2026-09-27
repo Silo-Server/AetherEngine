@@ -22,6 +22,20 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     var onFirstHDR10PlusDetected: (@Sendable () -> Void)?
     var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)?
 
+    /// AE#658: fires (decode thread) on the first displayed frame and whenever the decoded format or the
+    /// display buffer's format changes. Guarded by `lock`, like everything `emit` reads.
+    var onDecodedFormat: (@Sendable (DecodedVideoFormat) -> Void)?
+    private var decodedFormatKey: DecodedFormatKey?
+    private var reportedFormatKey: DecodedFormatKey?
+
+    /// The decoder's own output, taken before a deinterlace graph can rewrite the frame (the hardware
+    /// graph hands `emit` a VideoToolbox surface whose pixel format says nothing about the decode).
+    struct DecodedFormatKey: Equatable {
+        var pixelFormat: Int32
+        var color: ColorDescription
+        var pixelBufferType: OSType = 0
+    }
+
     /// True when the source is >8-bit (HDR10, AV1 HDR).
     private var use10Bit = false
 
@@ -271,6 +285,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             // AE#499: fill the fields the VUI left open from the container's declaration BEFORE any
             // consumer reads the frame, for the same reason the timestamp repair below runs here.
             ColorDescription.backfill(frame: f, container: containerColor)
+            decodedFormatKey = DecodedFormatKey(pixelFormat: f.pointee.format, color: ColorDescription(frame: f))
 
             // #407: repair the frame's own timestamp BEFORE anything reads it. A frame that reaches
             // the renderer with no PTS is unschedulable and gets dropped there, so every consumer
@@ -410,6 +425,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             guard let converted = convertFrameToPixelBuffer(f) else { return }
             pixelBuffer = converted
         }
+
+        reportDecodedFormat(pixelBuffer: pixelBuffer)
 
         let pts = f.pointee.pts
         let cmPTS: CMTime
@@ -558,6 +575,21 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
               let out = dst else { return nil }
         guard VTPixelTransferSessionTransferImage(session, from: src, to: out) == noErr else { return nil }
         return out
+    }
+
+    private func reportDecodedFormat(pixelBuffer: CVPixelBuffer) {
+        guard let onDecodedFormat, var key = decodedFormatKey else { return }
+        key.pixelBufferType = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        guard key != reportedFormatKey else { return }
+        reportedFormatKey = key
+        onDecodedFormat(DecodedVideoFormat(
+            frame: VideoStreamFormat(
+                pixelFormat: AVPixelFormat(rawValue: key.pixelFormat),
+                declaredBitDepth: 0,
+                color: key.color,
+                codecID: codecContext?.pointee.codec_id ?? AV_CODEC_ID_NONE,
+                profile: codecContext?.pointee.profile ?? AV_PROFILE_UNKNOWN),
+            pixelBufferFormat: DecodedVideoFormat.fourCC(key.pixelBufferType)))
     }
 
     // MARK: - AVFrame → CVPixelBuffer (sws_scale)

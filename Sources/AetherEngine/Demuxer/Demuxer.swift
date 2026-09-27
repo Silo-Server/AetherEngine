@@ -1313,6 +1313,7 @@ public final class Demuxer: @unchecked Sendable {
         // [Events] format line). Surfaced for LoadOptions.preserveASSMarkup hosts.
         var assHeader: String? = nil
         let codecID = codecpar.pointee.codec_id
+        let isAudio = codecpar.pointee.codec_type == AVMEDIA_TYPE_AUDIO
         if codecID == AV_CODEC_ID_ASS || codecID == AV_CODEC_ID_SSA,
            let extradata = codecpar.pointee.extradata,
            codecpar.pointee.extradata_size > 0 {
@@ -1335,8 +1336,26 @@ public final class Demuxer: @unchecked Sendable {
             isHearingImpaired: isHearingImpaired,
             isCommentary: isCommentary,
             isAtmos: isAtmos,
-            assHeader: assHeader
+            assHeader: assHeader,
+            sampleRate: isAudio ? Int(codecpar.pointee.sample_rate) : 0,
+            bitsPerSample: isAudio ? Int(max(codecpar.pointee.bits_per_raw_sample, 0)) : 0,
+            sampleFormat: isAudio ? Self.sampleFormatName(codecpar.pointee.format) : nil,
+            channelLayout: isAudio ? Self.channelLayoutDescription(&codecpar.pointee.ch_layout) : nil,
+            profile: VideoStreamFormat.profileName(codecID: codecID, profile: codecpar.pointee.profile)
         )
+    }
+
+    static func sampleFormatName(_ raw: Int32) -> String? {
+        let fmt = AVSampleFormat(rawValue: raw)
+        guard fmt != AV_SAMPLE_FMT_NONE else { return nil }
+        return av_get_sample_fmt_name(fmt).map { String(cString: $0) }
+    }
+
+    static func channelLayoutDescription(_ layout: UnsafePointer<AVChannelLayout>) -> String? {
+        guard layout.pointee.nb_channels > 0 else { return nil }
+        var buffer = [CChar](repeating: 0, count: 64)
+        guard av_channel_layout_describe(layout, &buffer, buffer.count) > 0 else { return nil }
+        return String(cString: buffer)
     }
 
     /// The language to publish for a stream. A disc keeps its track languages in its navigation data

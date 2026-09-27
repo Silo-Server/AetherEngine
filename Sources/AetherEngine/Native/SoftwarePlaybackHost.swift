@@ -93,6 +93,9 @@ final class SoftwarePlaybackHost {
     /// upgrade the published `videoFormat` from `.hdr10` → `.hdr10Plus`.
     nonisolated(unsafe) var onFirstHDR10PlusDetected: (@Sendable () -> Void)?
 
+    /// AE#658: forwarded from the video decoder, off-main.
+    nonisolated(unsafe) var onDecodedVideoFormat: (@Sendable (DecodedVideoFormat) -> Void)?
+
     /// #131: forwarded from the video decoder; decoded-frame A53 cc_data triplets, presentation order.
     nonisolated(unsafe) var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)?
 
@@ -862,6 +865,9 @@ final class SoftwarePlaybackHost {
 
         videoDecoder.onFirstHDR10PlusDetected = { [weak self] in
             self?.onFirstHDR10PlusDetected?()
+        }
+        videoDecoder.onDecodedFormat = { [weak self] format in
+            self?.onDecodedVideoFormat?(format)
         }
         videoDecoder.onA53Captions = { [weak self] triplets, pts in
             self?.onA53Captions?(triplets, pts)
