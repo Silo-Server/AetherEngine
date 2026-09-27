@@ -106,3 +106,44 @@ struct SequentialLongGOPPlaylistTests {
         #expect(frames == 720, "the listed segments carry \(frames) of 720 video frames:\n\(playlist)")
     }
 }
+
+/// Device log 2026-09-27: an AirPlay receiver had prefetched to seg20, the hop back swapped in a
+/// loopback item at 22.8 s, and its first fetch was seg5. The contiguity scan from there read the
+/// hole the cutter left at seg7 as a gap, asked for a restart, and the sequential origin's refusal
+/// published "Source cannot be repositioned" over a session that had every segment it needed.
+@Suite("A sequential origin serves a resident backward target from the cache")
+struct SequentialBackwardTargetTests {
+
+    private final class Recorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _indices: [Int] = []
+        func record(_ i: Int) { lock.lock(); _indices.append(i); lock.unlock() }
+        var indices: [Int] { lock.lock(); defer { lock.unlock() }; return _indices }
+    }
+
+    @Test("a backward jump across a cutter hole restarts nothing")
+    func backwardAcrossHoleKeepsProducer() throws {
+        let cache = SegmentCache(forwardWindow: 60, backwardWindow: 60)
+        defer { cache.close() }
+        let recorder = Recorder()
+        let plan = (0..<30).map { i in
+            HLSVideoEngine.Segment(startPts: Int64(i) * 4000, endPts: Int64(i + 1) * 4000,
+                                   startSeconds: Double(i) * 4.0, durationSeconds: 4.0)
+        }
+        let provider = VideoSegmentProvider(
+            cache: cache, segments: plan, codecsString: "avc1.64001F,fLaC", supplementalCodecs: nil,
+            resolution: (1280, 720), videoRange: .sdr, frameRate: 23.976, hdcpLevel: nil,
+            sourceBitrate: 3_000_000, sequentialAppendPlaylist: true,
+            restartHandler: { recorder.record($0) })
+        for i in 0...20 {
+            let hole = i == 1 || i == 7
+            provider.appendSequentialSegmentDuration(index: i, durationSeconds: hole ? 0 : 4)
+            if !hole { cache.store(index: i, data: Data(repeating: 0x5A, count: 8)) }
+        }
+
+        _ = provider.mediaSegmentURL(at: 20)
+        let url = provider.mediaSegmentURL(at: 5)
+        #expect(url != nil)
+        #expect(recorder.indices.isEmpty, "restart requested at \(recorder.indices)")
+    }
+}

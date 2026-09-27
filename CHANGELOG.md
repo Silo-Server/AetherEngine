@@ -35,6 +35,10 @@ the public-API contract.
   first GOP), and AVPlayer stalled at the end of seg0. Audio now follows the video cut there, as on
   live. The finalize reports are also anchored on the pump's first segment, so a skipped index known
   before seg0 is captured no longer holds back every later one.
+- **A backward jump on a sequential origin is served from the cache.** The residency scan read the
+  holes its cutter leaves as a gap and asked for a restart the origin cannot give, which published
+  "Source cannot be repositioned" over a session that held every segment it needed (an AirPlay hop
+  back to the device, 22 s in).
 
 - **A `FrameExtractor` still carries the colour space playback shows the picture in.** SDR stills
   were tagged sRGB while their pixels are in the source's own primaries and video transfer. They now
