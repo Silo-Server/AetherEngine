@@ -245,7 +245,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     /// Order-preserving funnel for sequential finalize reports.
     private func emitSequentialReport(index: Int, duration: Double) {
-        let base = seqNextReportIndex ?? index
+        // Anchored on the pump's first segment, not on the first report: a hole a long first GOP
+        // skipped is known before that segment's capture lands, and anchoring on the hole would
+        // leave every later report waiting for an index below it.
+        let base = seqNextReportIndex ?? min(index, baseIndex)
         seqNextReportIndex = base
         seqReadyReports[index] = duration
         var next = base
@@ -449,6 +452,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// for the segment the bytes ended up in. Pump thread only, like every other routing field.
     private var firstSyncItemPtsBySegment: [Int: Int64] = [:]
     private var pendingAudioSegIndex: Int = 0
+
+    /// A sequential origin's playlist advertises a segment from the VIDEO cut ledger (its EXTINF is
+    /// the distance between two keyframe-gated opens, and a plan index no keyframe opened is a hole
+    /// with no URI). Audio routed by time against the plan would open that hole on its own wherever
+    /// the source's GOP is longer than the stride, and the video after it would land in a file the
+    /// playlist never lists: a remote MKV with an 11 s first GOP lost 4 to 11 s that way and stalled
+    /// AVPlayer at the end of seg0. So there, as on live, audio follows the video cutter.
+    private var audioFollowsVideoCut: Bool { !isLive && onSequentialSegmentFinalized != nil }
 
     /// VOD keyframe-gated cutter: opens each segment at the IRAP that reaches its plan boundary (#92).
     private var vodCutter: VODSegmentCutter
@@ -4040,10 +4051,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                 trackedPacketFree(&fpVar)
                                 continue
                             }
-                            // Rescale FLAC pts to source video TB for segment lookup; live audio follows video cutter.
+                            // Rescale FLAC pts to source video TB for segment lookup; live and
+                            // sequential audio follow the video cutter.
                             let fpSeg: Int
                             if isLive {
                                 fpSeg = liveCurrentSegmentIndex
+                            } else if audioFollowsVideoCut {
+                                fpSeg = vodCutter.current
                             } else {
                                 let fpPtsInVideoTb = av_rescale_q(
                                     fp.pointee.pts,
@@ -4072,10 +4086,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         continue
                     }
                     if audio.stripAacAdts { Self.stripADTSHeader(packet) }
-                    let thisAudioSeg: Int = isLive ? liveCurrentSegmentIndex : 0
+                    let thisAudioSeg: Int = isLive
+                        ? liveCurrentSegmentIndex
+                        : (audioFollowsVideoCut ? vodCutter.current : 0)
                     if let prev = pendingAudioPkt {
                         let prevSeg: Int
-                        if isLive {
+                        if isLive || audioFollowsVideoCut {
                             prevSeg = pendingAudioSegIndex
                         } else {
                             let prevPtsInVideoTb = av_rescale_q(
@@ -4096,7 +4112,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         }
                     }
                     pendingAudioPkt = packet
-                    if isLive { pendingAudioSegIndex = thisAudioSeg }
+                    if isLive || audioFollowsVideoCut { pendingAudioSegIndex = thisAudioSeg }
                     pktPtr = nil
                     continue
                 }
@@ -4173,7 +4189,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
         if let prev = pendingAudioPkt, let audio = audioConfig {
             let prevSeg: Int
-            if isLive {
+            if isLive || audioFollowsVideoCut {
                 prevSeg = pendingAudioSegIndex
             } else {
                 let prevPtsInVideoTb = av_rescale_q(

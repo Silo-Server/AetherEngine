@@ -1359,6 +1359,19 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             // Cache gate: backwardWindow=20 covers Continuous-Audio handover refetches (~7-10 segments
             // backward); unconditional proactive restart re-armed the FLAC bridge and caused audible glitches.
             if cache.peekURL(index: index) != nil {
+                // A sequential origin has no restart to offer (its pump can only read from byte 0)
+                // and keeps every segment it cut, so a resident target is served from the cache.
+                // The contiguity scan below would read the plan indices its cutter left as holes
+                // (no URI, never listed) as a gap and hand the refusal a source failure to publish,
+                // which is what an AirPlay hop back to the loopback item did at 22 s in.
+                if sequentialAppendPlaylist {
+                    EngineLog.emit(
+                        "[HLSVideoEngine] declareTarget backward jump \(previousTarget) -> \(index): "
+                        + "resident on a sequential origin, served from the cache",
+                        category: .session
+                    )
+                    return
+                }
                 let frontier = cache.contiguousForwardFrontier(from: index)
                 let front = activeMarchFront
                 if Self.residentBackwardTargetKeepsProducer(

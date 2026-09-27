@@ -10,7 +10,35 @@ the public-API contract.
 
 ## [Unreleased]
 
+### Added
+
+- **`airPlayPictureStaysLocal`.** iOS publishes true while a wireless AirPlay receiver holds the audio
+  route and the session runs on the software host, whose picture stays on the device while its sound
+  goes to the TV. Nothing fails there, so a host had no way to tell the viewer why the receiver showed
+  no picture.
+
 ### Fixed
+
+- **A URL source that can only be read front to back plays on the native path, and AirPlays with a
+  picture.** An origin that ignores `Range` and names no length (a remote MKV on filesamples.com)
+  was forced onto the software host, which cannot seek on it either and never hands a receiver its
+  picture: AirPlay played the sound only. When the container states a duration the engine now serves
+  such a source as a sequential origin, and an AirPlay hop swaps the item onto the LAN address rather
+  than reopening a source that could only restart from byte 0.
+- **A forward-only source no longer loses its opening.** The cursor reset after the segment plan
+  seeked a source that cannot rewind, which drops the packets the probe had buffered and leaves the
+  Matroska demuxer resyncing wherever the stream had got to: the first GOP of a 30 s clip, 30 s into
+  a remote MKV on the software path.
+- **A sequential origin whose GOP is longer than the segment stride lists all of its media.** Audio
+  opened segments by time while the playlist is built from the video keyframe cuts, so the video
+  after an audio-opened boundary landed in a file the playlist never listed (4 to 11 s of an 11 s
+  first GOP), and AVPlayer stalled at the end of seg0. Audio now follows the video cut there, as on
+  live. The finalize reports are also anchored on the pump's first segment, so a skipped index known
+  before seg0 is captured no longer holds back every later one.
+- **A backward jump on a sequential origin is served from the cache.** The residency scan read the
+  holes its cutter leaves as a gap and asked for a restart the origin cannot give, which published
+  "Source cannot be repositioned" over a session that held every segment it needed (an AirPlay hop
+  back to the device, 22 s in).
 
 - **A `FrameExtractor` still carries the colour space playback shows the picture in.** SDR stills
   were tagged sRGB while their pixels are in the source's own primaries and video transfer. They now

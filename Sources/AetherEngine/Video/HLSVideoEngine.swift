@@ -1431,9 +1431,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
         }
 
         // 6. Reset demuxer cursor to 0 (cue prewarm moved it mid-file). Skipped for live
-        //    (no prewarm, forward-only feed).
+        //    (no prewarm, forward-only feed), and for a forward-only VOD source: the prewarm did not
+        //    run there, so the cursor never left the head, and a seek on a pb that cannot rewind
+        //    drops the probe's buffered packets and leaves matroskadec resyncing from wherever the
+        //    stream has got to (a remote MKV lost its first second, on the software path 30 s).
         if !isLiveSession {
-            dem.seek(to: 0)
+            if dem.isSourceSeekable { dem.seek(to: 0) }
             dem.endIndexPass()      // AE#585: the next read that lands outside a span is playback's
         }
 

@@ -38,6 +38,8 @@ final class ScriptedOriginServer: @unchecked Sendable {
         /// Filler bytes actually written. May be far below or above `declaredLength`.
         var bodyBytes: Int = 0
         var close: Bool = false
+        /// Real bytes to serve instead of the filler; `bodyBytes` is ignored when set.
+        var body: Data? = nil
     }
 
     private let listenFD: Int32
@@ -179,6 +181,15 @@ final class ScriptedOriginServer: @unchecked Sendable {
         guard method != "HEAD" else { return keepAlive }
 
         let sliceBytes = 256 * 1024
+        if let body = r.body {
+            var sent = 0
+            while sent < body.count && !stopped {
+                let n = min(sliceBytes, body.count - sent)
+                guard writeCounting(fd, Array(body[sent..<(sent + n)])) else { return false }
+                sent += n
+            }
+            return keepAlive
+        }
         let slice = [UInt8](repeating: 0x5A, count: sliceBytes)
         var sent = 0
         while sent < r.bodyBytes && !stopped {
