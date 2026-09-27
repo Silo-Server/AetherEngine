@@ -664,7 +664,8 @@ final class FrameDecodeContext: @unchecked Sendable {
         // Without this sws converts every picture with its BT.601 default, which put a 1080p
         // BT.709 colour bar up to 33 levels off in the still while playback showed it right.
         // The matrix comes from the rule the displayed buffer is tagged by, so both agree.
-        let coefficients = sws_getCoefficients(Self.swsColorspace(for: ColorDescription(frame: frame)))
+        let description = ColorDescription(frame: frame)
+        let coefficients = sws_getCoefficients(Self.swsColorspace(for: description))
         sws_setColorspaceDetails(
             swsContext, coefficients, Self.isFullRange(frame) ? 1 : 0,
             coefficients, 1, 0, 1 << 16, 1 << 16)
@@ -705,7 +706,8 @@ final class FrameDecodeContext: @unchecked Sendable {
 
         let data = Data(rgba)
         guard let provider = CGDataProvider(data: data as CFData),
-              let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
+              let colorSpace = ColorAttachments.colorSpace(for: ColorAttachments.presented(description))
+                ?? CGColorSpace(name: CGColorSpace.sRGB) else {
             return nil
         }
         // sws_scale RGBA yields opaque pixels (alpha 0xFF), so alpha is ignorable not premultiplied.
