@@ -153,6 +153,8 @@ func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liv
 private func networkTelemetryFragment(_ telemetry: LiveTelemetry?) -> String {
     guard let telemetry else { return "" }
     var out = ""
+    if let inst = telemetry.instantBitrateMbps { out += String(format: " inst=%.2fMbps", inst) }
+    if let avg = telemetry.averageBitrateMbps { out += String(format: " avg=%.2fMbps", avg) }
     if let mbps = telemetry.networkThroughputMbps { out += String(format: " net=%.2fMbps", mbps) }
     if let rx = telemetry.networkTransferredBytes { out += String(format: " rx=%.1fMB", Double(rx) / 1_048_576) }
     out += String(format: " origin=%.1fMB", Double(telemetry.demuxerBytesFetched) / 1_048_576)
@@ -1322,6 +1324,16 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
     // one when the question is what a host's picker ends up showing.
     let finalSubtitleTracks = engine.subtitleTracks
     let finalActiveSubtitle = engine.activeSubtitleTrackIndex
+    // The settled stats-panel identity. The SOURCE line at load prints before the remote-HLS bypass has
+    // read anything back from AVPlayer's item, so it reads empty there by construction.
+    let settledSource = "SOURCE codec=\(engine.sourceVideoCodecName ?? "nil") "
+        + "\(engine.sourceVideoWidth)x\(engine.sourceVideoHeight) "
+        + "fmt=\(engine.sourceVideoFormat) stream=\(engine.sourceVideoStreamFormat.map { String(describing: $0) } ?? "nil")"
+    let settledAudio = engine.audioTracks.map {
+        "#\($0.id) \($0.name) codec=\($0.codec) ch=\($0.channels) sr=\($0.sampleRate)"
+            + "\($0.profile.map { " profile=\($0)" } ?? "")\($0.isAtmos ? " atmos" : "")"
+    }.joined(separator: ", ")
+    let settledActiveAudio = engine.activeAudioTrackIndex
     if record != nil {
         await engine.stopRecording()
         print("  RECORD final state: \(engine.recordingState)")
@@ -1364,6 +1376,8 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         print("subtitle tracks (* = external): \(listed)")
         print("active subtitle: \(finalActiveSubtitle.map(String.init) ?? "none")")
     }
+    print("settled \(settledSource)")
+    print("audio tracks: \(settledAudio.isEmpty ? "none" : settledAudio) active=\(settledActiveAudio.map(String.init) ?? "none")")
     print("final t=\(String(format: "%.2f", finalTime))s state=\(String(describing: endState)) cues=\(cueCount)")
     let closingWindow = await MainActor.run { lastCues }
     print("WINDOW \(closingWindow.count) cues in the last published window")

@@ -9,9 +9,13 @@ import Foundation
 /// interpret a sub-second decoded queue as the size of the compressed packet cache.
 public struct LiveTelemetry: Equatable, Sendable {
     // Enthusiast section
+    /// Mean rate over the last 10 s of the bytes the session pulled from its source, from the demuxer's
+    /// count on the loopback and software paths. nil until the window spans two ticks. The remote-HLS
+    /// bypass has no demuxer, and what AVPlayer transferred there is buffer fill at link speed rather than
+    /// the stream's rate, so on that route this is the playing variant's declared BANDWIDTH.
     public let instantBitrateMbps: Double?
     /// Lifetime mean rate of the session, over the seconds it spent consuming media rather than over
-    /// wall-clock seconds since it started (AE#514). A pause therefore leaves this value standing
+    /// wall-clock seconds since it started (AE#514). Metered from the same counter as `instantBitrateMbps`; on the remote-HLS bypass it is the variant's declared AVERAGE-BANDWIDTH, or BANDWIDTH where the master omits it. A pause therefore leaves this value standing
     /// still instead of dragging it toward zero for as long as the pause lasts, and so does the tail
     /// after end-of-media. nil until the session has both accrued active time and fetched something:
     /// like `networkThroughputMbps`, a value that cannot be measured yet is a gap, never a zero.
