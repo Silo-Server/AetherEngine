@@ -597,9 +597,13 @@ public final class AetherEngine: ObservableObject {
     @Published public internal(set) var sourceVideoCodecName: String? = nil
 
     /// AE#658: the source video stream's pixel format, bit depth, colour description and profile as the
-    /// container and the probe's decoder declared them, nil before load, on sources without video, and on
-    /// the probe-free native HLS bypass. Companion to `decodedVideoFormat`, which is what the engine's own
-    /// decoder actually produced.
+    /// container and the probe's decoder declared them, nil before load and on sources without video.
+    /// Companion to `decodedVideoFormat`, which is what the engine's own decoder actually produced.
+    ///
+    /// On the probe-free native HLS bypass it is read back from AVPlayer's item video track once that
+    /// resolves: colour from the format description's extensions, profile, bit depth and pixel format from
+    /// its avcC / hvcC record where it carries one (nil otherwise, AV1 and VP9 included). That is the
+    /// DELIVERED stream, which under a server-side transcode is not the file the host's library holds.
     @Published public internal(set) var sourceVideoStreamFormat: VideoStreamFormat? = nil
 
     /// AE#658: the format the engine's software decoder produced and the display buffer it went into,
@@ -2162,8 +2166,20 @@ public final class AetherEngine: ObservableObject {
 
     /// Source video dimensions from the probe. Used as a bitmap-subtitle canvas fallback before the first PCS
     /// is parsed. 0 before load or when source has no video (AetherEngine#28). Also available in SourceProbe.
+    /// On the probe-free native HLS bypass they are the delivered stream's, read back from AVPlayer's item
+    /// track once it resolves, so a capped transcode reports the resolution it is actually playing.
     @Published public private(set) var sourceVideoWidth: Int32 = 0
     @Published public private(set) var sourceVideoHeight: Int32 = 0
+
+    /// The remote-HLS bypass's stand-in for the probe: what AVPlayer parsed of the delivered video.
+    func publishRemoteHLSVideoDescription(_ video: RemoteHLSStreamDescription.Video) {
+        if video.width > 0, video.height > 0 {
+            sourceVideoWidth = video.width
+            sourceVideoHeight = video.height
+        }
+        if let codec = video.codecName { sourceVideoCodecName = codec }
+        sourceVideoStreamFormat = video.format
+    }
     /// Display-width multiplier for non-square source pixels: `sourceVideoWidth * this` is the width
     /// the picture presents at. 1 before load, on square-pixel sources, and whenever the declared
     /// ratio is one the engine refuses to believe (#290), so it is never a number the picture
@@ -6653,7 +6669,20 @@ public final class AetherEngine: ObservableObject {
     /// expects ~0.5-1 s black frame (AVPlayer.replaceCurrentItem tears the surface). Display-criteria handshake
     /// is suppressed (video unchanged). `index` is the container stream index (TrackInfo.id). No-op if
     /// out-of-range, pointing at a non-audio stream, or already active.
+    ///
+    /// Not available on `VideoRoute.remoteBypass`: there `audioTracks` lists what AVPlayer built and is
+    /// informational, the selection belongs to AVFoundation, and a pick is logged and ignored rather than
+    /// turned into a reload the bypass has no audio override for. A host that wants another language on
+    /// that route loads a URL that carries it.
     public func selectAudioTrack(index: Int) {
+        if videoRoute == .remoteBypass {
+            EngineLog.emit(
+                "[AetherEngine] selectAudioTrack(\(index)) ignored: AVPlayer owns the audio selection on "
+                + "the remote-HLS bypass; audioTracks is informational there",
+                category: .engine
+            )
+            return
+        }
         // Forward-only custom sources (incl. live HLS-ingest) can't rewind; rebuilding would re-consume a
         // drained FIFO and stall silently. Logged so a picker that does nothing is explainable.
         if isCustomSource && !customSourceIsSeekable {

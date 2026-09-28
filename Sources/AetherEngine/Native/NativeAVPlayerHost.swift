@@ -163,6 +163,12 @@ final class NativeAVPlayerHost {
     /// spelling the engine publishes elsewhere. Set beside `detectedVideoFormat`, which the engine's sink
     /// reads it with; nil while no video track resolves.
     @Published private(set) var detectedVideoCodecName: String?
+    /// Dimensions and colour description of the delivered video from the same read, for the bypass's
+    /// `sourceVideoWidth` / `sourceVideoHeight` / `sourceVideoStreamFormat`. Set before `detectedVideoFormat`.
+    @Published private(set) var detectedVideoDescription: RemoteHLSStreamDescription.Video?
+    /// The audio tracks AVPlayer built for the item, read at the same two points as the video format.
+    /// The engine publishes them as `audioTracks` on the bypass, where no probe lists them.
+    @Published private(set) var detectedAudioTracks: [RemoteHLSStreamDescription.AudioReading] = []
 
     /// AetherEngine#168 follow-up: fires once when the armed carriage watchdog concludes the master
     /// advertises a video rendition but AVPlayer never built a video track past the grace window
@@ -413,6 +419,9 @@ final class NativeAVPlayerHost {
         /// then tunnels it through a 2-channel MAT carrier, so the route's channel count is not a
         /// statement about the audio and the surround-downmix warning below must not read it as one.
         var audioIsAtmosStreamCopy: Bool = false
+        /// Read the item's audio tracks back into `detectedAudioTracks`. Only the remote-HLS bypass needs
+        /// them; the loopback's probe already listed its audio, and the reads are XPC round trips.
+        var readsBackAudioTracks: Bool = false
     }
 
     /// AE#446 round 5: a fresh item is about to attach, invoked before anything can fetch a playlist
@@ -638,6 +647,7 @@ final class NativeAVPlayerHost {
                     }
                     // #168: publish the item's real dynamic range for the probe-free remote-HLS badge.
                     await self.publishDetectedVideoFormat(from: item)
+                    await self.publishDetectedAudioTracks(from: item)
                     guard self.sessionID == sid else { return }
                     // #168 follow-up: watch for an advertised video rendition that never builds a track
                     // (HEVC-in-MPEG-TS carriage); anchored at readyToPlay so dead origins never arm it.
@@ -707,6 +717,7 @@ final class NativeAVPlayerHost {
                         // #168: the video track can be absent from item.tracks at readyToPlay for HLS;
                         // re-read once playing so the remote-HLS badge settles on the real dynamic range.
                         await self.publishDetectedVideoFormat(from: item)
+                        await self.publishDetectedAudioTracks(from: item)
                     }
                 }
             }
@@ -2085,6 +2096,8 @@ final class NativeAVPlayerHost {
         detectedVideoFormat = nil
         detectedVideoFrameRate = nil
         detectedVideoCodecName = nil
+        detectedVideoDescription = nil
+        detectedAudioTracks = []
         // #168 follow-up: the carriage verdict belongs to the outgoing item.
         carriageWatchdogTask?.cancel()
         carriageWatchdogTask = nil
@@ -2439,9 +2452,11 @@ final class NativeAVPlayerHost {
             let ext = CMFormatDescriptionGetExtensions(cm) as? [String: Any] ?? [:]
             let transfer = ext[kCMFormatDescriptionExtension_TransferFunction as String] as? String
             let fmt = RemoteHLSFormatDetection.videoFormat(transferFunction: transfer, videoSubType: subType)
-            // Rate and codec before format: the engine's format sink reads both when it fires.
+            // Rate, codec and description before format: the engine's format sink reads them when it fires.
             if let rate, rate > 0 { detectedVideoFrameRate = rate }
             detectedVideoCodecName = RemoteHLSFormatDetection.codecName(videoSubType: subType)
+            let description = RemoteHLSStreamDescription.video(from: cm)
+            if detectedVideoDescription != description { detectedVideoDescription = description }
             if detectedVideoFormat != fmt {
                 detectedVideoFormat = fmt
                 EngineLog.emit(
@@ -2453,6 +2468,34 @@ final class NativeAVPlayerHost {
             }
             return
         }
+    }
+
+    /// The audio half of the read above, at the same two points. Language comes from the track, and where
+    /// the track has none (muxed HLS audio rarely does) from the audible option AVPlayer selected.
+    @MainActor
+    private func publishDetectedAudioTracks(from item: AVPlayerItem) async {
+        let sid = sessionID
+        guard sid != 0, playerItem === item, sessionContract.readsBackAudioTracks else { return }
+        var selectedOptionLanguage: String?
+        if let group = try? await item.asset.loadMediaSelectionGroup(for: .audible),
+           let option = item.currentMediaSelection.selectedMediaOption(in: group) {
+            selectedOptionLanguage = option.extendedLanguageTag
+        }
+        var readings: [RemoteHLSStreamDescription.AudioReading] = []
+        for itemTrack in item.tracks {
+            guard let assetTrack = itemTrack.assetTrack, assetTrack.mediaType == .audio else { continue }
+            guard let cm = try? await assetTrack.load(.formatDescriptions).first else { continue }
+            let extendedTag = try? await assetTrack.load(.extendedLanguageTag)
+            let languageCode = try? await assetTrack.load(.languageCode)
+            let language = [extendedTag ?? nil, languageCode ?? nil, selectedOptionLanguage]
+                .compactMap { $0 }.first { !$0.isEmpty && $0 != "und" }
+            if let reading = RemoteHLSStreamDescription.audioReading(
+                from: cm, isEnabled: itemTrack.isEnabled, language: language) {
+                readings.append(reading)
+            }
+        }
+        guard sessionID == sid, playerItem === item else { return }
+        if detectedAudioTracks != readings { detectedAudioTracks = readings }
     }
 
     /// Compact video track summary: dimensions + color attachments (primaries/transfer/matrix). Mismatch vs source-side codecpar signals DV/HDR signaling didn't survive the muxer.

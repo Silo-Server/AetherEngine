@@ -415,6 +415,29 @@ extension AetherEngine {
                 self.applyRemoteHLSDisplayCriteria(format: fmt, options: options)
             }
             .store(in: &nativeCancellables)
+        // What was DELIVERED, which on a capped transcode is not what the host's library holds: without it
+        // a stats panel fell back to the original file's 3840x2160 for a 1280x720 stream. Its own sink,
+        // because a later read can refine the description without changing the dynamic range.
+        // dropFirst on both: a reused host replays the outgoing item's reading on subscribe, before load resets it.
+        host.$detectedVideoDescription
+            .dropFirst()
+            .compactMap { $0 }
+            .sink { [weak self] video in
+                guard let self else { return }
+                self.publishRemoteHLSVideoDescription(video)
+            }
+            .store(in: &nativeCancellables)
+        // No probe lists this route's audio, so AVPlayer's own tracks are the list. Informational: AVPlayer
+        // owns the audio selection here, and `selectAudioTrack` refuses the route rather than reload it.
+        host.$detectedAudioTracks
+            .dropFirst()
+            .sink { [weak self] readings in
+                guard let self else { return }
+                let (tracks, active) = RemoteHLSStreamDescription.audioTracks(readings)
+                self.audioTracks = tracks
+                self.activeAudioTrackIndex = active
+            }
+            .store(in: &nativeCancellables)
         // #168 follow-up: an advertised video rendition that never builds an item track means HEVC carried
         // in MPEG-TS segments, which AVFoundation's HLS demuxer does not support (audio-only, black). The
         // loopback ingest remuxes TS to fMP4 and plays the same stream, so reroute there transparently.
@@ -546,7 +569,9 @@ extension AetherEngine {
                       // #334: the ceiling on silence this path never had. AVPlayer's "gave up" covers an
                       // origin that stops answering; it does not cover one that answers everything while
                       // AVFoundation builds no track, where nothing terminal is ever published.
-                      readinessDeadline: RemoteHLSReadinessDeadline.defaultBudgetSeconds))
+                      readinessDeadline: RemoteHLSReadinessDeadline.defaultBudgetSeconds,
+                      // No probe lists this route's audio, so the item's own tracks are the list.
+                      readsBackAudioTracks: true))
 
         attachRemoteHLSCueClock(host: host, expectedGeneration: bypassGeneration)
 
@@ -562,7 +587,9 @@ extension AetherEngine {
             host.play()
         }
         startMemoryProbe()
-        // No startLiveTelemetrySampler: all sampler counters read the loopback pipeline (demuxer / producer / cache / server), none of which exists on this bypass.
+        // The sampler reads AVPlayer's access log on this route: both bitrates, network rate and transfer,
+        // dropped frames and forward buffer. The loopback counters (producer, muxer, server) read zero.
+        startLiveTelemetrySampler()
     }
 
     /// AE#616: on this bypass `sourceTime` would otherwise be item time, which an origin that restarts
