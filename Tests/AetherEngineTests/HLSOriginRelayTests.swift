@@ -36,7 +36,9 @@ struct HLSOriginRelayAddressingTests {
             string: "https://jf.example.com/Videos/abc/master.m3u8?MediaSourceId=x&api_key=\(secret)")!
         let local = try #require(relay.localURL(for: origin, port: 51234, token: token))
         let text = local.absoluteString
-        for fragment in [secret, "jf", "example", "Videos", "master", "api", "MediaSourceId"] {
+        // Fragments long enough to mean something: the reference is random base64, and a two-letter
+        // fragment ("jf") turns up in it by chance on about one run in twenty (CI, 2026-09-28).
+        for fragment in [secret, "jf.example", "example", "Videos", "master.m3u8", "api_key", "MediaSourceId"] {
             #expect(!text.contains(fragment), "\(fragment) is readable in \(text)")
         }
         #expect(!text.contains("%"), "the reference should need no escaping: \(text)")
