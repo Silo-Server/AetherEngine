@@ -12,6 +12,25 @@ the public-API contract.
 
 _Nothing yet._
 
+## [7.22.0] - 2026-09-28
+
+### Changed
+
+- **The remote-HLS bypass publishes what a stats panel reads.** On `nativeRemoteHLS` (route
+  `.remoteBypass`) the engine published no `liveTelemetry`, an empty `audioTracks` and no delivered
+  video format, so a host fell back to its own metadata for the original file: a 1280x720 H.264 Jellyfin
+  transcode showed as "3840x2160, Main 10, 17 Mbps". Everything is now read from AVPlayer's own item, with
+  no second connection to the origin (#664):
+  - `diagnostics.liveTelemetry` runs on the bypass. The two bitrate fields are what the playing variant
+    declares (BANDWIDTH, and AVERAGE-BANDWIDTH or BANDWIDTH where the master omits it), because what
+    AVPlayer transferred is buffer fill at link speed. Network throughput, transferred bytes, dropped
+    frames and forward buffer come from the access log and the loaded ranges. The loopback counters read 0.
+  - `audioTracks` carries one `TrackInfo` per audio track AVPlayer built (codec, channels, sample rate,
+    profile, Atmos, language), ids from 400000. `selectAudioTrack` is informational on this route and
+    logs instead of acting.
+  - `sourceVideoWidth`, `sourceVideoHeight` and `sourceVideoStreamFormat` describe the stream AVPlayer
+    plays. Under a server-side transcode that is the transcode, not the library's file.
+
 ## [7.21.1] - 2026-09-27
 
 ### Fixed
