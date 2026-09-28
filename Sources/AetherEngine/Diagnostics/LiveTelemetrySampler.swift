@@ -44,42 +44,6 @@ struct RollingWindow<T: AdditiveArithmetic> {
     }
 }
 
-/// Rate of a cumulative session byte counter, in the shape the demuxer meter uses: a 10-second window
-/// of per-tick deltas for the instant rate, the lifetime total for the average. The remote-HLS bypass
-/// feeds it AVPlayer's own session transfer total, because that route has no demuxer to count.
-struct TransferRateMeter {
-    private var window = RollingWindow<Int64>(capacity: 10, zero: 0)
-    /// Highest total seen. A total that falls back (it should not, AE#443 folds retired items in) is
-    /// not counted a second time when it climbs again.
-    private(set) var lifetimeBytes: Int64 = 0
-
-    /// One tick. nil (no access-log entry yet) is a tick in which nothing arrived.
-    mutating func record(sessionBytes: Int64?) {
-        let total = sessionBytes ?? lifetimeBytes
-        window.push(max(0, total - lifetimeBytes))
-        lifetimeBytes = max(lifetimeBytes, total)
-    }
-
-    var windowBytes: Int64 { window.sum }
-
-    /// nil until the window spans time (two samples), like the demuxer-fed instant rate.
-    var instantMbps: Double? {
-        guard window.count >= 2 else { return nil }
-        return Double(window.sum) * 8.0 / Double(window.count) / 1_000_000.0
-    }
-
-    /// Same quotient and the same nil rule as `LiveTelemetrySampler.averageBitrateMbps` (AE#514).
-    func averageMbps(activeSeconds: Double) -> Double? {
-        guard activeSeconds > 0, lifetimeBytes > 0 else { return nil }
-        return Double(lifetimeBytes) * 8.0 / activeSeconds / 1_000_000.0
-    }
-
-    mutating func reset() {
-        window.reset()
-        lifetimeBytes = 0
-    }
-}
-
 /// Value snapshot of every AVFoundation property the native-path tick consumes. Each getter is a
 /// synchronous XPC round-trip to mediaserverd; a busy media server (display-mode change on an HDR
 /// start) turns any main-actor read into a fully blocked main thread and, past the watchdog
@@ -102,6 +66,10 @@ struct NativeAVFReadings: Sendable {
     var contiguousForwardBufferSeconds: Double? = nil
     /// Sum over all access-log events, for the [LagDiag] tick-over-tick drop delta.
     var droppedFramesLifetimeSum: Int = 0
+    /// The current variant's declared BANDWIDTH and AVERAGE-BANDWIDTH, in bits per second, from the
+    /// latest access-log entry. The log reports an undeclared value as negative.
+    var indicatedBitrate: Double = -1
+    var indicatedAverageBitrate: Double = -1
     var currentTimeSeconds: Double = .nan
     var timeControlStatus: AVPlayer.TimeControlStatus = .paused
     var rate: Float = 0
@@ -146,8 +114,6 @@ final class LiveTelemetrySampler {
     private var byteWindow = RollingWindow<Int64>(capacity: 10, zero: 0)   // 10-second rolling window
     private var frameWindow = RollingWindow<Int>(capacity: 10, zero: 0)
     private var bridgeByteWindow = RollingWindow<Int64>(capacity: 10, zero: 0)
-    /// Remote-HLS bypass: AVPlayer's session transfer total stands in for the demuxer counter.
-    private var consumerTransferMeter = TransferRateMeter()
 
     private var lastDemuxerBytes: Int64 = 0
     private var lastBridgeBytes: Int64 = 0
@@ -190,7 +156,6 @@ final class LiveTelemetrySampler {
         byteWindow.reset()
         frameWindow.reset()
         bridgeByteWindow.reset()
-        consumerTransferMeter.reset()
         // Seed from CURRENT counters: a zero seed pushes all pre-start prefetch bytes into tick 1, inflating instant bitrate for ~10 s.
         lastDemuxerBytes = engine?.demuxerBytesFetched ?? 0
         lastBridgeBytes = engine?.audioBridgeOutputBytesLifetime ?? 0
@@ -239,13 +204,24 @@ final class LiveTelemetrySampler {
     enum BitrateCounter: Equatable {
         /// Bytes the engine's demuxer pulled from the source (loopback and software).
         case demuxer
-        /// Bytes AVPlayer transferred, from its access log. The remote-HLS bypass has no demuxer, so this is
-        /// the only count of what the session pulled from the origin there.
-        case consumerTransfer
+        /// The bitrate the playing variant declares, from AVPlayer's access log. The remote-HLS bypass has no
+        /// demuxer, and what AVPlayer transferred is not the stream's rate: a buffer filling after a start or
+        /// a seek pulls at link speed (22.6 Mbps measured for a 3.7 Mbps transcode). The transfer stays in the
+        /// network fields.
+        case declaredVariant
     }
 
     nonisolated static func bitrateCounter(for route: VideoRoute) -> BitrateCounter {
-        route == .remoteBypass ? .consumerTransfer : .demuxer
+        route == .remoteBypass ? .declaredVariant : .demuxer
+    }
+
+    /// Both bitrate fields from the access log's declarations, in Mbps: instant is BANDWIDTH, average is
+    /// AVERAGE-BANDWIDTH, falling back to BANDWIDTH where the master omits it. Undeclared reads nil.
+    nonisolated static func declaredBitrates(indicated: Double, indicatedAverage: Double)
+        -> (instant: Double?, average: Double?) {
+        func mbps(_ bps: Double) -> Double? { bps.isFinite && bps > 0 ? bps / 1_000_000.0 : nil }
+        let instant = mbps(indicated)
+        return (instant, mbps(indicatedAverage) ?? instant)
     }
 
     /// Whether the native branch has the loopback pipeline behind it. On the bypass the producer's A/V gap
@@ -444,12 +420,13 @@ final class LiveTelemetrySampler {
             accumulatedFrameDelaySeconds = nil
         }
 
-        // Remote-HLS bypass: no demuxer, so both rates come from what AVPlayer itself transferred, over
-        // the same window and the same active-seconds divisor. networkTransferredBytes is that total too.
-        if Self.bitrateCounter(for: route) == .consumerTransfer {
-            consumerTransferMeter.record(sessionBytes: networkTransferredBytes)
-            instantBitrateMbps = consumerTransferMeter.instantMbps
-            averageBitrateMbps = consumerTransferMeter.averageMbps(activeSeconds: activeSeconds)
+        // Remote-HLS bypass: no demuxer, so both rates are what the playing variant declares.
+        if Self.bitrateCounter(for: route) == .declaredVariant {
+            let declared = Self.declaredBitrates(
+                indicated: nativeReadings?.indicatedBitrate ?? -1,
+                indicatedAverage: nativeReadings?.indicatedAverageBitrate ?? -1)
+            instantBitrateMbps = declared.instant
+            averageBitrateMbps = declared.average
         }
 
         // Feed the extractor yield gate (#93 startup): nil on non-native paths keeps the
@@ -626,6 +603,8 @@ final class LiveTelemetrySampler {
             let observed = event.observedBitrate
             readings.networkThroughputMbps = observed.isFinite && observed > 0
                 ? observed / 1_000_000.0 : nil
+            readings.indicatedBitrate = event.indicatedBitrate
+            readings.indicatedAverageBitrate = event.indicatedAverageBitrate
         }
         // AE#443: the counters are not. They are totals PER ENTRY, and AVFoundation opens a new entry
         // whenever the playback session changes under it, so reading `.last` publishes a number that
