@@ -2599,8 +2599,10 @@ public final class AetherEngine: ObservableObject {
         // AE#535: and only while the display is eligible for HDR, or the answer is about the window.
         if MasterFallbackDecision.isDisplayRejectionCode(rejection.code), !Self.panelRefusedHDRMaster {
             let eligibleNow = AVPlayer.eligibleForHDRPlayback
+            let switching = displayCriteria.displayModeSwitchInProgress
             if MasterFallbackDecision.shouldLatchPanelRefusal(
-                code: rejection.code, displayEligibleForHDRNow: eligibleNow) {
+                code: rejection.code, displayEligibleForHDRNow: eligibleNow,
+                displaySwitchInProgress: switching) {
                 Self.panelRefusedHDRMaster = true
                 EngineLog.emit(
                     "[DisplayCriteria] panel refused an HDR master (code=\(rejection.code)); this process "
@@ -2608,8 +2610,9 @@ public final class AetherEngine: ObservableObject {
                     category: .engine)
             } else {
                 EngineLog.emit(
-                    "[DisplayCriteria] AE#535 HDR master refused (code=\(rejection.code)) while the display "
-                    + "reads hdrEligible=no; this item falls back, the process does not latch the refusal",
+                    "[DisplayCriteria] HDR master refused (code=\(rejection.code)) while the display reads "
+                    + "hdrEligible=\(eligibleNow ? "yes" : "no") switching=\(switching ? "yes" : "no") "
+                    + "(#535, #667); this item falls back, the process does not latch the refusal",
                     category: .engine)
             }
         }
@@ -4511,20 +4514,46 @@ public final class AetherEngine: ObservableObject {
         //      where criteria are suppressed. The readout answers only around a dynamic-range transition,
         //      so a panel parked in HDR never proves itself and one tvOS 27 box stopped answering at all;
         //      a host that knows better says so, and a wrong claim costs the -11848 fallback, not the item.
-        let criteriaPanelReadout: Bool? =
+        var criteriaPanelReadout: Bool? =
             options.suppressDisplayCriteria ? nil : displayCriteria.currentPanelIsHDR()
-        let panelHDRAfterHandshake = Self.sessionPanelPresentsHDR(
+        var panelHDRAfterHandshake = Self.sessionPanelPresentsHDR(
             hostAsserts: options.panelIsInHDRMode, criteriaReadout: criteriaPanelReadout)
         // AE#459: the ROUTE may assume more than the LABEL may claim. `panelHDRAfterHandshake` stays the
         // label's answer, conservative by design; the route additionally offers an unproven but
         // HDR-eligible display the master and lets AVFoundation's acceptance be the readout `UIScreen`
         // has been measured getting wrong on a panel that was demonstrably presenting HDR. Live is excluded: its fallback is a rejoin at
         // the edge rather than a restored position, and that cost has not been measured.
-        let routingPanelHDR = Self.sessionRoutesAsHDRPanel(
+        var routingPanelHDR = Self.sessionRoutesAsHDRPanel(
             panelPresentsHDR: panelHDRAfterHandshake,
             attemptWhenUnproven: options.attemptsHDRMasterOnUnprovenPanel && !options.isLive,
             displayEligibleForHDR: observedDisplayCaps.supportsHDR,
             panelRefusedHDRMaster: Self.panelRefusedHDRMaster)
+        // AE#667: that acceptance only answers once the panel has arrived. See `unprovenMasterAwaitsSwitchEnd`.
+        if Self.unprovenMasterAwaitsSwitchEnd(
+            routesAsHDR: routingPanelHDR,
+            panelPresentsHDR: panelHDRAfterHandshake,
+            switchRunning: displayCriteria.observedSwitchIsRunning()) {
+            EngineLog.emit(
+                "[DisplayCriteria] unproven HDR master waits for the running switch to end before it is "
+                + "served (#667)",
+                category: .session)
+            await displayCriteria.waitForSwitch(consumesRecord: false, settleCap: .awaitObservedEnd)
+            if loadGeneration != gen {
+                probe.markClosed()
+                if probeOpened {
+                    Task.detached { [probe] in probe.close() }
+                }
+                try checkLoadCurrent(gen)
+            }
+            criteriaPanelReadout = options.suppressDisplayCriteria ? nil : displayCriteria.currentPanelIsHDR()
+            panelHDRAfterHandshake = Self.sessionPanelPresentsHDR(
+                hostAsserts: options.panelIsInHDRMode, criteriaReadout: criteriaPanelReadout)
+            routingPanelHDR = Self.sessionRoutesAsHDRPanel(
+                panelPresentsHDR: panelHDRAfterHandshake,
+                attemptWhenUnproven: options.attemptsHDRMasterOnUnprovenPanel && !options.isLive,
+                displayEligibleForHDR: observedDisplayCaps.supportsHDR,
+                panelRefusedHDRMaster: Self.panelRefusedHDRMaster)
+        }
         sessionPanelHDRReadout = criteriaPanelReadout
         sessionObservedDisplayCaps = observedDisplayCaps
         if routingPanelHDR != panelHDRAfterHandshake {
