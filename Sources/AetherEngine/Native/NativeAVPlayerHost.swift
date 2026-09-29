@@ -114,6 +114,9 @@ final class NativeAVPlayerHost {
     /// duration, and publishing that transient would bounce the engine through `.paused` and back for
     /// what the viewer must not even notice; the real status is republished when the recovery settles.
     private var prematureEndRecoveryInFlight = false
+    /// Uptime at which the last premature-end recovery handed transport back. A rate change AVPlayer
+    /// reported before it belongs to that recovery, even when its main-actor hop runs later.
+    private var prematureEndRecoveryEndedUptime: UInt64 = 0
     /// Mirrors avPlayer.timeControlStatus so the engine can reconcile when AVKit's transport bar, Control Center, or hardware buttons toggle the player externally (without this, engine state goes stale and play/pause presses are swallowed).
     @Published private(set) var timeControlStatus: AVPlayer.TimeControlStatus = .paused
     /// Monotonic count of AVPlayerItem playbackStalled notifications (#93 residual): the engine
@@ -648,12 +651,17 @@ final class NativeAVPlayerHost {
 
         rateObservation = avPlayer.observe(\.rate, options: [.new]) { [weak self] player, _ in
             let rate = player.rate
+            let observedAt = DispatchTime.now().uptimeNanoseconds
             EngineLog.emit("[NativeAVPlayerHost] #\(sid) rate=\(rate)", category: .engine)
             Task { @MainActor in
                 guard let self, self.sessionID == sid else { return }
                 self.rate = rate
-                // AE#287: a stop inside the premature-end re-seek is the recovery's, not the viewer's.
-                if rate != 0 || !self.prematureEndRecoveryInFlight {
+                // AE#287: a stop AVPlayer reported during the premature-end re-seek is the recovery's,
+                // not the viewer's. Judged by when AVPlayer reported it: this hop can run after the
+                // recovery has ended.
+                let recoveryOwned = self.prematureEndRecoveryInFlight
+                    || observedAt <= self.prematureEndRecoveryEndedUptime
+                if rate != 0 || !recoveryOwned {
                     self.stampTransport(rolling: rate != 0)
                 }
             }
@@ -1769,8 +1777,19 @@ final class NativeAVPlayerHost {
         // The session may have been handed over while the seek was in flight; a retired session
         // must not restart the player under its successor.
         guard sessionID == sid else { return true }
+        // A viewer who paused through the engine while the re-seek was in flight keeps the pause.
+        guard playIntent else {
+            prematureEndRecoveryInFlight = false
+            prematureEndRecoveryEndedUptime = DispatchTime.now().uptimeNanoseconds
+            timeControlStatus = avPlayer.timeControlStatus
+            EngineLog.emit(
+                "[NativeAVPlayerHost] #\(sessionID) AE#287 re-seeked; staying paused for the viewer",
+                category: .engine)
+            return true
+        }
         avPlayer.play()
         prematureEndRecoveryInFlight = false
+        prematureEndRecoveryEndedUptime = DispatchTime.now().uptimeNanoseconds
         // The premature end stopped the rate before the recovery began, and nobody paused: the
         // recovery has now commanded play, so drop that stamp even if AVPlayer's rate has not moved.
         stampTransport(rolling: true)
