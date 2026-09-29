@@ -2487,7 +2487,9 @@ public final class AetherEngine: ObservableObject {
         host.swapItem(url: fallbackURL,
                       startPosition: isLive ? nil : position,
                       skipInitialSeek: LiveReloadPolicy.skipInitialSeek(isLive: isLive, isRejoin: true))
-        host.play()
+        // Resume only a viewer who was playing; the host's intent (#122) survives the in-place swap.
+        // A paused title refused behind the tvOS screensaver used to start itself and wake it.
+        if host.transportIntentIsPlaying { host.play() }
     }
 
     /// #35 readiness-gate settle windows. Generous enough that a slow-but-healthy cold start reads as

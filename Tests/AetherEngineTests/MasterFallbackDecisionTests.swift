@@ -114,3 +114,27 @@ struct MasterFallbackPositionTests {
         #expect(body.contains("host.mountedStartPosition"))
     }
 }
+
+/// #93/#98: when a dead item's recovery reload is refused, the media fallback replaces it. Whether
+/// the fallback then PLAYS is the viewer's call, read from the host's durable intent (#122), which the
+/// in-place swap keeps: the stage-2 reload leaves it cleared for a viewer who paused.
+@Suite("#98: the media fallback resumes only a viewer who was playing")
+@MainActor
+struct MasterFallbackTransportTests {
+    /// The fallback needs a live loopback session to run, so this reads its call site, as the
+    /// placement test above does.
+    @Test("The media fallback asks the host's play intent before it plays")
+    func fallbackAsksTheIntent() throws {
+        let source = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/AetherEngine/AetherEngine.swift")
+        let text = try #require(try? String(contentsOf: source, encoding: .utf8))
+        let fn = try #require(text.range(of: "func fallBackToMediaPlaylist("))
+        let end = try #require(text[fn.upperBound...].range(of: "\n    }\n"))
+        let body = String(text[fn.lowerBound..<end.upperBound])
+        #expect(body.contains("if host.transportIntentIsPlaying { host.play() }"))
+        #expect(!body.contains("\n        host.play()\n"))
+    }
+}
