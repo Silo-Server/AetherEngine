@@ -109,6 +109,28 @@ struct Issue93ItemDeathReviveTests {
             pausedSinceUptime: 461 * Self.second, failureUptime: 460 * Self.second))
     }
 
+    @Test("with no press since the death, the transport it died in decides")
+    func reloadFollowsTransportAtDeath() {
+        #expect(!NativeAVPlayerHost.itemDeathReloadResumesPlaying(
+            diedUnderPause: true, commandSinceFailure: nil, transportRolling: false))
+        #expect(NativeAVPlayerHost.itemDeathReloadResumesPlaying(
+            diedUnderPause: false, commandSinceFailure: nil, transportRolling: false))
+    }
+
+    @Test("a Play or Pause pressed while the death is confirmed outranks the transport it died in")
+    func pressDuringConfirmationDecides() {
+        #expect(NativeAVPlayerHost.itemDeathReloadResumesPlaying(
+            diedUnderPause: true, commandSinceFailure: true, transportRolling: false))
+        #expect(!NativeAVPlayerHost.itemDeathReloadResumesPlaying(
+            diedUnderPause: false, commandSinceFailure: false, transportRolling: true))
+    }
+
+    @Test("a Play from outside the engine after a paused death resumes the reload")
+    func externalPlayAfterPausedDeath() {
+        #expect(NativeAVPlayerHost.itemDeathReloadResumesPlaying(
+            diedUnderPause: true, commandSinceFailure: nil, transportRolling: true))
+    }
+
     // MARK: - Host-side counting decision
 
     @Test("loopback path counts an end failure after playback was established")

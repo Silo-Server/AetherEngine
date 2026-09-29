@@ -128,6 +128,10 @@ final class NativeAVPlayerHost {
     /// paused (through the engine, AVKit, Control Center or PiP) and the item died under that pause.
     /// Set before `endFailureCount` publishes, so its subscribers read the value for their failure.
     private(set) var endFailureFollowedPause = false
+    /// The latest engine-routed transport command since the latest counted end failure: true for
+    /// play, false for pause, nil for none. A viewer can press either while the engine confirms the
+    /// death, and that press outranks the transport state the item died in.
+    private(set) var transportCommandSinceEndFailure: Bool?
     /// Uptime at which the mirrored `timeControlStatus` became `.paused`; nil while the transport rolls.
     private var pausedSinceUptime: UInt64?
     /// End of the last seekable time range (seconds); tracks the live edge for EVENT playlists.
@@ -759,6 +763,7 @@ final class NativeAVPlayerHost {
                     self.endFailureFollowedPause = Self.transportPausedBeforeFailure(
                         pausedSinceUptime: self.pausedSinceUptime,
                         failureUptime: DispatchTime.now().uptimeNanoseconds)
+                    self.transportCommandSinceEndFailure = nil
                     self.endFailureCount += 1
                 }
             }
@@ -924,6 +929,16 @@ final class NativeAVPlayerHost {
         guard let pausedSinceUptime, failureUptime > pausedSinceUptime else { return false }
         let pausedSeconds = Double(failureUptime - pausedSinceUptime) / 1_000_000_000
         return pausedSeconds >= pausedBeforeFailureMarginSeconds
+    }
+
+    /// Pure decision: does the reload of a dead item restart transport? A Play or Pause pressed
+    /// through the engine after the failure decides. Otherwise a transport rolling again (a Play from
+    /// AVKit, Control Center or PiP) resumes, and one that had stopped before the failure stays paused.
+    nonisolated static func itemDeathReloadResumesPlaying(
+        diedUnderPause: Bool, commandSinceFailure: Bool?, transportRolling: Bool
+    ) -> Bool {
+        if let commandSinceFailure { return commandSinceFailure }
+        return transportRolling || !diedUnderPause
     }
 
     /// #50: AVPlayer fires .failed for self-healing transients (loopback 404, AVIOReader reconnect) while playback advances uninterrupted (rrgomes: tcs=playing at .failed).
@@ -1667,12 +1682,14 @@ final class NativeAVPlayerHost {
     func play() {
         // Set intent before play() so readyToPlay observer can re-assert if the replaceCurrentItem swap swallowed it.
         playIntent = true
+        transportCommandSinceEndFailure = true
         // Call play() immediately (no defer-until-ready): item.status never advances past .unknown until AVPlayer is told to play.
         avPlayer.play()
     }
 
     func pause() {
         playIntent = false
+        transportCommandSinceEndFailure = false
         avPlayer.pause()
     }
 
@@ -1918,6 +1935,7 @@ final class NativeAVPlayerHost {
     func setRate(_ value: Float) {
         // Non-zero rate counts as play intent (must survive replaceCurrentItem swap like play() does).
         playIntent = (value != 0)
+        transportCommandSinceEndFailure = (value != 0)
         // #436: `play()` is rate 1.0 by definition, and it is re-issued from paths no client can see:
         // the readyToPlay re-assert after an item swap, interruption and background resume, the #287
         // premature-end recovery, plus AVKit's own transport and the remote command centre calling

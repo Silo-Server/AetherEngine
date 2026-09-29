@@ -1586,14 +1586,20 @@ extension AetherEngine {
                         )
                         return
                     }
+                    // Decided now rather than when the failure was counted: the viewer may have
+                    // pressed Play or Pause while the death was being confirmed.
+                    let resumesPlaying = NativeAVPlayerHost.itemDeathReloadResumesPlaying(
+                        diedUnderPause: diedUnderPause,
+                        commandSinceFailure: host.transportCommandSinceEndFailure,
+                        transportRolling: host.timeControlStatus != .paused)
                     EngineLog.emit(
                         "[AetherEngine] #93 item death (failedToPlayToEndTime) at "
                         + "\(String(format: "%.2f", position))s; reloading item through stage-2 "
                         + "recovery (attempt \(self.itemDeathReviveGate.attempts), pause guard bypassed"
-                        + (diedUnderPause ? ", died under the viewer's pause)" : ")"),
+                        + (resumesPlaying ? ")" : ", keeping the viewer's pause)"),
                         category: .engine)
                     self.reloadStalledConsumerItem(
-                        position: position, allowPausedConsumer: true, resumesPlaying: !diedUnderPause)
+                        position: position, allowPausedConsumer: true, resumesPlaying: resumesPlaying)
                 }
             }
             .store(in: &nativeCancellables)
