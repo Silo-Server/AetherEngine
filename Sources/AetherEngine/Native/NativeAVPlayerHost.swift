@@ -652,7 +652,10 @@ final class NativeAVPlayerHost {
             Task { @MainActor in
                 guard let self, self.sessionID == sid else { return }
                 self.rate = rate
-                self.stampTransport(rolling: rate != 0)
+                // AE#287: a stop inside the premature-end re-seek is the recovery's, not the viewer's.
+                if rate != 0 || !self.prematureEndRecoveryInFlight {
+                    self.stampTransport(rolling: rate != 0)
+                }
             }
         }
 
@@ -1768,6 +1771,9 @@ final class NativeAVPlayerHost {
         guard sessionID == sid else { return true }
         avPlayer.play()
         prematureEndRecoveryInFlight = false
+        // The premature end stopped the rate before the recovery began, and nobody paused: the
+        // recovery has now commanded play, so drop that stamp even if AVPlayer's rate has not moved.
+        stampTransport(rolling: true)
         timeControlStatus = avPlayer.timeControlStatus
         let resumedAt = await prematureEndReading().playhead
         EngineLog.emit(
