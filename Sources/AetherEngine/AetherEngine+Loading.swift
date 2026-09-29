@@ -1591,7 +1591,7 @@ extension AetherEngine {
                     let resumesPlaying = NativeAVPlayerHost.itemDeathReloadResumesPlaying(
                         diedUnderPause: diedUnderPause,
                         commandSinceFailure: host.transportCommandSinceEndFailure,
-                        transportRolling: host.timeControlStatus != .paused)
+                        transportRolling: host.rate != 0)
                     EngineLog.emit(
                         "[AetherEngine] #93 item death (failedToPlayToEndTime) at "
                         + "\(String(format: "%.2f", position))s; reloading item through stage-2 "
