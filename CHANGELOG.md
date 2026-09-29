@@ -10,6 +10,10 @@ the public-API contract.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [7.22.1] - 2026-09-29
+
 ### Fixed
 
 - **`LiveTelemetry`'s two bitrate fields measure the media played, not the bytes transferred** (#514).
