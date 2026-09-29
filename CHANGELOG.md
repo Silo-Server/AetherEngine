@@ -10,7 +10,17 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **An unproven HDR master is served after the display mode switch, not during it** (#667). The
+  pre-flight releases the load at its 2 s cap while an HDR switch is still running, which is what keeps
+  the load overlapping the switch (#348). On a panel whose EDR headroom never proves HDR (#459) the
+  engine then offers the master and lets AVPlayer's acceptance answer, and mid-switch AVPlayer answers
+  for the mode the panel is leaving: measured on tvOS 27, `-11868` 80 ms after the serve and 660 ms
+  before the switch ended. The refusal latched (#588), so every HDR title went media-direct and lost its
+  subtitle and audio renditions. That route now waits for a switch it saw start to end, re-reads the
+  panel, and routes then; the play gate held the first frame until that end anyway. A refusal raised
+  while a switch is in progress still earns the item its media fallback but no longer sets the latch.
 
 ## [7.22.1] - 2026-09-29
 

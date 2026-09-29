@@ -826,6 +826,39 @@ final class DisplayCriteriaController {
         #endif
     }
 
+    /// AE#667: whether a switch this load was armed for has been seen to start and not yet to end.
+    ///
+    /// Read from the notifications, not from `isDisplayModeSwitchInProgress` alone, because the flag is
+    /// documented as unreliable around a write and sticks `true` on panels whose DV switch never reports.
+    /// A switch nobody saw start answers false, so a caller waiting on this never waits for an end that
+    /// cannot be announced.
+    func observedSwitchIsRunning() -> Bool {
+        #if os(tvOS)
+        guard let window = resolveWindow() else { return false }
+        let snapshot = observation.snapshot()
+        guard Self.recordIsFreshEvidence(recordGeneration: snapshot.generation,
+                                         lastSpentGeneration: spentArmGeneration) else { return false }
+        let observed = Self.observedSwitch(
+            startedAtNanos: snapshot.startedAt,
+            endedAtNanos: snapshot.endedAt,
+            gateEntryNanos: DispatchTime.now().uptimeNanoseconds,
+            switchInProgress: window.avDisplayManager.isDisplayModeSwitchInProgress)
+        if case .running = observed { return true }
+        return false
+        #else
+        return false
+        #endif
+    }
+
+    /// AE#667: the system's in-progress flag, for a decision that may only be made more cautious by it.
+    var displayModeSwitchInProgress: Bool {
+        #if os(tvOS)
+        resolveWindow()?.avDisplayManager.isDisplayModeSwitchInProgress ?? false
+        #else
+        false
+        #endif
+    }
+
     /// Block until the panel settles its HDR mode negotiation, bounded so an
     /// unobservable switch can't stall the first frame.
     ///

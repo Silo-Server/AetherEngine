@@ -921,6 +921,27 @@ extension AetherEngine {
         return attemptWhenUnproven && displayEligibleForHDR && !panelRefusedHDRMaster
     }
 
+    /// AE#667: whether an unproven master has to wait for the running switch before it is served.
+    ///
+    /// The pre-flight releases the load at its 2 s cap while an HDR switch is still in flight, on purpose:
+    /// the overlap is what #348 kept, and a proven or media route has nothing to lose by it. The unproven
+    /// master is the one route that does, because its whole point is to let AVPlayer's acceptance stand in
+    /// for the readout, and AVPlayer answers for the mode the panel is in NOW. Measured on an Apple TV 4K
+    /// (tvOS 27.0, HDR10 panel): master served 140 ms after the cap, `-11868` 80 ms later, the switch
+    /// ending 660 ms after that, and the refusal latched, so every later HDR title went media-direct.
+    ///
+    /// Only a switch seen to START counts. A DV switch that never reports would make this an unbounded wait
+    /// for an end that cannot arrive, and a proven panel is excluded because it already answered. What the
+    /// wait costs is the prep that used to overlap the switch's tail; the play gate held the first frame
+    /// until that end anyway.
+    nonisolated static func unprovenMasterAwaitsSwitchEnd(
+        routesAsHDR: Bool,
+        panelPresentsHDR: Bool,
+        switchRunning: Bool
+    ) -> Bool {
+        routesAsHDR && !panelPresentsHDR && switchRunning
+    }
+
     /// AE#541: the HDR route of an in-place rebuild, composed from the same two decisions the load makes.
     ///
     /// The readout and the display's eligibility are the load's, because the rebuild runs no handshake to

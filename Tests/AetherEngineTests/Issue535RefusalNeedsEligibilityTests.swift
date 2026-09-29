@@ -13,21 +13,21 @@ struct Issue535RefusalNeedsEligibilityTests {
 
     @Test("A display rejection while the display is ineligible for HDR does not latch")
     func ineligibleWindowDoesNotLatch() {
-        #expect(!MasterFallbackDecision.shouldLatchPanelRefusal(code: -11868, displayEligibleForHDRNow: false))
-        #expect(!MasterFallbackDecision.shouldLatchPanelRefusal(code: -11848, displayEligibleForHDRNow: false))
+        #expect(!MasterFallbackDecision.shouldLatchPanelRefusal(code: -11868, displayEligibleForHDRNow: false, displaySwitchInProgress: false))
+        #expect(!MasterFallbackDecision.shouldLatchPanelRefusal(code: -11848, displayEligibleForHDRNow: false, displaySwitchInProgress: false))
     }
 
     @Test("A display rejection on an eligible display still latches")
     func eligibleRefusalStillLatches() {
-        #expect(MasterFallbackDecision.shouldLatchPanelRefusal(code: -11868, displayEligibleForHDRNow: true))
-        #expect(MasterFallbackDecision.shouldLatchPanelRefusal(code: -11848, displayEligibleForHDRNow: true))
+        #expect(MasterFallbackDecision.shouldLatchPanelRefusal(code: -11868, displayEligibleForHDRNow: true, displaySwitchInProgress: false))
+        #expect(MasterFallbackDecision.shouldLatchPanelRefusal(code: -11848, displayEligibleForHDRNow: true, displaySwitchInProgress: false))
     }
 
     /// -1002 is a manifest filtered at parse time (#130), a statement about the playlist, never the display.
     @Test("The parse-time rejection never latches, eligible or not")
     func parseRejectionNeverLatches() {
-        #expect(!MasterFallbackDecision.shouldLatchPanelRefusal(code: -1002, displayEligibleForHDRNow: true))
-        #expect(!MasterFallbackDecision.shouldLatchPanelRefusal(code: -1002, displayEligibleForHDRNow: false))
+        #expect(!MasterFallbackDecision.shouldLatchPanelRefusal(code: -1002, displayEligibleForHDRNow: true, displaySwitchInProgress: false))
+        #expect(!MasterFallbackDecision.shouldLatchPanelRefusal(code: -1002, displayEligibleForHDRNow: false, displaySwitchInProgress: false))
     }
 
     /// The fallback itself is unaffected: the item still reloads the media playlist whatever the latch does.
