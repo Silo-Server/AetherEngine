@@ -114,9 +114,13 @@ final class NativeAVPlayerHost {
     /// duration, and publishing that transient would bounce the engine through `.paused` and back for
     /// what the viewer must not even notice; the real status is republished when the recovery settles.
     private var prematureEndRecoveryInFlight = false
-    /// Uptime at which the last premature-end recovery handed transport back. A rate change AVPlayer
-    /// reported before it belongs to that recovery, even when its main-actor hop runs later.
+    /// Uptimes bounding the last premature-end recovery. A rate change AVPlayer reported inside that
+    /// interval belongs to the recovery, even when its main-actor hop runs after the recovery ended.
+    private var prematureEndRecoveryStartedUptime: UInt64 = 0
     private var prematureEndRecoveryEndedUptime: UInt64 = 0
+    /// Uptime of the newest transport event applied to `pausedSinceUptime`. Rate reports reach the
+    /// main actor after engine commands issued later, so an older report must not overwrite them.
+    private var transportStampEventUptime: UInt64 = 0
     /// Mirrors avPlayer.timeControlStatus so the engine can reconcile when AVKit's transport bar, Control Center, or hardware buttons toggle the player externally (without this, engine state goes stale and play/pause presses are swallowed).
     @Published private(set) var timeControlStatus: AVPlayer.TimeControlStatus = .paused
     /// Monotonic count of AVPlayerItem playbackStalled notifications (#93 residual): the engine
@@ -659,10 +663,10 @@ final class NativeAVPlayerHost {
                 // AE#287: a stop AVPlayer reported during the premature-end re-seek is the recovery's,
                 // not the viewer's. Judged by when AVPlayer reported it: this hop can run after the
                 // recovery has ended.
-                let recoveryOwned = self.prematureEndRecoveryInFlight
-                    || observedAt <= self.prematureEndRecoveryEndedUptime
+                let recoveryOwned = observedAt >= self.prematureEndRecoveryStartedUptime
+                    && (self.prematureEndRecoveryInFlight || observedAt <= self.prematureEndRecoveryEndedUptime)
                 if rate != 0 || !recoveryOwned {
-                    self.stampTransport(rolling: rate != 0)
+                    self.stampTransport(rolling: rate != 0, at: observedAt)
                 }
             }
         }
@@ -926,11 +930,13 @@ final class NativeAVPlayerHost {
 
     /// Keeps `pausedSinceUptime` on the commanded transport: cleared when it rolls, stamped once when
     /// it stops and left alone while it stays stopped.
-    private func stampTransport(rolling: Bool) {
+    private func stampTransport(rolling: Bool, at uptime: UInt64 = DispatchTime.now().uptimeNanoseconds) {
+        guard uptime >= transportStampEventUptime else { return }
+        transportStampEventUptime = uptime
         if rolling {
             pausedSinceUptime = nil
         } else if pausedSinceUptime == nil {
-            pausedSinceUptime = DispatchTime.now().uptimeNanoseconds
+            pausedSinceUptime = uptime
         }
     }
 
@@ -1764,6 +1770,7 @@ final class NativeAVPlayerHost {
         prematureEndRecoveryAttempts += 1
         lastPrematureEndRecoveryPlayhead = playhead
         prematureEndRecoveryInFlight = true
+        prematureEndRecoveryStartedUptime = DispatchTime.now().uptimeNanoseconds
         EngineLog.emit(
             "[NativeAVPlayerHost] #\(sessionID) AE#287 premature end: playhead="
             + "\(String(format: "%.3f", playhead))s duration=\(String(format: "%.3f", duration))s "
