@@ -2268,6 +2268,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return (producer, cache, server, demuxer, audioBridge)
     }
 
+    /// AE#514: bytes of the played streams by presentation time, fed by every producer of the session
+    /// (initial, seek restart, live reopen, revive), read by the telemetry sampler at the playhead.
+    let playedMediaLedger = PlayedMediaLedger()
+
     /// Bytes this session pulled from the SOURCE, across every demuxer it has had (see
     /// `retiredDemuxerBytes`). Not the same link as `LiveTelemetry.networkTransferredBytes`, which on
     /// the native path counts what AVPlayer pulled from the loopback server.
@@ -2629,6 +2633,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // below. The side readers read one gate for the whole session, so a restart must not leave
         // a gap where nobody claims the link.
         prod.sideReaderLinkGate = sideReaderLinkGate
+        prod.playedMediaLedger = playedMediaLedger
         prod.onFirstHDR10PlusDetected = { [weak self] in
             self?.notifyHDR10PlusOnce()
         }
