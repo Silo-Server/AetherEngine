@@ -1556,6 +1556,7 @@ extension AetherEngine {
             .sink { [weak self, weak host] count in
                 guard let self, let host else { return }
                 let clockAtFailure = host.renderedTime
+                let diedUnderPause = host.endFailureFollowedPause
                 self.itemDeathConfirmTask?.cancel()
                 self.itemDeathConfirmTask = Task { @MainActor [weak self, weak host] in
                     try? await Task.sleep(
@@ -1585,12 +1586,20 @@ extension AetherEngine {
                         )
                         return
                     }
+                    // Decided now rather than when the failure was counted: the viewer may have
+                    // pressed Play or Pause while the death was being confirmed.
+                    let resumesPlaying = NativeAVPlayerHost.itemDeathReloadResumesPlaying(
+                        diedUnderPause: diedUnderPause,
+                        commandSinceFailure: host.transportCommandSinceEndFailure,
+                        transportRolling: host.rate != 0)
                     EngineLog.emit(
                         "[AetherEngine] #93 item death (failedToPlayToEndTime) at "
                         + "\(String(format: "%.2f", position))s; reloading item through stage-2 "
-                        + "recovery (attempt \(self.itemDeathReviveGate.attempts), pause guard bypassed)",
+                        + "recovery (attempt \(self.itemDeathReviveGate.attempts), pause guard bypassed"
+                        + (resumesPlaying ? ")" : ", keeping the viewer's pause)"),
                         category: .engine)
-                    self.reloadStalledConsumerItem(position: position, allowPausedConsumer: true)
+                    self.reloadStalledConsumerItem(
+                        position: position, allowPausedConsumer: true, resumesPlaying: resumesPlaying)
                 }
             }
             .store(in: &nativeCancellables)

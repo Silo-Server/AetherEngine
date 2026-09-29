@@ -2830,7 +2830,12 @@ public final class AetherEngine: ObservableObject {
     ///   `LiveReloadPolicy.recoveryRejoinPosition` cannot. A window closed with ENDLIST is a finite asset
     ///   whose seekable end IS the playhead, so the distance-behind-live that policy reads is zero and it
     ///   would aim at the edge, discarding the rewind the viewer kept through the whole outage.
+    /// - Parameter resumesPlaying: false when the viewer wants the item paused (see
+    ///   `NativeAVPlayerHost.itemDeathReloadResumesPlaying`). The pause guard bypass admits the dead
+    ///   item; it must not also overrule the viewer, so the fresh item mounts paused at the anchor
+    ///   and the next Play resumes there.
     func reloadStalledConsumerItem(position: Double, allowPausedConsumer: Bool = false,
+                                   resumesPlaying: Bool = true,
                                    liveRejoinOverride: Double? = nil) {
         guard let host = nativeHost, let player = currentAVPlayer,
               let url = (player.currentItem?.asset as? AVURLAsset)?.url else { return }
@@ -2873,7 +2878,7 @@ public final class AetherEngine: ObservableObject {
             + Self.recoveryAnchorLogSuffix(
                 anchor: anchor, position: position,
                 pendingSeekTarget: pendingRecoverySeekClockTarget)
-            + " (same URL, same host)",
+            + " (same URL, same host" + (resumesPlaying ? ")" : ", staying paused for the viewer)"),
             category: .engine
         )
         // AE#454: the placement, expressed in the playlist the fresh item is about to load. A rejoin
@@ -2913,7 +2918,13 @@ public final class AetherEngine: ObservableObject {
         // AE#454 round 2: the item that is about to load is the one the placement was armed for, and
         // the only one whose axis the playlist will state.
         if didArmPlacement { liveRejoinPlacementGeneration = host.itemGeneration }
-        host.play()
+        if resumesPlaying {
+            host.play()
+        } else {
+            // Clears the intent latch a pause from AVKit, Control Center or PiP left set, so the fresh
+            // item's readyToPlay does not re-assert play() behind the viewer.
+            host.pause()
+        }
         if let rejoinPosition {
             // Stashed rather than seeked: the pre-readiness seek IS the wedge LiveReloadPolicy exists
             // to avoid, and a live seek does not defer itself (`shouldDeferHostSeek` excludes live), so

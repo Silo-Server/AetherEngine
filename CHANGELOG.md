@@ -25,6 +25,7 @@ the public-API contract.
 
 ### Fixed
 
+- A paused video no longer starts playing by itself. When the player item died while paused (`failedToPlayToEndTime`), the recovery reload bypassed the pause guard and called `play()` on the fresh item. The reload now keeps a pause made before the item died, whether it came through the engine, AVKit, Control Center or PiP, and mounts the item paused at the same position.
 - TrueHD Atmos rendered to APAC (`LoadOptions.objectAudioRendering`) no longer plays 42.7 ms ahead of the video. The bridge dropped the encoder's 2048 frames of priming and stamped the first content packet on the source position, but AVFoundation presents an APAC packet's audio 2048 frames before its timestamp, so every session ran early, at load and after every seek. The priming packets now stay in the stream and take the source position's timestamp.
 - Authorized native HLS uses the engine relay from the initial load, without forwarding origin credentials to the loopback asset. Optional subtitle playlist preparation shares the authorizer and has a bounded deadline across redirects and refreshes.
 - Static-header HLS redirects apply the shared credential policy, including Emby and MediaBrowser token headers, before contacting another origin.
