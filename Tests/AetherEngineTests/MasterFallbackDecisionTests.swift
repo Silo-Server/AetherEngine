@@ -116,15 +116,46 @@ struct MasterFallbackPositionTests {
 }
 
 /// #93/#98: when a dead item's recovery reload is refused, the media fallback replaces it. Whether
-/// the fallback then PLAYS is the viewer's call, read from the host's durable intent (#122), which the
-/// in-place swap keeps: the stage-2 reload leaves it cleared for a viewer who paused.
+/// the fallback then PLAYS is the viewer's call. The engine's intent (#122) misses a Play from AVKit,
+/// Control Center or PiP, so AVPlayer's rate is read as well.
 @Suite("#98: the media fallback resumes only a viewer who was playing")
 @MainActor
 struct MasterFallbackTransportTests {
+    @Test("An item the engine was playing is replaced playing")
+    func enginePlayResumes() {
+        #expect(NativeAVPlayerHost.mediaFallbackResumesPlaying(
+            intentIsPlaying: true, transportRolledSinceLoad: false, pausedBeforeRejection: false))
+    }
+
+    @Test("A Play from AVKit, Control Center or PiP, which leaves the intent clear, is kept")
+    func externalPlayResumes() {
+        #expect(NativeAVPlayerHost.mediaFallbackResumesPlaying(
+            intentIsPlaying: false, transportRolledSinceLoad: true, pausedBeforeRejection: false))
+    }
+
+    @Test("A viewer who paused before the refusal stays paused, whichever way the pause came")
+    func pauseBeforeRejectionStaysPaused() {
+        #expect(!NativeAVPlayerHost.mediaFallbackResumesPlaying(
+            intentIsPlaying: true, transportRolledSinceLoad: true, pausedBeforeRejection: true))
+        #expect(!NativeAVPlayerHost.mediaFallbackResumesPlaying(
+            intentIsPlaying: false, transportRolledSinceLoad: true, pausedBeforeRejection: true))
+    }
+
+    @Test("An item nobody told to play stays paused")
+    func neverPlayedStaysPaused() {
+        #expect(!NativeAVPlayerHost.mediaFallbackResumesPlaying(
+            intentIsPlaying: false, transportRolledSinceLoad: false, pausedBeforeRejection: false))
+    }
+
+    @Test("A rejection built without a transport verdict plays, as the fallback always did")
+    func defaultRejectionResumes() {
+        #expect(DisplayRejection(code: -11868, message: "", domain: nil).resumesPlaying)
+    }
+
     /// The fallback needs a live loopback session to run, so this reads its call site, as the
     /// placement test above does.
-    @Test("The media fallback asks the host's play intent before it plays")
-    func fallbackAsksTheIntent() throws {
+    @Test("The media fallback plays only on the rejection's verdict")
+    func fallbackAsksTheRejection() throws {
         let source = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -134,7 +165,7 @@ struct MasterFallbackTransportTests {
         let fn = try #require(text.range(of: "func fallBackToMediaPlaylist("))
         let end = try #require(text[fn.upperBound...].range(of: "\n    }\n"))
         let body = String(text[fn.lowerBound..<end.upperBound])
-        #expect(body.contains("if host.transportIntentIsPlaying { host.play() }"))
+        #expect(body.contains("if rejection.resumesPlaying {"))
         #expect(!body.contains("\n        host.play()\n"))
     }
 }

@@ -2482,14 +2482,22 @@ public final class AetherEngine: ObservableObject {
         EngineLog.emit(
             "[AetherEngine] AVPlayer rejected the master (code=\(rejection.code)); falling back to "
             + "media playlist (no CC/subtitle renditions) at "
-            + (isLive ? "the live edge" : "\(String(format: "%.2f", position))s"),
+            + (isLive ? "the live edge" : "\(String(format: "%.2f", position))s")
+            + (rejection.resumesPlaying ? "" : ", staying paused for the viewer"),
             category: .session)
         host.swapItem(url: fallbackURL,
                       startPosition: isLive ? nil : position,
                       skipInitialSeek: LiveReloadPolicy.skipInitialSeek(isLive: isLive, isRejoin: true))
-        // Resume only a viewer who was playing; the host's intent (#122) survives the in-place swap.
-        // A paused title refused behind the tvOS screensaver used to start itself and wake it.
-        if host.transportIntentIsPlaying { host.play() }
+        // Resume only a viewer who was playing (decided when the item was refused, from both the
+        // engine's intent and AVPlayer's rate). A paused title refused behind the tvOS screensaver
+        // used to start itself and wake it.
+        if rejection.resumesPlaying {
+            host.play()
+        } else {
+            // Clears the intent latch a pause from AVKit, Control Center or PiP left set, so the fresh
+            // item's readyToPlay does not re-assert play() behind the viewer.
+            host.pause()
+        }
     }
 
     /// #35 readiness-gate settle windows. Generous enough that a slow-but-healthy cold start reads as

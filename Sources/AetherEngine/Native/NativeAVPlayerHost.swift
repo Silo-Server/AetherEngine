@@ -150,6 +150,10 @@ final class NativeAVPlayerHost {
     /// engine-routed pause lands, cleared by any non-zero rate. The rate is what play and pause set,
     /// from any source, even on an item that cannot roll; `timeControlStatus` only reports the outcome.
     private var pausedSinceUptime: UInt64?
+    /// Whether AVPlayer's rate went non-zero on the current item, from any source. A Play from AVKit,
+    /// Control Center or PiP moves the rate but not `playIntent`, so this is the only record of it.
+    /// An in-place swap carries the outgoing item's rate in; a fresh load starts stopped.
+    private var transportRolledSinceLoad = false
     /// End of the last seekable time range (seconds); tracks the live edge for EVENT playlists.
     /// KVO mirror of `seekableTimeRanges`, NOT a live read: the getter is a sync XPC round-trip
     /// to mediaserverd, and clock-tick sinks plus the 1 Hz paused-live timer read this at a
@@ -668,6 +672,7 @@ final class NativeAVPlayerHost {
             Task { @MainActor in
                 guard let self, self.sessionID == sid else { return }
                 self.rate = rate
+                if rate != 0 { self.transportRolledSinceLoad = true }
                 // AE#287: a stop AVPlayer reported during the premature-end re-seek is the recovery's,
                 // not the viewer's. Judged by when AVPlayer reported it: this hop can run after the
                 // recovery has ended.
@@ -974,6 +979,17 @@ final class NativeAVPlayerHost {
         return transportRolling || !diedUnderPause
     }
 
+    /// Pure decision: does the media fallback play the item that replaces a refused master? A refused
+    /// item was told to play, since `item.status` does not advance before that, so it plays on unless
+    /// the viewer paused it before the refusal (the same one-second margin as an item death). Who told
+    /// it to play is read from both records: `playIntent` for the engine, and the rate for AVKit,
+    /// Control Center or PiP, which never touch the intent.
+    nonisolated static func mediaFallbackResumesPlaying(
+        intentIsPlaying: Bool, transportRolledSinceLoad: Bool, pausedBeforeRejection: Bool
+    ) -> Bool {
+        !pausedBeforeRejection && (intentIsPlaying || transportRolledSinceLoad)
+    }
+
     /// #50: AVPlayer fires .failed for self-healing transients (loopback 404, AVIOReader reconnect) while playback advances uninterrupted (rrgomes: tcs=playing at .failed).
     /// Discriminates on hasEverPlayed, not instantaneous timeControlStatus: .failed and timeControlStatus KVOs are unsynchronized (426b45c: still published terminal failure at 27.3s while AVPlayer played smoothly).
     /// Before first .playing: surface promptly (genuine startup failure). After: defer 5s and confirm -- clear if .playing or clock advanced, surface if both stopped.
@@ -1045,9 +1061,16 @@ final class NativeAVPlayerHost {
                     "[NativeAVPlayerHost] #\(sessionID) startup .failed is a master rejection "
                     + "(code=\(code)); signalling engine for media fallback instead of surfacing",
                     category: .engine)
-                pendingDisplayRejection = DisplayRejection(code: code,
-                                                           message: desc,
-                                                           domain: (item.error as NSError?)?.domain)
+                pendingDisplayRejection = DisplayRejection(
+                    code: code,
+                    message: desc,
+                    domain: (item.error as NSError?)?.domain,
+                    resumesPlaying: Self.mediaFallbackResumesPlaying(
+                        intentIsPlaying: playIntent,
+                        transportRolledSinceLoad: transportRolledSinceLoad,
+                        pausedBeforeRejection: Self.transportPausedBeforeFailure(
+                            pausedSinceUptime: pausedSinceUptime,
+                            failureUptime: DispatchTime.now().uptimeNanoseconds)))
                 return
             }
             // AE#561: a startup failure on the media itself (a segment Apple's parser refuses) is
@@ -2164,6 +2187,7 @@ final class NativeAVPlayerHost {
         readinessDeadlineSeconds = nil
         // Re-arm #50 hasEverPlayed: reused host must not inherit prior session's established state.
         hasEverPlayed = false
+        transportRolledSinceLoad = inPlaceSwap && avPlayer.rate != 0
         // #93 recovery reload: same content, same position, playback must continue. Skip the
         // pause + nil-item gap below (PiP content-source invalidation + transport bounce); the
         // old item keeps playing until replaceCurrentItem swaps in the fresh one, and playIntent
