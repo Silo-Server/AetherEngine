@@ -121,41 +121,62 @@ struct MasterFallbackPositionTests {
 @Suite("#98: the media fallback resumes only a viewer who was playing")
 @MainActor
 struct MasterFallbackTransportTests {
+    private func resumes(
+        command: Bool? = nil, intent: Bool, rolled: Bool, pausedBefore: Bool
+    ) -> Bool {
+        NativeAVPlayerHost.mediaFallbackResumesPlaying(
+            commandSinceRejection: command, intentIsPlaying: intent,
+            rolledSinceEngineStop: rolled, pausedBeforeRejection: pausedBefore)
+    }
+
     @Test("An item the engine was playing is replaced playing")
     func enginePlayResumes() {
-        #expect(NativeAVPlayerHost.mediaFallbackResumesPlaying(
-            intentIsPlaying: true, transportRolledSinceLoad: false, pausedBeforeRejection: false))
+        #expect(resumes(intent: true, rolled: false, pausedBefore: false))
     }
 
     @Test("A Play from AVKit, Control Center or PiP, which leaves the intent clear, is kept")
     func externalPlayResumes() {
-        #expect(NativeAVPlayerHost.mediaFallbackResumesPlaying(
-            intentIsPlaying: false, transportRolledSinceLoad: true, pausedBeforeRejection: false))
+        #expect(resumes(intent: false, rolled: true, pausedBefore: false))
     }
 
     @Test("A viewer who paused before the refusal stays paused, whichever way the pause came")
     func pauseBeforeRejectionStaysPaused() {
-        #expect(!NativeAVPlayerHost.mediaFallbackResumesPlaying(
-            intentIsPlaying: true, transportRolledSinceLoad: true, pausedBeforeRejection: true))
-        #expect(!NativeAVPlayerHost.mediaFallbackResumesPlaying(
-            intentIsPlaying: false, transportRolledSinceLoad: true, pausedBeforeRejection: true))
+        #expect(!resumes(intent: true, rolled: true, pausedBefore: true))
+        #expect(!resumes(intent: false, rolled: true, pausedBefore: true))
     }
 
-    @Test("An item nobody told to play stays paused")
-    func neverPlayedStaysPaused() {
-        #expect(!NativeAVPlayerHost.mediaFallbackResumesPlaying(
-            intentIsPlaying: false, transportRolledSinceLoad: false, pausedBeforeRejection: false))
+    /// An engine pause inside the one-second margin reads as the refusal's own stop, but it clears the
+    /// intent and the roll, so the viewer's pause still holds.
+    @Test("An engine pause just before the refusal stays paused")
+    func enginePauseInsideTheMarginStaysPaused() {
+        #expect(!resumes(intent: false, rolled: false, pausedBefore: false))
     }
 
-    @Test("A rejection built without a transport verdict plays, as the fallback always did")
-    func defaultRejectionResumes() {
-        #expect(DisplayRejection(code: -11868, message: "", domain: nil).resumesPlaying)
+    @Test("A Play or Pause through the engine after the refusal decides")
+    func commandAfterRejectionDecides() {
+        #expect(resumes(command: true, intent: true, rolled: false, pausedBefore: true))
+        #expect(!resumes(command: false, intent: false, rolled: true, pausedBefore: false))
+    }
+
+    /// Engine commands that drive the host's records, on a real host with a mounted item.
+    @Test("The host's records follow engine and external transport")
+    func hostRecordsFollowTransport() {
+        let host = NativeAVPlayerHost()
+        defer { host.tearDown() }
+        host.load(url: URL(fileURLWithPath: "/nonexistent-master-fallback-transport-test.m3u8"),
+                  startPosition: 0, contract: .init())
+        // A fresh load nobody played: stays paused.
+        #expect(!host.mediaFallbackResumesPlaying())
+        host.play()
+        #expect(host.mediaFallbackResumesPlaying())
+        host.pause()
+        #expect(!host.mediaFallbackResumesPlaying())
     }
 
     /// The fallback needs a live loopback session to run, so this reads its call site, as the
     /// placement test above does.
-    @Test("The media fallback plays only on the rejection's verdict")
-    func fallbackAsksTheRejection() throws {
+    @Test("The media fallback plays only on the host's verdict, read before the swap")
+    func fallbackAsksTheHost() throws {
         let source = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -165,7 +186,10 @@ struct MasterFallbackTransportTests {
         let fn = try #require(text.range(of: "func fallBackToMediaPlaylist("))
         let end = try #require(text[fn.upperBound...].range(of: "\n    }\n"))
         let body = String(text[fn.lowerBound..<end.upperBound])
-        #expect(body.contains("if rejection.resumesPlaying {"))
+        let verdict = try #require(body.range(of: "let resumesPlaying = host.mediaFallbackResumesPlaying()"))
+        let swap = try #require(body.range(of: "host.swapItem("))
+        #expect(verdict.lowerBound < swap.lowerBound)
+        #expect(body.contains("if resumesPlaying {"))
         #expect(!body.contains("\n        host.play()\n"))
     }
 }

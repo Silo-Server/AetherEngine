@@ -2479,19 +2479,20 @@ public final class AetherEngine: ObservableObject {
         // started: the #93/#65 stage-2 recovery swaps a fresh item in at the position it held, and a
         // rejection of THAT item has to come back there, not rewind to the first mount.
         let position = host.mountedStartPosition ?? 0
+        // Read before the swap, which resets what it reads.
+        let resumesPlaying = host.mediaFallbackResumesPlaying()
         EngineLog.emit(
             "[AetherEngine] AVPlayer rejected the master (code=\(rejection.code)); falling back to "
             + "media playlist (no CC/subtitle renditions) at "
             + (isLive ? "the live edge" : "\(String(format: "%.2f", position))s")
-            + (rejection.resumesPlaying ? "" : ", staying paused for the viewer"),
+            + (resumesPlaying ? "" : ", staying paused for the viewer"),
             category: .session)
         host.swapItem(url: fallbackURL,
                       startPosition: isLive ? nil : position,
                       skipInitialSeek: LiveReloadPolicy.skipInitialSeek(isLive: isLive, isRejoin: true))
-        // Resume only a viewer who was playing (decided when the item was refused, from both the
-        // engine's intent and AVPlayer's rate). A paused title refused behind the tvOS screensaver
-        // used to start itself and wake it.
-        if rejection.resumesPlaying {
+        // Resume only a viewer who was playing, read from both the engine's intent and AVPlayer's
+        // rate. A paused title refused behind the tvOS screensaver used to start itself and wake it.
+        if resumesPlaying {
             host.play()
         } else {
             // Clears the intent latch a pause from AVKit, Control Center or PiP left set, so the fresh

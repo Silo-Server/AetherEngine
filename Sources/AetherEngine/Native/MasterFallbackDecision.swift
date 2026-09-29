@@ -10,9 +10,6 @@ struct DisplayRejection: Sendable, Equatable {
     /// `NSError.domain` of the item error behind the rejection: the message is AVFoundation's
     /// localized text, so the domain is what still classifies once it is published (#376).
     let domain: String?
-    /// Whether the media fallback plays: the refused item was playing, or told to play, and the
-    /// viewer had not paused it. See `NativeAVPlayerHost.mediaFallbackResumesPlaying`.
-    var resumesPlaying: Bool = true
 }
 
 /// Pure master to media fallback decision (#98). Kept separate and pure so the gate is testable
