@@ -44,7 +44,9 @@ struct HLSLocalServerSlowPeerTests {
 
     @Test("A connection that presented the token keeps its keep-alive idle past the stranger deadline")
     func authenticatedKeepAliveSurvives() async throws {
-        let server = HLSLocalServer(provider: StubProvider(), unauthenticatedHeadSeconds: 0.5)
+        // The stranger deadline runs from accept, so it must leave room for a worker thread that a
+        // loaded runner schedules late, or the first request is dropped before it is read.
+        let server = HLSLocalServer(provider: StubProvider(), unauthenticatedHeadSeconds: 2)
         try server.start()
         defer { server.stop() }
 
@@ -52,7 +54,7 @@ struct HLSLocalServerSlowPeerTests {
         defer { close(fd) }
         let path = "/\(server.pathToken)/media.m3u8"
         #expect(await Self.onOwnThread { Self.requestStatus(fd: fd, path: path) } == 200)
-        try await Task.sleep(for: .milliseconds(1500))
+        try await Task.sleep(for: .milliseconds(3000))
         #expect(await Self.onOwnThread { Self.requestStatus(fd: fd, path: path) } == 200,
                 "the second request on an authenticated keep-alive connection was not answered")
     }
