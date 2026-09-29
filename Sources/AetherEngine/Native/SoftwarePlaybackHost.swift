@@ -54,6 +54,10 @@ final class SoftwarePlaybackHost {
         demuxer?.avioBytesFetched
     }
 
+    /// AE#514: bytes of the played streams by presentation time on the source axis (the axis of
+    /// `sourceClockSeconds`), fed by the read loops once the timeline fold has been applied.
+    nonisolated let playedMediaLedger = PlayedMediaLedger()
+
     @Published private(set) var isReady: Bool = false
     @Published private(set) var currentTime: Double = 0
     /// Raw synchronizer clock in the SOURCE axis (same axis as demuxed packet PTS and
@@ -1675,6 +1679,7 @@ final class SoftwarePlaybackHost {
         let getSubtitleTapSink: @Sendable () -> ((@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational, Bool) -> Void)?) = { [weak self] in
             self?.subtitleTapSink
         }
+        let playedMediaLedger = playedMediaLedger
         // AE#560: both read loops hand every source packet to this before any branching.
         let recordingTap: @Sendable (UnsafeMutablePointer<AVPacket>) -> Void = { [weak self] pkt in
             self?.tapForRecording(pkt)
@@ -1780,7 +1785,8 @@ final class SoftwarePlaybackHost {
                     subtitleTimeBases: subTimeBases,
                     splitDisplaySetSubtitleStreamIndices: subSplitSetIndices,
                     subtitleTapSink: getSubtitleTapSink,
-                    recordingTap: recordingTap
+                    recordingTap: recordingTap,
+                    playedMedia: playedMediaLedger
                 )
             }
             let lookahead = audioLookahead
@@ -1855,7 +1861,8 @@ final class SoftwarePlaybackHost {
                 subtitleTimeBases: subTimeBases,
                 splitDisplaySetSubtitleStreamIndices: subSplitSetIndices,
                 subtitleTapSink: getSubtitleTapSink,
-                recordingTap: recordingTap
+                recordingTap: recordingTap,
+                playedMedia: playedMediaLedger
             )
         }
     }
@@ -1879,7 +1886,8 @@ final class SoftwarePlaybackHost {
         subtitleTimeBases: [Int32: AVRational] = [:],
         splitDisplaySetSubtitleStreamIndices: Set<Int32> = [],
         subtitleTapSink: @Sendable () -> ((@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational, Bool) -> Void)?) = { nil },
-        recordingTap: @escaping @Sendable (UnsafeMutablePointer<AVPacket>) -> Void = { _ in }
+        recordingTap: @escaping @Sendable (UnsafeMutablePointer<AVPacket>) -> Void = { _ in },
+        playedMedia: PlayedMediaLedger? = nil
     ) {
         let discontinuityThresholdSeconds = 10.0
         var prevRawVideoPtsSec = Double.nan
@@ -1993,6 +2001,7 @@ final class SoftwarePlaybackHost {
                 if rawPts != Int64.min, tbSec > 0 {
                     let ptsSec = Double(rawPts) * tbSec
                     noteEdge(ptsSec)
+                    playedMedia?.record(isVideo ? .video : .audio, pts: ptsSec, bytes: Int(packet.pointee.size))
                     if let data = packet.pointee.data, packet.pointee.size > 0 {
                         let bytes = Data(bytes: data, count: Int(packet.pointee.size))
                         let isKey = isVideo && (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
@@ -2363,7 +2372,8 @@ final class SoftwarePlaybackHost {
         subtitleTimeBases: [Int32: AVRational] = [:],
         splitDisplaySetSubtitleStreamIndices: Set<Int32> = [],
         subtitleTapSink: @Sendable () -> ((@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational, Bool) -> Void)?) = { nil },
-        recordingTap: @escaping @Sendable (UnsafeMutablePointer<AVPacket>) -> Void = { _ in }
+        recordingTap: @escaping @Sendable (UnsafeMutablePointer<AVPacket>) -> Void = { _ in },
+        playedMedia: PlayedMediaLedger? = nil
     ) {
         // Clock arming: one-shot latch (seekClock is not idempotent -- re-calling snaps clock back to initialClockTime). Shared with host so a seek before first audio isn't overridden by a late re-arm.
 
@@ -2743,6 +2753,16 @@ final class SoftwarePlaybackHost {
                     let offsetTicks = Int64((discontinuityOffsetSec / tbSec).rounded())
                     if packet.pointee.pts != Int64.min { packet.pointee.pts -= offsetTicks }
                     if packet.pointee.dts != Int64.min { packet.pointee.dts -= offsetTicks }
+                }
+            }
+
+            // AE#514: on the folded axis the clock runs on, which is what the sampler reads the playhead off.
+            if let playedMedia, streamIdx == videoStreamIndex || streamIdx == audioStreamIndex {
+                let tbSec = streamIdx == videoStreamIndex ? videoTimeBaseSeconds : audioTimeBaseSeconds
+                let ticks = packet.pointee.pts != Int64.min ? packet.pointee.pts : packet.pointee.dts
+                if ticks != Int64.min, tbSec > 0 {
+                    playedMedia.record(streamIdx == videoStreamIndex ? .video : .audio,
+                                       pts: Double(ticks) * tbSec, bytes: Int(packet.pointee.size))
                 }
             }
 

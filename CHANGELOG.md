@@ -10,7 +10,18 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **`LiveTelemetry`'s two bitrate fields measure the media played, not the bytes transferred** (#514).
+  Both were metered from the reader's transfer counter, which parts from playback on every route that
+  reads ahead: a 20 Mbps VOD stream read about 35 Mbps (prefetch and seek re-fetches counted as they
+  arrived), and a paused live session kept draining its origin into the DVR window while the divisor
+  stood still, so its average climbed for as long as the pause ran. The pumps now record the played
+  video and audio packets by presentation time, and the sampler charges what the playhead crossed:
+  `instantBitrateMbps` over about the last 10 s of playback, `averageBitrateMbps` over the session.
+  Both stand still through a pause on every route, live included, and a seek charges nothing for the
+  span it jumps. The transfer remains `networkThroughputMbps`. The remote-HLS bypass is unchanged (it
+  reports the variant's declared rates).
 
 ## [7.22.0] - 2026-09-28
 

@@ -510,6 +510,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// before `start()`; nil for hosts that drive the engine without one (`aetherctl`, tests).
     var sideReaderLinkGate: SideReaderLinkGate?
 
+    /// AE#514: the session's ledger of played-stream packet bytes, which the bitrate fields read at the
+    /// playhead. Set once before `start()`, like the gate above; nil for hosts that drive the engine
+    /// without a session (`aetherctl` probes, tests).
+    var playedMediaLedger: PlayedMediaLedger?
+
     /// Forward-only producer restart counter; surfaced in live telemetry. Written on pump thread, read under packetCounterLock.
     var restartCount: Int {
         packetCounterLock.lock()
@@ -2719,8 +2724,34 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// while playback listens to the bridged rendition.
     private func readNextSourcePacketMergedTapped() throws -> (packet: UnsafeMutablePointer<AVPacket>, origin: PacketOrigin)? {
         let read = try readNextSourcePacketMerged()
-        if let read { tapForRecording(read.packet) }
+        if let read {
+            tapForRecording(read.packet)
+            recordPlayedMedia(read.packet, origin: read.origin)
+        }
         return read
+    }
+
+    /// AE#514: the video stream and the audio stream this session plays, on the source axis the engine
+    /// folds AVPlayer's clock back onto (`source_pts - playlistShiftSeconds`).
+    private func recordPlayedMedia(_ packet: UnsafeMutablePointer<AVPacket>, origin: PacketOrigin) {
+        guard let ledger = playedMediaLedger, packet.pointee.size > 0 else { return }
+        let index = packet.pointee.stream_index
+        let track: PlayedMediaLedger.Track
+        let timeBase: AVRational
+        if origin == .main, index == videoStreamIndex {
+            track = .video
+            timeBase = sourceVideoTimeBase
+        } else if let audio = audioConfig, index == audio.sourceStreamIndex,
+                  (origin == .side) == (sideAudioDemuxer != nil) {
+            track = .audio
+            timeBase = audio.sourceTimeBase
+        } else {
+            return
+        }
+        let ticks = packet.pointee.pts != Int64.min ? packet.pointee.pts : packet.pointee.dts
+        guard ticks != Int64.min, timeBase.num > 0, timeBase.den > 0 else { return }
+        ledger.record(track, pts: Double(ticks) * Double(timeBase.num) / Double(timeBase.den),
+                      bytes: Int(packet.pointee.size))
     }
 
     private func readNextSourcePacketMerged() throws -> (packet: UnsafeMutablePointer<AVPacket>, origin: PacketOrigin)? {

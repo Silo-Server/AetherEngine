@@ -118,16 +118,16 @@ final class LiveTelemetrySampler {
     private var lastDemuxerBytes: Int64 = 0
     private var lastBridgeBytes: Int64 = 0
     private var lastFramesEnqueued: Int = 0
-    private var sessionStartBytes: Int64 = 0
 
-    /// AE#514: wall-clock seconds this session spent in a phase that consumes media, accumulated one
-    /// tick at a time. The divisor of the lifetime average, in place of the wall clock since start.
-    /// Readable so a test can pin that the tick charges it, not only that the fold over it is right.
-    private(set) var activeSeconds: Double = 0
+    /// AE#514: both bitrate fields, metered over what the playhead crossed. Readable so a test can pin
+    /// that the tick feeds it, not only that the meter is right.
+    private(set) var playedMeter = PlayedBitrateMeter()
 
-    /// Timestamp of the previous tick, anchoring the delta charged above. nil until the first tick,
-    /// which therefore charges nothing: that is also the tick which seeds `sessionStartBytes`, so the
-    /// numerator and the divisor start counting at the same instant.
+    /// The ledger the meter was last advanced against. A different one is a different session, whose
+    /// playhead and bytes have nothing to do with the old meter's.
+    private var meterLedger: ObjectIdentifier?
+
+    /// Timestamp of the previous tick: the wall time the playhead had to cover its step in.
     private var lastTickTime: Date?
 
     /// [LagDiag] tick-over-tick state (#93 post-recovery lag diagnosis).
@@ -160,9 +160,9 @@ final class LiveTelemetrySampler {
         lastDemuxerBytes = engine?.demuxerBytesFetched ?? 0
         lastBridgeBytes = engine?.audioBridgeOutputBytesLifetime ?? 0
         lastFramesEnqueued = 0
-        activeSeconds = 0
+        playedMeter = PlayedBitrateMeter()
+        meterLedger = nil
         lastTickTime = nil
-        sessionStartBytes = 0
         lagLastClock = nil
         lagLastDroppedSum = 0
         eomParkFrozenTicks = 0
@@ -231,77 +231,47 @@ final class LiveTelemetrySampler {
         route != .remoteBypass
     }
 
-    /// AE#514: whether a tick's second belongs in the lifetime average's divisor.
-    ///
-    /// That average used to divide by wall-clock time since the session started, which made a pause
-    /// permanently wrong in one direction. `demuxerBytesFetched` stops advancing once the forward
-    /// buffer is full, the wall clock does not, so a 2.8 Mbps file left paused for three minutes
-    /// reported 0.4 Mbps and afterwards climbed back only asymptotically: the paused seconds never
-    /// left the divisor again. Same shape at the end of a source, where the sampler keeps ticking
-    /// until the host tears the session down.
-    ///
-    /// The line is drawn at "is the session consuming media", not at "is the picture moving". A seek
-    /// and a rebuffer are where the bytes arrive hardest, and a stalled reader is a real part of what
-    /// this session averaged, so charging their seconds is what keeps the quotient equal to the rate
-    /// the session pulled at. Only a pause and the three phases with no live session behind them
-    /// stand outside it.
-    static func chargesActiveTime(_ phase: PlaybackPhase) -> Bool {
-        switch phase {
-        case .paused, .idle, .ended, .error:
-            return false
-        case .loading, .playing, .seeking, .rebuffering, .stalled:
-            return true
+    /// AE#514: where the playhead stands on the axis the played-media ledger is keyed on, the source
+    /// axis the pumps read packets on. Native folds AVPlayer's clock back with the producer's shift
+    /// (`source_pts - playlistShiftSeconds`) rather than reading `sourceTime`, which publishes the item
+    /// axis on a sequential origin (#368). nil where there is no ledger-fed pipeline to read it off.
+    nonisolated static func ledgerPlayhead(backend: PlaybackBackend, nativeClock: Double?, playlistShift: Double,
+                               softwareSourceClock: Double?) -> Double? {
+        switch backend {
+        case .native:
+            guard let nativeClock, nativeClock.isFinite else { return nil }
+            return nativeClock + playlistShift
+        case .software:
+            return softwareSourceClock
+        case .aether, .none, .audio:
+            return nil
         }
-    }
-
-    /// Lifetime mean of the bytes the session fetched over the seconds it spent consuming them (AE#514).
-    ///
-    /// nil rather than zero until both halves are measurable, mirroring `observedTransferMbps`: a host
-    /// cannot tell a confident 0.00 Mbps from a session that has not fetched anything yet. The old
-    /// wall-clock form published exactly that on its first tick, where the lifetime delta is zero by
-    /// construction because the same tick seeds the baseline it then subtracts.
-    static func averageBitrateMbps(lifetimeBytes: Int64, activeSeconds: Double) -> Double? {
-        guard activeSeconds > 0, lifetimeBytes > 0 else { return nil }
-        return Double(lifetimeBytes) * 8.0 / activeSeconds / 1_000_000.0
     }
 
     private func tick() async {
         guard let engine = engine else { return }
 
-        // AE#514: this tick's wall-clock second goes into the lifetime average's divisor only if the
-        // session was consuming media in it. See `chargesActiveTime` for where the line runs.
         let tickTime = Date()
-        if let previous = lastTickTime, Self.chargesActiveTime(engine.playbackPhase) {
-            activeSeconds += tickTime.timeIntervalSince(previous)
-        }
+        let wallSeconds = lastTickTime.map { tickTime.timeIntervalSince($0) } ?? 0
         lastTickTime = tickTime
 
         let route = engine.videoRoute
 
-        // Instant + average bitrate from demuxer byte counters (loopback and SW; the bypass overrides below)
+        // What the reader pulled from the source. Transfer, not media rate: it feeds the network fields
+        // and [LagDiag], never the bitrate fields (AE#514, see `playedMeter`).
         let demuxerBytes = engine.demuxerBytesFetched
         let bytesThisTick = max(0, demuxerBytes - lastDemuxerBytes)
         lastDemuxerBytes = demuxerBytes
-        if sessionStartBytes == 0 { sessionStartBytes = demuxerBytes }
         byteWindow.push(bytesThisTick)
 
-        var instantBitrateMbps: Double?
-        if byteWindow.count >= 2 {
-            let totalBytes = byteWindow.sum
-            let seconds = Double(byteWindow.count)
-            instantBitrateMbps = Double(totalBytes) * 8.0 / seconds / 1_000_000.0
-        } else {
-            instantBitrateMbps = nil
-        }
+        let transferMbps: Double? = byteWindow.count >= 2
+            ? Double(byteWindow.sum) * 8.0 / Double(byteWindow.count) / 1_000_000.0
+            : nil
 
         let observedTransferMbps = Self.observedTransferMbps(
             windowBytes: byteWindow.sum,
             activeSeconds: byteWindow.activeCount,
             samples: byteWindow.count)
-
-        var averageBitrateMbps = Self.averageBitrateMbps(
-            lifetimeBytes: max(0, demuxerBytes - sessionStartBytes),
-            activeSeconds: activeSeconds)
 
         // Live audio-bridge output bitrate from the bridge's cumulative encoded-byte counter. 0 on the
         // stream-copy / AVPlayer-native / video-only paths (no bridge), which surfaces as nil.
@@ -420,6 +390,27 @@ final class LiveTelemetrySampler {
             accumulatedFrameDelaySeconds = nil
         }
 
+        // AE#514: the bitrate fields are the media the playhead crossed, never the transfer.
+        var instantBitrateMbps: Double?
+        var averageBitrateMbps: Double?
+        if let ledger = engine.playedMediaLedger {
+            let identity = ObjectIdentifier(ledger)
+            if meterLedger != identity {
+                meterLedger = identity
+                playedMeter = PlayedBitrateMeter()
+            }
+            playedMeter.advance(
+                to: Self.ledgerPlayhead(
+                    backend: engine.playbackBackend,
+                    nativeClock: nativeReadings?.currentTimeSeconds,
+                    playlistShift: engine.playlistShiftSeconds,
+                    softwareSourceClock: engine.softwareHost?.sourceClockSeconds),
+                wallSeconds: wallSeconds,
+                ledger: ledger)
+            instantBitrateMbps = playedMeter.instantMbps
+            averageBitrateMbps = playedMeter.averageMbps
+        }
+
         // Remote-HLS bypass: no demuxer, so both rates are what the playing variant declares.
         if Self.bitrateCounter(for: route) == .declaredVariant {
             let declared = Self.declaredBitrates(
@@ -434,7 +425,7 @@ final class LiveTelemetrySampler {
         engine.extractorYieldState.setForwardBuffer(forwardBufferSeconds)
 
         if let readings = nativeReadings {
-            emitLagDiag(engine: engine, readings: readings, netMbps: instantBitrateMbps)
+            emitLagDiag(engine: engine, readings: readings, netMbps: transferMbps)
             if Self.readsLoopbackPipeline(route) {
                 evaluateEndOfMediaPark(engine: engine, readings: readings)
             }
