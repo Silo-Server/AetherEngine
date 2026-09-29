@@ -124,6 +124,12 @@ final class NativeAVPlayerHost {
     /// at .paused, which every pause-guarded recovery layer misreads as user intent; the engine
     /// subscribes and escalates into the stage-2 item reload with the pause guard bypassed.
     @Published private(set) var endFailureCount: Int = 0
+    /// Whether the transport had already stopped before the latest counted end failure: the viewer
+    /// paused (through the engine, AVKit, Control Center or PiP) and the item died under that pause.
+    /// Set before `endFailureCount` publishes, so its subscribers read the value for their failure.
+    private(set) var endFailureFollowedPause = false
+    /// Uptime at which the mirrored `timeControlStatus` became `.paused`; nil while the transport rolls.
+    private var pausedSinceUptime: UInt64?
     /// End of the last seekable time range (seconds); tracks the live edge for EVENT playlists.
     /// KVO mirror of `seekableTimeRanges`, NOT a live read: the getter is a sync XPC round-trip
     /// to mediaserverd, and clock-tick sinks plus the 1 Hz paused-live timer read this at a
@@ -669,6 +675,11 @@ final class NativeAVPlayerHost {
                 guard let self, self.sessionID == sid else { return }
                 // AE#287: swallow the pause AVPlayer takes while a premature-end recovery re-seeks.
                 if status == .paused, self.prematureEndRecoveryInFlight { return }
+                if status != .paused {
+                    self.pausedSinceUptime = nil
+                } else if self.pausedSinceUptime == nil {
+                    self.pausedSinceUptime = DispatchTime.now().uptimeNanoseconds
+                }
                 self.timeControlStatus = status
                 self.startLiveJoinImmediatelyIfHolding(waitingReason: reason)
                 // First .playing: re-sample route after 2.5s settle -- AVKit only negotiates HDMI format on playback start (issue #24).
@@ -745,6 +756,9 @@ final class NativeAVPlayerHost {
                     surfaceEndFailures: false, hasEverPlayed: self.hasEverPlayed) {
                     // #93 round 3: loopback path. Count the death for the engine's revive
                     // escalation; a startup death (never played) stays with the startup watchdogs.
+                    self.endFailureFollowedPause = Self.transportPausedBeforeFailure(
+                        pausedSinceUptime: self.pausedSinceUptime,
+                        failureUptime: DispatchTime.now().uptimeNanoseconds)
                     self.endFailureCount += 1
                 }
             }
@@ -894,6 +908,22 @@ final class NativeAVPlayerHost {
         surfaceEndFailures: Bool, hasEverPlayed: Bool
     ) -> Bool {
         !surfaceEndFailures && hasEverPlayed
+    }
+
+    /// The dead item's own `.paused` and its `failedToPlayToEndTime` land within a runloop turn of
+    /// each other, in either order (the two are unsynchronized, see #50). A pause older than this
+    /// was the viewer's.
+    nonisolated static let pausedBeforeFailureMarginSeconds: Double = 1.0
+
+    /// Pure decision: had the transport already stopped when the item died? Read from AVPlayer's
+    /// own `timeControlStatus` rather than the #122 intent latch, because AVKit's transport bar,
+    /// Control Center and PiP pause and resume the player without passing through the engine.
+    nonisolated static func transportPausedBeforeFailure(
+        pausedSinceUptime: UInt64?, failureUptime: UInt64
+    ) -> Bool {
+        guard let pausedSinceUptime, failureUptime > pausedSinceUptime else { return false }
+        let pausedSeconds = Double(failureUptime - pausedSinceUptime) / 1_000_000_000
+        return pausedSeconds >= pausedBeforeFailureMarginSeconds
     }
 
     /// #50: AVPlayer fires .failed for self-healing transients (loopback 404, AVIOReader reconnect) while playback advances uninterrupted (rrgomes: tcs=playing at .failed).

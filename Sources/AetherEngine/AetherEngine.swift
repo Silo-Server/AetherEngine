@@ -2830,7 +2830,11 @@ public final class AetherEngine: ObservableObject {
     ///   `LiveReloadPolicy.recoveryRejoinPosition` cannot. A window closed with ENDLIST is a finite asset
     ///   whose seekable end IS the playhead, so the distance-behind-live that policy reads is zero and it
     ///   would aim at the edge, discarding the rewind the viewer kept through the whole outage.
+    /// - Parameter resumesPlaying: false for an item that died under a viewer's pause. The pause
+    ///   guard bypass admits the dead item; it must not also overrule the viewer, so the fresh item
+    ///   mounts paused at the anchor and the next Play resumes there.
     func reloadStalledConsumerItem(position: Double, allowPausedConsumer: Bool = false,
+                                   resumesPlaying: Bool = true,
                                    liveRejoinOverride: Double? = nil) {
         guard let host = nativeHost, let player = currentAVPlayer,
               let url = (player.currentItem?.asset as? AVURLAsset)?.url else { return }
@@ -2838,10 +2842,6 @@ public final class AetherEngine: ObservableObject {
         guard Self.stalledConsumerRecoveryAllowed(
             consumerIsPaused: player.timeControlStatus == .paused,
             allowPausedConsumer: allowPausedConsumer) else { return }
-        // Read before the swap: a dead item under a viewer's pause comes back paused.
-        let resumesPlaying = Self.stalledConsumerReloadResumesPlaying(
-            allowPausedConsumer: allowPausedConsumer,
-            transportIntentIsPlaying: host.transportIntentIsPlaying)
         // AE#422: mirror, not `currentTime()`. See `reengageStalledConsumer`; this path runs one
         // grace window deeper into the same stall.
         let anchor = Self.recoveryAnchorPosition(

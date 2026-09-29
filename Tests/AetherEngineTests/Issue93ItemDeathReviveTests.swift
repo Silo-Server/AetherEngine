@@ -78,26 +78,35 @@ struct Issue93ItemDeathReviveTests {
             consumerIsPaused: false, allowPausedConsumer: false))
     }
 
-    // MARK: - Transport after the reload
+    // MARK: - Viewer pause before the death
 
-    @Test("an item that died while playing is reloaded playing")
-    func itemDeathWhilePlayingResumes() {
-        #expect(AetherEngine.stalledConsumerReloadResumesPlaying(
-            allowPausedConsumer: true, transportIntentIsPlaying: true))
-    }
+    private static let second: UInt64 = 1_000_000_000
 
     @Test("an item that died under a viewer's pause is reloaded paused")
-    func itemDeathUnderViewerPauseStaysPaused() {
-        // The field report: paused on an Apple TV, the item died minutes later and the
-        // reload started playback with nobody touching the remote.
-        #expect(!AetherEngine.stalledConsumerReloadResumesPlaying(
-            allowPausedConsumer: true, transportIntentIsPlaying: false))
+    func deathUnderViewerPause() {
+        // The field report: paused on an Apple TV, the item died minutes later and the reload
+        // started playback with nobody touching the remote.
+        #expect(NativeAVPlayerHost.transportPausedBeforeFailure(
+            pausedSinceUptime: 10 * Self.second, failureUptime: 460 * Self.second))
     }
 
-    @Test("stall-driven reloads of a rolling consumer keep resuming")
-    func stallReloadResumes() {
-        #expect(AetherEngine.stalledConsumerReloadResumesPlaying(
-            allowPausedConsumer: false, transportIntentIsPlaying: true))
+    @Test("an item that died while rolling is reloaded playing")
+    func deathWhileRolling() {
+        #expect(!NativeAVPlayerHost.transportPausedBeforeFailure(
+            pausedSinceUptime: nil, failureUptime: 460 * Self.second))
+    }
+
+    @Test("the dead item's own pause, landing just before the notification, is not the viewer's")
+    func deathParksItsOwnPause() {
+        #expect(!NativeAVPlayerHost.transportPausedBeforeFailure(
+            pausedSinceUptime: 460 * Self.second - Self.second / 20,
+            failureUptime: 460 * Self.second))
+    }
+
+    @Test("a pause stamped after the notification is not the viewer's")
+    func pauseAfterNotification() {
+        #expect(!NativeAVPlayerHost.transportPausedBeforeFailure(
+            pausedSinceUptime: 461 * Self.second, failureUptime: 460 * Self.second))
     }
 
     // MARK: - Host-side counting decision

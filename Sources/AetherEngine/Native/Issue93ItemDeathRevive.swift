@@ -45,17 +45,4 @@ extension AetherEngine {
     ) -> Bool {
         !consumerIsPaused || allowPausedConsumer
     }
-
-    /// Pure decision: does a stage-2 item reload restart transport on the fresh item? The bypass
-    /// above admits a dead item past the pause guard; it must not also overrule the viewer. Item
-    /// death parks `timeControlStatus` at `.paused` but leaves the host's durable #122 intent
-    /// alone, and only an engine-routed pause clears it, so an item that died under a viewer's
-    /// pause is reloaded paused at its anchor and the next Play resumes there. Playing it instead
-    /// restarted a paused session on its own, minutes after the viewer paused it. Every other
-    /// stage-2 trigger refused a paused consumer on the way in, so it resumes as before.
-    nonisolated static func stalledConsumerReloadResumesPlaying(
-        allowPausedConsumer: Bool, transportIntentIsPlaying: Bool
-    ) -> Bool {
-        !allowPausedConsumer || transportIntentIsPlaying
-    }
 }
