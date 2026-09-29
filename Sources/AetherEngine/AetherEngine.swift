@@ -2296,10 +2296,6 @@ public final class AetherEngine: ObservableObject {
     /// session so a media reload that also fails cannot loop. Reset on each load.
     var masterFallbackUsed = false
 
-    /// Start position of the current loopback video load, replayed if the master is rejected and we
-    /// reload the media playlist (a startup-failed item has no reliable renderedTime).
-    var lastNativeVideoStartPosition: Double = 0
-
     /// #93 PiP skips: AVKit-side seeks (PiP +-15s buttons) bypass the engine seek API, so a far
     /// playhead jump is detected on $renderedTime and, once settled, the native subtitle readers
     /// re-anchor and the remembered rendition selection replays (its deselect/reselect busts
@@ -2479,17 +2475,30 @@ public final class AetherEngine: ObservableObject {
         // #130: a live fallback is a REJOIN of the running ingest (the window may have slid since
         // the failed master attempt); a stale explicit position can wedge AVPlayer against the
         // backlog, so skip the initial seek and let it pick edge-minus-holdback (LiveReloadPolicy).
-        // VOD keeps the explicit pre-failure position.
-        let position = lastNativeVideoStartPosition
+        // VOD reloads where the rejected item was placed. That is not always where the session
+        // started: the #93/#65 stage-2 recovery swaps a fresh item in at the position it held, and a
+        // rejection of THAT item has to come back there, not rewind to the first mount.
+        let position = host.mountedStartPosition ?? 0
+        // Read before the swap, which resets what it reads.
+        let resumesPlaying = host.mediaFallbackResumesPlaying()
         EngineLog.emit(
             "[AetherEngine] AVPlayer rejected the master (code=\(rejection.code)); falling back to "
             + "media playlist (no CC/subtitle renditions) at "
-            + (isLive ? "the live edge" : "\(String(format: "%.2f", position))s"),
+            + (isLive ? "the live edge" : "\(String(format: "%.2f", position))s")
+            + (resumesPlaying ? "" : ", staying paused for the viewer"),
             category: .session)
         host.swapItem(url: fallbackURL,
                       startPosition: isLive ? nil : position,
                       skipInitialSeek: LiveReloadPolicy.skipInitialSeek(isLive: isLive, isRejoin: true))
-        host.play()
+        // Resume only a viewer who was playing, read from both the engine's intent and AVPlayer's
+        // rate. A paused title refused behind the tvOS screensaver used to start itself and wake it.
+        if resumesPlaying {
+            host.play()
+        } else {
+            // Clears the intent latch a pause from AVKit, Control Center or PiP left set, so the fresh
+            // item's readyToPlay does not re-assert play() behind the viewer.
+            host.pause()
+        }
     }
 
     /// #35 readiness-gate settle windows. Generous enough that a slow-but-healthy cold start reads as
