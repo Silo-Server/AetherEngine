@@ -132,7 +132,8 @@ final class NativeAVPlayerHost {
     /// play, false for pause, nil for none. A viewer can press either while the engine confirms the
     /// death, and that press outranks the transport state the item died in.
     private(set) var transportCommandSinceEndFailure: Bool?
-    /// Uptime at which the mirrored `timeControlStatus` became `.paused`; nil while the transport rolls.
+    /// Uptime at which the transport stopped: set when the mirrored `timeControlStatus` becomes
+    /// `.paused` or an engine-routed pause lands, cleared when it rolls or the engine is told to play.
     private var pausedSinceUptime: UInt64?
     /// End of the last seekable time range (seconds); tracks the live edge for EVENT playlists.
     /// KVO mirror of `seekableTimeRanges`, NOT a live read: the getter is a sync XPC round-trip
@@ -1688,6 +1689,7 @@ final class NativeAVPlayerHost {
         // Set intent before play() so readyToPlay observer can re-assert if the replaceCurrentItem swap swallowed it.
         playIntent = true
         transportCommandSinceEndFailure = true
+        pausedSinceUptime = nil
         // Call play() immediately (no defer-until-ready): item.status never advances past .unknown until AVPlayer is told to play.
         avPlayer.play()
     }
@@ -1695,6 +1697,9 @@ final class NativeAVPlayerHost {
     func pause() {
         playIntent = false
         transportCommandSinceEndFailure = false
+        // Stamped here as well as from KVO: pausing a player that is already `.paused` (an item parked
+        // after a recovery) changes no status, and the viewer's pause must still count.
+        if pausedSinceUptime == nil { pausedSinceUptime = DispatchTime.now().uptimeNanoseconds }
         avPlayer.pause()
     }
 
@@ -1945,6 +1950,11 @@ final class NativeAVPlayerHost {
         // Non-zero rate counts as play intent (must survive replaceCurrentItem swap like play() does).
         playIntent = (value != 0)
         transportCommandSinceEndFailure = (value != 0)
+        if value != 0 {
+            pausedSinceUptime = nil
+        } else if pausedSinceUptime == nil {
+            pausedSinceUptime = DispatchTime.now().uptimeNanoseconds
+        }
         // #436: `play()` is rate 1.0 by definition, and it is re-issued from paths no client can see:
         // the readyToPlay re-assert after an item swap, interruption and background resume, the #287
         // premature-end recovery, plus AVKit's own transport and the remote command centre calling
