@@ -78,6 +78,28 @@ struct Issue93ItemDeathReviveTests {
             consumerIsPaused: false, allowPausedConsumer: false))
     }
 
+    // MARK: - Transport after the reload
+
+    @Test("an item that died while playing is reloaded playing")
+    func itemDeathWhilePlayingResumes() {
+        #expect(AetherEngine.stalledConsumerReloadResumesPlaying(
+            allowPausedConsumer: true, transportIntentIsPlaying: true))
+    }
+
+    @Test("an item that died under a viewer's pause is reloaded paused")
+    func itemDeathUnderViewerPauseStaysPaused() {
+        // The field report: paused on an Apple TV, the item died minutes later and the
+        // reload started playback with nobody touching the remote.
+        #expect(!AetherEngine.stalledConsumerReloadResumesPlaying(
+            allowPausedConsumer: true, transportIntentIsPlaying: false))
+    }
+
+    @Test("stall-driven reloads of a rolling consumer keep resuming")
+    func stallReloadResumes() {
+        #expect(AetherEngine.stalledConsumerReloadResumesPlaying(
+            allowPausedConsumer: false, transportIntentIsPlaying: true))
+    }
+
     // MARK: - Host-side counting decision
 
     @Test("loopback path counts an end failure after playback was established")

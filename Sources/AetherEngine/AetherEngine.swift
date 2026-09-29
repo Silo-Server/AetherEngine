@@ -2838,6 +2838,10 @@ public final class AetherEngine: ObservableObject {
         guard Self.stalledConsumerRecoveryAllowed(
             consumerIsPaused: player.timeControlStatus == .paused,
             allowPausedConsumer: allowPausedConsumer) else { return }
+        // Read before the swap: a dead item under a viewer's pause comes back paused.
+        let resumesPlaying = Self.stalledConsumerReloadResumesPlaying(
+            allowPausedConsumer: allowPausedConsumer,
+            transportIntentIsPlaying: host.transportIntentIsPlaying)
         // AE#422: mirror, not `currentTime()`. See `reengageStalledConsumer`; this path runs one
         // grace window deeper into the same stall.
         let anchor = Self.recoveryAnchorPosition(
@@ -2873,7 +2877,7 @@ public final class AetherEngine: ObservableObject {
             + Self.recoveryAnchorLogSuffix(
                 anchor: anchor, position: position,
                 pendingSeekTarget: pendingRecoverySeekClockTarget)
-            + " (same URL, same host)",
+            + " (same URL, same host" + (resumesPlaying ? ")" : ", staying paused for the viewer)"),
             category: .engine
         )
         // AE#454: the placement, expressed in the playlist the fresh item is about to load. A rejoin
@@ -2913,7 +2917,7 @@ public final class AetherEngine: ObservableObject {
         // AE#454 round 2: the item that is about to load is the one the placement was armed for, and
         // the only one whose axis the playlist will state.
         if didArmPlacement { liveRejoinPlacementGeneration = host.itemGeneration }
-        host.play()
+        if resumesPlaying { host.play() }
         if let rejoinPosition {
             // Stashed rather than seeked: the pre-readiness seek IS the wedge LiveReloadPolicy exists
             // to avoid, and a live seek does not defer itself (`shouldDeferHostSeek` excludes live), so
