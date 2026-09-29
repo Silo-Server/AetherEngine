@@ -10,6 +10,10 @@ the public-API contract.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [7.22.2] - 2026-09-29
+
 ### Fixed
 
 - **An unproven HDR master is served after the display mode switch, not during it** (#667). The
