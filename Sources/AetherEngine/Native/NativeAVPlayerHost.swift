@@ -679,12 +679,7 @@ final class NativeAVPlayerHost {
                 guard let self, self.sessionID == sid else { return }
                 // AE#287: swallow the pause AVPlayer takes while a premature-end recovery re-seeks.
                 if status == .paused, self.prematureEndRecoveryInFlight { return }
-                if status != .paused {
-                    self.pausedSinceUptime = nil
-                } else if self.pausedSinceUptime == nil {
-                    self.pausedSinceUptime = DispatchTime.now().uptimeNanoseconds
-                }
-                self.timeControlStatus = status
+                self.mirrorTimeControlStatus(status)
                 self.startLiveJoinImmediatelyIfHolding(waitingReason: reason)
                 // First .playing: re-sample route after 2.5s settle -- AVKit only negotiates HDMI format on playback start (issue #24).
                 if status == .playing { self.hasEverPlayed = true }
@@ -913,6 +908,16 @@ final class NativeAVPlayerHost {
         surfaceEndFailures: Bool, hasEverPlayed: Bool
     ) -> Bool {
         !surfaceEndFailures && hasEverPlayed
+    }
+
+    /// Publishes AVPlayer's status and keeps `pausedSinceUptime` in step with it.
+    private func mirrorTimeControlStatus(_ status: AVPlayer.TimeControlStatus) {
+        if status != .paused {
+            pausedSinceUptime = nil
+        } else if pausedSinceUptime == nil {
+            pausedSinceUptime = DispatchTime.now().uptimeNanoseconds
+        }
+        timeControlStatus = status
     }
 
     /// The dead item's own `.paused` and its `failedToPlayToEndTime` land within a runloop turn of
@@ -1756,7 +1761,7 @@ final class NativeAVPlayerHost {
         guard sessionID == sid else { return true }
         avPlayer.play()
         prematureEndRecoveryInFlight = false
-        timeControlStatus = avPlayer.timeControlStatus
+        mirrorTimeControlStatus(avPlayer.timeControlStatus)
         let resumedAt = await prematureEndReading().playhead
         EngineLog.emit(
             "[NativeAVPlayerHost] #\(sessionID) AE#287 resumed: rate=\(avPlayer.rate) "
