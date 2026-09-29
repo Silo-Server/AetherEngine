@@ -1761,7 +1761,11 @@ final class NativeAVPlayerHost {
         guard sessionID == sid else { return true }
         avPlayer.play()
         prematureEndRecoveryInFlight = false
-        mirrorTimeControlStatus(avPlayer.timeControlStatus)
+        // Read right after the recovery's own play(): `.paused` here is the item not yet rolling, not
+        // a viewer pause, so it may clear the pause stamp but never set it. Later KVO keeps it current.
+        let status = avPlayer.timeControlStatus
+        if status != .paused { pausedSinceUptime = nil }
+        timeControlStatus = status
         let resumedAt = await prematureEndReading().playhead
         EngineLog.emit(
             "[NativeAVPlayerHost] #\(sessionID) AE#287 resumed: rate=\(avPlayer.rate) "
