@@ -120,18 +120,22 @@ struct BoundedFetchTests {
         defer { origin.stop() }
         let session = makeSession()
         defer { session.invalidateAndCancel() }
-        // The per-byte accumulation this replaced took 5 s for this body in a debug build. Best of three,
-        // because a suite run on a loaded machine stretches one wall-clock sample (12 s seen) while the
-        // per-byte cost would stay above the bar in every sample.
-        var best = Duration.seconds(3600)
+        // Measured against `session.data(for:)` on the same origin in the same run, not against a wall
+        // clock: a loaded suite stretched an absolute sample to 8 s, while the per-byte accumulation this
+        // replaced ran about 27x slower than the plain fetch under any load (audit NET-113).
+        var bestPlain = Duration.seconds(3600)
+        var bestBounded = Duration.seconds(3600)
         for _ in 0..<3 {
-            let started = ContinuousClock.now
+            let plainStart = ContinuousClock.now
+            let (plain, _) = try await session.data(for: request(origin))
+            bestPlain = min(bestPlain, ContinuousClock.now - plainStart)
+            #expect(plain.count == size)
+            let boundedStart = ContinuousClock.now
             let (data, _) = try await BoundedPlaylistFetch.data(for: request(origin), session: session, limit: 64 * 1024 * 1024)
-            best = min(best, ContinuousClock.now - started)
+            bestBounded = min(bestBounded, ContinuousClock.now - boundedStart)
             #expect(data.count == size)
-            if best < .seconds(1.5) { break }
         }
-        #expect(best < .seconds(1.5), "took \(best)")
+        #expect(bestBounded < bestPlain * 4 + .milliseconds(250), "bounded \(bestBounded) vs plain \(bestPlain)")
     }
 
     @Test("a segment may weigh 20 MB/s of its own duration between 32 MiB and 256 MiB")
