@@ -241,6 +241,59 @@ final class HLSLocalServer: @unchecked Sendable {
         return rest
     }
 
+    /// The request line as it is logged: the route after the session token, never the token itself
+    /// (audit SUB-107).
+    static func requestLineForLog(method: Substring, routePath: String, query: String,
+                                  version: Substring?) -> String {
+        var line = "\(method) \(routePath)"
+        if !query.isEmpty { line += "?\(query)" }
+        if let version { line += " \(version)" }
+        return escapedForLog(line)
+    }
+
+    /// The headers whose values the first-request dump shows: the capability headers it exists for
+    /// (#50), and the address the client used (#86). Nothing that carries a credential.
+    static let loggedRequestHeaderValues: Set<String> = [
+        "accept", "host", "range", "user-agent", "x-playback-session-id",
+    ]
+
+    /// Audit Vcred-102: on the #316 / AE#495 stand-in route AVPlayer sends the host's own headers to
+    /// this server too, credentials included (measured), so the dump names every header and prints a
+    /// value only where `loggedRequestHeaderValues` says it answers a question.
+    static func requestHeadersForLog(_ headerLines: [String]) -> String {
+        headerLines.map { line -> String in
+            guard let colon = line.firstIndex(of: ":") else { return "?" }
+            let name = line[..<colon].trimmingCharacters(in: .whitespaces)
+            let shown = loggedRequestHeaderValues.contains(name.lowercased()) ? line : name
+            return escapedForLog(shown, limit: maximumStrangerText)
+        }.joined(separator: " | ")
+    }
+
+    /// Longest stretch of a stranger's request text a log line carries. A head may be 8 KB, and one
+    /// line of that per interval would still crowd a small log ring.
+    static let maximumStrangerText = 256
+
+    /// Request text as a log line may carry it: C0 controls and DEL escaped, so a bare LF cannot forge
+    /// a line of its own (audit NET-111), and cut after `limit` characters. Done here rather than in
+    /// `EngineLog`, which passes the multi-line playlist bodies this server logs on purpose.
+    static func escapedForLog(_ text: String, limit: Int = .max) -> String {
+        var out = ""
+        var count = 0
+        for scalar in text.unicodeScalars {
+            if count >= limit {
+                out += "..."
+                break
+            }
+            if scalar.value < 0x20 || scalar.value == 0x7F {
+                out += String(format: "\\x%02X", scalar.value)
+            } else {
+                out.unicodeScalars.append(scalar)
+            }
+            count += 1
+        }
+        return out
+    }
+
     /// Kernel-assigned ephemeral port. Zero until start() succeeds.
     private(set) var port: UInt16 = 0
 
@@ -329,6 +382,12 @@ final class HLSLocalServer: @unchecked Sendable {
     private var listenFd: Int32 = -1
     private var shouldStop = false
     private var clientFds = Set<Int32>()
+
+    /// Audit SUB-107: whether `pathToken` is registered with the log redactor. The token is the
+    /// capability that keeps LAN strangers off the stream, and every line that prints a server URL
+    /// (`load url=`, `asset.url=`, the #316 serving line) would otherwise hand it to a shared log
+    /// for as long as the session lives.
+    private var tokenRegistered = false
 
     /// Active connection count; engine memory probe watches for unexpectedly rising accumulation (AVPlayer normally holds 1-3 connections).
     var activeConnectionCount: Int {
@@ -429,6 +488,10 @@ final class HLSLocalServer: @unchecked Sendable {
     private static let acceptFailureBackoffMicroseconds: useconds_t = 100_000
     private var acceptFailureLog = LogThrottle(interval: 5)
     private var refusalLog = LogThrottle(interval: 5)
+    /// Audit NET-111: every line a connection that never presented the token can cause shares this, so
+    /// a LAN peer looping short connections costs the host's log one line per interval, not two per
+    /// request.
+    private var strangerLog = LogThrottle(interval: 5)
 
     // MARK: - Init
 
@@ -453,11 +516,12 @@ final class HLSLocalServer: @unchecked Sendable {
 
     private let unauthenticatedHeadDeadline: TimeInterval
 
-    /// Admits `origin` to the relay and returns the address standing in for it, for a player
-    /// pointed at the relay rather than at a provider's playlists. Nil before `start()` or with
-    /// no relay mounted.
+    /// Allows `origin` on the relay and returns the address standing in for it, for a player
+    /// pointed at the relay rather than at a provider's playlists. Grants no credentials: that is
+    /// the caller's decision, for a URL the host handed over (audit NET-109). Nil before `start()`
+    /// or with no relay mounted.
     func relayURL(for origin: URL) -> URL? {
-        guard let relay, relay.admit(origin) != nil else { return nil }
+        guard let relay, relay.allow(origin) != nil else { return nil }
         stateLock.lock()
         let listeningPort = port
         stateLock.unlock()
@@ -535,6 +599,9 @@ final class HLSLocalServer: @unchecked Sendable {
         listenFd = fd
         port = assignedPort
         shouldStop = false
+        if !tokenRegistered {
+            tokenRegistered = LogRedaction.register(pathToken)
+        }
         stateLock.unlock()
 
         EngineLog.emit("[HLSLocalServer] Listening on port \(assignedPort)",
@@ -559,7 +626,12 @@ final class HLSLocalServer: @unchecked Sendable {
         mediaPlaylistBuildCount = 0
         let clients = clientFds
         clientFds.removeAll()
+        let unregisterToken = tokenRegistered
+        tokenRegistered = false
         stateLock.unlock()
+        // Last, so a line still in flight from a connection being shut down is redacted too; the
+        // token opens nothing once the listener is gone.
+        defer { if unregisterToken { LogRedaction.unregister(pathToken) } }
         // AE#597: the one line that says a listener went away. Without it a log cannot tell a
         // server that was released from one that outlived its session on a port of its own.
         EngineLog.emit(
@@ -702,7 +774,7 @@ final class HLSLocalServer: @unchecked Sendable {
                 : acceptedAt + unauthenticatedHeadDeadline
             guard let request = readHTTPRequest(
                 fd, firstByteDeadline: firstByteDeadline, authenticated: authenticated) else { return }
-            guard processRequest(request, on: fd) else { return }
+            guard processRequest(request, on: fd, authenticated: authenticated) else { return }
             authenticated = true
         }
     }
@@ -735,8 +807,8 @@ final class HLSLocalServer: @unchecked Sendable {
             }
             if n == 0 {
                 if buffer.isEmpty { return nil }
-                EngineLog.emit("[HLSLocalServer] peer EOF mid-request fd=\(fd)",
-                               category: .hlsServer)
+                emitRequestProblem("[HLSLocalServer] peer EOF mid-request fd=\(fd)",
+                                   authenticated: authenticated)
                 return nil
             }
             if n < 0 {
@@ -747,8 +819,8 @@ final class HLSLocalServer: @unchecked Sendable {
                                    category: .hlsServer, level: authenticated ? .info : .verbose)
                     return nil
                 }
-                EngineLog.emit("[HLSLocalServer] recv error fd=\(fd) errno=\(err)",
-                               category: .hlsServer)
+                emitRequestProblem("[HLSLocalServer] recv error fd=\(fd) errno=\(err)",
+                                   authenticated: authenticated)
                 return nil
             }
             if buffer.isEmpty {
@@ -759,8 +831,8 @@ final class HLSLocalServer: @unchecked Sendable {
                 return buffer.prefix(end + 4)
             }
             if buffer.count > 8192 {
-                EngineLog.emit("[HLSLocalServer] request too large fd=\(fd) bytes=\(buffer.count)",
-                               category: .hlsServer)
+                emitRequestProblem("[HLSLocalServer] request too large fd=\(fd) bytes=\(buffer.count)",
+                                   authenticated: authenticated)
                 return nil
             }
         }
@@ -793,21 +865,40 @@ final class HLSLocalServer: @unchecked Sendable {
         }
     }
 
-    private func processRequest(_ request: Data, on fd: Int32) -> Bool {
+    /// A line caused by a connection that has not presented the token: throttled, since anyone on the
+    /// LAN can cause it (audit NET-111). An authenticated connection's lines go out as they come.
+    private func emitRequestProblem(_ line: String, authenticated: Bool) {
+        guard !authenticated else {
+            EngineLog.emit(line, category: .hlsServer)
+            return
+        }
+        stateLock.lock()
+        let admitted = strangerLog.admit(now: Self.uptimeSeconds())
+        stateLock.unlock()
+        guard let suppressed = admitted else { return }
+        EngineLog.emit(
+            line + (suppressed > 0
+                ? " (\(suppressed) more from unauthenticated connections since the last line)" : ""),
+            category: .hlsServer)
+    }
+
+    private func processRequest(_ request: Data, on fd: Int32, authenticated: Bool) -> Bool {
         byteCounterLock.lock()
         _requestCount &+= 1
         byteCounterLock.unlock()
         guard let text = String(data: request, encoding: .utf8) else {
-            EngineLog.emit("[HLSLocalServer] non-UTF8 request bytes (\(request.count)B)",
-                           category: .hlsServer)
+            emitRequestProblem("[HLSLocalServer] non-UTF8 request bytes (\(request.count)B)",
+                               authenticated: authenticated)
             return false
         }
         let firstLine = text.components(separatedBy: "\r\n").first ?? ""
         let parts = firstLine.split(separator: " ", maxSplits: 2,
                                     omittingEmptySubsequences: true)
         guard parts.count >= 2 else {
-            EngineLog.emit("[HLSLocalServer] malformed request line: '\(firstLine)'",
-                           category: .hlsServer)
+            emitRequestProblem(
+                "[HLSLocalServer] malformed request line: "
+                    + "'\(Self.escapedForLog(firstLine, limit: Self.maximumStrangerText))'",
+                authenticated: authenticated)
             return false
         }
         let rawTarget = String(parts[1])
@@ -825,18 +916,24 @@ final class HLSLocalServer: @unchecked Sendable {
         // The listener is reachable from the whole LAN, so an unprefixed request is a scan or a
         // stale URL, never AVPlayer following a playlist we handed out.
         guard let routePath = Self.pathAfterToken(pathToken, in: path) else {
-            EngineLog.emit("[HLSLocalServer] rejected request without a valid session token: \(firstLine)",
-                           category: .hlsServer)
-            _ = send404(fd: fd, path: path, reason: "bad session token")
+            // One line for the rejection and the 404 together: the path is the stranger's text.
+            emitRequestProblem(
+                "[HLSLocalServer] rejected request without a valid session token, -> 404: "
+                    + Self.escapedForLog(firstLine, limit: Self.maximumStrangerText),
+                authenticated: authenticated)
+            _ = send404(fd: fd, path: path, reason: "bad session token", logged: false)
             return false
         }
         let normalizedPath = (routePath == "/audio.m3u8") ? "/media.m3u8" : routePath
+        let loggedRequest = Self.requestLineForLog(
+            method: parts[0], routePath: routePath, query: query,
+            version: parts.count > 2 ? parts[2] : nil)
 
         // #50 diag: promoted to .info so the host mirror names the failing path without a verbose build. Revert once #50 is root-caused.
         // AE#446: the fd is what says whether a blocking-reload hold is parking the connection the
         // next segment request needs. Same fd on both, and the segment could not be read until the
         // hold returned; different fds, and the client chose not to fetch.
-        EngineLog.emit("[HLSLocalServer] \(firstLine) fd=\(fd)", category: .hlsServer)
+        EngineLog.emit("[HLSLocalServer] \(loggedRequest) fd=\(fd)", category: .hlsServer)
         // #227 diag: name each distinct client once, so an AirPlay session shows whether the receiver fetches
         // for itself (its own LAN address appears) or the sender pulls everything (only 127.0.0.1 / own IP).
         if let peer = Self.peerAddress(of: fd) {
@@ -844,7 +941,7 @@ final class HLSLocalServer: @unchecked Sendable {
             let isNewPeer = loggedPeers.insert(peer).inserted
             stateLock.unlock()
             if isNewPeer {
-                EngineLog.emit("[HLSLocalServer] #227 client \(peer) first request: \(firstLine)", category: .hlsServer)
+                EngineLog.emit("[HLSLocalServer] #227 client \(peer) first request: \(loggedRequest)", category: .hlsServer)
             }
         }
         // Dump request headers once per session; AVPlayer capability headers (Accept, Range, X-Playback-Session-Id) can influence silent variant rejection.
@@ -854,7 +951,7 @@ final class HLSLocalServer: @unchecked Sendable {
         stateLock.unlock()
         if dumpHeaders {
             let allLines = text.components(separatedBy: "\r\n")
-            let headers = allLines.dropFirst().prefix(while: { !$0.isEmpty }).joined(separator: " | ")
+            let headers = Self.requestHeadersForLog(Array(allLines.dropFirst().prefix(while: { !$0.isEmpty })))
             // #50 diag: once-per-session, promoted to .info to surface any
             // Range / capability header that explains the 404. Revert with the
             // arrival-line promotion above once #50 is root-caused.
@@ -1300,10 +1397,12 @@ final class HLSLocalServer: @unchecked Sendable {
         }
     }
 
-    private func send404(fd: Int32, path: String, reason: String) -> Bool {
+    private func send404(fd: Int32, path: String, reason: String, logged: Bool = true) -> Bool {
         let response = Self.responseHeader(status: "404 Not Found", contentLength: 0, contentType: nil)
-        EngineLog.emit("[HLSLocalServer] -> 404 \(path) reason=\(reason)",
-                       category: .hlsServer)
+        if logged {
+            EngineLog.emit("[HLSLocalServer] -> 404 \(path) reason=\(reason)",
+                           category: .hlsServer)
+        }
         return writeAll(fd: fd, data: response, path: path)
     }
 

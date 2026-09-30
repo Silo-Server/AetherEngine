@@ -7,7 +7,7 @@ import AetherEngine
 func runDoviTest(url: URL) -> Int32 {
     let outputPath = debugOutputPath("aetherctl-dovitest.hevc")
     let rpuPath = debugOutputPath("host.rpu")
-    print("aetherctl dovitest: \(url.absoluteString)")
+    print(EngineLog.redacted("aetherctl dovitest: \(url.absoluteString)"))
     print("output: \(outputPath)")
     print("")
 

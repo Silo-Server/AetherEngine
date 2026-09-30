@@ -20,7 +20,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     private let httpHeaders: [String: String]
     /// The URL the host gave `httpHeaders` for. A companion inherits its parent's, since its own
     /// playlist URL is one the master named (audit NET-7).
-    private let credentialOrigin: URL
+    let credentialOrigin: URL
     private let role: Role
     private let fifo = ByteFIFO(capacity: 16 * 1024 * 1024)
     /// Wider than the VOD reader's 2 MB: a live window with hours of DVR at short segments is a
