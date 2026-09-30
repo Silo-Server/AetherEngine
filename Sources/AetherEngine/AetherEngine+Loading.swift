@@ -28,7 +28,9 @@ extension AetherEngine {
         // just left, and the window's edge is a running maximum a single wrong sample latches.
         if liveItemPlacementPending { return }
         // Newest seam at or before the raw clock wins: activates seams on forward play, re-applies pre-seam shift on backward DVR seeks.
-        if let active = presentationAxis.shiftSeconds(atItemSeconds: value) {
+        // Audit PERF-106: published on the engine, so an unchanged write would fire its
+        // objectWillChange on every 10 Hz tick (the reason `clock` exists).
+        if let active = presentationAxis.shiftSeconds(atItemSeconds: value), active != playlistShiftSeconds {
             playlistShiftSeconds = active
         }
         if pendingRecoverySeekClockTarget == nil {
@@ -891,7 +893,7 @@ extension AetherEngine {
                 // Fold with the shift in effect AT the raw clock, not with the newest one: while old-epoch buffer
                 // is still on screen those differ, and the picture is what the clock has to describe.
                 let activeShift = self.presentationAxis.shiftSeconds(atItemSeconds: self.nativeClockSeconds) ?? seconds
-                self.playlistShiftSeconds = activeShift
+                if activeShift != self.playlistShiftSeconds { self.playlistShiftSeconds = activeShift }
                 // The cache did not move, but the fold onto the display axis did. Re-publish the band
                 // from the raw spans so it does not carry the retired epoch's offset until the next
                 // segment lands (AE#468 follow-up).
