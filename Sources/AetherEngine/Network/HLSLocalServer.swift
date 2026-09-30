@@ -453,11 +453,12 @@ final class HLSLocalServer: @unchecked Sendable {
 
     private let unauthenticatedHeadDeadline: TimeInterval
 
-    /// Admits `origin` to the relay and returns the address standing in for it, for a player
-    /// pointed at the relay rather than at a provider's playlists. Nil before `start()` or with
-    /// no relay mounted.
+    /// Allows `origin` on the relay and returns the address standing in for it, for a player
+    /// pointed at the relay rather than at a provider's playlists. Grants no credentials: that is
+    /// the caller's decision, for a URL the host handed over (audit NET-109). Nil before `start()`
+    /// or with no relay mounted.
     func relayURL(for origin: URL) -> URL? {
-        guard let relay, relay.admit(origin) != nil else { return nil }
+        guard let relay, relay.allow(origin) != nil else { return nil }
         stateLock.lock()
         let listeningPort = port
         stateLock.unlock()

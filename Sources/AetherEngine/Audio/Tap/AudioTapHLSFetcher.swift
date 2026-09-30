@@ -21,12 +21,14 @@ final class AudioTapHLSFetcher: @unchecked Sendable {
 
     private let session: URLSession
     /// Same per-stream headers the player's AVURLAsset sends (#119); header-enforcing origins
-    /// 403 the tap's playlist / segment / key fetches without them.
-    private let httpHeaders: [String: String]
+    /// 403 the tap's playlist / segment / key fetches without them. The credential headers go only
+    /// to the origin of `credentialOrigin`, the URL the host loaded: every other URL here is one a
+    /// playlist named, on any host or scheme (audit DEC-103, the NET-7 rule).
+    private let credentials: CredentialScope
     private let keyCacheLock = NSLock()
     private var keyCache: [String: Data] = [:]
 
-    init(session: URLSession? = nil, httpHeaders: [String: String] = [:]) {
+    init(session: URLSession? = nil, httpHeaders: [String: String] = [:], credentialOrigin: URL? = nil) {
         if let session {
             self.session = session
         } else {
@@ -36,12 +38,12 @@ final class AudioTapHLSFetcher: @unchecked Sendable {
             self.session = URLSession(
                 configuration: cfg, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
         }
-        self.httpHeaders = httpHeaders
+        credentials = CredentialScope(headers: httpHeaders, anchor: credentialOrigin)
     }
 
     private func get(_ url: URL) async throws -> (Data, URLResponse) {
         var request = URLRequest(url: url)
-        for (field, value) in httpHeaders {
+        for (field, value) in credentials.headers(for: url) {
             request.setValue(value, forHTTPHeaderField: field)
         }
         return try await session.data(for: request)

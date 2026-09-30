@@ -43,20 +43,19 @@ final class HLSOriginRelay: @unchecked Sendable {
 
     private let stateLock = NSLock()
 
-    /// Origins this relay will fetch, as scheme://host:port. Seeded by `admit(_:)` and grown
-    /// as playlists reveal where their own sub-resources live, so a stream split across hosts
-    /// keeps working while a request naming somewhere nobody advertised is still refused.
+    /// Origins this relay will fetch, as scheme://host:port. Seeded by `allow(_:)` and
+    /// `grantCredentials(to:httpHeaders:)` and grown as playlists reveal where their own
+    /// sub-resources live, so a stream split across hosts keeps working while a request naming
+    /// somewhere nobody advertised is still refused.
     private var allowedOrigins = Set<String>()
 
-    /// Sent upstream on every fetch. Origins that gate on Referer, User-Agent or
-    /// Authorization need these, and they can no longer ride on the asset because the asset
-    /// now points at the local server.
-    private var upstreamHeaders: [String: String] = [:]
-
-    /// The URLs the host itself pointed the relay at. Credential headers follow a fetch only to
-    /// one of these origins with no TLS downgrade; an origin a playlist revealed gets the rest of
-    /// the headers but not the token (audit NET-7).
-    private var credentialOrigins: [URL] = []
+    /// Sent upstream on every fetch. Origins that gate on Referer, User-Agent or Authorization need
+    /// these, and they can no longer ride on the asset because the asset now points at the local
+    /// server. The anchors are the URLs the host itself pointed the relay at: credential headers
+    /// follow a fetch only to one of those origins with no TLS downgrade, and an origin a playlist
+    /// revealed or a redirect landed on gets the rest of the headers but not the token (audit NET-7,
+    /// NET-109).
+    private var credentials = CredentialScope(headers: [:], anchors: [])
 
     /// The NSURLError code of the last upstream handshake this relay lost to system trust, if any.
     ///
@@ -144,17 +143,43 @@ final class HLSOriginRelay: @unchecked Sendable {
 
     // MARK: - Admission
 
-    /// Lets this relay fetch `origin`, and adopts the headers a load carries. Returns the
+    /// Lets this relay fetch `origin` without granting it the host's credentials. Returns the
     /// origin key, or nil for a URL with no host to fetch from.
     @discardableResult
-    func admit(_ origin: URL, httpHeaders: [String: String] = [:]) -> String? {
+    func allow(_ origin: URL) -> String? {
         guard let key = Self.originKey(for: origin) else { return nil }
         stateLock.lock()
         allowedOrigins.insert(key)
-        if !httpHeaders.isEmpty { upstreamHeaders = httpHeaders }
-        if !credentialOrigins.contains(origin) { credentialOrigins.append(origin) }
         stateLock.unlock()
         return key
+    }
+
+    /// Lets this relay fetch `origin` AND send it the credential headers, and adopts the headers a
+    /// load carries. Only for a URL the host itself handed over (audit NET-109): anything a
+    /// playlist or a redirect produced goes through `allow(_:)`.
+    @discardableResult
+    func grantCredentials(to origin: URL, httpHeaders: [String: String] = [:]) -> String? {
+        guard let key = Self.originKey(for: origin) else { return nil }
+        stateLock.lock()
+        allowedOrigins.insert(key)
+        let anchors = credentials.anchors.contains(origin)
+            ? credentials.anchors : credentials.anchors + [origin]
+        credentials = CredentialScope(
+            headers: httpHeaders.isEmpty ? credentials.headers : httpHeaders, anchors: anchors)
+        stateLock.unlock()
+        return key
+    }
+
+    /// The URLs whose origins receive the host's credentials.
+    var credentialAnchors: [URL] {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return credentials.anchors
+    }
+
+    /// The headers a relayed fetch of `target` carries upstream.
+    func upstreamHeaders(for target: URL) -> [String: String] {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return credentials.headers(for: target)
     }
 
     /// scheme://host:port for `url`, which is the granularity the allow list works at.
@@ -289,7 +314,7 @@ final class HLSOriginRelay: @unchecked Sendable {
 
         stateLock.lock()
         let permitted = allowedOrigins.contains(key)
-        let headers = Self.headers(upstreamHeaders, for: origin, grantedFor: credentialOrigins)
+        let headers = credentials.headers(for: origin)
         stateLock.unlock()
         guard permitted else {
             EngineLog.emit(
@@ -330,17 +355,6 @@ final class HLSOriginRelay: @unchecked Sendable {
                     status: 200, body: Data(rewritten.utf8),
                     contentType: "application/vnd.apple.mpegurl", contentRange: nil))
         }
-    }
-
-    /// Everything the host sent, with the credentials only when `target` is one of the host's own
-    /// origins (same host, same port, no downgrade).
-    static func headers(_ headers: [String: String], for target: URL, grantedFor anchors: [URL])
-        -> [String: String]
-    {
-        if anchors.contains(where: { RedirectHeaderPolicy.credentialsAllowed(from: $0, to: target) }) {
-            return headers
-        }
-        return RedirectHeaderPolicy.scoped(headers, grantedFor: nil, sentTo: target)
     }
 
     private static func looksLikePlaylist(url: URL, contentType: String?) -> Bool {

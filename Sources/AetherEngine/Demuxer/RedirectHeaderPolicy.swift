@@ -88,3 +88,29 @@ enum RedirectHeaderPolicy {
         url.port ?? (scheme == "https" ? 443 : 80)
     }
 }
+
+/// Audit NET-109: which URLs may receive the headers a host handed over. Being allowed to fetch a
+/// URL (a playlist named it, a redirect landed there) and being granted the host's credentials are
+/// separate decisions: only the URLs the host itself passed in are anchors, and every other target
+/// gets the same headers minus the credentials, the rule a redirect follows. One type so the relay,
+/// the subtitle proxy, the audio tap and the live rendition fetch cannot each decide differently.
+struct CredentialScope: Sendable {
+    let headers: [String: String]
+    let anchors: [URL]
+
+    init(headers: [String: String], anchors: [URL]) {
+        self.headers = headers
+        self.anchors = anchors
+    }
+
+    init(headers: [String: String], anchor: URL?) {
+        self.init(headers: headers, anchors: anchor.map { [$0] } ?? [])
+    }
+
+    func headers(for target: URL) -> [String: String] {
+        if anchors.contains(where: { RedirectHeaderPolicy.credentialsAllowed(from: $0, to: target) }) {
+            return headers
+        }
+        return RedirectHeaderPolicy.scoped(headers, grantedFor: nil, sentTo: target)
+    }
+}

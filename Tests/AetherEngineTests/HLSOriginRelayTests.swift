@@ -104,7 +104,7 @@ struct HLSOriginRelayAddressingTests {
     func rewritesMediaPlaylist() throws {
         let relay = HLSOriginRelay()
         let origin = URL(string: "https://media.example.com/hls/media.m3u8?ApiKey=k")!
-        relay.admit(origin)
+        relay.grantCredentials(to: origin)
 
         let playlist = """
             #EXTM3U
@@ -152,7 +152,7 @@ struct HLSOriginRelayAddressingTests {
         // engine has.
         let relay = HLSOriginRelay()
         let origin = URL(string: "https://media.example.com/hls/master.m3u8")!
-        relay.admit(origin)
+        relay.grantCredentials(to: origin)
 
         let master = """
             #EXTM3U
@@ -180,7 +180,7 @@ struct HLSOriginRelayAddressingTests {
         // fetch to time out. Nothing here waits on a name resolving, and the three
         // differ only by port, which the allow list treats as part of the origin.
         let origin = URL(string: "https://127.0.0.1:9/hls/media.m3u8")!
-        relay.admit(origin)
+        relay.grantCredentials(to: origin)
 
         _ = relay.rewritePlaylist(
             "#EXTM3U\n#EXTINF:6.0,\nhttps://127.0.0.1:10/seg1.ts\n", relativeTo: origin,
@@ -202,7 +202,7 @@ struct HLSOriginRelayAddressingTests {
         try server.start()
         defer { server.stop(); relay.stop() }
         let origin = URL(string: "https://127.0.0.1:9/hls/media.m3u8")!
-        relay.admit(origin)
+        relay.grantCredentials(to: origin)
 
         let stranger = try #require(relay.localURL(
             for: origin, port: server.port, token: String(repeating: "cd", count: 16)))

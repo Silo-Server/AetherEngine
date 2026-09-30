@@ -22,6 +22,15 @@ extension AetherEngine {
         id >= liveSubtitleRenditionTrackIDBase && id < liveSubtitleRenditionTrackIDBase + 1_000
     }
 
+    /// Audit Vcred-101: the rendition playlist and every segment it lists are URIs the master named,
+    /// on any host or scheme, so the host's credentials go only to the ingest's own origin, as on the
+    /// ingest's other fetches. No live ingest reader, no anchor, no credentials.
+    nonisolated static func liveSubtitleRenditionCredentials(headers: [String: String], source: IOReader?)
+        -> CredentialScope
+    {
+        CredentialScope(headers: headers, anchor: (source as? LiveIngestSourceInfo)?.credentialOrigin)
+    }
+
     /// Publish the renditions the live ingest resolved. Called once per load, before playback settles;
     /// the master's declaration is proof enough that the track exists, so unlike the caption tap there
     /// is nothing to wait for.
@@ -95,7 +104,8 @@ extension AetherEngine {
         // The state line is worth having but not every two seconds: LogTap is a ring buffer, and a
         // line that repeats 30 times a minute pushes out everything a reader came for.
         var pollsSinceStateLine = 0
-        let headers = loadedOptions.httpHeaders
+        let credentials = Self.liveSubtitleRenditionCredentials(
+            headers: loadedOptions.httpHeaders, source: customReader)
         while !Task.isCancelled {
             guard activeSubtitleTrackIndex == trackID else { return }
             // The source axis can be re-anchored under a running session (a producer seam republishes
@@ -111,7 +121,8 @@ extension AetherEngine {
             }
             var pollInterval = 2.0
             do {
-                let text = try await Self.fetchText(rendition.playlistURL, headers: headers)
+                let text = try await Self.fetchText(
+                    rendition.playlistURL, headers: credentials.headers(for: rendition.playlistURL))
                 guard case .media(let media) = try HLSPlaylistParser.parse(text) else { return }
                 pollInterval = max(1, media.targetDuration)
                 // Anchor the work at the playhead, not at the start of the playlist. A rendition
@@ -134,7 +145,7 @@ extension AetherEngine {
                           let url = HLSPlaylistParser.resolve(uri: segment.uri, against: rendition.playlistURL)
                     else { continue }
                     seen.insert(segment.uri)
-                    guard let body = try? await Self.fetchText(url, headers: headers),
+                    guard let body = try? await Self.fetchText(url, headers: credentials.headers(for: url)),
                           let parsed = WebVTTSegmentParser.parse(body) else { continue }
                     guard activeSubtitleTrackIndex == trackID else { return }
                     let fresh = WebVTTSegmentParser.cues(from: parsed, segmentWallStart: wallStart,
