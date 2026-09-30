@@ -709,13 +709,25 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// Cascade, most specific first: the demuxer's own claim for this packet, then the last genuine
     /// delta this stream showed, then the frame duration the producer already carries for the last
     /// trun sample, then the historical single tick for a stream that has never carried a usable
-    /// timestamp at all.
+    /// timestamp at all. Each arm is capped at `maxStrideTicks` (audit SEG-101: a crafted
+    /// BlockDuration near the source bound walked nine packets to Int64.max), the same second
+    /// `updatedStrideTicks` already applies to a learned stride.
     static func repairStrideTicks(packetDuration: Int64, observedStride: Int64,
-                                  fallbackDuration: Int64) -> Int64 {
-        if packetDuration > 0 { return packetDuration }
-        if observedStride > 0 { return observedStride }
-        if fallbackDuration > 0 { return fallbackDuration }
+                                  fallbackDuration: Int64, maxStrideTicks: Int64 = .max) -> Int64 {
+        let cap = Swift.max(maxStrideTicks, 1)
+        if packetDuration > 0 { return Swift.min(packetDuration, cap) }
+        if observedStride > 0 { return Swift.min(observedStride, cap) }
+        if fallbackDuration > 0 { return Swift.min(fallbackDuration, cap) }
         return 1
+    }
+
+    /// Audit SEG-101: the dts a packet with neither timestamp gets, or nil when the walk would leave
+    /// the plausible source range. The packet is then dropped, and the next genuine timestamp
+    /// re-anchors the stream.
+    static func synthesizedDts(anchor: Int64, stride: Int64) -> Int64? {
+        let (dts, overflow) = anchor.addingReportingOverflow(stride)
+        guard !overflow, SourceTimestampBounds.plausible(dts) == dts else { return nil }
+        return dts
     }
 
     /// Adopts `dts - previousDts` as the stream's stride when it is forward and inside
@@ -3156,11 +3168,16 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     } else {
                         // Neither timestamp survived. One tick per packet is not a presentation time,
                         // it is a frozen clock; advance by this stream's frame interval instead.
+                        let strideTb = isVideoPkt ? sourceVideoTbSeconds : audioSourceTbSeconds
                         let stride = Self.repairStrideTicks(
                             packetDuration: packet.pointee.duration,
                             observedStride: isVideoPkt ? videoSourceStrideTicks : audioSourceStrideTicks,
-                            fallbackDuration: isVideoPkt ? videoFallbackDurationPts : audioFallbackDurationPts)
-                        packet.pointee.dts = anchor &+ stride
+                            fallbackDuration: isVideoPkt ? videoFallbackDurationPts : audioFallbackDurationPts,
+                            maxStrideTicks: strideTb > 0 ? Int64(Self.maxSynthesizedStrideSeconds / strideTb) : .max)
+                        guard let synthesized = Self.synthesizedDts(anchor: anchor, stride: stride) else {
+                            continue
+                        }
+                        packet.pointee.dts = synthesized
                         packet.pointee.pts = packet.pointee.dts
                         timestampsSynthesized = true
                         noteSynthesizedTimestamp(strideTicks: stride, isVideo: isVideoPkt)
@@ -3431,7 +3448,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                    packet.pointee.dts <= lastVideoSourceDts,
                    SourceTimestampBounds.difference(lastVideoSourceDts, packet.pointee.dts) <= monoGlitchVideoTicks {
                     let original = packet.pointee.dts
-                    let bumped = lastVideoSourceDts + 1
+                    let bumped = SourceTimestampBounds.sum(lastVideoSourceDts, 1)
                     let ptsValid = packet.pointee.pts != Int64.min
                     if !ptsValid || bumped <= packet.pointee.pts {
                         packet.pointee.dts = bumped
@@ -3472,7 +3489,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     // pts/dts skew so dts <= pts isn't a useful gate;
                     // just bump.
                     let original = packet.pointee.dts
-                    packet.pointee.dts = lastAudioSourceDts + 1
+                    packet.pointee.dts = SourceTimestampBounds.sum(lastAudioSourceDts, 1)
                     if !loggedFirstAudioDtsBump {
                         loggedFirstAudioDtsBump = true
                         EngineLog.emit(
