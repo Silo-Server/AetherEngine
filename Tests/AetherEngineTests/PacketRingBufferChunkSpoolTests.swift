@@ -81,8 +81,13 @@ struct PacketRingBufferChunkSpoolTests {
             try ring.append(pts: Double(i) * 0.0125, isKeyframe: i % 100 == 0, isVideo: i % 2 == 0, bytes: payload)
         }
         #expect(ring.seqBounds.end == count)
-        // The file-per-packet ring kept 554-586 B per entry (a URL each): 55 MB for these 100k.
-        #expect(ring.indexFootprintBytes < 5 << 20)
+        // The file-per-packet ring kept 554-586 B per entry (a URL each): 55 MB for these 100k. The
+        // footprint is array CAPACITY, which moves with growth and allocator rounding (4.2 MB measured
+        // alone, over 5 MB once in a full parallel run), so the bound is a multiple of the flat minimum
+        // that still sits far under the defect.
+        let flatMinimum = count * MemoryLayout<PacketRingBuffer.Entry>.stride
+        #expect(ring.indexFootprintBytes < flatMinimum * 6,
+                "footprint \(ring.indexFootprintBytes) against a flat minimum of \(flatMinimum)")
     }
 
     // MARK: - Byte budget
