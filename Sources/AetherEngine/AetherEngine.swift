@@ -4066,6 +4066,10 @@ public final class AetherEngine: ObservableObject {
         var probedAudioTracks: [TrackInfo] = []
         var probedSubtitleTracks: [TrackInfo] = []
         var probedDefaultAudioIndex: Int32 = -1
+        // Audit LIF-107: published only after the post-probe generation check below. The AE#532 audit
+        // is a second read `stopInternal` cannot abort, so a superseded load can return from it after
+        // its successor's prologue and would write this source's geometry over the reset.
+        var probedGeometry: (width: Int32, height: Int32, pixelAspect: Double?)?
         // AE#493: what this session takes the display to be. The observed table is what the platform
         // could answer; the session table adds what the host asserted, because Dolby Vision has no
         // public capability API on macOS and eligibility deliberately does not claim it. Composed once,
@@ -4192,19 +4196,17 @@ public final class AetherEngine: ObservableObject {
                 // The base-layer route is the one exception: it serves hvc1 and asks for hvc1.
                 detectedDVProfile = (detectedFormat == .dolbyVision) && !presentsDolbyVisionBaseLayer
                 detectedFieldOrder = stream.pointee.codecpar.pointee.field_order
-                sourceVideoWidth = stream.pointee.codecpar.pointee.width
-                sourceVideoHeight = stream.pointee.codecpar.pointee.height
-                if let sar = PixelAspectPolicy.declaredPixelAspect(
+                let width = stream.pointee.codecpar.pointee.width
+                let height = stream.pointee.codecpar.pointee.height
+                let sar = PixelAspectPolicy.declaredPixelAspect(
                     bitstream: stream.pointee.codecpar.pointee.sample_aspect_ratio,
                     container: stream.pointee.sample_aspect_ratio,
-                    width: sourceVideoWidth,
-                    height: sourceVideoHeight
-                ) {
-                    sourceVideoPixelAspectRatio = Double(sar.num) / Double(sar.den)
-                }
+                    width: width,
+                    height: height
+                )
+                probedGeometry = (width, height, sar.map { Double($0.num) / Double($0.den) })
                 detectedVideoBitrate = probe.declaredBitrate(stream: stream)
                 detectedVideoStreamFormat = VideoStreamFormat(codecpar: stream.pointee.codecpar)
-                lastDetectedVideoCodec = detectedCodecID
             }
             probedAudioTracks = probe.audioTrackInfos()
             probedSubtitleTracks = probe.subtitleTrackInfos()
@@ -4223,6 +4225,12 @@ public final class AetherEngine: ObservableObject {
                 Task.detached { [probe] in probe.close() }
             }
             try checkLoadCurrent(gen)
+        }
+        if let probedGeometry {
+            sourceVideoWidth = probedGeometry.width
+            sourceVideoHeight = probedGeometry.height
+            if let pixelAspect = probedGeometry.pixelAspect { sourceVideoPixelAspectRatio = pixelAspect }
+            lastDetectedVideoCodec = detectedCodecID
         }
 
         // Custom sources have no URL to reopen from: a failed probe is fatal.
