@@ -1383,6 +1383,10 @@ public final class AetherEngine: ObservableObject {
     /// The ended recording's drain and trailer, run off the main actor (audit REC-1).
     var recordingFinish: Task<Void, Never>?
 
+    /// Bumped by every `stopRecording()`, so a `startRecording` that was waiting on `recordingFinish`
+    /// can tell that a stop overtook it (audit FEA-106).
+    var recordingStopSerial: UInt64 = 0
+
     /// Republishes `recordingState` progress at 1 Hz while a recording runs.
     var recordingProgressTimer: Timer?
 
