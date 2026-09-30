@@ -1746,6 +1746,18 @@ extension AetherEngine {
         let w = sourceVideoWidth > 0 ? sourceVideoWidth : 1920
         let h = sourceVideoHeight > 0 ? sourceVideoHeight : 1080
         let startAt = startAtSeconds ?? sourceTime
+        // Sodalite#156: the anchor next to the playhead it is supposed to mean. `sourceTime` is
+        // written on the native path only by the render sink and by seek landings, never by the clock
+        // tick (#49), and while an external screen holds the picture nothing renders locally. A
+        // reader anchored on a stale or zero source time refills from the head of the file and then
+        // serves empty .vtt for the window the receiver is actually asking for, which is a caption
+        // box with nothing in it. These two numbers disagreeing is that defect; them agreeing means
+        // the reader simply has not caught up yet, which is a different problem with a different fix.
+        EngineLog.emit("[AetherEngine] #156 reader anchor: startAt=\(String(format: "%.2f", startAt))s "
+                       + "sourceTime=\(String(format: "%.2f", sourceTime))s "
+                       + "clock=\(String(format: "%.2f", currentTime))s "
+                       + "explicit=\(startAtSeconds.map { String(format: "%.2f", $0) } ?? "nil")",
+                       category: .engine)
         let reader = customClone
         // #76: same bounded-probe + active-title open as the inline reader.
         let probesize = loadedOptions.probesize
