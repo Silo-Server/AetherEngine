@@ -2296,8 +2296,14 @@ extension AetherEngine {
         // It follows the TARGET route, not the previous one: a rebuild that flips to software renders
         // into its own layer, and a preserved host would leave AVKit bound to a stale player with
         // audio still flowing into the next load (the release `load()` does by hand on that branch).
+        // Audit LIF-104: the AE#597 reset outranks the #15 reuse here exactly as it does in `load`,
+        // or the first rebuild after a reset mounts its item on the invalidated AVPlayer.
+        let mediaServicesWereReset = consumeMediaServicesReset()
         claimSoftwarePathTakeover()   // AE#629
-        stopInternal(resetDisplayCriteria: false, keepNativeHost: !targetSoftwarePath, keepCustomReader: true)
+        stopInternal(resetDisplayCriteria: false,
+                     keepNativeHost: !targetSoftwarePath && !mediaServicesWereReset,
+                     keepCustomReader: true)
+        if mediaServicesWereReset { dropAudioPlayerHostAfterMediaServicesReset() }
         EngineLog.emit("[AetherEngine] reload: stopInternal done (\(elapsedMs(since: reloadStart))ms)", category: .engine)
         let gen = loadGeneration
         loadedURL = url
