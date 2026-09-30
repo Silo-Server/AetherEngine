@@ -4092,21 +4092,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                 trackedPacketFree(&fpVar)
                                 continue
                             }
-                            // Rescale FLAC pts to source video TB for segment lookup; live and
-                            // sequential audio follow the video cutter.
-                            let fpSeg: Int
-                            if isLive {
-                                fpSeg = liveCurrentSegmentIndex
-                            } else if audioFollowsVideoCut {
-                                fpSeg = vodCutter.current
-                            } else {
-                                let fpPtsInVideoTb = av_rescale_q(
-                                    fp.pointee.pts,
-                                    audio.inputTimeBase,
-                                    sourceVideoTimeBase
-                                )
-                                fpSeg = segmentIndex(forSourcePts: fpPtsInVideoTb)
-                            }
+                            let fpSeg = bridgedAudioSegmentIndex(fp, audio: audio)
                             guard let muxer = ensureMuxer(forSegmentIndex: fpSeg) else {
                                 trackedPacketFree(&fpVar)
                                 bridgedMuxerGone = true
@@ -4257,17 +4243,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // EOF tail flush for bridge audio: drains ~100-200 ms remainder (per-feed only emits full frames).
         if case .eof = exitReason, let audio = audioConfig, let bridge = audio.bridge {
             for fp in bridge.flush() {
-                let fpSeg: Int
-                if isLive {
-                    fpSeg = liveCurrentSegmentIndex
-                } else {
-                    let fpPtsInVideoTb = av_rescale_q(
-                        fp.pointee.pts,
-                        audio.inputTimeBase,
-                        sourceVideoTimeBase
-                    )
-                    fpSeg = segmentIndex(forSourcePts: fpPtsInVideoTb)
-                }
+                let fpSeg = bridgedAudioSegmentIndex(fp, audio: audio)
                 if let muxer = ensureMuxer(forSegmentIndex: fpSeg) {
                     fp.pointee.stream_index = muxer.audioOutputStreamIndex
                     av_packet_rescale_ts(fp, audio.inputTimeBase, muxer.muxerAudioTimeBase)
@@ -4298,6 +4274,16 @@ final class HLSSegmentProducer: @unchecked Sendable {
         finishCondition.unlock()
 
         onPumpFinished?(exitReason)
+    }
+
+    /// The segment a bridged audio packet belongs to. Live and sequential audio follow the video
+    /// cutter; everything else is routed by the packet's own time against the plan. One helper for the
+    /// per-feed and the end-of-file flush, because the flush missing the sequential rule opened a plan
+    /// index the cutter never reached and cost the archive its final segment (audit SEG-103).
+    private func bridgedAudioSegmentIndex(_ packet: UnsafeMutablePointer<AVPacket>, audio: AudioConfig) -> Int {
+        if isLive { return liveCurrentSegmentIndex }
+        if audioFollowsVideoCut { return vodCutter.current }
+        return segmentIndex(forSourcePts: av_rescale_q(packet.pointee.pts, audio.inputTimeBase, sourceVideoTimeBase))
     }
 
     // MARK: - Look-behind finalize helpers
