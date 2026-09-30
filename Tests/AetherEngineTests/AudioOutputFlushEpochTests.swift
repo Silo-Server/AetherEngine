@@ -81,6 +81,46 @@ struct AudioOutputFlushEpochTests {
         #expect(output.epoch != afterFlush)
     }
 
+    private final class Returned: @unchecked Sendable {
+        private let lock = NSLock()
+        private var done = false
+        func set() { lock.withLock { done = true } }
+        var isSet: Bool { lock.withLock { done } }
+    }
+
+    private final class BufferBox: @unchecked Sendable {
+        let buffer: CMSampleBuffer
+        init(_ buffer: CMSampleBuffer) { self.buffer = buffer }
+    }
+
+    /// AE#549's observer takes the output's lock on whatever thread AVFoundation posts from, and `enqueue`
+    /// now holds that lock across `renderer.enqueue`. A renderer that posts from inside `enqueue` (the
+    /// 27 SDKs move the same condition into the enqueue call itself) would make the feed thread wait on a
+    /// lock it already holds, and every later `flush()` / `stop()` / `seekClock()` with it.
+    @Test("an automatic-flush notification posted from inside enqueue does not hang the feed",
+          .timeLimit(.minutes(1)))
+    func automaticFlushPostedInsideEnqueueDoesNotDeadlock() async throws {
+        let output = AudioOutput()
+        let box = BufferBox(try #require(makeBuffer(pts: 1)))
+        output.afterRendererEnqueueForTesting = { [unowned output] in
+            NotificationCenter.default.post(name: .AVSampleBufferAudioRendererWasFlushedAutomatically,
+                                            object: output.renderer)
+        }
+        let returned = Returned()
+        let feed = Thread {
+            output.enqueue(sampleBuffer: box.buffer)
+            returned.set()
+        }
+        feed.start()
+
+        let finished = try await waitFor(upTo: .seconds(10)) { returned.isSet }
+        #expect(finished, "the feed thread is parked on a lock it holds itself")
+        guard finished else { return }
+
+        try await waitFor { output.automaticFlushCount == 1 }
+        #expect(output.automaticFlushCount == 1, "the flush still happens, serialized with enqueueing")
+    }
+
     @Test("an unconditional enqueue is untouched by the epoch")
     func unconditionalEnqueueStillEnqueues() throws {
         let output = AudioOutput()
