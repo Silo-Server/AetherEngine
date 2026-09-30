@@ -502,7 +502,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     // MARK: - Streaming Mode (sequential GET)
 
-    private var streamBuffer = Data()
+    /// Held as the delivered chunks, like the persistent window (AE#619): a read trims its consumed
+    /// head by advancing an offset, where `Data.subdata` copied the whole 32-64 MB still ahead of the
+    /// cut on every read (audit PERF-102). Guarded by `streamLock`.
+    private var streamBuffer = ChunkedByteWindow()
     private var streamBytesRead: Int64 = 0
     /// Most bytes `streamBuffer` has held at once, for the bound tests. Guarded by `streamLock`.
     private var streamPeakBytes = 0
@@ -800,6 +803,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         defer { streamLock.unlock() }
         return streamPeakBytes
     }
+
+    #if DEBUG
+    /// Storage address of every chunk the streaming buffer still holds, first to last. A trim that
+    /// copied the buffer would move all of them.
+    var streamChunkAddressesForTesting: [UnsafeRawPointer?] {
+        streamLock.lock()
+        defer { streamLock.unlock() }
+        return streamBuffer.chunkStorageAddresses()
+    }
+    #endif
 
     /// Bytes the persistent window holds, behind and ahead of the cursor.
     var windowBytesForTesting: Int {
@@ -1646,7 +1659,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
         streamLock.lock()
         streamEnded = true
-        streamBuffer = Data()
+        streamBuffer.removeAll()
         let sTask = streamingTask
         let sSession = streamingSession
         let wasSuspended = streamingTaskSuspended
@@ -1824,22 +1837,17 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 let toCopy = min(available, requestSize - totalRead)
 
                 streamLock.lock()
-                streamBuffer.withUnsafeBytes { raw in
-                    let src = raw.baseAddress!.advanced(by: posInBuffer)
-                        .assumingMemoryBound(to: UInt8.self)
-                    buf.advanced(by: totalRead).update(from: src, count: toCopy)
-                }
+                streamBuffer.copyBytes(to: buf.advanced(by: totalRead), from: posInBuffer, count: toCopy)
                 streamLock.unlock()
 
                 position += Int64(toCopy)
                 totalRead += toCopy
 
-                // subdata (not removeFirst): removeFirst leaks backing storage (see trimWindowLocked).
                 streamLock.lock()
                 let consumed = Int(position - streamBytesRead)
                 if consumed > Self.streamTrimThreshold {
                     let trimAmount = consumed - Self.streamTrimThreshold
-                    streamBuffer = streamBuffer.subdata(in: trimAmount..<streamBuffer.count)
+                    streamBuffer.dropFirst(trimAmount)
                     streamBytesRead += Int64(trimAmount)
                 }
                 var toResume: URLSessionDataTask?
@@ -3637,7 +3645,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 self.streamLock.unlock()
                 return
             }
-            self.streamBuffer.append(data)
+            // Owned bytes: the chunk is retained until it is consumed, and a delivery that still
+            // references the transport's dispatch_data would pin its buffer for that long.
+            self.streamBuffer.append(data.withUnsafeBytes { Data($0) })
             self.streamPeakBytes = max(self.streamPeakBytes, self.streamBuffer.count)
             var toCancel: URLSessionDataTask?
             if self.streamBuffer.count > Self.streamHardCap {
