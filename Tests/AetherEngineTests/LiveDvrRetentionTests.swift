@@ -30,6 +30,7 @@ final class LiveDvrRetentionTests: XCTestCase {
         let segmentBytes = 1_500_000                    // ~2 s at 6 Mbps, the fastZap live shape
         let budget = 512 << 20                          // 512 MiB: far more than this run needs
         let cache = SegmentCache(forwardWindow: 10, retentionBudgetBytes: budget)
+        defer { cache.close() }   // a cache that is only dropped leaves its ~300 MB of segments in the temp dir
         let payload = Data(repeating: 0xAB, count: segmentBytes)
         let total = 200
 
@@ -53,6 +54,7 @@ final class LiveDvrRetentionTests: XCTestCase {
         let segmentBytes = 1_000_000
         let budget = 30 * segmentBytes                  // room for ~30 segments outside the window
         let cache = SegmentCache(forwardWindow: 10, retentionBudgetBytes: budget)
+        defer { cache.close() }   // a cache that is only dropped leaves its ~300 MB of segments in the temp dir
         let payload = Data(repeating: 0xAB, count: segmentBytes)
         let total = 200
 

@@ -75,9 +75,19 @@ final class HLSOriginRelay: @unchecked Sendable {
     private let session: URLSession
 
     private let heldBodyLimit: Int
+    private let pendingLimit: Int
 
-    init(maximumHeldBodyBytes: Int = HLSOriginRelay.maximumHeldBodyBytes) {
+    /// Audit NET-107: fetches cut off because the consumer fell `pendingLimit` bytes behind. Diagnostics and tests.
+    var cappedFetchCount: Int {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return _cappedFetchCount
+    }
+    private var _cappedFetchCount = 0
+
+    init(maximumHeldBodyBytes: Int = HLSOriginRelay.maximumHeldBodyBytes,
+         maximumPendingBytes: Int = HLSOriginRelay.maximumPendingBytes) {
         heldBodyLimit = maximumHeldBodyBytes
+        pendingLimit = maximumPendingBytes
         let config = URLSessionConfiguration.ephemeral
         config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         config.urlCache = nil
@@ -390,6 +400,11 @@ final class HLSOriginRelay: @unchecked Sendable {
     static let maximumHeldPlaylistBytes = 16 * 1024 * 1024
     static let maximumHeldBodyBytes = 64 * 1024 * 1024
 
+    /// Audit NET-107: what one streamed fetch may hold for a consumer that is not draining. Above any
+    /// segment a player asks for in one request, so a consumer that is merely slow is never cut off,
+    /// and far enough under a session's memory that a stalled one cannot turn it into a heap.
+    static let maximumPendingBytes = 32 * 1024 * 1024
+
     /// The answers that mean "you are asking too often", which arm the pacer for this origin.
     private static let refusalStatuses: Set<Int> = [429, 503, 509]
 
@@ -422,12 +437,15 @@ final class HLSOriginRelay: @unchecked Sendable {
             for: origin, label: "relay", timeout: Self.slotWaitSeconds)
         defer { OriginRequestBudget.shared.release(ticket) }
 
-        let pump = UpstreamPump()
+        let pump = UpstreamPump(hardCapBytes: pendingLimit) { [weak self] in
+            guard let self else { return }
+            self.stateLock.lock()
+            self._cappedFetchCount += 1
+            self.stateLock.unlock()
+        }
         let task = session.dataTask(with: request)
         task.delegate = pump
         task.resume()
-        // abandon before cancel: a body parked at the high-water mark is waiting on a consumer, and
-        // cancelling the task does not wake it.
         defer { pump.abandon(); task.cancel() }
 
         guard let http = pump.awaitHead() else {
@@ -577,14 +595,23 @@ final class HLSOriginRelay: @unchecked Sendable {
 /// land. Holding them here instead, and writing from the delegate callback, would put a socket the
 /// player has stopped reading in front of every other task on this session's serial delegate queue.
 ///
-/// The bound is what makes the handoff backpressure rather than an unbounded copy of the body: the
-/// producer waits once the consumer is that far behind, which is the same shape the direct route has
-/// when a socket stops draining.
+/// Audit NET-107: the producer never waits. The delegate queue is serial across every task on the
+/// session, so parking it inside `didReceive` for one consumer that stopped reading (an AirPlay
+/// receiver on a slow link) held up the head and body of every other relayed fetch for a whole
+/// park. Backpressure by `URLSessionTask.suspend()` is no way out: transports that ignore it were
+/// measured (#220), and suspended flows correlated with every connection in the process going deaf
+/// (#310). So the bound is a cap on what one fetch may hold: past it the fetch is cancelled, the
+/// body the player was promised ends short and the server closes the connection, which is how a
+/// truncated transfer already reads, and the player asks again.
 private final class UpstreamPump: NSObject, URLSessionDataDelegate, @unchecked Sendable {
 
-    /// One segment's worth of slack. Enough that a fast origin never waits on a loopback write, small
-    /// enough that a stalled player cannot turn a session into a heap of parked segments.
-    private static let highWaterBytes = 4 * 1024 * 1024
+    private let hardCapBytes: Int
+    private let onCapped: @Sendable () -> Void
+
+    init(hardCapBytes: Int, onCapped: @escaping @Sendable () -> Void) {
+        self.hardCapBytes = hardCapBytes
+        self.onCapped = onCapped
+    }
 
     private let condition = NSCondition()
     private var head: HTTPURLResponse?
@@ -592,6 +619,7 @@ private final class UpstreamPump: NSObject, URLSessionDataDelegate, @unchecked S
     private var finished = false
     private var failure: Error?
     private var consumerGaveUp = false
+    private var capped = false
 
     // MARK: - Consumer, on the server's worker thread
 
@@ -643,8 +671,7 @@ private final class UpstreamPump: NSObject, URLSessionDataDelegate, @unchecked S
         }
     }
 
-    /// Stops the producer waiting on a consumer that is no longer there. Without it a body parked at
-    /// the high-water mark holds the delegate queue for the life of the session.
+    /// Tells the producer to stop buffering for a consumer that is no longer there.
     func abandon() {
         condition.lock()
         consumerGaveUp = true
@@ -679,14 +706,26 @@ private final class UpstreamPump: NSObject, URLSessionDataDelegate, @unchecked S
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         condition.lock()
-        while pending.count >= Self.highWaterBytes && !consumerGaveUp { condition.wait() }
-        let abandoned = consumerGaveUp
-        if !abandoned {
-            pending.append(data)
-            condition.broadcast()
+        var stop = consumerGaveUp || capped
+        var newlyCapped = false
+        if !stop {
+            if pending.count + data.count > hardCapBytes {
+                capped = true
+                newlyCapped = true
+                stop = true
+            } else {
+                pending.append(data)
+                condition.broadcast()
+            }
         }
         condition.unlock()
-        if abandoned { dataTask.cancel() }
+        if newlyCapped {
+            EngineLog.emit(
+                "[HLSOriginRelay] the consumer fell more than \(hardCapBytes >> 20) MiB behind one fetch; "
+                + "cancelling it so the player asks again", category: .hlsServer)
+            onCapped()
+        }
+        if stop { dataTask.cancel() }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {

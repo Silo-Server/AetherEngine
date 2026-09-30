@@ -453,7 +453,7 @@ extension AetherEngine {
         guard var w = liveWindow else { return }
         w.noteEdge(edgeSessionTime)
         w.notePlayhead(currentTime)
-        w.noteResidentFloor(residentLiveFloorSessionSeconds())
+        w.noteResidentFloor(residentLiveFloorSessionSeconds() ?? softwareHost?.dvrResidentFloorSessionSeconds)
         // Sodalite#104 round 4: the cadence the playlist declares, which outranks how the source
         // happened to deliver. nil on the paths that serve no playlist of ours.
         w.noteTargetDuration(liveTargetDurationSeconds)
