@@ -2313,6 +2313,9 @@ extension AetherEngine {
         if mediaServicesWereReset { dropAudioPlayerHostAfterMediaServicesReset() }
         EngineLog.emit("[AetherEngine] reload: stopInternal done (\(elapsedMs(since: reloadStart))ms)", category: .engine)
         let gen = loadGeneration
+        // Audit LIF-101: the same settle point as `load`, for the same readiness waypoint.
+        beginLoadInFlight(gen)
+        defer { endLoadInFlight(gen) }
         loadedURL = url
         lastDetectedVideoCodec = preservedVideoCodec
 
