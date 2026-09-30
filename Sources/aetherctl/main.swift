@@ -106,7 +106,7 @@ func printUsage() {
       aetherctl segverify [--from N] [--count K] [--no-dv] [--force-dv] [--dv-base-layer] [--dump <dir>] <url>
                           (#92: SW-decode each segment in isolation; framesDecoded==0 => not independent)
       aetherctl disc-inspect <disc.iso>
-      aetherctl dovitest <file>
+      aetherctl dovitest [--out PATH.hevc] <file>
       aetherctl extract [--at <sec>] [--snapshot] [--width <px>] [--loops <n>] <url>
       aetherctl audio [--seconds N] <url>
       aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] <url>
@@ -236,7 +236,8 @@ func printUsage() {
                 8.1 (and drop the enhancement layer) via
                 DoviRpuConverter, and write the result to
                 aetherctl-dovitest.hevc (Annex-B) in a private
-                per-run temporary directory, printed. Feed
+                per-user temporary directory (printed, reused and
+                overwritten by the next run), or to --out PATH. Feed
                 that to `dovi_tool extract-rpu` + `info` to validate
                 the rewritten RPU against ground truth.
 
@@ -260,7 +261,7 @@ func printUsage() {
                 frame-accurately at full resolution. Use --loops N
                 with `leaks --atExit` to detect memory leaks.
                 Writes the first frame to aetherctl-extract-<mode>.png
-                in a private per-run temporary directory, printed.
+                in a private per-user temporary directory, printed.
 
       audio     Load a source through the engine's audio-only path
                 (LoadOptions.audioOnly=true), play for ~10 seconds,
@@ -444,14 +445,15 @@ if first == "disc-inspect" {
 // DV P7 -> 8.1 converter validation harness.
 if first == "dovitest" {
     var rest = Array(args.dropFirst(2))
+    let outPath = takeStringFlag("--out", from: &rest)
     guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
         print("ERROR: dovitest requires a <file> argument")
-        print("Usage: aetherctl dovitest <file>")
+        print("Usage: aetherctl dovitest [--out PATH.hevc] <file>")
         exit(64)
     }
     rest.removeAll { $0 == urlArg }
     rejectStrayFlags(rest, subcommand: "dovitest")
-    exit(runDoviTest(url: parseSourceURL(urlArg)))
+    exit(runDoviTest(url: parseSourceURL(urlArg), outputPath: outPath))
 }
 
 // #93 post-recovery judder: raw video packet timing per demuxer open profile.
