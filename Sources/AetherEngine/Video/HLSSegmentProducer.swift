@@ -2841,11 +2841,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
         isLive: Bool,
         bufferedBytes: Int,
         packetSize: Int,
-        capBytes: Int
+        capBytes: Int,
+        bufferedCount: Int = 0,
+        maxEntries: Int = HLSSegmentProducer.maxPregateAudioBufferEntries
     ) -> Bool {
         guard isAudioPkt, audioWaitForVideo, isHeadOfStream || !isLive else { return false }
-        return bufferedBytes + max(packetSize, 0) <= capBytes
+        return bufferedCount < maxEntries && bufferedBytes + max(packetSize, 0) <= capBytes
     }
+
+    /// Audit SEG-102: the byte cap charges payload only, and each entry costs an `AVPacket`, a buffer
+    /// ref and an array slot besides, so 1-byte laced packets pinned about 1.4 GB under the 8 MiB cap
+    /// while the VOD gate waited unbounded. Above what the byte cap admits for AAC or AC-3, and still
+    /// about 22 minutes of 20 ms Opus frames.
+    static let maxPregateAudioBufferEntries = 65_536
 
     /// Overwrite packed side-audio timestamps with the synthesized program clock.
     /// KNOWN LIMITATION: free-running clock does NOT follow a live video rebase; A/V sync is lost from that boundary on.
@@ -3199,7 +3207,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     isLive: isLive,
                     bufferedBytes: pregateAudioBufferBytes,
                     packetSize: Int(packet.pointee.size),
-                    capBytes: Self.maxPregateAudioBufferBytes
+                    capBytes: Self.maxPregateAudioBufferBytes,
+                    bufferedCount: pregateAudioBuffer.count
                 ) {
                     pregateAudioBuffer.append((packet, origin))
                     pregateAudioBufferBytes += Int(packet.pointee.size)
@@ -3211,7 +3220,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     pregateAudioOverflowLogged = true
                     EngineLog.emit(
                         "[HLSSegmentProducer] pre-gate audio buffer hit the "
-                        + "\(Self.maxPregateAudioBufferBytes)-byte cap; dropping further leading audio "
+                        + "\(Self.maxPregateAudioBufferBytes)-byte / \(Self.maxPregateAudioBufferEntries)-entry "
+                        + "cap; dropping further leading audio "
                         + "(wide interleave beyond cap)",
                         category: .session
                     )

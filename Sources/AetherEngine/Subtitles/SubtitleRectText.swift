@@ -88,7 +88,9 @@ enum SubtitleRectText {
             }
             return nil
         }
-        guard let x = value("PlayResX"), let y = value("PlayResY"), x > 0, y > 0 else { return nil }
+        // `Double(_:)` accepts `inf` and `nan` (audit SUB-112).
+        guard let x = value("PlayResX"), let y = value("PlayResY"), x > 0, y > 0,
+              x.isFinite, y.isFinite else { return nil }
         return CGSize(width: x, height: y)
     }
 
@@ -248,7 +250,11 @@ enum SubtitleRectText {
             Double($0.trimmingCharacters(in: .whitespaces))
         }
         guard parts.count == 2, let x = parts[0], let y = parts[1] else { return nil }
-        return CGPoint(x: x / playRes.width, y: y / playRes.height)
+        // Audit SUB-112: a NaN or infinite tag (`Double(_:)` accepts both) breaks the [0, 1]
+        // contract, and a host laying out with it raises; the cue falls back to its alignment.
+        let normalized = CGPoint(x: x / playRes.width, y: y / playRes.height)
+        guard normalized.x.isFinite, normalized.y.isFinite else { return nil }
+        return normalized
     }
 
     /// Trim whitespace and newlines across the edges of a run sequence, so a styled cue matches

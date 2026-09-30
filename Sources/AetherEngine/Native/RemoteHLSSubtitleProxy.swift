@@ -242,7 +242,7 @@ enum RemoteHLSSubtitleProxy {
     }
 
     /// Longest program this proxy will serve as a whole-program WebVTT rendition.
-    static let maxProgramDurationSeconds: Double = 7 * 24 * 3600
+    static let maxProgramDurationSeconds: Double = MediaDurationCeiling.seconds
 
     /// A hostile or malformed EXTINF (`inf`, negative, or a huge total) reaches `Int(Double)` in
     /// `wholeSecondsCovering` downstream and traps (audit NAT-1); refuse it here instead. Internal

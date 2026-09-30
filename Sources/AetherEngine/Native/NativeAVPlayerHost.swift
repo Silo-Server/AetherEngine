@@ -2666,7 +2666,7 @@ final class NativeAVPlayerHost {
         var parts: [String] = []
         if let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(fmt) {
             let asbd = asbdPtr.pointee
-            parts.append("sr=\(Int(asbd.mSampleRate))")
+            parts.append("sr=\(RemoteHLSStreamDescription.wholeSampleRate(asbd.mSampleRate))")
             parts.append("ch=\(asbd.mChannelsPerFrame)")
             parts.append(String(format: "bits=%d", asbd.mBitsPerChannel))
             parts.append("fmt=\(fourccString(asbd.mFormatID))")

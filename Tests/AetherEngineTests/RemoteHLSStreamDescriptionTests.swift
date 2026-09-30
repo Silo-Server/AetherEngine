@@ -261,4 +261,24 @@ struct RemoteHLSStreamDescriptionTests {
         let desc = try Self.videoDescription(subType: Self.avc1, width: 16, height: 16, extensions: [:])
         #expect(RemoteHLSStreamDescription.audioReading(from: desc, isEnabled: true, language: nil) == nil)
     }
+
+    // Audit NAT-106: a QuickTime SoundDescriptionV2 carries its rate as a Float64 verbatim, so on the
+    // bypass the origin controls it, and `Int(_:)` trapped past `Int.max` (the log site on NaN too).
+    @Test("a non-finite, negative or absurd sample rate reads as unknown", arguments: [
+        Double.nan, .infinity, -48_000, 1e300, 1e9,
+    ])
+    func hostileSampleRate(rate: Double) {
+        let reading = RemoteHLSStreamDescription.AudioReading(
+            formatID: kAudioFormatLinearPCM, sampleRate: rate, channels: 2, bitsPerChannel: 24,
+            carriesJOC: false, isEnabled: true, language: nil)
+        #expect(RemoteHLSStreamDescription.audioTracks([reading]).tracks.first?.sampleRate == 0)
+        #expect(RemoteHLSStreamDescription.wholeSampleRate(rate) == 0)
+    }
+
+    @Test("an ordinary sample rate is kept")
+    func ordinarySampleRate() {
+        #expect(RemoteHLSStreamDescription.wholeSampleRate(48_000) == 48_000)
+        #expect(RemoteHLSStreamDescription.wholeSampleRate(44_100.0) == 44_100)
+        #expect(RemoteHLSStreamDescription.wholeSampleRate(768_000) == 768_000)
+    }
 }

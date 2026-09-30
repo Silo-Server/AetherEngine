@@ -16,7 +16,7 @@ struct NativeSubtitleRenditionInfo: Sendable, Equatable {
 
 /// Single source of truth for sliding live window size. Playlist firstVisible and cache evictBelow
 /// both read this so they can never drift (drift = playlist lists a segment the cache deleted, or vice versa).
-/// effectiveWindowSeconds = dvrWindowSeconds ?? liveOnlyFloorSeconds;
+/// effectiveWindowSeconds = dvrWindowSeconds clamped to [0, 1 day] ?? liveOnlyFloorSeconds;
 /// windowSegmentCount = max(minSafeSegments, ceil(effective / targetSegmentDurationSeconds)).
 struct LiveWindowSizing {
     /// Live-only floor: 60 s so disk and playlist stay finite even without DVR seek.
@@ -58,9 +58,17 @@ struct LiveWindowSizing {
     /// has to: comparing the served count against a value that already carries the clamps would report
     /// every clamped window as unclamped.
     func requestedSegmentCount(observedSegmentDurationSeconds: Double?) -> Int {
-        let effective = dvrWindowSeconds ?? Self.liveOnlyFloorSeconds
+        let effective = Self.effectiveWindowSeconds(dvrWindowSeconds)
         let divisor = max(max(0.5, targetSegmentDurationSeconds), observedSegmentDurationSeconds ?? 0)
         return Int(ceil(effective / divisor))
+    }
+
+    /// Audit SEG-107: the window is a host value, and `.infinity` ("keep everything"), NaN or anything
+    /// past `Int` trapped the conversion above. A day is far deeper than the playlist ceiling ever
+    /// serves, and keeps the log's `requested x cadence` product in range.
+    static func effectiveWindowSeconds(_ dvrWindowSeconds: Double?) -> Double {
+        guard let window = dvrWindowSeconds, !window.isNaN else { return liveOnlyFloorSeconds }
+        return min(max(window, 0), Double(LiveEdgePolicy.maxCoveredWholeSeconds))
     }
 
     /// AE#443: how many segments of the observed size the session's disk allowance holds.

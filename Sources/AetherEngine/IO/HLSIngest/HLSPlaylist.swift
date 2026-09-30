@@ -178,7 +178,8 @@ enum HLSPlaylistParser {
 
         for line in lines {
             if line.hasPrefix("#EXT-X-TARGETDURATION:") {
-                targetDuration = Double(line.dropFirst("#EXT-X-TARGETDURATION:".count))
+                targetDuration = try boundedDuration(line.dropFirst("#EXT-X-TARGETDURATION:".count),
+                                                     tag: "TARGETDURATION")
             } else if line.hasPrefix("#EXT-X-MEDIA-SEQUENCE:") {
                 // A hostile or MITM value near Int.max makes `mediaSequence + segments.count`
                 // overflow and trap downstream (audit NET-3); reject it here instead. A merely
@@ -191,7 +192,7 @@ enum HLSPlaylistParser {
                 }
             } else if line.hasPrefix("#EXTINF:") {
                 let payload = line.dropFirst("#EXTINF:".count)
-                pendingDuration = Double(payload.split(separator: ",").first.map(String.init) ?? "")
+                pendingDuration = try boundedDuration(payload.split(separator: ",").first ?? "", tag: "EXTINF")
             } else if line.hasPrefix("#EXT-X-DISCONTINUITY") && !line.hasPrefix("#EXT-X-DISCONTINUITY-SEQUENCE") {
                 pendingDiscontinuity = true
             } else if line.hasPrefix("#EXT-X-KEY:") {
@@ -259,6 +260,19 @@ enum HLSPlaylistParser {
             hasUnsupportedEncryption: hasUnsupportedEncryption,
             hasMap: hasMap
         )
+    }
+
+    /// A duration tag's value; nil when it does not parse, which keeps the pre-existing fallbacks.
+    /// `Double(_:)` accepts `inf`, `nan` and any magnitude, and every consumer converts to an integer
+    /// somewhere downstream (audit NET-101), so a non-finite value or one past the program ceiling is
+    /// refused here. Negatives are left to the consumers: they trap nothing, and a sloppy live origin
+    /// should not lose its channel over one.
+    private static func boundedDuration(_ text: Substring, tag: String) throws -> Double? {
+        guard let value = Double(text) else { return nil }
+        guard value.isFinite, value <= MediaDurationCeiling.seconds else {
+            throw HLSIngestError.playlistInvalid(reason: "\(tag) out of range")
+        }
+        return value
     }
 
     /// Parse a `0x`-prefixed hex EXT-X-KEY IV into 16-byte big-endian Data. Returns nil on malformed length (caller falls back to sequence-number IV).

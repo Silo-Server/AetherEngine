@@ -759,7 +759,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
     for (delay, group) in Dictionary(grouping: audioDelaySwitches, by: \.delayMilliseconds)
         .sorted(by: { $0.key < $1.key }) {
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: UInt64(max(0, delay)) * 1_000_000)
+            try? await Task.sleep(nanoseconds: sleepNanoseconds(milliseconds: delay))
             for audioDelaySwitch in group {
                 print("  HOSTCALL setAudioDelay(\(audioDelaySwitch.milliseconds) ms) at "
                       + "+\(delay) ms "
@@ -772,7 +772,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
 
     if let teletextSwitch {
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: UInt64(max(0, teletextSwitch.delayMilliseconds)) * 1_000_000)
+            try? await Task.sleep(nanoseconds: sleepNanoseconds(milliseconds: teletextSwitch.delayMilliseconds))
             let target = teletextSwitch.page.map(String.init) ?? "auto"
             print("  HOSTCALL setTeletextPage(\(target)) at +\(teletextSwitch.delayMilliseconds) ms "
                   + "(was \(engine.teletextPage.map(String.init) ?? "auto"))")
@@ -786,7 +786,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
     // exactly the pair a host's recovery ladder has to tell apart.
     if let optionCorrection {
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: UInt64(max(0, optionCorrection.delayMilliseconds)) * 1_000_000)
+            try? await Task.sleep(nanoseconds: sleepNanoseconds(milliseconds: optionCorrection.delayMilliseconds))
             let labels = optionCorrection.changes.map(\.label).joined(separator: ", ")
             let before = engine.currentTime
             print("  HOSTCALL reloadAtCurrentPosition(applying: \(labels)) at +\(optionCorrection.delayMilliseconds) ms "
@@ -825,7 +825,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
     if let audioSwitch {
         let mon = monitor
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: UInt64(max(0, audioSwitch.delayMilliseconds)) * 1_000_000)
+            try? await Task.sleep(nanoseconds: sleepNanoseconds(milliseconds: audioSwitch.delayMilliseconds))
             print("  HOSTCALL selectAudioTrack(index: \(audioSwitch.index)) "
                   + "at +\(audioSwitch.delayMilliseconds) ms (was \(engine.activeAudioTrackIndex.map(String.init) ?? "none"))")
             engine.selectAudioTrack(index: audioSwitch.index)

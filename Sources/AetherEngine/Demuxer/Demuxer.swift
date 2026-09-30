@@ -406,13 +406,56 @@ public final class Demuxer: @unchecked Sendable {
 
     /// Fold a raw timestamp onto the contiguous presentation timeline given its byte position and time base.
     /// Must be called under `accessLock`.
-    private func normalizedTimestamp(_ ts: Int64, pos: Int64, timeBase: AVRational) -> Int64 {
+    private func normalizedTimestamp(_ ts: Int64, pos: Int64, timeBase: AVRational) -> Int64? {
         guard ts != Int64.min, !clipTimeline.isEmpty else { return ts }
-        let sub = clipSubtractSeconds(forPos: pos)
-        guard sub != 0, timeBase.num > 0, timeBase.den > 0 else { return ts }
-        let subTicks = Int64((sub * Double(timeBase.den) / Double(timeBase.num)).rounded())
-        return ts &- subTicks
+        return Self.foldedIndexTimestamp(ts, subtractSeconds: clipSubtractSeconds(forPos: pos), timeBase: timeBase)
     }
+
+    /// The AE#105 fold of one index entry, nil when the shift or the result leaves the tick range. The
+    /// shift comes from the disc's own playlist, and a wrapped entry is worse than a missing one: the
+    /// plan built from it lands wherever the wrap put it (audit HLS-102).
+    static func foldedIndexTimestamp(_ ts: Int64, subtractSeconds sub: Double, timeBase: AVRational) -> Int64? {
+        guard sub != 0, timeBase.num > 0, timeBase.den > 0 else { return ts }
+        let subTicks = (sub * Double(timeBase.den) / Double(timeBase.num)).rounded()
+        guard subTicks.isFinite, abs(subTicks) < Self.maxPlausibleIndexTicks else { return nil }
+        let (folded, overflow) = ts.subtractingReportingOverflow(Int64(subTicks))
+        return overflow ? nil : folded
+    }
+
+    /// The #409 decode-ladder offset applied to one index entry, nil on overflow (audit HLS-102).
+    static func offsetIndexTimestamp(_ ts: Int64, by offset: Int64?) -> Int64? {
+        guard let offset else { return ts }
+        let (placed, overflow) = ts.addingReportingOverflow(offset)
+        return overflow ? nil : placed
+    }
+
+    /// Whether an index entry can be a real position (audit HLS-102): under 2^62 ticks, so any
+    /// difference of two entries fits `Int64`, and under 4e9 s on its own time base. libavformat
+    /// rejects only NOPTS and the relative-timestamp band near `Int64.max`; entries near `Int64.min`
+    /// and just below the band reach the plan builders otherwise. Epoch-anchored sources stay inside
+    /// both limits (1.79e18 ns in 2026 is under 2^62 until about 2116, 1.79e9 epoch seconds under 4e9
+    /// until about 2096).
+    static func isPlausibleIndexTimestamp(_ ts: Int64, timeBase: AVRational) -> Bool {
+        guard ts != Int64.min, ts.magnitude < UInt64(1) << 62,
+              timeBase.num > 0, timeBase.den > 0 else { return false }
+        return abs(Double(ts) * Double(timeBase.num) / Double(timeBase.den)) < maxPlausibleIndexSeconds
+    }
+
+    static let maxPlausibleIndexTicks: Double = 0x1p62
+    static let maxPlausibleIndexSeconds: Double = 4e9
+
+    /// Seconds as ticks on `timeBase`, nil unless the result is finite and under 2^62 ticks (audit
+    /// DMX-113, BIT-105). This is where every seconds-based reposition becomes an integer, and
+    /// `Int64(_:)` traps on NaN, infinity and anything past `Int64`; every caller already treats a
+    /// failed seek as one. Truncates like the plain conversion it replaces.
+    nonisolated static func ticks(forSeconds seconds: Double, timeBase: AVRational) -> Int64? {
+        guard timeBase.num > 0, timeBase.den > 0 else { return nil }
+        let ticks = seconds * Double(timeBase.den) / Double(timeBase.num)
+        guard ticks.isFinite, abs(ticks) < maxPlausibleIndexTicks else { return nil }
+        return Int64(ticks)
+    }
+
+    nonisolated static let avTimeBase = AVRational(num: 1, den: AV_TIME_BASE)
 
     /// True once a disc structure (BD/DVD/UDF) was recognized at open. Disc sources concat
     /// MPEG-TS / VOB clips and have no EOF cue index, so the MKV cue-index prewarm seek is
@@ -451,12 +494,23 @@ public final class Demuxer: @unchecked Sendable {
     /// everything - the non-seekable pb ran no tail estimate, so the container value is 0 or
     /// garbage from fabricated range data - then a custom time-seekable reader's own duration,
     /// then the disc/container resolution above.
+    ///
+    /// The result is clamped to `[0, MediaDurationCeiling.seconds]` (audit HLS-102): a corrupt header
+    /// can state about 9.2e12 s, which the segment plan turned into a trapping tick conversion or a
+    /// multi-terabyte reservation. Clamped rather than zeroed, so a slightly broken header still plays.
     static func effectiveDurationSeconds(
         declared: Double?, readerDuration: Double?, discTitle: Double?, container: Double
     ) -> Double {
-        if let declared, declared > 0 { return declared }
-        if let readerDuration, readerDuration > 0 { return readerDuration }
-        return effectiveDurationSeconds(discTitle: discTitle, container: container)
+        let resolved: Double
+        if let declared, declared > 0 {
+            resolved = declared
+        } else if let readerDuration, readerDuration > 0 {
+            resolved = readerDuration
+        } else {
+            resolved = effectiveDurationSeconds(discTitle: discTitle, container: container)
+        }
+        guard resolved.isFinite, resolved > 0 else { return 0 }
+        return min(resolved, MediaDurationCeiling.seconds)
     }
 
     /// Open a media URL and probe its streams.
@@ -1510,18 +1564,17 @@ public final class Demuxer: @unchecked Sendable {
         guard count > 0 else { return [] }
         let tb = stream.pointee.time_base
         var result: [Int64] = []
-        result.reserveCapacity(Int(count))
         for i in 0..<count {
-            guard let entry = avformat_index_get_entry(stream, i) else { continue }
-            // AVINDEX_KEYFRAME = 0x0001
-            if entry.pointee.flags & 0x0001 != 0,
-               entry.pointee.timestamp != Int64.min {
-                // Fold each entry onto the contiguous timeline (multi-clip disc) so the segment plan
-                // built from these IRAP positions matches the normalized packets (AE#105), then onto
-                // the repaired decode ladder if #409 moved it.
-                let folded = normalizedTimestamp(entry.pointee.timestamp, pos: entry.pointee.pos, timeBase: tb)
-                result.append(compositionOffset.map { folded &+ $0 } ?? folded)
-            }
+            // AVINDEX_KEYFRAME = 0x0001. Fold each entry onto the contiguous timeline (multi-clip disc)
+            // so the segment plan built from these IRAP positions matches the normalized packets
+            // (AE#105), then onto the repaired decode ladder if #409 moved it.
+            guard let entry = avformat_index_get_entry(stream, i),
+                  entry.pointee.flags & 0x0001 != 0,
+                  Self.isPlausibleIndexTimestamp(entry.pointee.timestamp, timeBase: tb),
+                  let folded = normalizedTimestamp(entry.pointee.timestamp, pos: entry.pointee.pos, timeBase: tb),
+                  let placed = Self.offsetIndexTimestamp(folded, by: compositionOffset)
+            else { continue }
+            result.append(placed)
         }
         return result
     }
@@ -1620,7 +1673,9 @@ public final class Demuxer: @unchecked Sendable {
     /// when this demuxer opened mid-file. Int64.min when the container has no index yet.
     private func firstIndexedTimestamp(of stream: UnsafeMutablePointer<AVStream>) -> Int64 {
         guard avformat_index_get_entries_count(stream) > 0,
-              let entry = avformat_index_get_entry(stream, 0) else { return Int64.min }
+              let entry = avformat_index_get_entry(stream, 0),
+              Self.isPlausibleIndexTimestamp(entry.pointee.timestamp, timeBase: stream.pointee.time_base)
+        else { return Int64.min }
         return entry.pointee.timestamp
     }
 
@@ -1631,14 +1686,15 @@ public final class Demuxer: @unchecked Sendable {
             guard let read = try readDemuxedPacketLocked() else { return nil }
             var packet: UnsafeMutablePointer<AVPacket>? = read
             let index = read.pointee.stream_index
-            guard var assembler = subpictureAssemblers[index] else { return read }
+            guard subpictureAssemblers[index] != nil else { return read }
             let timing = DVDSubpictureAssembler.Timing(
                 pts: read.pointee.pts, dts: read.pointee.dts,
                 pos: read.pointee.pos, duration: read.pointee.duration)
-            let unit = assembler.ingest(
+            // In place (audit DMX-106): a copied-out assembler shares the dictionary's buffer, so
+            // every fragment's append copied the whole partial unit.
+            let unit = subpictureAssemblers[index]?.ingest(
                 UnsafeRawBufferPointer(start: read.pointee.data, count: Int(max(0, read.pointee.size))),
                 timing: timing)
-            subpictureAssemblers[index] = assembler
             guard let unit else {
                 trackedPacketFree(&packet)
                 continue
@@ -1647,7 +1703,8 @@ public final class Demuxer: @unchecked Sendable {
             guard let joined = trackedPacketAlloc() else { trackedPacketFree(&packet); return nil }
             var out: UnsafeMutablePointer<AVPacket>? = joined
             // `av_new_packet` resets every prop, so the copy comes after it.
-            guard av_new_packet(joined, Int32(unit.data.count)) >= 0,
+            guard let joinedSize = Int32(exactly: unit.data.count),
+                  av_new_packet(joined, joinedSize) >= 0,
                   av_packet_copy_props(joined, read) >= 0 else {
                 trackedPacketFree(&out)
                 trackedPacketFree(&packet)
@@ -1797,7 +1854,8 @@ public final class Demuxer: @unchecked Sendable {
     func seek(to seconds: Double) -> Bool {
         accessLock.lock()
         defer { accessLock.unlock() }
-        guard let ctx = formatContext else { return false }
+        guard let ctx = formatContext,
+              let timestamp = Self.ticks(forSeconds: seconds, timeBase: Self.avTimeBase) else { return false }
         // #409: the read position moves, so the repair drops its picture-order anchor and
         // re-anchors on the next keyframe (a seek always lands on one).
         compositionRepair?.noteSeek()
@@ -1806,7 +1864,6 @@ public final class Demuxer: @unchecked Sendable {
             resetAfterTimeSeek(ctx)
             return true
         }
-        let timestamp = Int64(seconds * Double(AV_TIME_BASE))
         let ret = avformat_seek_file(ctx, -1, Int64.min, timestamp, Int64.max, 0)
         if ret < 0 {
             #if DEBUG
@@ -1953,6 +2010,17 @@ public final class Demuxer: @unchecked Sendable {
         defer { accessLock.unlock() }
         guard let ctx = formatContext else { return false }
         guard probeControl?.isStopped != true else { return false }
+        // A stream-anchored seek carries the target in that stream's own time base; only the -1
+        // form is expressed in AV_TIME_BASE units.
+        var anchor: Int32 = -1
+        var timeBase = Self.avTimeBase
+        if anchorStreamIndex >= 0, anchorStreamIndex < Int32(ctx.pointee.nb_streams),
+           let tb = ctx.pointee.streams[Int(anchorStreamIndex)]?.pointee.time_base,
+           tb.num > 0, tb.den > 0 {
+            anchor = anchorStreamIndex
+            timeBase = tb
+        }
+        guard let timestamp = Self.ticks(forSeconds: seconds, timeBase: timeBase) else { return false }
         // #409: the read position moves, so the repair drops its picture-order anchor and
         // re-anchors on the next keyframe (a seek always lands on one).
         compositionRepair?.noteSeek()
@@ -1972,16 +2040,6 @@ public final class Demuxer: @unchecked Sendable {
         // seek on a remote ISO sat wedged ~230 s and every later re-arm queued behind it.
         avioProvider?.beginReadDeadline(secondsFromNow: timeout)
         defer { avioProvider?.endReadDeadline() }
-        // A stream-anchored seek carries the target in that stream's own time base; only the -1
-        // form is expressed in AV_TIME_BASE units.
-        var anchor: Int32 = -1
-        var timestamp = Int64(seconds * Double(AV_TIME_BASE))
-        if anchorStreamIndex >= 0, anchorStreamIndex < Int32(ctx.pointee.nb_streams),
-           let tb = ctx.pointee.streams[Int(anchorStreamIndex)]?.pointee.time_base,
-           tb.num > 0, tb.den > 0 {
-            anchor = anchorStreamIndex
-            timestamp = Int64(seconds * Double(tb.den) / Double(tb.num))
-        }
         let ret = avformat_seek_file(ctx, anchor, Int64.min, timestamp, Int64.max, 0)
         avformat_flush(ctx)
         resetSubpictureAssembly()  // #651: libavformat just dropped the parsers this stands in for
@@ -2101,7 +2159,15 @@ public final class Demuxer: @unchecked Sendable {
     ) -> Int64? {
         guard fileSize > 0, duration > 0, target >= 0 else { return nil }
         let fraction = min(1.0, max(0.0, (target - startOrigin - earlyBiasSeconds) / duration))
-        return Int64(Double(fileSize) * fraction)
+        return clampedByteOffset(Double(fileSize) * fraction, fileSize: fileSize)
+    }
+
+    /// `raw` as a byte offset in `[0, fileSize]` (audit DMX-103). The compare runs on the Double:
+    /// the total is whatever the origin wrote in `Content-Range`, and a `min(fileSize, ...)` after
+    /// `Int64(_:)` comes too late for a product that rounds up to 2^63 or past it.
+    nonisolated static func clampedByteOffset(_ raw: Double, fileSize: Int64) -> Int64 {
+        guard raw > 0 else { return 0 }
+        return raw >= Double(fileSize) ? fileSize : Int64(raw)
     }
 
     /// Landing verdict for one byte-estimate probe (#112 round 10).
@@ -2126,7 +2192,7 @@ public final class Demuxer: @unchecked Sendable {
         let late = landed > target
         let farEarly = landed < target - byteEstimateAcceptEarlyWindowSeconds
         guard late || farEarly else { return .accept }
-        let corrected = min(fileSize, max(0, Int64(Double(currentByte) * (targetRel / landedRel))))
+        let corrected = clampedByteOffset(Double(currentByte) * (targetRel / landedRel), fileSize: fileSize)
         guard corrected != currentByte else { return .accept }
         return .probe(corrected)
     }
