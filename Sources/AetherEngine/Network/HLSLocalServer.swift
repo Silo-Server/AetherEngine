@@ -251,6 +251,24 @@ final class HLSLocalServer: @unchecked Sendable {
         return escapedForLog(line)
     }
 
+    /// The headers whose values the first-request dump shows: the capability headers it exists for
+    /// (#50), and the address the client used (#86). Nothing that carries a credential.
+    static let loggedRequestHeaderValues: Set<String> = [
+        "accept", "host", "range", "user-agent", "x-playback-session-id",
+    ]
+
+    /// Audit Vcred-102: on the #316 / AE#495 stand-in route AVPlayer sends the host's own headers to
+    /// this server too, credentials included (measured), so the dump names every header and prints a
+    /// value only where `loggedRequestHeaderValues` says it answers a question.
+    static func requestHeadersForLog(_ headerLines: [String]) -> String {
+        headerLines.map { line -> String in
+            guard let colon = line.firstIndex(of: ":") else { return "?" }
+            let name = line[..<colon].trimmingCharacters(in: .whitespaces)
+            let shown = loggedRequestHeaderValues.contains(name.lowercased()) ? line : name
+            return escapedForLog(shown, limit: maximumStrangerText)
+        }.joined(separator: " | ")
+    }
+
     /// Longest stretch of a stranger's request text a log line carries. A head may be 8 KB, and one
     /// line of that per interval would still crowd a small log ring.
     static let maximumStrangerText = 256
@@ -933,7 +951,7 @@ final class HLSLocalServer: @unchecked Sendable {
         stateLock.unlock()
         if dumpHeaders {
             let allLines = text.components(separatedBy: "\r\n")
-            let headers = allLines.dropFirst().prefix(while: { !$0.isEmpty }).joined(separator: " | ")
+            let headers = Self.requestHeadersForLog(Array(allLines.dropFirst().prefix(while: { !$0.isEmpty })))
             // #50 diag: once-per-session, promoted to .info to surface any
             // Range / capability header that explains the 404. Revert with the
             // arrival-line promotion above once #50 is root-caused.

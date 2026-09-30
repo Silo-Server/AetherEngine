@@ -111,10 +111,52 @@ struct HLSLocalServerSessionTokenTests {
                 == "GET /media.m3u8?_HLS_msn=12 HTTP/1.1")
     }
 
+    // MARK: - Credential headers in the log (audit Vcred-102)
+
+    /// On the #316 / AE#495 stand-in route AVPlayer carries the host's own headers to this server, so
+    /// the once-per-session header dump printed whatever credential the host passed.
+    @Test("The first-request header dump names a credential header but never prints its value")
+    func headerDumpOmitsCredentialValues() throws {
+        let tap = HeaderLineTap()
+        defer { tap.restore() }
+        let server = HLSLocalServer(provider: StubProvider())
+        try server.start()
+        defer { server.stop() }
+        let marker = "X-Probe-\(UUID().uuidString.prefix(8))"
+
+        let status = Self.status(
+            port: server.port, path: "/\(server.pathToken)/media.m3u8",
+            extraHeaders: [#"Authorization: Digest username="bob", response="6629fae49393a05397450978507c4ef1""#,
+                           "X-Portal-Auth: SECRETportal123", "\(marker): 1", "Range: bytes=0-1"])
+        #expect(status == 200)
+
+        // Header names no redactor rule knows, which is the point: the dump must not depend on one.
+        let dumped = tap.lines.filter { $0.contains("first request headers") && $0.contains(marker) }
+        #expect(dumped.count == 1)
+        for line in dumped {
+            #expect(!line.contains("6629fae49393a05397450978507c4ef1"), "\(line)")
+            #expect(!line.contains("SECRETportal123"), "\(line)")
+            #expect(line.contains("Authorization"))
+            #expect(line.contains("X-Portal-Auth"))
+            #expect(line.contains("Range: bytes=0-1"))
+        }
+    }
+
+    @Test("Only the capability headers keep their values in the dump")
+    func headerDumpFormat() {
+        let dumped = HLSLocalServer.requestHeadersForLog([
+            "Host: 127.0.0.1:50123", "Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123",
+            "Cookie: session=SECRETsess123", "Range: bytes=0-1", "X-Playback-Session-Id: 5A0C",
+            "Accept: */*", "User-Agent: AppleCoreMedia/1.0", "garbage",
+        ])
+        #expect(dumped == "Host: 127.0.0.1:50123 | Authorization | Cookie | Range: bytes=0-1 | "
+                + "X-Playback-Session-Id: 5A0C | Accept: */* | User-Agent: AppleCoreMedia/1.0 | ?")
+    }
+
     // MARK: - Helpers
 
     /// Status line of a plain GET, or 0 when the request could not be completed.
-    private static func status(port: UInt16, path: String) -> Int {
+    private static func status(port: UInt16, path: String, extraHeaders: [String] = []) -> Int {
         let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
         guard fd >= 0 else { return 0 }
         defer { close(fd) }
@@ -129,7 +171,8 @@ struct HLSLocalServerSessionTokenTests {
             }
         }
         guard connected == 0 else { return 0 }
-        let request = "GET \(path) HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        let extra = extraHeaders.map { "\($0)\r\n" }.joined()
+        let request = "GET \(path) HTTP/1.1\r\nHost: 127.0.0.1\r\n\(extra)Connection: close\r\n\r\n"
         let sent = Array(request.utf8).withUnsafeBytes { send(fd, $0.baseAddress, $0.count, 0) }
         guard sent > 0 else { return 0 }
         var buffer = [UInt8](repeating: 0, count: 256)
@@ -149,4 +192,28 @@ private final class StubProvider: HLSSegmentProvider, @unchecked Sendable {
     var segmentCount: Int { 1 }
     func segmentDuration(at index: Int) -> Double { 4.0 }
     var playlistType: HLSPlaylistType { .vod }
+}
+
+/// Captures `EngineLog` lines for one test; the handler is global, so it is restored on every path.
+private final class HeaderLineTap: @unchecked Sendable {
+    private let lock = NSLock()
+    private var captured: [String] = []
+    private let previous: ((String) -> Void)?
+
+    init() {
+        previous = EngineLog.handler
+        EngineLog.handler = { [self] line in
+            lock.lock()
+            captured.append(line)
+            lock.unlock()
+        }
+    }
+
+    func restore() { EngineLog.handler = previous }
+
+    var lines: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return captured
+    }
 }
