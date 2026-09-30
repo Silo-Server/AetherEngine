@@ -2,7 +2,7 @@ import Foundation
 
 /// Pure cursor over successive live playlist refreshes. Returns each segment exactly once. Handles join, forward growth, and window-slide (rejoin + discontinuity flag for downstream PTS rebase).
 ///
-/// Join policy: target duration coverage `max(minJoinCoverageSeconds, 1.5 * targetDuration)`, bounded by `edgeOffset` segments and by the eviction margin. Count-only join burst up to 36s of backlog on long-segment providers, which caused a one-time AVPlayer pacing stall a few seconds into every direct session (device repro 2026-06-11). The 1.5x term ensures at least one upstream cadence of buffer across the bursty inter-batch arrival gap (device repro 2026-06-11: ~5s stalls every ~20s with a single-segment join). A shrinking playlist (spec-violating server) is treated as a stall.
+/// Join policy: target duration coverage `max(minJoinCoverageSeconds, 1.5 * targetDuration, loopback cushion)`, bounded by `edgeOffset` segments and by the eviction margin. Count-only join burst up to 36s of backlog on long-segment providers, which caused a one-time AVPlayer pacing stall a few seconds into every direct session (device repro 2026-06-11). The 1.5x term ensures at least one upstream cadence of buffer across the bursty inter-batch arrival gap (device repro 2026-06-11: ~5s stalls every ~20s with a single-segment join). A shrinking playlist (spec-violating server) is treated as a stall.
 ///
 /// `edgeOffset` is a sanity bound on the burst, not the policy. It used to be 3, which is a COUNT standing in for a burst measured in SECONDS, and the coverage term above already bounds long segments on its own (6s segments break at 12s, 12s segments at 24s). So the count only ever bound SHORT segments, which are exactly the sources the 8s coverage floor was written for, and it cut them to a third of it. The cost was not only buffer: three joined segments yield only TWO finalized ones downstream, because the last one is still open until the next arrives, and the loopback startup cushion wants three. The live join therefore waited one upstream segment duration in wall clock for content the origin was already holding. Measured on `hlsfixture --window 8` with `play --live --fast-zap` (three runs per row, engine 6.76.1 against this change): first picture on a 2s-segment channel 2.22s before, 0.20s after; on 1s segments 0.41 to 1.22s before (it depended on where in the upstream segment cycle the tune landed) against 0.18 to 0.20s after, the phase dependency gone with it. A window three segments deep has nothing deeper to join into and is unchanged. The origin request log is what says the depth is not paid back later: both arms fetch up to the same upstream segment number at the same wall clock, so the burst is caught up at I/O speed rather than becoming a standing lag behind the live edge.
 struct HLSPlaylistTracker {
@@ -34,6 +34,25 @@ struct HLSPlaylistTracker {
         return min(edgeOffset, windowSegmentCount - 1)
     }
 
+    /// AE#678: the join has to carry the cushion the loopback's first serve will ask for, or every zap
+    /// ends at the bounded start's grace. The served TARGETDURATION is floored by the longest upstream
+    /// segment (`ceil(longest / 1.5)`, AE#447), so the gate wants `3 x` that, and `1.5 x TD` alone is
+    /// always a hair short of it: two 10 s segments are 20 s against a 21 s holdback. The last joined
+    /// segment's final GOP also stays open downstream until the next upstream segment arrives, so one
+    /// GOP of margin on top, bounded by the segment and by `openGOPMarginSeconds`. A whole segment of
+    /// margin would be the strict bound, and on a 10 s provider it is a fourth 10 s download the start
+    /// then waits for on a shared link (measured 3.7 s to first picture against 40 Mbit/s).
+    static func loopbackCushionCoverageSeconds(segments: [HLSMediaSegment]) -> Double {
+        guard let longest = segments.map(\.duration).max(), longest > 0 else { return 0 }
+        let targetDuration = LiveEdgePolicy.targetDurationForCadence(longest)
+        return LiveEdgePolicy.holdBackSeconds(targetDuration: targetDuration)
+            + min(longest, openGOPMarginSeconds)
+    }
+
+    /// Longest GOP the join margin plans for. IPTV and broadcast GOPs run 0.5 to 4 s; a longer one
+    /// only costs the bounded start's grace, which is what every join paid before AE#678.
+    static let openGOPMarginSeconds: Double = 4
+
     init(edgeOffset: Int = 8, minJoinCoverageSeconds: Double = 8) {
         self.edgeOffset = edgeOffset
         self.minJoinCoverageSeconds = minJoinCoverageSeconds
@@ -62,7 +81,8 @@ struct HLSPlaylistTracker {
         }
 
         func joinStart() -> Int {
-            let coverage = max(minJoinCoverageSeconds, 1.5 * playlist.targetDuration)
+            let coverage = max(minJoinCoverageSeconds, 1.5 * playlist.targetDuration,
+                               Self.loopbackCushionCoverageSeconds(segments: playlist.segments))
             let limit = Self.joinSegmentLimit(edgeOffset: edgeOffset,
                                               windowSegmentCount: playlist.segments.count)
             var taken = 0

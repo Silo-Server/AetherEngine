@@ -399,6 +399,51 @@ public final class Demuxer: @unchecked Sendable {
     /// leaves it nil and emits nothing.
     var onOpenProgress: (@Sendable (DemuxerOpenStage) -> Void)?
 
+    /// AE#678: when this open started and when each stage finished, for the one timing line an open
+    /// emits. `#361`'s checkpoints carry the same boundaries to the host, but only as a ladder with no
+    /// durations, and a downstream integrator had to guess whether the connect, the container or the
+    /// stream analysis was the slow leg.
+    private var openStartedAt: DispatchTime?
+    private var openStageTimes: [DemuxerOpenStage: DispatchTime] = [:]
+
+    private func beginOpenTiming() {
+        openStartedAt = DispatchTime.now()
+        openStageTimes = [:]
+    }
+
+    private func reportOpenStage(_ stage: DemuxerOpenStage) {
+        openStageTimes[stage] = DispatchTime.now()
+        onOpenProgress?(stage)
+        if stage == .streamsProbed { emitOpenTimings(outcome: nil) }
+    }
+
+    /// Stills and the subtitle side reader open far too often to narrate, and the latter skips the
+    /// stream analysis the line exists to time.
+    private var reportsOpenTimings: Bool {
+        openProfile.readerLabel != DemuxerOpenProfile.stillExtraction.readerLabel && !openProfile.skipStreamInfo
+    }
+
+    private func emitOpenTimings(outcome: String?) {
+        guard reportsOpenTimings, let start = openStartedAt else { return }
+        openStartedAt = nil
+        func ms(_ from: DispatchTime?, _ to: DispatchTime?) -> String {
+            guard let from, let to, to.uptimeNanoseconds >= from.uptimeNanoseconds else { return "-" }
+            return "\((to.uptimeNanoseconds - from.uptimeNanoseconds) / 1_000_000)ms"
+        }
+        let source = openStageTimes[.sourceOpened]
+        let container = openStageTimes[.containerOpened]
+        let probed = openStageTimes[.streamsProbed] ?? (outcome == nil ? nil : DispatchTime.now())
+        let streams = formatContext.map { Int($0.pointee.nb_streams) } ?? 0
+        EngineLog.emit(
+            "[Demuxer] open timings (\(openProfile.readerLabel)): connect \(ms(start, source)), "
+            + "open_input \(ms(source ?? start, container)), find_stream_info \(ms(container, probed)), "
+            + "total \(ms(start, probed)); \(streams) stream(s), probesize \(openProfile.probesize / 1_048_576) MiB, "
+            + "analyzeduration \(openProfile.maxAnalyzeDuration / 1_000_000) s"
+            + (outcome.map { "; \($0)" } ?? ""),
+            category: .demux
+        )
+    }
+
     // MARK: - Disc titles / chapters (#67)
 
     private(set) var discTitles: [DiscTitle] = []
@@ -577,6 +622,7 @@ public final class Demuxer: @unchecked Sendable {
     func open(url: URL, extraHeaders: [String: String] = [:], profile: DemuxerOpenProfile = .playback, isLive: Bool = false, selectTitleID: Int? = nil) throws {
         if isCloseRequested { throw DemuxerError.openFailed(code: -1) }
         self.openProfile = profile
+        beginOpenTiming()
         self.auditSource = isLive ? nil : (url, extraHeaders)
         let isHTTP = url.scheme == "http" || url.scheme == "https"
 
@@ -618,13 +664,13 @@ public final class Demuxer: @unchecked Sendable {
         formatContext = openedCtx
         // #361: a local file has no connection to come up, so the source stage is credited by this
         // one rather than reported separately.
-        onOpenProgress?(.containerOpened)
+        reportOpenStage(.containerOpened)
 
         try probeStreams(openedCtx)
         accessLock.lock()
         refreshStreamTableLocked()
         accessLock.unlock()
-        onOpenProgress?(.streamsProbed)
+        reportOpenStage(.streamsProbed)
     }
 
     /// Open a custom `IOReader` source. `formatHint` disambiguates probing when
@@ -635,6 +681,7 @@ public final class Demuxer: @unchecked Sendable {
     func open(reader: IOReader, formatHint: String? = nil, profile: DemuxerOpenProfile = .playback, isLive: Bool = false, selectTitleID: Int? = nil, discCacheKey: String? = nil) throws {
         if isCloseRequested { throw DemuxerError.openFailed(code: -1) }
         self.openProfile = profile
+        beginOpenTiming()
         self.auditSource = nil
         if reader.discImageProbeEnabled,
            let discInfo = try DiscReader.wrap(reader, selectTitleID: selectTitleID, cacheKey: discCacheKey) {
@@ -746,7 +793,7 @@ public final class Demuxer: @unchecked Sendable {
             abandonProvider(provider)
             throw DemuxerError.openFailed(code: -1)
         }
-        onOpenProgress?(.sourceOpened)   // #361
+        reportOpenStage(.sourceOpened)   // #361
 
         // AE#460 follow-up: a live source rebuilt on a RETAINED reader resumes where that reader
         // is, not at the host's base. A fresh AVIOContext starts its byte axis at 0 regardless, so
@@ -823,14 +870,14 @@ public final class Demuxer: @unchecked Sendable {
             throw DemuxerError.openFailed(code: ret)
         }
         formatContext = ctxPtr  // avformat_open_input may reallocate
-        onOpenProgress?(.containerOpened)   // #361
+        reportOpenStage(.containerOpened)   // #361
         declareDiscSubpictureStreams(ctxPtr!)
 
         try probeStreams(ctxPtr!)
         accessLock.lock()
         refreshStreamTableLocked()
         accessLock.unlock()
-        onOpenProgress?(.streamsProbed)     // #361
+        reportOpenStage(.streamsProbed)     // #361
         // #281: every parse seek this open performs has happened by now, so the provider can drop
         // the cold-start state that only exists to serve them. Deliberately after probeStreams:
         // find_stream_info is where the trailing-index ping-pong lives, not avformat_open_input.
@@ -973,6 +1020,7 @@ public final class Demuxer: @unchecked Sendable {
         let findRet = avformat_find_stream_info(ctx, nil)
         unparkUnresolvableAudio(ctx, parked)
         guard findRet >= 0 else {
+            emitOpenTimings(outcome: "find_stream_info failed (\(findRet))")
             throw DemuxerError.streamInfoFailed(code: findRet)
         }
         logStreams(ctx)

@@ -285,6 +285,38 @@ struct Issue177IngestPrefetchTests {
         #expect(origin.concurrencyHighWater <= HLSLiveIngestReader.maxConcurrentSegmentFetches)
     }
 
+    @Test("a declared single-request origin gets its segments one at a time (AE#678)")
+    func declaredRequestCeilingSerializesTheBacklog() throws {
+        let segmentCount = 16
+        let segments = (0..<segmentCount).map { makeSegment(index: $0) }
+        var delays = [Int](repeating: 20, count: segmentCount)
+        delays[9] = 400
+        let origin = try #require(LoopbackHLSOrigin(
+            segments: segments, delaysMs: delays, initialWindow: 8))
+        defer { origin.stop() }
+
+        let url = try #require(URL(string: "http://127.0.0.1:\(origin.port)/media.m3u8"))
+        OriginRequestBudget.shared.setHostLimit(1, for: url)
+        defer { OriginRequestBudget.shared.setHostLimit(nil, for: url) }
+        let reader = HLSLiveIngestReader(playlistURL: url)
+        defer { reader.close() }
+
+        let expected = segments[1...].reduce(Data(), +)
+        let got = drain(reader, expectedBytes: expected.count, timeout: 90)
+
+        #expect(reader.terminalError == nil)
+        #expect(got == expected)
+        #expect(origin.concurrencyHighWater == 1, "the ingest overran the host's declared request ceiling")
+    }
+
+    @Test("the prefetch window narrows to the origin's request budget")
+    func prefetchWindowFollowsTheBudget() {
+        #expect(HLSLiveIngestReader.segmentFetchConcurrency(budgetLimit: nil) == 4)
+        #expect(HLSLiveIngestReader.segmentFetchConcurrency(budgetLimit: 1) == 1)
+        #expect(HLSLiveIngestReader.segmentFetchConcurrency(budgetLimit: 2) == 2)
+        #expect(HLSLiveIngestReader.segmentFetchConcurrency(budgetLimit: 12) == 4)
+    }
+
     @Test("single-segment playlists still ingest correctly through the pipeline")
     func singleSegmentStillWorks() throws {
         let segments = [makeSegment(index: 7)]

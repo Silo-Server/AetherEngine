@@ -65,6 +65,17 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     /// fetches saturate the link while bounding in-memory segment bytes to the window size.
     static let maxConcurrentSegmentFetches = 4
 
+    /// AE#678: the prefetch window narrowed to the origin's request budget. A host that declares
+    /// `maxConcurrentSourceRequests = 1` for a single-connection provider meant every request this
+    /// reader makes, and four parallel segment fetches were four connections to it.
+    static func segmentFetchConcurrency(budgetLimit: Int?) -> Int {
+        guard let budgetLimit else { return maxConcurrentSegmentFetches }
+        return max(1, min(maxConcurrentSegmentFetches, budgetLimit))
+    }
+
+    /// The URL the host loaded, which is what `OriginRequestBudget` keys the declared ceiling on.
+    var budgetOriginURL: URL { playlistURL }
+
     /// First-segment classification latch; touched only from the ingest task's ordered commit path.
     private var sniffedFirstSegment = false
 
@@ -342,13 +353,15 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
             }
             return (segment, url)
         }
+        let window = Self.segmentFetchConcurrency(
+            budgetLimit: OriginRequestBudget.shared.limit(for: mediaURL))
         return try await withThrowingTaskGroup(of: (Int, Data).self) { group -> Bool in
             var nextToSpawn = 0
             var nextToCommit = 0
             var ready: [Int: Data] = [:]
 
             while nextToSpawn < resolved.count,
-                  nextToSpawn < nextToCommit + Self.maxConcurrentSegmentFetches {
+                  nextToSpawn < nextToCommit + window {
                 spawnFetch(into: &group, index: nextToSpawn, item: resolved[nextToSpawn], mediaURL: mediaURL)
                 nextToSpawn += 1
             }
@@ -375,7 +388,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                     }
                 }
                 while nextToSpawn < resolved.count,
-                      nextToSpawn < nextToCommit + Self.maxConcurrentSegmentFetches {
+                      nextToSpawn < nextToCommit + window {
                     spawnFetch(into: &group, index: nextToSpawn, item: resolved[nextToSpawn], mediaURL: mediaURL)
                     nextToSpawn += 1
                 }
@@ -556,6 +569,40 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
     }
 
+    /// AE#678: every ingest request is charged to `OriginRequestBudget` like the reader's and the relay's,
+    /// so the host's declared ceiling and a ceiling learned from a refusal bind this path too. The slot
+    /// wait blocks, so it runs off the cooperative pool; no ticket is ever held across another acquire.
+    private func budgeted(
+        _ url: URL, label: String, _ fetch: () async throws -> (Data, URLResponse)
+    ) async throws -> (Data, URLResponse) {
+        let ticket: OriginRequestBudget.Ticket? = await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                continuation.resume(returning: OriginRequestBudget.shared.acquire(
+                    for: url, label: label, timeout: Self.budgetSlotWaitSeconds,
+                    shouldAbort: { self?.isClosed ?? true }))
+            }
+        }
+        defer { OriginRequestBudget.shared.release(ticket) }
+        try Task.checkCancellation()
+        let (data, response) = try await fetch()
+        if let http = response as? HTTPURLResponse {
+            if let finalURL = http.url, finalURL != url {
+                OriginRequestBudget.shared.noteRedirect(from: url, to: finalURL)
+            }
+            if Self.refusalStatuses.contains(http.statusCode) {
+                OriginRequestBudget.shared.noteRefusal(
+                    for: http.url ?? url, status: http.statusCode,
+                    retryAfter: http.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init))
+            }
+        }
+        return (data, response)
+    }
+
+    static let budgetSlotWaitSeconds: TimeInterval = 10
+    static let refusalStatuses: Set<Int> = [429, 503, 509]
+
+    private var isClosed: Bool { startLock.withLock { closed } }
+
     /// Applies the configured origin headers to every ingest fetch, credentials only where the host's
     /// origin is (audit NET-7). Internal for the header-contract tests.
     func makeRequest(_ url: URL) -> URLRequest {
@@ -569,8 +616,10 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
 
     /// Fetch + parse a playlist. Returns parsed playlist and final URL after redirects (relative segment URIs resolve against it).
     private func fetchPlaylist(_ url: URL) async throws -> (HLSPlaylist, URL) {
-        let (data, response) = try await BoundedPlaylistFetch.data(
-            for: makeRequest(url), session: session, limit: Self.maximumPlaylistBytes)
+        let (data, response) = try await budgeted(url, label: "ingest-playlist") {
+            try await BoundedPlaylistFetch.data(
+                for: self.makeRequest(url), session: self.session, limit: Self.maximumPlaylistBytes)
+        }
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard (200..<300).contains(status) else {
             throw HLSIngestError.playlistUnreachable(status: status)
@@ -589,7 +638,9 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
             do {
                 let (data, response): (Data, URLResponse)
                 do {
-                    (data, response) = try await BoundedFetch.data(for: makeRequest(url), session: session, limit: limit)
+                    (data, response) = try await budgeted(url, label: "ingest-segment") {
+                        try await BoundedFetch.data(for: self.makeRequest(url), session: self.session, limit: limit)
+                    }
                 } catch is BoundedFetch.Exceeded {
                     // Audit NET-112: an endless body is the origin's answer, not a blip to retry.
                     throw HLSIngestError.playlistInvalid(reason: "segment exceeds \(limit) bytes")
@@ -629,8 +680,10 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await BoundedFetch.data(
-                for: makeRequest(url), session: session, limit: BoundedFetch.keyLimit)
+            (data, response) = try await budgeted(url, label: "ingest-key") {
+                try await BoundedFetch.data(
+                    for: self.makeRequest(url), session: self.session, limit: BoundedFetch.keyLimit)
+            }
         } catch is BoundedFetch.Exceeded {
             throw HLSIngestError.segmentDecryptFailed(reason: "key exceeds \(BoundedFetch.keyLimit) bytes")
         }
