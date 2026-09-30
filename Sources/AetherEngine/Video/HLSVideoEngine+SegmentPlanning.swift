@@ -442,7 +442,7 @@ extension HLSVideoEngine {
         return out
     }
 
-    /// Scan packets for in-band VPS/SPS/PPS when hvcC `numOfArrays=0` (DV P5 MP4 encoders, e.g. Wandering Earth 2 WEB-DL, issue #19). AVPlayer symptom: `item.tracks count=2`, `fourCC=<no fdesc>`, `CoreMediaErrorDomain -4`. Caller must seek back after this consumes packets.
+    /// Scan packets for in-band VPS/SPS/PPS when hvcC `numOfArrays=0` (DV P5 MP4 encoders, e.g. Wandering Earth 2 WEB-DL, issue #19). AVPlayer symptom: `item.tracks count=2`, `fourCC=<no fdesc>`, `CoreMediaErrorDomain -4`. On a source that can rewind the scan consumes packets and the caller must seek back; on a forward-only one it only peeks (`scanSourceHead`).
     ///
     /// `rewindBeforeScan` rewinds to the head first, because in-band parameter sets are guaranteed at
     /// the first IRAP but only recur every GOP after it. Without the rewind the scan inherited whatever
@@ -479,8 +479,6 @@ extension HLSVideoEngine {
         guard Self.configRecordNeedsInBandRebuild(extradata, size: extradataSize) else { return nil }
         let naluLengthSize = 4   // the predicate above already required it
 
-        if rewindBeforeScan { demuxer.seek(to: 0) }
-
         var vps: [UInt8]?
         var sps: [UInt8]?
         var pps: [UInt8]?
@@ -490,25 +488,11 @@ extension HLSVideoEngine {
         var packetsScanned = 0
         // Second cap so a stream that never yields a video packet cannot walk the whole source.
         let readBudget = 512
-        var packetsRead = 0
 
-        while packetsScanned < packetBudget && packetsRead < readBudget {
-            let readResult: UnsafeMutablePointer<AVPacket>?
-            do {
-                readResult = try demuxer.readPacket()
-            } catch {
-                break
-            }
-            guard let pkt = readResult else { break }
-            defer {
-                // trackedPacketFree not raw av_packet_free: readPacket allocs via trackedPacketAlloc; raw free leaves PacketBalanceTracker.pktAlive permanently high.
-                var maybePkt: UnsafeMutablePointer<AVPacket>? = pkt
-                trackedPacketFree(&maybePkt)
-            }
-            packetsRead += 1
-            if pkt.pointee.stream_index != videoStreamIndex { continue }
+        scanSourceHead(demuxer: demuxer, rewind: rewindBeforeScan, readBudget: readBudget) { pkt in
+            if pkt.pointee.stream_index != videoStreamIndex { return false }
             packetsScanned += 1
-            guard let pktData = pkt.pointee.data else { continue }
+            guard let pktData = pkt.pointee.data else { return packetsScanned >= packetBudget }
             let pktSize = Int(pkt.pointee.size)
 
             var offset = 0
@@ -530,7 +514,7 @@ extension HLSVideoEngine {
                 offset += nalLen
             }
 
-            if vps != nil && sps != nil && pps != nil { break }
+            return (vps != nil && sps != nil && pps != nil) || packetsScanned >= packetBudget
         }
 
         guard let vps, let sps, let pps else {
@@ -560,6 +544,44 @@ extension HLSVideoEngine {
         return hvcC
     }
 
+    /// Shows the packets at the head of the source to `inspect`, which returns true once it has seen
+    /// enough, looking at no more than `readBudget` of them.
+    ///
+    /// A source that can rewind is rewound (when `rewind`) and the packets are CONSUMED, which is
+    /// what these scans always did: `start()` seeks back to 0 afterwards. A source that cannot rewind
+    /// has nothing to seek back with, so whatever the scan consumed is gone from the archive
+    /// (audit HLS-103: a sequential origin lost its opening GOP to the framing probe). Those are
+    /// PEEKED instead: the packets the scan looked at stay queued for the producer.
+    func scanSourceHead(
+        demuxer: Demuxer,
+        rewind: Bool,
+        readBudget: Int,
+        _ inspect: (UnsafeMutablePointer<AVPacket>) -> Bool
+    ) {
+        guard demuxer.isSourceSeekable else {
+            try? demuxer.peekPackets(maxPackets: readBudget, inspect)
+            return
+        }
+        if rewind { demuxer.seek(to: 0) }
+        var packetsRead = 0
+        while packetsRead < readBudget {
+            let readResult: UnsafeMutablePointer<AVPacket>?
+            do {
+                readResult = try demuxer.readPacket()
+            } catch {
+                break
+            }
+            guard let pkt = readResult else { break }
+            defer {
+                // trackedPacketFree not raw av_packet_free: readPacket allocs via trackedPacketAlloc; raw free leaves PacketBalanceTracker.pktAlive permanently high.
+                var maybePkt: UnsafeMutablePointer<AVPacket>? = pkt
+                trackedPacketFree(&maybePkt)
+            }
+            packetsRead += 1
+            if inspect(pkt) { break }
+        }
+    }
+
     /// What the muxer should ship for a source whose config record is Annex B (#365), and the
     /// framing every NAL walker in the session should use.
     struct VideoFramingNormalization {
@@ -580,8 +602,10 @@ extension HLSVideoEngine {
     /// length happens to read as `00 00 01` and drops everything else. Measured 1080p: a 2,158,448 B
     /// segment came out at 61,912 B, AVPlayer reached `readyToPlay` and never produced a frame.
     ///
-    /// Consumes packets and leaves the demuxer cursor where it stopped; `start()` seeks back to 0
-    /// afterwards, same contract as the in-band scan and the cue prewarm.
+    /// On a source that can rewind it consumes packets and leaves the demuxer cursor where it
+    /// stopped; `start()` seeks back to 0 afterwards, same contract as the in-band scan and the cue
+    /// prewarm. A forward-only source is peeked instead (`scanSourceHead`), so the producer still
+    /// receives the packets the probe looked at.
     func normalizeVideoFraming(
         demuxer: Demuxer,
         videoStreamIndex: Int32,
@@ -659,27 +683,13 @@ extension HLSVideoEngine {
         packetBudget: Int = 4,
         readBudget: Int = 512
     ) -> VideoNALFraming? {
-        demuxer.seek(to: 0)
         var lengthPrefixed = 0
         var annexB = 0
         var inspected = 0
-        var packetsRead = 0
 
-        while inspected < packetBudget && packetsRead < readBudget {
-            let readResult: UnsafeMutablePointer<AVPacket>?
-            do {
-                readResult = try demuxer.readPacket()
-            } catch {
-                break
-            }
-            guard let pkt = readResult else { break }
-            defer {
-                var maybePkt: UnsafeMutablePointer<AVPacket>? = pkt
-                trackedPacketFree(&maybePkt)
-            }
-            packetsRead += 1
+        scanSourceHead(demuxer: demuxer, rewind: true, readBudget: readBudget) { pkt in
             guard pkt.pointee.stream_index == videoStreamIndex,
-                  let data = pkt.pointee.data, pkt.pointee.size > 4 else { continue }
+                  let data = pkt.pointee.data, pkt.pointee.size > 4 else { return false }
             inspected += 1
             let size = Int(pkt.pointee.size)
             if VideoConfigRecord.walksAsLengthPrefixed(data, size: size) {
@@ -687,6 +697,7 @@ extension HLSVideoEngine {
             } else if VideoConfigRecord.startsWithStartCode(data, size: size) {
                 annexB += 1
             }
+            return inspected >= packetBudget
         }
 
         let framing: VideoNALFraming?

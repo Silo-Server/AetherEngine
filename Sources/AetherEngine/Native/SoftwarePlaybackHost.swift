@@ -1907,6 +1907,9 @@ final class SoftwarePlaybackHost {
             do {
                 packet = try demuxer.readPacket()
             } catch {
+                // Audit SEG-104: a stop closes the demuxer, which aborts a parked read. That is the
+                // stop arriving, not a lost source.
+                if stopRequested() { return false }
                 EngineLog.emit("[SWHost] live reader read failed: \(error)", category: .swPlayback)
                 onError("Playback error: \(error.localizedDescription)")
                 onSourceEnded()

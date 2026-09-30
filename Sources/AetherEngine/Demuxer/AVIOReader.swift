@@ -2966,7 +2966,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // means "wait for the short thing to finish", not "give up".
         let requestURLForBudget = request.url ?? url
         let ticket = OriginRequestBudget.shared.acquire(
-            for: requestURLForBudget, label: "\(label) pump", timeout: Self.pumpSlotWaitSeconds)
+            for: requestURLForBudget, label: "\(label) pump", timeout: Self.pumpSlotWaitSeconds,
+            shouldAbort: { [weak self] in self?.isClosed ?? true })
+        // Audit DMX-112: a pump torn down while parked for its slot leaves without a transfer.
+        if ticket == nil, isClosed { return }
 
         let transfer: any PersistentTransfer
         if heldConnectionEnabled {
@@ -4121,7 +4124,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private func requestTicket(for url: URL, label: String,
                                timeout: TimeInterval) throws -> OriginRequestBudget.Ticket? {
         guard let probeControl else {
-            return OriginRequestBudget.shared.acquire(for: url, label: label, timeout: timeout)
+            let ticket = OriginRequestBudget.shared.acquire(
+                for: url, label: label, timeout: timeout,
+                shouldAbort: { [weak self] in self?.isClosed ?? true })
+            if ticket == nil, isClosed { throw CancellationError() }
+            return ticket
         }
         guard !isClosed else { throw CancellationError() }
         try probeControl.check()
