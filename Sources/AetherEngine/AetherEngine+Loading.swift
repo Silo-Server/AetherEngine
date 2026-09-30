@@ -2177,13 +2177,17 @@ extension AetherEngine {
     /// This path publishes its failure and used to return silently either way, so a caller could
     /// not tell a rebuilt session from a dead one; `reloadAtCurrentPosition(applying:)` is built on
     /// exactly that distinction. Callers that only drive UI keep discarding it.
+    ///
+    /// `resumePlaying` is the transport the rebuild comes back in; nil reads the session's own
+    /// (`sessionRebuildResumesPlaying`, AE#464 round 2), which is what an audio or title pick wants.
     @discardableResult
     func reloadWithAudioOverride(
         url: URL,
         audioStreamIndex: Int32?,
         expectedGeneration: UInt64,
         discTitleIDOverride: Int? = nil,
-        resumeOverride: Double? = nil
+        resumeOverride: Double? = nil,
+        resumePlaying: Bool? = nil
     ) async -> Error? {
         // Liveness guard: a stop()/load() between scheduling and here would resurrect a dismissed session or kill the successor. Generation captured at schedule time; both stop() and load() invalidate it.
         guard loadGeneration == expectedGeneration, loadedURL != nil else {
@@ -2256,13 +2260,16 @@ extension AetherEngine {
             category: .engine
         )
 
+        // Audit LIF-102: read before `.loading`, which is the state this rebuild is about to hide the
+        // session's transport behind. The audio pick never wrote it into `loadedOptions.autoplay`
+        // (that is the mount flag there), so the rebuild used to end in an unconditional `play()`.
+        let resumesPlaying = resumePlaying ?? sessionRebuildResumesPlaying
         state = .loading
         // AE#464 round 2: this branch reaches `loadSoftware` / `loadNative` rather than `load`, so it
         // parks its own rebuild position for anything that stacks behind it. Round 3 parks the
-        // transport beside it; this branch reads `loadedOptions` field by field, and the caller has
-        // already written the session's own transport into it.
+        // transport beside it.
         positionUnderReconstruction = resumeAt
-        transportIntentUnderReconstruction = loadedOptions.autoplay
+        transportIntentUnderReconstruction = resumesPlaying
         let previousAudioIndex = activeAudioTrackIndex
         // Snapshot before stopInternal wipes state. Must reload on the same backend: loadNative on a SW-routed AV1 source throws unsupportedCodec (HLSVideoEngine only accepts HEVC / H.264 / VP9 / probed-AV1).
         let wasOnSoftwarePath = (playbackBackend == .software)
@@ -2419,7 +2426,8 @@ extension AetherEngine {
                     audioTracks: audioTracks, activeIndex: softwareHost?.audioStreamIndex ?? -1
                 )
                 presentCurrentLayer()
-                softwareHost?.play()
+                // #124: not resuming leaves the host paused; its readiness settles `.loading -> .paused`.
+                if resumesPlaying { softwareHost?.play() }
             } else {
                 EngineLog.emit("[AetherEngine] reload: loadNative enter audio=\(audioStreamIndex.map(String.init) ?? "nil") resumeAt=\(String(format: "%.2f", resumeAt))s", category: .engine)
                 // #339: the only write this reload can still produce is a sole-writer host's re-write on the
@@ -2507,10 +2515,10 @@ extension AetherEngine {
                     ),
                     settleCap: loadedOptions.isLive ? .standard : .awaitObservedEnd)
                 try checkLoadCurrent(gen)
-                nativeHost?.play()
+                if resumesPlaying { nativeHost?.play() }
             }
             try checkLoadCurrent(gen)
-            state = .playing
+            if resumesPlaying { state = .playing }
             // Re-arm samplers: stopInternal nilled them, and the reload path bypasses public load() that normally restarts them. Without this, liveTelemetry stays nil and the stats overlay shows "-" after every audio switch.
             startMemoryProbe()
             startLiveTelemetrySampler()
@@ -2522,7 +2530,7 @@ extension AetherEngine {
             if loadedOptions.isLive, !targetSoftwarePath {
                 armLiveReloadWatchdog(generation: gen)
             }
-            EngineLog.emit("[AetherEngine] reload: state=.playing total=\(elapsedMs(since: reloadStart))ms", category: .engine)
+            EngineLog.emit("[AetherEngine] reload: state=\(resumesPlaying ? ".playing" : "paused on readiness") total=\(elapsedMs(since: reloadStart))ms", category: .engine)
         } catch is CancellationError {
             // Superseded by a newer load/stop: it owns the engine state.
             return nil
