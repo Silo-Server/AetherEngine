@@ -118,8 +118,6 @@ func printUsage() {
                           never EOF, unknown size; prints physFP and its slope against that rate)
       aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--serve-only] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--reload-test] [--sw] [--drop-after N] [--discontinuity-at N] [--realtime] [--realtime-rate X] [--fast-zap] [--preroll N] [--rewind-hold N] [--gen-highbitrate-seed]
                      [--freeze-after N] [--unfreeze-after N] [--rewind-before-freeze N] [--force-recovery-reload-at N] [--live-only] [--no-blocking-reload] [--force-master]
-                     [--freeze-after N] [--unfreeze-after N] [--rewind-before-freeze N] [--force-recovery-reload-at N]
-                     [--no-blocking-reload]
       aetherctl dvr [--path native|sw|both] [--seconds N] [--dvr-window N]
       aetherctl dualsubs <file> --primary <streamIndex> --secondary <streamIndex> [--seek <seconds>]
       aetherctl hlsfixture <input.ts> [--port N] [--segment-seconds N] [--target-duration N] [--window N]
@@ -216,13 +214,16 @@ func printUsage() {
                 mediastreamvalidator / mp4dump / ffprobe from another
                 terminal:
 
-                  curl -i  http://127.0.0.1:<port>/master.m3u8
-                  curl -o  /tmp/init.mp4  http://127.0.0.1:<port>/init.mp4
-                  curl -o  /tmp/seg0.mp4  http://127.0.0.1:<port>/seg0.mp4
-                  mediastreamvalidator http://127.0.0.1:<port>/master.m3u8
+                  curl -i  http://127.0.0.1:<port>/<token>/master.m3u8
+                  curl -o  /tmp/init.mp4  http://127.0.0.1:<port>/<token>/init.mp4
+                  curl -o  /tmp/seg0.mp4  http://127.0.0.1:<port>/<token>/seg0.mp4
+                  mediastreamvalidator http://127.0.0.1:<port>/<token>/master.m3u8
                   mp4dump --verbosity 1 /tmp/init.mp4
                   ffprobe -v debug /tmp/seg0.mp4
-                  open 'http://127.0.0.1:<port>/master.m3u8'
+                  open 'http://127.0.0.1:<port>/<token>/master.m3u8'
+
+                The server answers only paths that start with its
+                per-session token; copy <port>/<token> from the printed URL.
 
                 Ctrl-C to tear down.
 
