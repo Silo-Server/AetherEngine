@@ -429,20 +429,16 @@ public final class Demuxer: @unchecked Sendable {
         return overflow ? nil : placed
     }
 
-    /// Whether an index entry can be a real position (audit HLS-102): under 2^62 ticks, so any
-    /// difference of two entries fits `Int64`, and under 4e9 s on its own time base. libavformat
-    /// rejects only NOPTS and the relative-timestamp band near `Int64.max`; entries near `Int64.min`
-    /// and just below the band reach the plan builders otherwise. Epoch-anchored sources stay inside
-    /// both limits (1.79e18 ns in 2026 is under 2^62 until about 2116, 1.79e9 epoch seconds under 4e9
-    /// until about 2096).
+    /// Whether an index entry can be a real position (audit HLS-102), by the same rule the packet
+    /// funnel applies (`SourceTimestampBounds.plausible(_:timeBase:)`). libavformat rejects only NOPTS
+    /// and the relative-timestamp band near `Int64.max`; entries near `Int64.min` and just below the
+    /// band reach the plan builders otherwise.
     static func isPlausibleIndexTimestamp(_ ts: Int64, timeBase: AVRational) -> Bool {
-        guard ts != Int64.min, ts.magnitude < UInt64(1) << 62,
-              timeBase.num > 0, timeBase.den > 0 else { return false }
-        return abs(Double(ts) * Double(timeBase.num) / Double(timeBase.den)) < maxPlausibleIndexSeconds
+        guard timeBase.num > 0, timeBase.den > 0 else { return false }
+        return SourceTimestampBounds.plausible(ts, timeBase: timeBase) != Int64.min
     }
 
-    static let maxPlausibleIndexTicks: Double = 0x1p62
-    static let maxPlausibleIndexSeconds: Double = 4e9
+    static let maxPlausibleIndexTicks = Double(SourceTimestampBounds.demuxedMagnitude)
 
     /// Seconds as ticks on `timeBase`, nil unless the result is finite and under 2^62 ticks (audit
     /// DMX-113, BIT-105). This is where every seconds-based reposition becomes an integer, and
