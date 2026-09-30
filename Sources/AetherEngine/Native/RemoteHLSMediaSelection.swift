@@ -62,6 +62,14 @@ enum RemoteHLSMediaSelection {
         option.playlistName ?? option.displayName
     }
 
+    /// The option that carries an injected rendition's served NAME (audit NAT-104). Matched on
+    /// `injectionKey`, the identity the dedupe and the auto-select mirror already use: a first-hit test
+    /// of `playlistName == name || displayName == name` picked the ORIGIN's option whenever its localized
+    /// display name equalled the sidecar's NAME, and the origin's renditions sit ahead of the injected ones.
+    static func injectedRenditionIndex(named name: String, in options: [LegibleOption]) -> Int? {
+        options.firstIndex { injectionKey($0) == name }
+    }
+
     /// Reroute only the typed VOD-path misroute, and only for URL sources: custom readers have no
     /// URL for AVPlayer to open, and the live raw-path misroute has its own destination
     /// (`shouldRouteLiveOntoIngest`, AE#363).

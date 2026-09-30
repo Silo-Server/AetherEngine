@@ -2647,21 +2647,22 @@ extension AetherEngine {
         Task { @MainActor in
             self.currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically = false
             guard let group = try? await item.asset.loadMediaSelectionGroup(for: .legible) else { return }
-            var match: AVMediaSelectionOption?
-            var seen: [String] = []
+            var snapshots: [RemoteHLSMediaSelection.LegibleOption] = []
             for option in group.options {
-                let playlistName = await RemoteHLSMediaSelection.playlistName(of: option)
-                seen.append(playlistName ?? option.displayName)
-                if match == nil, playlistName == name || option.displayName == name { match = option }
+                snapshots.append(RemoteHLSMediaSelection.LegibleOption(
+                    displayName: option.displayName, extendedLanguageTag: nil,
+                    isDefault: false, isForced: false, isSDH: false,
+                    playlistName: await RemoteHLSMediaSelection.playlistName(of: option)))
             }
-            guard let option = match else {
+            let seen = snapshots.map(RemoteHLSMediaSelection.injectionKey)
+            guard let index = RemoteHLSMediaSelection.injectedRenditionIndex(named: name, in: snapshots) else {
                 EngineLog.emit(
                     "[AetherEngine] #316: injected rendition \"\(name)\" is not in the item's legible "
                     + "group (\(seen.joined(separator: ", ")))",
                     category: .engine)
                 return
             }
-            item.select(option, in: group)
+            item.select(group.options[index], in: group)
             EngineLog.emit("[AetherEngine] #316: selected injected rendition \"\(name)\" for external id=\(id)",
                            category: .engine)
         }
