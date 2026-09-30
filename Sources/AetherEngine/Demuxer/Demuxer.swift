@@ -244,6 +244,27 @@ public final class Demuxer: @unchecked Sendable {
         }
     }
 
+    /// Audit NET-110: the disc reader `openHTTP` builds for a remote disc image. The disc adapter's
+    /// `ConcatIOReader.close()` is a no-op and the bridge does not own its reader, so this is the only
+    /// owner left to end the reader's `URLSession`. Guarded by `providerLock`.
+    private var _ownedSourceReader: IOReader?
+
+    private func adoptOwnedSourceReader(_ reader: IOReader) {
+        providerLock.lock()
+        let previous = _ownedSourceReader
+        _ownedSourceReader = reader
+        providerLock.unlock()
+        previous?.close()
+    }
+
+    private func releaseOwnedSourceReader() {
+        providerLock.lock()
+        let reader = _ownedSourceReader
+        _ownedSourceReader = nil
+        providerLock.unlock()
+        reader?.close()
+    }
+
     /// Audit HLS-2: `markClosed()` before the provider exists used to be a no-op, so a teardown
     /// that raced an in-flight open let it finish its connect and probe.
     private let closeRequestLock = NSLock()
@@ -600,15 +621,29 @@ public final class Demuxer: @unchecked Sendable {
         if !isLive, Self.isDiscImageURL(url) {
             let warm = HTTPDiscIOReader.takePrewarm(for: url, extraHeaders: extraHeaders)
             if let discReader = HTTPDiscIOReader(url: url, extraHeaders: extraHeaders, prewarmed: warm) {
-                if let discInfo = try DiscReader.wrap(discReader, selectTitleID: selectTitleID, cacheKey: url.absoluteString) {
+                adoptOwnedSourceReader(discReader)
+                let discInfo: DiscInfo?
+                do {
+                    discInfo = try DiscReader.wrap(discReader, selectTitleID: selectTitleID, cacheKey: url.absoluteString)
+                } catch {
+                    releaseOwnedSourceReader()
+                    if let warm { SourcePrewarmStore.shared.store(warm, for: url) }
+                    throw error
+                }
+                if let discInfo {
                     adoptDiscInfo(discInfo)
                     auditSource = nil
                     let bridge = CustomIOReaderBridge(reader: discInfo.reader)
                     let inputFormat = av_find_input_format(discInfo.formatHint)
-                    try openWithProvider(bridge, inputFormat: inputFormat, isLive: false)
+                    do {
+                        try openWithProvider(bridge, inputFormat: inputFormat, isLive: false)
+                    } catch {
+                        releaseOwnedSourceReader()
+                        throw error
+                    }
                     return
                 }
-                discReader.close()
+                releaseOwnedSourceReader()
             }
             // Not a disc: hand the warm back so the streaming reader below adopts it (#647).
             if let warm { SourcePrewarmStore.shared.store(warm, for: url) }
@@ -2370,6 +2405,7 @@ public final class Demuxer: @unchecked Sendable {
 
         avioProvider?.close()
         avioProvider = nil
+        releaseOwnedSourceReader()
     }
 
     deinit {
