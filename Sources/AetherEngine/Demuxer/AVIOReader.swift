@@ -1312,8 +1312,31 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         _ = streamDataReady.wait(timeout: .now() + .seconds(15))
                         try failIfStreamingRefused(fallbackStatus: pumpRefusal)
                     } else {
+                        // Audit DMX-101: a cold open that was refused or slow never judged the
+                        // origin's range support, and the probe above takes a 200's Content-Length
+                        // for a size. This connection is then the first to see the origin's answer,
+                        // so it gets the same head classification and confirmation.
+                        winCond.lock()
+                        rangeVerdictPending = true
+                        winCond.unlock()
                         startPersistentConnection(at: 0)
-                        if !awaitFirstPersistentData() {
+                        let gotData = awaitFirstPersistentData()
+                        if let caught = takeRangeVerdictAfterProbe() {
+                            caught.abandoned?.cancelTransfer()
+                            caught.abandoned?.releaseOriginTicket()
+                            try probeControl?.check()
+                            let confirmation = confirmRangeIsIgnored(contentLength: caught.contentLength)
+                            try probeControl?.check()
+                            if confirmation == .ignored {
+                                openForwardOnlyBecauseRangeIsIgnored(contentLength: caught.contentLength)
+                                try failIfStreamingRefused(fallbackStatus: 0)
+                            } else {
+                                startPersistentConnection(at: 0)
+                                if !awaitFirstPersistentData() {
+                                    EngineLog.emit("[AVIOReader] Persistent open (post-probe): no data within 15s, proceeding to read-loop reconnect", category: .demux)
+                                }
+                            }
+                        } else if !gotData {
                             EngineLog.emit("[AVIOReader] Persistent open (post-probe): no data within 15s, proceeding to read-loop reconnect", category: .demux)
                         }
                     }
@@ -1492,6 +1515,27 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return (false, transfer, status, ignoredLength)
     }
 
+    /// Audit DMX-101: the verdict of the post-probe connection, which `resolveOptimisticOpen` does
+    /// for the cold one. The size is already resolved by the probe, so nothing here keys off it:
+    /// a caught origin gets its connection abandoned under the lock, with the window emptied, and
+    /// a connection that was not caught is left running. The flag is cleared either way, so a
+    /// refill or reconnect later in the session is never read as a verdict. Demux thread,
+    /// open-time only.
+    private func takeRangeVerdictAfterProbe() -> (contentLength: Int64, abandoned: (any PersistentTransfer)?)? {
+        winCond.lock()
+        defer { winCond.unlock() }
+        rangeVerdictPending = false
+        guard let contentLength = rangeIgnoredAtOpenLength else { return nil }
+        rangeIgnoredAtOpenLength = nil
+        connGeneration &+= 1
+        let transfer = activeTransfer
+        activeTransfer = nil
+        window.removeAll()
+        connEnded = true
+        winCond.broadcast()
+        return (contentLength, transfer)
+    }
+
     private enum RangeConfirmation { case honoured, ignored }
 
     /// Audit DMX-101: the cold connection's 200 is one answer. Some CDNs send a 200 on a cache miss
@@ -1538,7 +1582,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             "[AVIOReader] \(label) origin does not honour Range (Content-Length \(contentLength)); "
             + "playing forward-only from one unranged GET (audit DMX-101)", category: .demux)
         originIgnoresRange = true
+        winCond.lock()
         fileSize = -1
+        winCond.unlock()
         streamLock.lock()
         streamExpectedBytes = contentLength > 0 ? contentLength : -1
         streamLock.unlock()

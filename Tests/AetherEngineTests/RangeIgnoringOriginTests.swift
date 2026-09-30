@@ -84,18 +84,10 @@ struct RangeIgnoringOriginTests {
 
     // MARK: - On the wire
 
-    @Test("an origin that ignores Range is read forward-only past the 32 MB range boundary",
-          .timeLimit(.minutes(2)))
-    func forwardOnlyPastTheRangeBoundary() throws {
-        let total = Int64(72 * mb)
-        let maybe = ThrottledOriginServer(totalSize: total, throttleUs: 500, patternedBody: true,
-                                          respond: { _, _, _ in .serve200 })
-        let server = try #require(maybe)
-        defer { server.stop() }
-        let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/movie.ts")!)
-        defer { reader.markClosed(); reader.close() }
-        try reader.open()
-
+    /// What a forward-only source owes: a non-seekable pb that still states its length, every byte of
+    /// the body once and in order, a clean EOF, a bounded buffer, and no ranged request past the open.
+    private func expectForwardOnlyPlayback(_ reader: AVIOReader, _ server: ThrottledOriginServer,
+                                           total: Int64, unrangedRequests: ClosedRange<Int> = 1...1) {
         #expect(reader.originIgnoresRange)
         #expect(!reader.isSeekable, "the pb must be non-seekable so FFmpeg never seeks a source that cannot")
         #expect(reader.seek(offset: 0, whence: Self.avseekSize) == total,
@@ -113,12 +105,49 @@ struct RangeIgnoringOriginTests {
 
         // One unranged GET carried the whole body. Everything else is the open's own: the bounded
         // range that was answered with a 200, the one byte confirmation, the suffix tail prefetch.
-        #expect(server.rangeHeaderPresence.filter { !$0 }.count == 1)
+        #expect(unrangedRequests.contains(server.rangeHeaderPresence.filter { !$0 }.count),
+                "\(server.rangeHeaderPresence.filter { !$0 }.count) requests without a Range header")
         let tail = total - Int64(AVIOReader.tailPrefetchBytes)
         let strays = server.requestLog.enumerated().filter { index, request in
             server.rangeHeaderPresence[index] && request.start > 1 && request.start != tail
         }
         #expect(strays.isEmpty, "ranged requests past the open: \(strays.map(\.element))")
+    }
+
+    @Test("an origin that ignores Range is read forward-only past the 32 MB range boundary",
+          .timeLimit(.minutes(2)))
+    func forwardOnlyPastTheRangeBoundary() throws {
+        let total = Int64(72 * mb)
+        let maybe = ThrottledOriginServer(totalSize: total, throttleUs: 500, patternedBody: true,
+                                          respond: { _, _, _ in .serve200 })
+        let server = try #require(maybe)
+        defer { server.stop() }
+        let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/movie.ts")!)
+        defer { reader.markClosed(); reader.close() }
+        try reader.open()
+
+        expectForwardOnlyPlayback(reader, server, total: total)
+    }
+
+    @Test("a cold open that was refused once does not hide an origin that ignores Range",
+          .timeLimit(.minutes(2)))
+    func refusedColdOpenStillFindsTheIgnoredRange() throws {
+        let total = Int64(72 * mb)
+        let once = FirstClaim()
+        let respond: @Sendable (Int, Int64, String) -> ThrottledOriginServer.Directive = { _, offset, _ in
+            offset == 0 && once.take() ? .status(503) : .serve200
+        }
+        let maybe = ThrottledOriginServer(totalSize: total, throttleUs: 500, patternedBody: true,
+                                          respond: respond)
+        let server = try #require(maybe)
+        defer { server.stop() }
+        let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/movie.ts")!)
+        defer { reader.markClosed(); reader.close() }
+        try reader.open()
+
+        // The size probe's HEAD fallback has no Range header either, and it fires when the probe
+        // behind a refusal is slow, which is the case here.
+        expectForwardOnlyPlayback(reader, server, total: total, unrangedRequests: 1...2)
     }
 
     @Test("an origin that honours Range keeps the seekable path and its range refills",
@@ -147,6 +176,41 @@ struct RangeIgnoringOriginTests {
         }
         #expect(read >= 36 * Int64(mb))
         #expect(server.rangeHeaderPresence.allSatisfy { $0 }, "a ranged source asked for an unranged GET")
+        #expect(server.requestedRanges.contains { $0.start == 32 * Int64(mb) },
+                "the refill at the 32 MB boundary never asked for its range")
+        #expect(!server.requestLog.contains { $0.start == 1 && $0.end == 1 },
+                "an honoured range needs no confirmation")
+    }
+
+    @Test("an origin that honours Range and refused the cold open once keeps the seekable path",
+          .timeLimit(.minutes(2)))
+    func refusedColdOpenOnHonouringOriginStaysSeekable() throws {
+        let total = Int64(40 * mb)
+        let once = FirstClaim()
+        let respond: @Sendable (Int, Int64, String) -> ThrottledOriginServer.Directive = { _, offset, _ in
+            offset == 0 && once.take() ? .status(503) : .serve206
+        }
+        let server = try #require(ThrottledOriginServer(totalSize: total, throttleUs: 500, respond: respond))
+        defer { server.stop() }
+        let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!)
+        defer { reader.markClosed(); reader.close() }
+        try reader.open()
+
+        #expect(!reader.originIgnoresRange)
+        #expect(reader.isSeekable)
+        #expect(reader.resolvedByteSize == total)
+
+        let chunk = 256 * 1024
+        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: chunk)
+        defer { buf.deallocate() }
+        var read: Int64 = 0
+        while read < 36 * Int64(mb) {
+            let n = reader.read(into: buf, size: Int32(chunk))
+            #expect(n > 0, "read failed at \(read)")
+            if n <= 0 { break }
+            read += Int64(n)
+        }
+        #expect(read >= 36 * Int64(mb))
         #expect(server.requestedRanges.contains { $0.start == 32 * Int64(mb) },
                 "the refill at the 32 MB boundary never asked for its range")
         #expect(!server.requestLog.contains { $0.start == 1 && $0.end == 1 },
