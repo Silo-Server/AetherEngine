@@ -52,9 +52,11 @@ struct HDR10PlusScanInputBudgetTests {
 }
 
 /// Matroska with the plain HDR10 fixture's two HEVC frames at the head and a long PCM tail after them.
-private enum TailHeavyMatroska {
+/// `junkTail` swaps the PCM clusters for zeros that no EBML element starts in, which libavformat
+/// resyncs through byte by byte inside a single `av_read_frame`.
+enum TailHeavyMatroska {
 
-    static func make(foreignBytes: Int) throws -> Data {
+    static func make(foreignBytes: Int, junkTail: Bool = false) throws -> Data {
         let mp4 = try ProbeTestFixtures.decode(HDR10PlusProbeIntegrationTests.hdr10Base64)
         let (hvcC, frames) = try hevcTrack(mp4)
 
@@ -89,7 +91,8 @@ private enum TailHeavyMatroska {
                             simpleBlock(track: 1, relative: 0, payload: frames[0]) +
                             simpleBlock(track: 1, relative: 40, payload: frames[1]))
         let silence = [UInt8](repeating: 0, count: blockBytes)
-        for i in 0..<max(1, foreignBytes / blockBytes) {
+        if junkTail { clusters += [UInt8](repeating: 0, count: foreignBytes) }
+        for i in 0..<(junkTail ? 0 : max(1, foreignBytes / blockBytes)) {
             clusters += element([0x1F, 0x43, 0xB6, 0x75],
                                 element([0xE7], uint(100 + i * 170)) +
                                 simpleBlock(track: 2, relative: 0, payload: silence))

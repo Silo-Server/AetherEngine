@@ -384,7 +384,8 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
             func spawn(_ index: Int) {
                 let item = resolvedSegments[index]
                 group.addTask {
-                    let bytes = try await self.fetch(item.1)
+                    let bytes = try await self.fetch(
+                        item.1, limit: BoundedFetch.segmentLimit(forDuration: item.0.duration))
                     guard let crypt = item.0.crypt else { return (index, bytes) }
                     return (
                         index,
@@ -533,8 +534,15 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         return (try HLSPlaylistParser.parse(text), response.url ?? url)
     }
 
-    private func fetch(_ url: URL) async throws -> Data {
-        let (data, response) = try await session.data(for: makeRequest(url))
+    /// A segment or a key body, cut off at `limit` while it arrives (audit NET-112).
+    private func fetch(_ url: URL, limit: Int) async throws -> Data {
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await BoundedFetch.data(for: makeRequest(url), session: session, limit: limit)
+        } catch is BoundedFetch.Exceeded {
+            throw HLSIngestError.playlistInvalid(reason: "body exceeds \(limit) bytes")
+        }
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard (200..<300).contains(status), !data.isEmpty else {
             throw HLSIngestError.playlistUnreachable(status: status)
@@ -564,7 +572,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         if let cached = keyCacheLock.withLock({ keyCache[keyURL.absoluteString] }) {
             key = cached
         } else {
-            let fetched = try await fetch(keyURL)
+            let fetched = try await fetch(keyURL, limit: BoundedFetch.keyLimit)
             guard fetched.count == kCCKeySizeAES128 else {
                 throw HLSIngestError.segmentDecryptFailed(reason: "key length is not 16 bytes")
             }
