@@ -444,6 +444,19 @@ public final class Demuxer: @unchecked Sendable {
     static let maxPlausibleIndexTicks: Double = 0x1p62
     static let maxPlausibleIndexSeconds: Double = 4e9
 
+    /// Seconds as ticks on `timeBase`, nil unless the result is finite and under 2^62 ticks (audit
+    /// DMX-113, BIT-105). This is where every seconds-based reposition becomes an integer, and
+    /// `Int64(_:)` traps on NaN, infinity and anything past `Int64`; every caller already treats a
+    /// failed seek as one. Truncates like the plain conversion it replaces.
+    nonisolated static func ticks(forSeconds seconds: Double, timeBase: AVRational) -> Int64? {
+        guard timeBase.num > 0, timeBase.den > 0 else { return nil }
+        let ticks = seconds * Double(timeBase.den) / Double(timeBase.num)
+        guard ticks.isFinite, abs(ticks) < maxPlausibleIndexTicks else { return nil }
+        return Int64(ticks)
+    }
+
+    nonisolated static let avTimeBase = AVRational(num: 1, den: AV_TIME_BASE)
+
     /// True once a disc structure (BD/DVD/UDF) was recognized at open. Disc sources concat
     /// MPEG-TS / VOB clips and have no EOF cue index, so the MKV cue-index prewarm seek is
     /// useless there and a cold mid-disc range read is expensive on a remote ISO (#76).
@@ -1810,7 +1823,8 @@ public final class Demuxer: @unchecked Sendable {
     func seek(to seconds: Double) -> Bool {
         accessLock.lock()
         defer { accessLock.unlock() }
-        guard let ctx = formatContext else { return false }
+        guard let ctx = formatContext,
+              let timestamp = Self.ticks(forSeconds: seconds, timeBase: Self.avTimeBase) else { return false }
         // #409: the read position moves, so the repair drops its picture-order anchor and
         // re-anchors on the next keyframe (a seek always lands on one).
         compositionRepair?.noteSeek()
@@ -1819,7 +1833,6 @@ public final class Demuxer: @unchecked Sendable {
             resetAfterTimeSeek(ctx)
             return true
         }
-        let timestamp = Int64(seconds * Double(AV_TIME_BASE))
         let ret = avformat_seek_file(ctx, -1, Int64.min, timestamp, Int64.max, 0)
         if ret < 0 {
             #if DEBUG
@@ -1966,6 +1979,17 @@ public final class Demuxer: @unchecked Sendable {
         defer { accessLock.unlock() }
         guard let ctx = formatContext else { return false }
         guard probeControl?.isStopped != true else { return false }
+        // A stream-anchored seek carries the target in that stream's own time base; only the -1
+        // form is expressed in AV_TIME_BASE units.
+        var anchor: Int32 = -1
+        var timeBase = Self.avTimeBase
+        if anchorStreamIndex >= 0, anchorStreamIndex < Int32(ctx.pointee.nb_streams),
+           let tb = ctx.pointee.streams[Int(anchorStreamIndex)]?.pointee.time_base,
+           tb.num > 0, tb.den > 0 {
+            anchor = anchorStreamIndex
+            timeBase = tb
+        }
+        guard let timestamp = Self.ticks(forSeconds: seconds, timeBase: timeBase) else { return false }
         // #409: the read position moves, so the repair drops its picture-order anchor and
         // re-anchors on the next keyframe (a seek always lands on one).
         compositionRepair?.noteSeek()
@@ -1985,16 +2009,6 @@ public final class Demuxer: @unchecked Sendable {
         // seek on a remote ISO sat wedged ~230 s and every later re-arm queued behind it.
         avioProvider?.beginReadDeadline(secondsFromNow: timeout)
         defer { avioProvider?.endReadDeadline() }
-        // A stream-anchored seek carries the target in that stream's own time base; only the -1
-        // form is expressed in AV_TIME_BASE units.
-        var anchor: Int32 = -1
-        var timestamp = Int64(seconds * Double(AV_TIME_BASE))
-        if anchorStreamIndex >= 0, anchorStreamIndex < Int32(ctx.pointee.nb_streams),
-           let tb = ctx.pointee.streams[Int(anchorStreamIndex)]?.pointee.time_base,
-           tb.num > 0, tb.den > 0 {
-            anchor = anchorStreamIndex
-            timestamp = Int64(seconds * Double(tb.den) / Double(tb.num))
-        }
         let ret = avformat_seek_file(ctx, anchor, Int64.min, timestamp, Int64.max, 0)
         avformat_flush(ctx)
         resetSubpictureAssembly()  // #651: libavformat just dropped the parsers this stands in for
@@ -2114,7 +2128,15 @@ public final class Demuxer: @unchecked Sendable {
     ) -> Int64? {
         guard fileSize > 0, duration > 0, target >= 0 else { return nil }
         let fraction = min(1.0, max(0.0, (target - startOrigin - earlyBiasSeconds) / duration))
-        return Int64(Double(fileSize) * fraction)
+        return clampedByteOffset(Double(fileSize) * fraction, fileSize: fileSize)
+    }
+
+    /// `raw` as a byte offset in `[0, fileSize]` (audit DMX-103). The compare runs on the Double:
+    /// the total is whatever the origin wrote in `Content-Range`, and a `min(fileSize, ...)` after
+    /// `Int64(_:)` comes too late for a product that rounds up to 2^63 or past it.
+    nonisolated static func clampedByteOffset(_ raw: Double, fileSize: Int64) -> Int64 {
+        guard raw > 0 else { return 0 }
+        return raw >= Double(fileSize) ? fileSize : Int64(raw)
     }
 
     /// Landing verdict for one byte-estimate probe (#112 round 10).
@@ -2139,7 +2161,7 @@ public final class Demuxer: @unchecked Sendable {
         let late = landed > target
         let farEarly = landed < target - byteEstimateAcceptEarlyWindowSeconds
         guard late || farEarly else { return .accept }
-        let corrected = min(fileSize, max(0, Int64(Double(currentByte) * (targetRel / landedRel))))
+        let corrected = clampedByteOffset(Double(currentByte) * (targetRel / landedRel), fileSize: fileSize)
         guard corrected != currentByte else { return .accept }
         return .probe(corrected)
     }

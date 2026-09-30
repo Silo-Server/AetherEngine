@@ -405,8 +405,8 @@ final class FrameDecodeContext: @unchecked Sendable {
 
         demuxer.seek(to: seekSeconds)
 
-        guard timeBase.num > 0 else { return nil }
-        let targetPTS = Int64((seekSeconds * Double(timeBase.den)) / Double(timeBase.num))
+        // A target the stream's own time base cannot hold is no position in it (audit BIT-105).
+        guard let targetPTS = Demuxer.ticks(forSeconds: seekSeconds, timeBase: timeBase) else { return nil }
 
         var frame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
         guard frame != nil else { return nil }

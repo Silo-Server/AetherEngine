@@ -5242,6 +5242,12 @@ public final class AetherEngine: ObservableObject {
     }
 
     public func seek(to seconds: Double) async {
+        // Audit DMX-113: the `.loading` branch below would otherwise publish a NaN or infinite
+        // position into the clock, and the hosts' seeks hand it to the Demuxer as ticks.
+        guard seconds.isFinite else {
+            EngineLog.emit("[AetherEngine] seek(to:\(seconds)) ignored: not a finite position", category: .engine)
+            return
+        }
         await seek(to: seconds, origin: .host)
     }
 
