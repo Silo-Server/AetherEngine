@@ -3011,6 +3011,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     guard let read = try readNextSourcePacket() else {
                         break readLoop
                     }
+                    // Audit SEG-104: a stop that landed while this read was parked means the session
+                    // has already replaced this pump, so what the read returned is not its to act on.
+                    if checkShouldStop() {
+                        var stale: UnsafeMutablePointer<AVPacket>? = read.packet
+                        trackedPacketFree(&stale)
+                        exitReason = .stopRequested
+                        break readLoop
+                    }
                     packet = read.packet
                     origin = read.origin
                     packetsRead += 1
@@ -4175,6 +4183,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // a URL reopen of the very origin that starved. The verdict is what the exit means.
         if noCutWatchdog?.hasLatchedExit == true {
             if case .stopRequested = exitReason {} else { exitReason = .segmentStall }
+        }
+
+        // Audit SEG-104: the abort of a parked read surfaces as end of file, which is not the source's.
+        if case .eof = exitReason, checkShouldStop() {
+            exitReason = .stopRequested
         }
 
         // muxerFailed from a backpressure break is a wedge (host re-anchors) or a stop (teardown), not a real failure.
