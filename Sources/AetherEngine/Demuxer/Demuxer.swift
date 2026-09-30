@@ -326,6 +326,12 @@ public final class Demuxer: @unchecked Sendable {
     private var compositionRepair: (any H264TimestampRepairSession)?
     private var compositionRepairEvaluated = false
 
+    /// Audit HLS-103: packets `peekPackets` read ahead of the cursor on a source that cannot rewind.
+    /// They are already through everything `readPacket` does to a packet (the #409 repair, the
+    /// timestamp bound), so `readPacket` hands them out first and as they are. Freed by a
+    /// reposition and by `close()`. Guarded by `accessLock`.
+    private var peekedPackets: [UnsafeMutablePointer<AVPacket>] = []
+
     /// #407: video streams whose PTS `+genpts` invented out of decode order, because the container
     /// carries none of its own. Cleared on the way out of `readPacketLocked` so the decoder's reorder
     /// owns the presentation axis. Decided once at open, see `armGeneratedPTSSuppression`.
@@ -1751,6 +1757,44 @@ public final class Demuxer: @unchecked Sendable {
     func readPacket(isCurrent: @Sendable () -> Bool = { true }) throws -> UnsafeMutablePointer<AVPacket>? {
         accessLock.lock()
         defer { accessLock.unlock() }
+        if !peekedPackets.isEmpty {
+            guard isCurrent() else { throw CancellationError() }
+            return peekedPackets.removeFirst()
+        }
+        return try readPipelinePacketLocked(isCurrent: isCurrent)
+    }
+
+    /// Shows the packets at the read position to `inspect`, in order, WITHOUT consuming them: what it
+    /// looked at is held and the next `readPacket()` calls return it first (audit HLS-103). For a source
+    /// that cannot rewind, where a probe that reads packets and seeks back has nothing to seek back
+    /// with. `inspect` returns true once it has seen enough. Stops at `maxPackets` held, at the end of
+    /// the source, or on a read error, which is thrown with the packets read so far still held.
+    func peekPackets(maxPackets: Int,
+                     _ inspect: (UnsafeMutablePointer<AVPacket>) -> Bool) throws {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        var index = 0
+        while index < maxPackets {
+            if index == peekedPackets.count {
+                guard let packet = try readPipelinePacketLocked() else { return }
+                peekedPackets.append(packet)
+            }
+            if inspect(peekedPackets[index]) { return }
+            index += 1
+        }
+    }
+
+    /// Caller holds `accessLock`.
+    private func dropPeekedPacketsLocked() {
+        for held in peekedPackets {
+            var packet: UnsafeMutablePointer<AVPacket>? = held
+            trackedPacketFree(&packet)
+        }
+        peekedPackets.removeAll()
+    }
+
+    /// One packet through the demuxer's own pipeline, bypassing the peek queue. Caller holds `accessLock`.
+    private func readPipelinePacketLocked(isCurrent: @Sendable () -> Bool = { true }) throws -> UnsafeMutablePointer<AVPacket>? {
         while true {
             // A read-ahead decision made before a seek cannot start a NEW-position read after
             // the seek releases this lock, then throw that first new packet away as stale.
@@ -2038,10 +2082,16 @@ public final class Demuxer: @unchecked Sendable {
         // re-anchors on the next keyframe (a seek always lands on one).
         compositionRepair?.noteSeek()
         if let reader = timeSeekableReader {
+            dropPeekedPacketsLocked()
             guard repositionTimeSeekable(reader, toSourceSeconds: seconds, streamIndex: -1) else { return false }
             resetAfterTimeSeek(ctx)
             return true
         }
+        // Audit HLS-103: libavformat flushes its packet queue before it even tries a seek, so on a
+        // source that cannot rewind a refused seek is pure loss. A live AVIOReader reports itself
+        // seekable by design, so live callers keep their own rules.
+        guard isSourceSeekable else { return false }
+        dropPeekedPacketsLocked()
         let ret = avformat_seek_file(ctx, -1, Int64.min, timestamp, Int64.max, 0)
         if ret < 0 {
             #if DEBUG
@@ -2071,12 +2121,15 @@ public final class Demuxer: @unchecked Sendable {
             guard timeBase.num > 0, timeBase.den > 0 else { return false }
             let seconds = Double(timestamp) * Double(timeBase.num)
                 / Double(timeBase.den)
+            dropPeekedPacketsLocked()
             guard repositionTimeSeekable(reader, toSourceSeconds: seconds, streamIndex: streamIndex) else {
                 return false
             }
             resetAfterTimeSeek(ctx)
             return true
         }
+        guard isSourceSeekable else { return false }  // audit HLS-103, see `seek(to:)`
+        dropPeekedPacketsLocked()
         let ret = avformat_seek_file(
             ctx,
             streamIndex,
@@ -2207,12 +2260,15 @@ public final class Demuxer: @unchecked Sendable {
         // over HTTP would additionally be a request storm. No read deadline is armed: the reader's
         // reposition is a bookkeeping operation, the refetch happens behind the FIFO.
         if let reader = timeSeekableReader {
+            dropPeekedPacketsLocked()
             guard repositionTimeSeekable(reader, toSourceSeconds: seconds, streamIndex: anchorStreamIndex) else {
                 return false
             }
             resetAfterTimeSeek(ctx)
             return true
         }
+        guard isSourceSeekable else { return false }  // audit HLS-103, see `seek(to:)`
+        dropPeekedPacketsLocked()
         // #112 round 9: the deadline lives on the provider protocol. Casting to AVIOReader here left a
         // disc-adapter source (CustomIOReaderBridge over HTTPDiscIOReader) unbounded: one positioning
         // seek on a remote ISO sat wedged ~230 s and every later re-arm queued behind it.
@@ -2415,6 +2471,8 @@ public final class Demuxer: @unchecked Sendable {
         defer { accessLock.unlock() }
         guard let ctx = formatContext else { return false }
         compositionRepair?.noteSeek()  // #409: re-anchor on the next keyframe
+        guard isSourceSeekable else { return false }  // audit HLS-103, see `seek(to:)`
+        dropPeekedPacketsLocked()
         let ret = avformat_seek_file(ctx, -1, Int64.min, byteTarget, Int64.max, AVSEEK_FLAG_BYTE)
         avformat_flush(ctx)
         resetSubpictureAssembly()  // #651: libavformat just dropped the parsers this stands in for
@@ -2551,6 +2609,7 @@ public final class Demuxer: @unchecked Sendable {
         trackSnapshot = TrackSnapshot()
         while streamUsers > 0 { streamTableLock.wait() }
         streamTableLock.unlock()
+        dropPeekedPacketsLocked()
         if formatContext != nil {
             avformat_close_input(&formatContext)
         }
