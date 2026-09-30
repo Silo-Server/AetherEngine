@@ -243,7 +243,6 @@ struct LogRedactionTests {
 
     @Test("a registered secret goes wherever it sits, raw or percent-encoded, until unregistered")
     func registeredSecret() {
-        defer { LogRedaction.unregisterAll() }
         #expect(EngineLog.registerSecret("p@ss w0rd"))
         let raw = LogRedaction.redact("[x] http://h:8080/john/p%40ss%20w0rd/123 alt=p@ss w0rd.")
         #expect(raw == "[x] http://h:8080/john/<redacted>/123 alt=<redacted>.")
@@ -253,9 +252,135 @@ struct LogRedactionTests {
 
     @Test("a value too short to match literally is refused")
     func shortSecretRefused() {
-        defer { LogRedaction.unregisterAll() }
         #expect(!EngineLog.registerSecret("abc"))
         #expect(LogRedaction.redact("[x] abc") == "[x] abc")
+    }
+
+    /// Audit SUB-109: `registerSecret` was a set, so the second owner of a value unregistering it
+    /// (logout of one of two profiles sharing a password) unmasked it for the first.
+    @Test("a secret registered twice stays redacted until both registrations are gone")
+    func registrationsAreCounted() {
+        let secret = "sh4redPassw0rd"
+        #expect(EngineLog.registerSecret(secret))
+        #expect(EngineLog.registerSecret(secret))
+        EngineLog.unregisterSecret(secret)
+        #expect(LogRedaction.redact("[x] pw=\(secret)x") == "[x] pw=<redacted>x")
+        EngineLog.unregisterSecret(secret)
+        #expect(LogRedaction.redact("[x] v=\(secret)x") == "[x] v=\(secret)x")
+    }
+
+    // MARK: - Nameless shapes inside a percent-encoded URL (audit SUB-104)
+
+    /// An IPTV proxy or a debrid wrapper carries the upstream URL percent-encoded in its own query.
+    /// The key forms of that were covered by NET-1; the shapes that need no key only matched raw.
+    @Test("a nameless credential inside a percent-encoded URL goes", arguments: [
+        ("url=http://proxy/x?u=http%3A%2F%2Fiptv.example%2Flive%2Falice%2FSECRETpass%2F1234.ts",
+         "url=http://proxy/x?u=http%3A%2F%2Fiptv.example%2Flive%2Falice%2F<redacted>%2F1234.ts"),
+        ("u=http%3A%2F%2Faddon%2FeyJzdG9yZXMiOlsiYSJdLCJjIjoiU0VDUkVUeHl6IiwidCI6InQifQ%2Fmanifest.json",
+         "u=http%3A%2F%2Faddon%2F<redacted>%2Fmanifest.json"),
+        ("u=smb%3A%2F%2Fbob%3ASECRETpw%40nas%2Fshare", "u=smb%3A%2F%2Fbob%3A<redacted>%40nas%2Fshare"),
+        ("http://addon/v1-eyJzdG9yZXMiOlsiYSJdLCJjIjoiU0VDUkVUeHl6IiwidCI6InQifQ/manifest.json",
+         "http://addon/v1-<redacted>/manifest.json"),
+    ])
+    func namelessShapesThroughEscapes(input: String, expected: String) {
+        #expect(LogRedaction.redact(input) == expected)
+    }
+
+    @Test("the same shapes encoded twice go too", arguments: [
+        "http://iptv.example/live/alice/SECRETpass/1234.ts",
+        "http://addon/eyJzdG9yZXMiOlsiYSJdLCJjIjoiU0VDUkVUeHl6IiwidCI6InQifQ/manifest.json",
+        "smb://bob:SECRETpw@nas/share",
+    ])
+    func namelessShapesEncodedTwice(upstream: String) {
+        let once = upstream.addingPercentEncoding(withAllowedCharacters: .alphanumerics)!
+        let twice = once.addingPercentEncoding(withAllowedCharacters: .alphanumerics)!
+        let out = LogRedaction.redact("[NativeAVPlayerHost] #1 load url=https://mfp.example/p?d=\(twice) startPos=nil")
+        for secret in ["SECRETpass", "SECRETpw", "U0VDUkVUeHl6"] { #expect(!out.contains(secret), "\(out)") }
+        #expect(out.contains("<redacted>"))
+        #expect(out.hasSuffix(" startPos=nil"))
+    }
+
+    /// NET-114: `"\(error)"` of a URLError prints the failing URL twice through its userInfo.
+    @Test("an interpolated URLError loses the encoded upstream credential of its failing URL")
+    func urlErrorDescription() {
+        let upstream = "http://iptv/live/alice/SECRETpass/1.ts"
+            .addingPercentEncoding(withAllowedCharacters: .alphanumerics)!
+        let failing = "http://127.0.0.1:1/live/playlist.m3u8?u=\(upstream)"
+        let error = NSError(domain: NSURLErrorDomain, code: NSURLErrorTimedOut,
+                            userInfo: [NSURLErrorFailingURLStringErrorKey: failing,
+                                       NSURLErrorFailingURLErrorKey: URL(string: failing)!])
+        let out = LogRedaction.redact("[HLSVODIngest] carriage probe inconclusive: \(error)")
+        #expect(!out.contains("SECRETpass"), "\(out)")
+    }
+
+    @Test("an error summary names the URL error code and host, never the failing URL")
+    func errorSummaryDropsTheURL() throws {
+        let failing = try #require(URL(string: "http://iptv.example:8080/get.php?username=u&password=Pa:ss"))
+        let urlError = URLError(.timedOut, userInfo: [NSURLErrorFailingURLErrorKey: failing,
+                                                      NSURLErrorFailingURLStringErrorKey: failing.absoluteString])
+        let summary = EngineLog.summary(of: urlError)
+        #expect(summary == "NSURLError \(NSURLErrorTimedOut) from iptv.example")
+        #expect(EngineLog.summary(of: HLSIngestError.playlistUnreachable(status: 403))
+                == "playlistUnreachable(403)")
+    }
+
+    @Test("an escape-heavy line with nothing secret in it comes back unchanged", arguments: [
+        "[ffmpeg] Opening 'https://s/Videos/My%20Movie%20(2009)/stream.mkv' for reading",
+        "[x] url=https://s/Shows/Show%20Name/Season%2001/Show%20Name%20-%20S01E01.mkv ok",
+        "[x] path=%2Fmedia%2Flive%2Fchannel1%2Findex.m3u8 ok",
+        "[HLSLocalServer] GET /0123/aether-origin-relay?ref=eW91IGNhbm5vdCByZWFkIHRoaXM_3kJ-qZ HTTP/1.1 fd=9",
+    ])
+    func escapesWithoutSecretsSurvive(line: String) {
+        #expect(LogRedaction.redact(line) == line)
+    }
+
+    // MARK: - Query values that hold a terminator (audit SUB-108)
+
+    @Test("a query password holding : ; , ) or > goes whole", arguments: [":", ";", ",", ")", ">"])
+    func queryPasswordWithPunctuation(mark: String) {
+        let out = LogRedaction.redact("https://h/get.php?username=u&password=SECRET\(mark)tail123&type=m3u")
+        #expect(out == "https://h/get.php?username=u&password=<redacted>&type=m3u")
+    }
+
+    @Test("punctuation that prose puts after a value still ends it")
+    func proseAfterAValue() {
+        #expect(LogRedaction.redact("[x] fetch failed (api_key=abc), retrying")
+                == "[x] fetch failed (api_key=<redacted>), retrying")
+        #expect(LogRedaction.redact("[x] seen <token=abc>") == "[x] seen <token=<redacted>>")
+    }
+
+    // MARK: - Credential names outside Jellyfin and Xtream (audit SUB-109)
+
+    @Test("the other backends' credential names are covered", arguments: [
+        ("Authorization: Bearer SECRETopaque12345", "Authorization: Bearer <redacted>"),
+        ("Authorization: Basic dmluY2VudDpzZWNyZXQxMjM0", "Authorization: Basic <redacted>"),
+        ("Cookie: PHPSESSID=SECRETsess123; other=1", "Cookie: <redacted>; other=1"),
+        ("Set-Cookie: session=SECRETsess123; Path=/", "Set-Cookie: <redacted>; Path=/"),
+        ("X-Api-Key: SECRETkey123", "X-Api-Key: <redacted>"),
+        ("https://h/a?api-key=SECRETkey123&x=1", "https://h/a?api-key=<redacted>&x=1"),
+        (#"{"api_key":"SECRETjson123"}"#, #"{"api_key":"<redacted>"}"#),
+        (#"["X-Emby-Token": "SECRETjson123"]"#, #"["X-Emby-Token": "<redacted>"]"#),
+        ("https://h/p.php?user=u&pwd=SECRETkey123", "https://h/p.php?user=u&pwd=<redacted>"),
+        ("https://h/p.php?user=u&passwd=SECRETkey123", "https://h/p.php?user=u&passwd=<redacted>"),
+        ("authToken=SECRETrt123 done", "authToken=<redacted> done"),
+        ("refreshToken=SECRETrt123 done", "refreshToken=<redacted> done"),
+        ("sessionToken=SECRETrt123 done", "sessionToken=<redacted> done"),
+        ("auth_token=SECRETrt123 done", "auth_token=<redacted> done"),
+        ("https://h/a?sessionid=SECRETsid123&session_id=SECRETsid456", "https://h/a?sessionid=<redacted>&session_id=<redacted>"),
+    ])
+    func otherBackendNames(input: String, expected: String) {
+        #expect(LogRedaction.redact(input) == expected)
+    }
+
+    @Test("prose around the new names is left alone", arguments: [
+        "[http] 401 with WWW-Authenticate: Bearer realm=\"fixture\"",
+        "[auth] a bearer token was sent",
+        "[auth] basic auth failed",
+        "[x] X-Playback-Session-Id: 5A0C2D7E-1234",
+        "[x] no cookie was set",
+    ])
+    func proseAroundNewNames(line: String) {
+        #expect(LogRedaction.redact(line) == line)
     }
 
     /// The point of putting this in EngineLog rather than in each host: the handler a host installs

@@ -40,7 +40,8 @@ public enum EngineLog {
         LogRedaction.register(value)
     }
 
-    /// Stops redacting a value passed to `registerSecret(_:)`, for example on logout.
+    /// Stops redacting a value passed to `registerSecret(_:)`, for example on logout. Registrations are
+    /// counted, so a value two owners registered stays redacted until both have unregistered it.
     public static func unregisterSecret(_ value: String) {
         LogRedaction.unregister(value)
     }
@@ -91,5 +92,18 @@ public enum EngineLog {
         case .verbose:
             loggers[category]?.debug("\(line, privacy: .public)")
         }
+    }
+}
+
+extension EngineLog {
+    /// Audit NET-114: `"\(error)"` of a URLError prints its userInfo, which is the failing URL twice
+    /// with its whole query. The code and the host say what failed without handing the log the URL.
+    /// Any other error keeps its own description.
+    static func summary(of error: Error) -> String {
+        let bridged = error as NSError
+        guard bridged.domain == NSURLErrorDomain else { return "\(error)" }
+        let failing = (bridged.userInfo[NSURLErrorFailingURLErrorKey] as? URL)
+            ?? (bridged.userInfo[NSURLErrorFailingURLStringErrorKey] as? String).flatMap(URL.init(string:))
+        return "NSURLError \(bridged.code)" + (failing?.host.map { " from \($0)" } ?? "")
     }
 }

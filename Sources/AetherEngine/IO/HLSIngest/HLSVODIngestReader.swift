@@ -111,7 +111,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         } catch {
             if Task.isCancelled { throw CancellationError() }
             EngineLog.emit(
-                "[HLSVODIngest] carriage probe inconclusive: \(error)",
+                "[HLSVODIngest] carriage probe inconclusive: \(EngineLog.summary(of: error))",
                 category: .engine
             )
             return nil
@@ -449,7 +449,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         producer = nil
         condition.broadcast()
         condition.unlock()
-        EngineLog.emit("[HLSVODIngest] terminal: \(error)", category: .engine)
+        EngineLog.emit("[HLSVODIngest] terminal: \(EngineLog.summary(of: error))", category: .engine)
     }
 
     private func resolveMedia() async throws -> ResolvedMedia {
