@@ -248,7 +248,32 @@ final class HLSLocalServer: @unchecked Sendable {
         var line = "\(method) \(routePath)"
         if !query.isEmpty { line += "?\(query)" }
         if let version { line += " \(version)" }
-        return line
+        return escapedForLog(line)
+    }
+
+    /// Longest stretch of a stranger's request text a log line carries. A head may be 8 KB, and one
+    /// line of that per interval would still crowd a small log ring.
+    static let maximumStrangerText = 256
+
+    /// Request text as a log line may carry it: C0 controls and DEL escaped, so a bare LF cannot forge
+    /// a line of its own (audit NET-111), and cut after `limit` characters. Done here rather than in
+    /// `EngineLog`, which passes the multi-line playlist bodies this server logs on purpose.
+    static func escapedForLog(_ text: String, limit: Int = .max) -> String {
+        var out = ""
+        var count = 0
+        for scalar in text.unicodeScalars {
+            if count >= limit {
+                out += "..."
+                break
+            }
+            if scalar.value < 0x20 || scalar.value == 0x7F {
+                out += String(format: "\\x%02X", scalar.value)
+            } else {
+                out.unicodeScalars.append(scalar)
+            }
+            count += 1
+        }
+        return out
     }
 
     /// Kernel-assigned ephemeral port. Zero until start() succeeds.
@@ -445,6 +470,10 @@ final class HLSLocalServer: @unchecked Sendable {
     private static let acceptFailureBackoffMicroseconds: useconds_t = 100_000
     private var acceptFailureLog = LogThrottle(interval: 5)
     private var refusalLog = LogThrottle(interval: 5)
+    /// Audit NET-111: every line a connection that never presented the token can cause shares this, so
+    /// a LAN peer looping short connections costs the host's log one line per interval, not two per
+    /// request.
+    private var strangerLog = LogThrottle(interval: 5)
 
     // MARK: - Init
 
@@ -727,7 +756,7 @@ final class HLSLocalServer: @unchecked Sendable {
                 : acceptedAt + unauthenticatedHeadDeadline
             guard let request = readHTTPRequest(
                 fd, firstByteDeadline: firstByteDeadline, authenticated: authenticated) else { return }
-            guard processRequest(request, on: fd) else { return }
+            guard processRequest(request, on: fd, authenticated: authenticated) else { return }
             authenticated = true
         }
     }
@@ -760,8 +789,8 @@ final class HLSLocalServer: @unchecked Sendable {
             }
             if n == 0 {
                 if buffer.isEmpty { return nil }
-                EngineLog.emit("[HLSLocalServer] peer EOF mid-request fd=\(fd)",
-                               category: .hlsServer)
+                emitRequestProblem("[HLSLocalServer] peer EOF mid-request fd=\(fd)",
+                                   authenticated: authenticated)
                 return nil
             }
             if n < 0 {
@@ -772,8 +801,8 @@ final class HLSLocalServer: @unchecked Sendable {
                                    category: .hlsServer, level: authenticated ? .info : .verbose)
                     return nil
                 }
-                EngineLog.emit("[HLSLocalServer] recv error fd=\(fd) errno=\(err)",
-                               category: .hlsServer)
+                emitRequestProblem("[HLSLocalServer] recv error fd=\(fd) errno=\(err)",
+                                   authenticated: authenticated)
                 return nil
             }
             if buffer.isEmpty {
@@ -784,8 +813,8 @@ final class HLSLocalServer: @unchecked Sendable {
                 return buffer.prefix(end + 4)
             }
             if buffer.count > 8192 {
-                EngineLog.emit("[HLSLocalServer] request too large fd=\(fd) bytes=\(buffer.count)",
-                               category: .hlsServer)
+                emitRequestProblem("[HLSLocalServer] request too large fd=\(fd) bytes=\(buffer.count)",
+                                   authenticated: authenticated)
                 return nil
             }
         }
@@ -818,21 +847,40 @@ final class HLSLocalServer: @unchecked Sendable {
         }
     }
 
-    private func processRequest(_ request: Data, on fd: Int32) -> Bool {
+    /// A line caused by a connection that has not presented the token: throttled, since anyone on the
+    /// LAN can cause it (audit NET-111). An authenticated connection's lines go out as they come.
+    private func emitRequestProblem(_ line: String, authenticated: Bool) {
+        guard !authenticated else {
+            EngineLog.emit(line, category: .hlsServer)
+            return
+        }
+        stateLock.lock()
+        let admitted = strangerLog.admit(now: Self.uptimeSeconds())
+        stateLock.unlock()
+        guard let suppressed = admitted else { return }
+        EngineLog.emit(
+            line + (suppressed > 0
+                ? " (\(suppressed) more from unauthenticated connections since the last line)" : ""),
+            category: .hlsServer)
+    }
+
+    private func processRequest(_ request: Data, on fd: Int32, authenticated: Bool) -> Bool {
         byteCounterLock.lock()
         _requestCount &+= 1
         byteCounterLock.unlock()
         guard let text = String(data: request, encoding: .utf8) else {
-            EngineLog.emit("[HLSLocalServer] non-UTF8 request bytes (\(request.count)B)",
-                           category: .hlsServer)
+            emitRequestProblem("[HLSLocalServer] non-UTF8 request bytes (\(request.count)B)",
+                               authenticated: authenticated)
             return false
         }
         let firstLine = text.components(separatedBy: "\r\n").first ?? ""
         let parts = firstLine.split(separator: " ", maxSplits: 2,
                                     omittingEmptySubsequences: true)
         guard parts.count >= 2 else {
-            EngineLog.emit("[HLSLocalServer] malformed request line: '\(firstLine)'",
-                           category: .hlsServer)
+            emitRequestProblem(
+                "[HLSLocalServer] malformed request line: "
+                    + "'\(Self.escapedForLog(firstLine, limit: Self.maximumStrangerText))'",
+                authenticated: authenticated)
             return false
         }
         let rawTarget = String(parts[1])
@@ -850,9 +898,12 @@ final class HLSLocalServer: @unchecked Sendable {
         // The listener is reachable from the whole LAN, so an unprefixed request is a scan or a
         // stale URL, never AVPlayer following a playlist we handed out.
         guard let routePath = Self.pathAfterToken(pathToken, in: path) else {
-            EngineLog.emit("[HLSLocalServer] rejected request without a valid session token: \(firstLine)",
-                           category: .hlsServer)
-            _ = send404(fd: fd, path: path, reason: "bad session token")
+            // One line for the rejection and the 404 together: the path is the stranger's text.
+            emitRequestProblem(
+                "[HLSLocalServer] rejected request without a valid session token, -> 404: "
+                    + Self.escapedForLog(firstLine, limit: Self.maximumStrangerText),
+                authenticated: authenticated)
+            _ = send404(fd: fd, path: path, reason: "bad session token", logged: false)
             return false
         }
         let normalizedPath = (routePath == "/audio.m3u8") ? "/media.m3u8" : routePath
@@ -1328,10 +1379,12 @@ final class HLSLocalServer: @unchecked Sendable {
         }
     }
 
-    private func send404(fd: Int32, path: String, reason: String) -> Bool {
+    private func send404(fd: Int32, path: String, reason: String, logged: Bool = true) -> Bool {
         let response = Self.responseHeader(status: "404 Not Found", contentLength: 0, contentType: nil)
-        EngineLog.emit("[HLSLocalServer] -> 404 \(path) reason=\(reason)",
-                       category: .hlsServer)
+        if logged {
+            EngineLog.emit("[HLSLocalServer] -> 404 \(path) reason=\(reason)",
+                           category: .hlsServer)
+        }
         return writeAll(fd: fd, data: response, path: path)
     }
 
