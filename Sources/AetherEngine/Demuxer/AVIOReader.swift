@@ -5237,6 +5237,11 @@ enum AVIOReaderError: Error, Equatable, CustomStringConvertible, LocalizedError 
     /// the same reason `httpStatus` is: without it the open surfaces FFmpeg's invalid data and a
     /// self-signed origin reads as a corrupt file.
     case transportSecurityFailed(code: Int)
+    /// Audit NET-102: a remote disc image on an origin that answers a range request with the whole
+    /// source (a 200). A disc image is a filesystem, which no reader can walk forward-only, so this
+    /// fails at the first response head. A plain media URL on such an origin plays forward-only
+    /// instead (audit DMX-101).
+    case originIgnoresRange
 
     var description: String {
         switch self {
@@ -5248,6 +5253,8 @@ enum AVIOReaderError: Error, Equatable, CustomStringConvertible, LocalizedError 
         case .httpStatus(let status): return "Origin answered HTTP \(status) for the source"
         case .transportSecurityFailed(let code):
             return TransportSecurityFailure.sentence(for: code)
+        case .originIgnoresRange:
+            return "The origin ignores HTTP Range requests, which a remote disc image needs"
         }
     }
 
