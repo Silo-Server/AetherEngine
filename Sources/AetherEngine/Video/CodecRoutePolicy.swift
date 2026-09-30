@@ -174,7 +174,12 @@ extension HLSVideoEngine {
         var trimmedConstraints = constraintBytes
         while let last = trimmedConstraints.last, last == 0 { trimmedConstraints.removeLast() }
         let tier = tierFlag == 1 ? "H" : "L"
-        var s = "\(sampleEntry).\(spacePrefix)\(profileIDC).\(compatHex).\(tier)\(levelIDC)"
+        // Some encoders stamp level 5.2 (156) on 1080p24 streams. AVPlayer screens a master's declared
+        // level against the device and refuses 5.2 on an Apple TV 4K (-11848, CoreMedia -15517), while
+        // the same bytes decode fine media-direct, where nothing is declared. Level 5.1 covers up to
+        // 2160p60, so the attribute declares no more than that; the init segment's hvcC is untouched.
+        let declaredLevel = min(levelIDC, 153)
+        var s = "\(sampleEntry).\(spacePrefix)\(profileIDC).\(compatHex).\(tier)\(declaredLevel)"
         if !trimmedConstraints.isEmpty {
             s += "." + trimmedConstraints.map { String(format: "%02x", $0) }.joined(separator: ".")
         }
@@ -613,7 +618,7 @@ extension HLSVideoEngine {
             return CodecRoute(
                 codecTagOverride: "hvc1",
                 videoRange: .pq,
-                primaryCodecs: "hvc1.2.4.L\(hevcLevel)",
+                primaryCodecs: plainHEVCCodecs(codecpar: codecpar, fallbackLevel: hevcLevel),
                 supplementalCodecs: supplemental,
                 doviConfig: doviConfig,
                 convertP7ToProfile81: false,
@@ -635,7 +640,7 @@ extension HLSVideoEngine {
             return CodecRoute(
                 codecTagOverride: "hvc1",
                 videoRange: .hlg,
-                primaryCodecs: "hvc1.2.4.L\(hevcLevel)",
+                primaryCodecs: plainHEVCCodecs(codecpar: codecpar, fallbackLevel: hevcLevel),
                 supplementalCodecs: supplemental,
                 doviConfig: doviConfig,
                 convertP7ToProfile81: false,
@@ -657,7 +662,7 @@ extension HLSVideoEngine {
             return CodecRoute(
                 codecTagOverride: "hvc1",
                 videoRange: .pq,
-                primaryCodecs: "hvc1.2.4.L\(hevcLevel)",
+                primaryCodecs: plainHEVCCodecs(codecpar: codecpar, fallbackLevel: hevcLevel),
                 supplementalCodecs: supplemental,
                 doviConfig: doviConfig,
                 convertP7ToProfile81: effectiveDvMode,
