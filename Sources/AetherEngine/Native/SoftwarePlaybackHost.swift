@@ -1534,7 +1534,7 @@ final class SoftwarePlaybackHost {
 
     /// Reconstruct AVPacket from ring entry, convert PTS from seconds back to stream time_base, and route to decoders. Returns true when audio buffers were enqueued (used for feeder clock arming).
     @discardableResult
-    nonisolated private static func feedRingPacket(
+    nonisolated static func feedRingPacket(
         _ pkt: PacketRingBuffer.Packet,
         videoDecoder: any VideoDecodingPipeline,
         audioDecoder: AudioDecoder?,
@@ -1544,6 +1544,7 @@ final class SoftwarePlaybackHost {
         videoTimeBaseSeconds: Double,
         audioTimeBaseSeconds: Double,
         audioTapSink: (@Sendable (CMSampleBuffer) -> Void)?,
+        audioEpoch: UInt64,
         noteDecodeGeneration: @Sendable () -> Void
     ) -> Bool {
         let tbSec = pkt.isVideo ? videoTimeBaseSeconds : audioTimeBaseSeconds
@@ -1573,8 +1574,11 @@ final class SoftwarePlaybackHost {
         } else if let aDec = audioDecoder, let aOut = audioOutput {
             var enqueued = false
             for buf in aDec.decode(packet: p) {
-                audioTapSink?(buf)   // #95: mirror before enqueue
-                aOut.enqueue(sampleBuffer: buf)
+                // DEC-106 on the DVR path: `audioEpoch` was read before the ring read, so a rewind's flush
+                // retires what this packet decodes to. A pre-seek buffer kept at the head of the fresh queue
+                // carries a higher stamp than the new clock and mutes audio for the rewind distance.
+                guard aOut.enqueue(sampleBuffer: buf, ifEpoch: audioEpoch) else { return enqueued }
+                audioTapSink?(buf)   // #95: mirrored behind the accept
                 enqueued = true
             }
             return enqueued
@@ -2073,7 +2077,7 @@ final class SoftwarePlaybackHost {
         var hadLead = false
         var rebuffering = false
         var lastLowLeadLog = DispatchTime(uptimeNanoseconds: 0)
-        func pumpAudio() {
+        func pumpAudio(epoch audioEpoch: UInt64) {
             guard let aDec = audioDecoder, let aOut = audioOutput, audioStreamIndex >= 0 else { return }
             var seq = audioLookahead.align(to: readCursor())
             func pumpIteration() -> Bool {
@@ -2106,6 +2110,7 @@ final class SoftwarePlaybackHost {
                     videoTimeBaseSeconds: videoTimeBaseSeconds,
                     audioTimeBaseSeconds: audioTimeBaseSeconds,
                     audioTapSink: audioTapSink(),
+                    audioEpoch: audioEpoch,
                     noteDecodeGeneration: noteDecodeGeneration
                 )
                 if !armed {
@@ -2179,6 +2184,10 @@ final class SoftwarePlaybackHost {
         }
 
         func feederIteration() -> Bool {
+            // Read before anything else: a DVR seek clears `isPlaying`, then flushes the audio output, then
+            // moves the cursor, so an epoch read ahead of the playing check is retired by any flush that
+            // lands after the cursor this iteration reads (audit DEC-106).
+            let audioEpoch = audioOutput?.epoch ?? 0
             if !isPlaying() {
                 condition.lock()
                 while !isPlaying() && !stopRequested() {
@@ -2191,7 +2200,7 @@ final class SoftwarePlaybackHost {
             }
 
             // Keep the audio renderer topped up before (possibly expensive) video work.
-            pumpAudio()
+            pumpAudio(epoch: audioEpoch)
 
             let cursor = readCursor()
             let bounds = ring.seqBounds
@@ -2244,7 +2253,7 @@ final class SoftwarePlaybackHost {
                     autoreleasepool {
                         Thread.sleep(forTimeInterval: 0.005)
                         waitTicks += 1
-                        if waitTicks % 20 == 0 { pumpAudio() }
+                        if waitTicks % 20 == 0 { pumpAudio(epoch: audioEpoch) }
                         // #337: the pump is what can still arm the clock from here, so its spent
                         // pre-arm budget is what turns this park terminal (an audio track that
                         // never decodes a buffer). The renderer cannot drain at a stopped clock,
@@ -2285,6 +2294,7 @@ final class SoftwarePlaybackHost {
                 videoTimeBaseSeconds: videoTimeBaseSeconds,
                 audioTimeBaseSeconds: audioTimeBaseSeconds,
                 audioTapSink: audioTapSink(),
+                audioEpoch: audioEpoch,
                 noteDecodeGeneration: noteDecodeGeneration
             )
 
