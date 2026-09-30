@@ -114,10 +114,12 @@ final class HLSOriginRelay: @unchecked Sendable {
         config.urlCache = nil
         config.timeoutIntervalForRequest = trustProbeSeconds
         config.timeoutIntervalForResource = trustProbeSeconds
-        // No delegate on purpose. This session must answer the way AVPlayer's own networking does,
-        // which is system trust and nothing else; handing it `EngineTLS.sessionDelegate` would ask
-        // the host and get back the answer that hides what is being measured.
-        let session = URLSession(configuration: config)
+        // No trust delegate on purpose. This session must answer the way AVPlayer's own networking
+        // does, which is system trust and nothing else; handing it `EngineTLS.sessionDelegate` would
+        // ask the host and get back the answer that hides what is being measured. The redirect rule
+        // still applies (audit NET-108).
+        let session = URLSession(
+            configuration: config, delegate: EngineTLS.redirectDelegate, delegateQueue: nil)
         defer { session.invalidateAndCancel() }
 
         var request = URLRequest(url: origin)

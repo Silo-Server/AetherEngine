@@ -38,10 +38,11 @@ enum RedirectHeaderPolicy {
     }
 
     /// Builds the request actually handed back to URLSession on redirect: re-applies the
-    /// original Range (URLSession drops custom headers on cross-host redirect, and
-    /// Range-dependent proxies 400 without it), replays the policy-filtered extra
-    /// headers, and scrubs any credential header URLSession itself carried over when
-    /// the target is not credential-worthy.
+    /// original Range (Range-dependent proxies 400 without it), replays the policy-filtered
+    /// extra headers, and scrubs any credential header URLSession itself carried over when
+    /// the target is not credential-worthy. URLSession's default redirect copies every custom
+    /// header except `Authorization` to the new host (measured on CFNetwork 3896, audit
+    /// NET-108), so the scrub is what keeps a token and a cookie off a cross-origin target.
     static func redirectRequest(
         _ request: URLRequest,
         originalURL: URL?,
