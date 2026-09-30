@@ -6,8 +6,7 @@ import Testing
 /// the access token in that same query, and `EngineLog` emits with `.public` privacy into OSLog plus
 /// whatever handler the host installed, so an unredacted line is a live credential in a Console.app
 /// capture, a sysdiagnose, and every in-app log a host builds on the handler.
-/// Serialized: `EngineLog.handler` is process-global, so two of these running at once would
-/// each install over the other and read an empty capture.
+/// Serialized: the secret-registry tests mutate process-global redaction state.
 @Suite("EngineLog credential stripping", .serialized)
 struct LogRedactionTests {
 
@@ -395,10 +394,8 @@ struct LogRedactionTests {
     /// must never see the raw token, whether or not that host scrubs its own log.
     @Test("the host handler receives the redacted line")
     func handlerSeesRedactedLine() {
-        let box = LineBox()
-        let previous = EngineLog.handler
-        EngineLog.handler = { box.append($0) }
-        defer { EngineLog.handler = previous }
+        let box = EngineLogCapture()
+        defer { box.end() }
 
         EngineLog.emit("[test-496a] load url=https://s/v?api_key=\(token)&Static=true", category: .engine)
 
@@ -415,31 +412,13 @@ struct LogRedactionTests {
     /// shared funnel and not on the `.info` branch alone.
     @Test("a verbose line is withheld from the handler")
     func verboseSkipsTheHandler() {
-        let box = LineBox()
-        let previous = EngineLog.handler
-        EngineLog.handler = { box.append($0) }
-        defer { EngineLog.handler = previous }
+        let box = EngineLogCapture()
+        defer { box.end() }
 
         EngineLog.emit("[test-496b] per-segment trace api_key=\(token)", category: .session, level: .verbose)
 
         // #496: same singleton, same rule. The bare `box.lines.isEmpty` failed a full run once on
         // an unrelated AVIOReader line from a parallel suite, which says nothing about `.verbose`.
         #expect(box.lines.filter { $0.contains("[test-496b]") }.isEmpty)
-    }
-
-    /// The handler is called on whatever thread emitted, so the capture needs its own lock.
-    private final class LineBox: @unchecked Sendable {
-        private let lock = NSLock()
-        private var storage: [String] = []
-
-        func append(_ line: String) {
-            lock.lock(); defer { lock.unlock() }
-            storage.append(line)
-        }
-
-        var lines: [String] {
-            lock.lock(); defer { lock.unlock() }
-            return storage
-        }
     }
 }

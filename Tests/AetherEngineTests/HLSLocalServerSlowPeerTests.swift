@@ -84,8 +84,8 @@ struct HLSLocalServerSlowPeerTests {
 
     @Test("The stop line names the port that was released")
     func stopLineNamesThePort() throws {
-        let tap = LineTap()
-        defer { tap.restore() }
+        let tap = EngineLogCapture()
+        defer { tap.end() }
         let server = HLSLocalServer(provider: StubProvider())
         try server.start()
         let port = server.port
@@ -98,8 +98,8 @@ struct HLSLocalServerSlowPeerTests {
     /// peer looping short connections could scroll a 300-line ring in a fraction of a second.
     @Test("A flood of tokenless requests costs the log a handful of lines")
     func tokenlessFloodIsThrottled() async throws {
-        let tap = LineTap()
-        defer { tap.restore() }
+        let tap = EngineLogCapture()
+        defer { tap.end() }
         let server = HLSLocalServer(provider: StubProvider())
         try server.start()
         defer { server.stop() }
@@ -234,30 +234,6 @@ private final class Trickle: @unchecked Sendable {
 
     func stop() {
         lock.lock(); stopped = true; lock.unlock()
-    }
-}
-
-/// Captures `EngineLog` lines for one test; the handler is global, so it is restored on every path.
-private final class LineTap: @unchecked Sendable {
-    private let lock = NSLock()
-    private var lines: [String] = []
-    private let previous: ((String) -> Void)?
-
-    init() {
-        previous = EngineLog.handler
-        EngineLog.handler = { [self] line in
-            lock.lock()
-            lines.append(line)
-            lock.unlock()
-        }
-    }
-
-    func restore() { EngineLog.handler = previous }
-
-    func matching(_ needle: String) -> [String] {
-        lock.lock()
-        defer { lock.unlock() }
-        return lines.filter { $0.contains(needle) }
     }
 }
 

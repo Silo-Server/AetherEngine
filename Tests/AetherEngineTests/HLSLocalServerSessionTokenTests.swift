@@ -117,8 +117,8 @@ struct HLSLocalServerSessionTokenTests {
     /// the once-per-session header dump printed whatever credential the host passed.
     @Test("The first-request header dump names a credential header but never prints its value")
     func headerDumpOmitsCredentialValues() throws {
-        let tap = HeaderLineTap()
-        defer { tap.restore() }
+        let tap = EngineLogCapture()
+        defer { tap.end() }
         let server = HLSLocalServer(provider: StubProvider())
         try server.start()
         defer { server.stop() }
@@ -192,28 +192,4 @@ private final class StubProvider: HLSSegmentProvider, @unchecked Sendable {
     var segmentCount: Int { 1 }
     func segmentDuration(at index: Int) -> Double { 4.0 }
     var playlistType: HLSPlaylistType { .vod }
-}
-
-/// Captures `EngineLog` lines for one test; the handler is global, so it is restored on every path.
-private final class HeaderLineTap: @unchecked Sendable {
-    private let lock = NSLock()
-    private var captured: [String] = []
-    private let previous: ((String) -> Void)?
-
-    init() {
-        previous = EngineLog.handler
-        EngineLog.handler = { [self] line in
-            lock.lock()
-            captured.append(line)
-            lock.unlock()
-        }
-    }
-
-    func restore() { EngineLog.handler = previous }
-
-    var lines: [String] {
-        lock.lock()
-        defer { lock.unlock() }
-        return captured
-    }
 }

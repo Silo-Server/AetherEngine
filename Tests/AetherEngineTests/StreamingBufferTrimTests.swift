@@ -57,25 +57,26 @@ struct StreamingBufferTrimTests {
         try reader.open()
         try await waitFor { reader.streamPeakBufferBytesForTesting >= total }
 
+        // Everything is resident and nothing consumed yet, so this is every chunk the body arrived in.
+        let before = reader.streamChunkAddressesForTesting
+        #expect(before.count > 1, "the body arrived as one chunk, so this could not tell a copy from a slice")
+
         let chunk = 262_000
         let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: chunk)
         defer { buf.deallocate() }
-        // Past the 1 MB lookback, so every later read trims.
+        // A chunk is released once the read position is a lookback past its end, and how large
+        // URLSession makes the chunks is not this test's to know (larger on a CI runner), so read
+        // until one goes. The body is the bound: if it ends first, nothing was released and that fails.
         var read = 0
-        while read < 2 * 1024 * 1024 {
+        var after = before
+        while after.count >= before.count, read < total {
             let n = Int(reader.read(into: buf, size: Int32(chunk)))
             #expect(n > 0)
             if n <= 0 { return }
             read += n
+            after = reader.streamChunkAddressesForTesting
         }
-        let before = reader.streamChunkAddressesForTesting
-        #expect(before.count > 1, "the body arrived as one chunk, so this could not tell a copy from a slice")
-
-        for _ in 0..<8 {
-            #expect(reader.read(into: buf, size: Int32(chunk)) > 0)
-        }
-        let after = reader.streamChunkAddressesForTesting
-        #expect(after.count < before.count, "the trim released nothing")
+        #expect(after.count < before.count, "the trim released nothing before the body ended")
         #expect(after.count > 1)
         #expect(Array(before.suffix(after.count)) == after,
                 "a trim reallocated the chunks it kept: the buffer was copied, not sliced")
