@@ -41,16 +41,26 @@ final class AudioTapHLSFetcher: @unchecked Sendable {
         credentials = CredentialScope(headers: httpHeaders, anchor: credentialOrigin)
     }
 
-    private func get(_ url: URL) async throws -> (Data, URLResponse) {
+    /// Audit DEC-103: every body is cut off at its cap while it arrives. Playlists take the ingest
+    /// readers' 8 MiB, keys 64 bytes, and a segment, which here is audio only, the floor of the
+    /// duration-derived video cap.
+    private static let maximumPlaylistBytes = 8 * 1024 * 1024
+    private static let maximumSegmentBytes = BoundedFetch.segmentLimit(forDuration: 0)
+
+    private func get(_ url: URL, limit: Int) async throws -> (Data, URLResponse) {
         var request = URLRequest(url: url)
         for (field, value) in credentials.headers(for: url) {
             request.setValue(value, forHTTPHeaderField: field)
         }
-        return try await session.data(for: request)
+        do {
+            return try await BoundedFetch.data(for: request, session: session, limit: limit)
+        } catch let error as BoundedFetch.Exceeded {
+            throw FetchError.invalidPlaylist("body exceeds \(error.limit) bytes")
+        }
     }
 
     func fetchPlaylist(_ url: URL) async throws -> (HLSPlaylist, URL) {
-        let (data, response) = try await get(url)
+        let (data, response) = try await get(url, limit: Self.maximumPlaylistBytes)
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard (200..<300).contains(status) else { throw FetchError.http(status) }
         guard let text = String(data: data, encoding: .utf8) else {
@@ -60,7 +70,7 @@ final class AudioTapHLSFetcher: @unchecked Sendable {
     }
 
     func fetchSegment(_ url: URL, crypt: HLSSegmentCrypt?, base: URL) async throws -> Data {
-        let (data, response) = try await get(url)
+        let (data, response) = try await get(url, limit: Self.maximumSegmentBytes)
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         if status == 404 { return Data() }               // slid out of window; caller advances
         guard (200..<300).contains(status) else { throw FetchError.http(status) }
@@ -78,7 +88,7 @@ final class AudioTapHLSFetcher: @unchecked Sendable {
     private func fetchKey(_ url: URL) async throws -> Data {
         let cacheKey = url.absoluteString
         if let cached = keyCacheLock.withLock({ keyCache[cacheKey] }) { return cached }
-        let (data, response) = try await get(url)
+        let (data, response) = try await get(url, limit: BoundedFetch.keyLimit)
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard (200..<300).contains(status), data.count == 16 else { throw FetchError.http(status) }
         keyCacheLock.withLock { keyCache[cacheKey] = data }
