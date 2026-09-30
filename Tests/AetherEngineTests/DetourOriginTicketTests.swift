@@ -1,0 +1,61 @@
+import Testing
+import Foundation
+@testable import AetherEngine
+
+/// Audit DMX-105: a detour block took an origin ticket in `detourFetchBlock` and a second one inside
+/// `syncRequest`. On an origin capped at two requests, with the pump holding one, the outer ticket
+/// took the last slot and the inner acquire waited its whole four second budget for it: +4 s per
+/// block, and a third request on the books against a limit of two. A reader that already holds a
+/// ticket must never block on another, so the detour holds one.
+@Suite("Detour origin ticket", .serialized)
+struct DetourOriginTicketTests {
+
+    @Test("a detour block behind a pump holding one of two slots takes one slot and no wait",
+          .timeLimit(.minutes(2)))
+    func detourTakesOneTicket() async throws {
+        let total: Int64 = 64 * 1024 * 1024
+        // About 6 MB/s: the pump still has seconds of its 32 MB range to go when the detour is asked for.
+        let maybe = ThrottledOriginServer(totalSize: total, throttleUs: 40_000)
+        let server = try #require(maybe)
+        defer { server.stop() }
+        let url = URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!
+        OriginRequestBudget.shared.setHostLimit(2, for: url)
+        defer { OriginRequestBudget.shared.setHostLimit(nil, for: url) }
+
+        let reader = AVIOReader(url: url)
+        defer { reader.markClosed(); reader.close() }
+        try reader.open()
+
+        let chunk = 256 * 1024
+        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: chunk)
+        defer { buf.deallocate() }
+        var read = 0
+        while read < 13 * 1024 * 1024 {
+            let n = Int(reader.read(into: buf, size: Int32(chunk)))
+            #expect(n > 0, "forward read failed at \(read)")
+            if n <= 0 { return }
+            read += n
+        }
+        #expect(reader.hasLiveConnectionForTesting, "the pump was not on the link, so the detour had no rival")
+
+        // Backward past the retained head and the window (which trimmed to about 8 MB): the read
+        // that opens the detour block holding 4 to 8 MB.
+        let target = Int64(5 * 1024 * 1024)
+        #expect(reader.seek(offset: target, whence: Int32(SEEK_SET)) == target)
+        let start = ContinuousClock.now
+        let served = reader.read(into: buf, size: Int32(chunk))
+        let elapsed = ContinuousClock.now - start
+
+        #expect(served > 0)
+        #expect(elapsed < .seconds(2), "the detour took \(elapsed): it waited on a slot it already held")
+        #expect(reader.hasLiveConnectionForTesting,
+                "the detour only got its slot once the pump's range had finished")
+        let books = try #require(OriginRequestBudget.shared.snapshot(for: url))
+        #expect(books.limit == 2)
+        #expect(books.peakInflight == 2, "peak \(books.peakInflight) on the books against a limit of 2")
+        // The detour block is the 4 MB aligned block holding the target, and nothing else asks for
+        // exactly that range: the pump's refills are 32 MB and the tail prefetch is a suffix.
+        #expect(server.requestedRanges.contains { $0.start == 4 * 1024 * 1024 && $0.end == 8 * 1024 * 1024 - 1 },
+                "no detour block went out, so this measured nothing: \(server.requestedRanges)")
+    }
+}
