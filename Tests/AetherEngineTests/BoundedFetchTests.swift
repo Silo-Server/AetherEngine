@@ -120,12 +120,18 @@ struct BoundedFetchTests {
         defer { origin.stop() }
         let session = makeSession()
         defer { session.invalidateAndCancel() }
-        let started = ContinuousClock.now
-        let (data, _) = try await BoundedPlaylistFetch.data(for: request(origin), session: session, limit: 64 * 1024 * 1024)
-        let elapsed = ContinuousClock.now - started
-        #expect(data.count == size)
-        // The per-byte accumulation this replaced took 5 s for this body in a debug build.
-        #expect(elapsed < .seconds(1.5), "took \(elapsed)")
+        // The per-byte accumulation this replaced took 5 s for this body in a debug build. Best of three,
+        // because a suite run on a loaded machine stretches one wall-clock sample (12 s seen) while the
+        // per-byte cost would stay above the bar in every sample.
+        var best = Duration.seconds(3600)
+        for _ in 0..<3 {
+            let started = ContinuousClock.now
+            let (data, _) = try await BoundedPlaylistFetch.data(for: request(origin), session: session, limit: 64 * 1024 * 1024)
+            best = min(best, ContinuousClock.now - started)
+            #expect(data.count == size)
+            if best < .seconds(1.5) { break }
+        }
+        #expect(best < .seconds(1.5), "took \(best)")
     }
 
     @Test("a segment may weigh 20 MB/s of its own duration between 32 MiB and 256 MiB")
