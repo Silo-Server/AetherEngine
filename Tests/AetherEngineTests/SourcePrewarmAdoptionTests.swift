@@ -207,7 +207,7 @@ struct SourcePrewarmAdoptionTests {
     /// write-once rule treats any positive `fileSize` as settled, so a warm that belongs to a
     /// different response would fix a wrong EOF point for the whole session. The connection that is
     /// actually serving the session gets to overrule it.
-    @Test("a connection that states a different size drops the warm")
+    @Test("a connection that states a different size drops the warm", .timeLimit(.minutes(1)))
     func sizeMismatchDropsTheWarm() async throws {
         SourcePrewarmStore.shared.clear()
         let server = try #require(ThrottledOriginServer(totalSize: fileSize))
@@ -220,9 +220,7 @@ struct SourcePrewarmAdoptionTests {
         let reader = AVIOReader(url: url(server))
         defer { reader.markClosed(); reader.close() }
         try reader.open()
-        for _ in 0..<100 where reader.resolvedByteSize != restated {
-            try? await Task.sleep(nanoseconds: 20_000_000)
-        }
+        try await waitFor { reader.resolvedByteSize == restated }
 
         #expect(reader.resolvedByteSize == restated,
                 "the session kept the warm's size over the one its own connection stated")

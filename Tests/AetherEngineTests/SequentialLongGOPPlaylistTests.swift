@@ -82,13 +82,9 @@ struct SequentialLongGOPPlaylistTests {
         defer { engine.stop() }
         let mediaURL = try #require(engine.mediaPlaylistURL)
 
-        var playlist = ""
-        for _ in 0..<300 {
-            playlist = (try? String(contentsOf: mediaURL, encoding: .utf8)) ?? ""
-            if playlist.contains("#EXT-X-ENDLIST") { break }
-            try await Task.sleep(nanoseconds: 50_000_000)
-        }
-        #expect(playlist.contains("#EXT-X-ENDLIST"), "the playlist never completed:\n\(playlist)")
+        func playlistText() -> String { (try? String(contentsOf: mediaURL, encoding: .utf8)) ?? "" }
+        try await waitFor { playlistText().contains("#EXT-X-ENDLIST") }
+        let playlist = playlistText()
 
         let lines = playlist.split(whereSeparator: \.isNewline).map(String.init)
         let durations = lines.filter { $0.hasPrefix("#EXTINF:") }
