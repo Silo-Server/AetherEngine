@@ -66,6 +66,11 @@ final class AudioOutput: @unchecked Sendable {
     private var automaticFlushObserver: NSObjectProtocol?
     private var _automaticFlushCount = 0
 
+    /// Where the AE#549 flush runs. The posting thread must never wait on `lock`: `enqueue` holds it
+    /// across `renderer.enqueue` (DEC-106), and a renderer that posts from inside that call would make the
+    /// feed thread wait on a lock it already holds, with every `flush()` / `stop()` / `seekClock()` behind it.
+    private let automaticFlushQueue = DispatchQueue(label: "engine.audio.autoflush")
+
     /// AE#549: the renderer throws its queue away when the route changes under it, and posts the
     /// timestamp of the first sample it dropped. Nothing in the engine observed that, so the lead
     /// that was discarded was neither re-fed nor mentioned anywhere.
@@ -90,18 +95,21 @@ final class AudioOutput: @unchecked Sendable {
             guard let self else { return }
             let flushedFrom = (note.userInfo?[AVSampleBufferAudioRendererFlushTimeKey] as? NSValue)?
                 .timeValue.seconds
-            lock.lock()
-            _automaticFlushCount += 1
-            let count = _automaticFlushCount
-            renderer.flush()
-            lock.unlock()
-            EngineLog.emit(
-                "[AudioOutput] AE#549 renderer flushed itself (#\(count)): "
-                + "dropped from \(flushedFrom.map { String(format: "%.3f", $0) } ?? "unknown")s, "
-                + "clock at \(String(format: "%.3f", currentTimeSeconds))s rate=\(rate); "
-                + "audio returns once the feed reaches the clock",
-                category: .swPlayback
-            )
+            automaticFlushQueue.async { [weak self] in
+                guard let self else { return }
+                lock.lock()
+                _automaticFlushCount += 1
+                let count = _automaticFlushCount
+                renderer.flush()
+                lock.unlock()
+                EngineLog.emit(
+                    "[AudioOutput] AE#549 renderer flushed itself (#\(count)): "
+                    + "dropped from \(flushedFrom.map { String(format: "%.3f", $0) } ?? "unknown")s, "
+                    + "clock at \(String(format: "%.3f", currentTimeSeconds))s rate=\(rate); "
+                    + "audio returns once the feed reaches the clock",
+                    category: .swPlayback
+                )
+            }
         }
     }
 
@@ -195,6 +203,9 @@ final class AudioOutput: @unchecked Sendable {
                 + String(format: " (sample at %.3fs delivered at %.3fs)", source, source + offset.seconds)
         }
         renderer.enqueue(delivered)
+        #if DEBUG
+        afterRendererEnqueueForTesting?()
+        #endif
         lock.unlock()
         if let offsetLine { EngineLog.emit(offsetLine, category: .swPlayback) }
 
@@ -219,6 +230,9 @@ final class AudioOutput: @unchecked Sendable {
     }
 
     #if DEBUG
+    /// Test-only: runs inside `enqueue`'s locked section, right after the renderer took the buffer, which
+    /// is where a renderer that posts its notifications from inside `enqueue` would post them.
+    var afterRendererEnqueueForTesting: (@Sendable () -> Void)?
     private var _loggedFirstEnqueue = false
     private var _loggedRendererError = false
     #endif
