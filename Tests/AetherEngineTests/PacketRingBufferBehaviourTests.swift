@@ -9,12 +9,7 @@ import Testing
 @Suite("DVR ring behaviour")
 struct PacketRingBufferBehaviourTests {
 
-    private func makeScratch() -> URL {
-        let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("prbbehave-\(UUID().uuidString)", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir
-    }
+    private func makeScratch(_ dirs: ScratchDirs) -> URL { dirs.make(prefix: "prbbehave") }
 
     private func payload(_ i: Int, count: Int = 16) -> Data {
         Data((0..<count).map { UInt8(truncatingIfNeeded: i &+ $0) })
@@ -35,7 +30,8 @@ struct PacketRingBufferBehaviourTests {
 
     @Test("Packets read back by sequence with their flags and bytes, audio and video interleaved")
     func readsBackBySequence() throws {
-        let ring = try PacketRingBuffer(windowSeconds: 3600, scratch: makeScratch())
+        let dirs = ScratchDirs()
+        let ring = try PacketRingBuffer(windowSeconds: 3600, scratch: makeScratch(dirs))
         defer { ring.close() }
         try ring.append(pts: 10, isKeyframe: true, isVideo: true, bytes: Data([1, 2, 3]))
         try ring.append(pts: 10, isKeyframe: false, isVideo: false, bytes: Data([4]))
@@ -57,7 +53,8 @@ struct PacketRingBufferBehaviourTests {
 
     @Test("Eviction keeps the retained span on a video keyframe and advances the first sequence")
     func evictionIsKeyframeAlignedAndMonotonic() throws {
-        let ring = try PacketRingBuffer(windowSeconds: 10, scratch: makeScratch())
+        let dirs = ScratchDirs()
+        let ring = try PacketRingBuffer(windowSeconds: 10, scratch: makeScratch(dirs))
         defer { ring.close() }
         var lastFirst = 0
         for second in 0..<60 {
@@ -86,13 +83,14 @@ struct PacketRingBufferBehaviourTests {
 
     @Test("Nothing is evicted while the retained history fits the window, and an infinite window keeps everything")
     func wholeWindowIsKept() throws {
-        let short = try PacketRingBuffer(windowSeconds: 100, scratch: makeScratch())
+        let dirs = ScratchDirs()
+        let short = try PacketRingBuffer(windowSeconds: 100, scratch: makeScratch(dirs))
         defer { short.close() }
         try fill(short, seconds: 30)
         #expect(short.seqBounds.first == 0)
         #expect(short.seqBounds.end == 30 * 25 * 2)
 
-        let forever = try PacketRingBuffer(windowSeconds: .infinity, scratch: makeScratch())
+        let forever = try PacketRingBuffer(windowSeconds: .infinity, scratch: makeScratch(dirs))
         defer { forever.close() }
         try fill(forever, seconds: 30)
         #expect(forever.seqBounds.first == 0)
@@ -101,7 +99,8 @@ struct PacketRingBufferBehaviourTests {
 
     @Test("Rewind lookups: newest keyframe at or before a target, earliest keyframe as the floor")
     func rewindLookups() throws {
-        let ring = try PacketRingBuffer(windowSeconds: 3600, scratch: makeScratch())
+        let dirs = ScratchDirs()
+        let ring = try PacketRingBuffer(windowSeconds: 3600, scratch: makeScratch(dirs))
         defer { ring.close() }
         // The session joined mid-GOP: two non-key packets precede the first keyframe.
         try ring.append(pts: 4.8, isKeyframe: false, isVideo: true, bytes: Data([0]))
@@ -123,7 +122,8 @@ struct PacketRingBufferBehaviourTests {
 
     @Test("Rewind lookups stay correct after eviction has moved the first sequence")
     func rewindLookupsAfterEviction() throws {
-        let ring = try PacketRingBuffer(windowSeconds: 10, scratch: makeScratch())
+        let dirs = ScratchDirs()
+        let ring = try PacketRingBuffer(windowSeconds: 10, scratch: makeScratch(dirs))
         defer { ring.close() }
         try fill(ring, seconds: 60, gopSeconds: 2)
         let bounds = ring.seqBounds
@@ -141,7 +141,8 @@ struct PacketRingBufferBehaviourTests {
 
     @Test("packets(fromPts:) replays from the first video keyframe, audio included")
     func replayStartsOnAVideoKeyframe() throws {
-        let ring = try PacketRingBuffer(windowSeconds: 3600, scratch: makeScratch())
+        let dirs = ScratchDirs()
+        let ring = try PacketRingBuffer(windowSeconds: 3600, scratch: makeScratch(dirs))
         defer { ring.close() }
         try ring.append(pts: 1.0, isKeyframe: false, isVideo: false, bytes: Data([1]))
         try ring.append(pts: 1.1, isKeyframe: false, isVideo: true, bytes: Data([2]))
@@ -157,7 +158,8 @@ struct PacketRingBufferBehaviourTests {
 
     @Test("A still run opens on the keyframe, carries video only, and respects its bounds")
     func stillRunShape() throws {
-        let ring = try PacketRingBuffer(windowSeconds: 3600, scratch: makeScratch())
+        let dirs = ScratchDirs()
+        let ring = try PacketRingBuffer(windowSeconds: 3600, scratch: makeScratch(dirs))
         defer { ring.close() }
         try fill(ring, seconds: 10, gopSeconds: 2)
 
@@ -181,7 +183,8 @@ struct PacketRingBufferBehaviourTests {
 
     @Test("close() clears the index at once and is idempotent")
     func closeIsImmediateAndIdempotent() throws {
-        let ring = try PacketRingBuffer(windowSeconds: 60, scratch: makeScratch())
+        let dirs = ScratchDirs()
+        let ring = try PacketRingBuffer(windowSeconds: 60, scratch: makeScratch(dirs))
         try fill(ring, seconds: 4)
         #expect(ring.seqBounds.end > 0)
         ring.close()
@@ -190,4 +193,19 @@ struct PacketRingBufferBehaviourTests {
         #expect(ring.oldestPts == nil)
         ring.close()
     }
+}
+
+/// Removes every directory it handed out when the test that owns it ends. `PacketRingBuffer.close()`
+/// unlinks in the background, which a finished test process does not wait for.
+private final class ScratchDirs: @unchecked Sendable {
+    private let lock = NSLock()
+    private var dirs: [URL] = []
+    func make(prefix: String) -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        lock.lock(); dirs.append(dir); lock.unlock()
+        return dir
+    }
+    deinit { for dir in dirs { try? FileManager.default.removeItem(at: dir) } }
 }

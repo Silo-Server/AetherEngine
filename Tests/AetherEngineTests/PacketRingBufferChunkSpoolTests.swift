@@ -9,12 +9,7 @@ import Testing
 @Suite("DVR ring chunk spool")
 struct PacketRingBufferChunkSpoolTests {
 
-    private func makeScratch(in base: URL? = nil) -> URL {
-        let parent = base ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-        let dir = parent.appendingPathComponent("prbspool-\(UUID().uuidString)", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir
-    }
+    private func makeScratch(_ dirs: ScratchDirs) -> URL { dirs.make(prefix: "prbspool") }
 
     private func packetFiles(in dir: URL) -> [URL] {
         ((try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [])
@@ -30,7 +25,8 @@ struct PacketRingBufferChunkSpoolTests {
 
     @Test("Packets spool into a few chunk files, not one file per packet")
     func spoolsIntoChunkFiles() throws {
-        let scratch = makeScratch()
+        let dirs = ScratchDirs()
+        let scratch = makeScratch(dirs)
         let ring = try PacketRingBuffer(windowSeconds: 3600, scratch: scratch)
         defer { ring.close() }
         let payload = Data(repeating: 0x5A, count: 1024)
@@ -75,8 +71,9 @@ struct PacketRingBufferChunkSpoolTests {
 
     @Test("The index is a flat record per packet, not a heap object per packet")
     func indexIsCompact() throws {
+        let dirs = ScratchDirs()
         #expect(MemoryLayout<PacketRingBuffer.Entry>.stride == 24)
-        let ring = try PacketRingBuffer(windowSeconds: .infinity, scratch: makeScratch())
+        let ring = try PacketRingBuffer(windowSeconds: .infinity, scratch: makeScratch(dirs))
         defer { ring.close() }
         let payload = Data(repeating: 1, count: 64)
         let count = 100_000
@@ -92,7 +89,8 @@ struct PacketRingBufferChunkSpoolTests {
 
     @Test("A byte budget bounds the disk use, even with an infinite window, and the span opens on a keyframe")
     func byteBudgetBoundsDiskAndKeepsKeyframeAlignment() throws {
-        let scratch = makeScratch()
+        let dirs = ScratchDirs()
+        let scratch = makeScratch(dirs)
         let budget = 8 << 20
         let ring = try PacketRingBuffer(windowSeconds: .infinity, scratch: scratch, byteBudget: budget)
         defer { ring.close() }
@@ -118,7 +116,8 @@ struct PacketRingBufferChunkSpoolTests {
 
     @Test("The budget holds when the window is finite too, and the stricter bound wins")
     func strictestBoundWins() throws {
-        let ring = try PacketRingBuffer(windowSeconds: 20, scratch: makeScratch(), byteBudget: 64 << 20)
+        let dirs = ScratchDirs()
+        let ring = try PacketRingBuffer(windowSeconds: 20, scratch: makeScratch(dirs), byteBudget: 64 << 20)
         defer { ring.close() }
         let payload = Data(repeating: 3, count: 4 << 10)
         for i in 0..<400 {
@@ -130,7 +129,8 @@ struct PacketRingBufferChunkSpoolTests {
 
     @Test("A budget smaller than one chunk never evicts the only chunk")
     func tinyBudgetKeepsTheTail() throws {
-        let ring = try PacketRingBuffer(windowSeconds: .infinity, scratch: makeScratch(), byteBudget: 1)
+        let dirs = ScratchDirs()
+        let ring = try PacketRingBuffer(windowSeconds: .infinity, scratch: makeScratch(dirs), byteBudget: 1)
         defer { ring.close() }
         for i in 0..<50 {
             try ring.append(pts: Double(i), isKeyframe: i % 5 == 0, isVideo: true, bytes: Data(repeating: 9, count: 10_000))
@@ -146,7 +146,8 @@ struct PacketRingBufferChunkSpoolTests {
 
     @Test("A GOP larger than the whole budget still cannot grow the directory without bound")
     func hugeGopIsBoundedToo() throws {
-        let scratch = makeScratch()
+        let dirs = ScratchDirs()
+        let scratch = makeScratch(dirs)
         let budget = 1 << 20
         let ring = try PacketRingBuffer(windowSeconds: .infinity, scratch: scratch, byteBudget: budget)
         defer { ring.close() }
@@ -161,7 +162,8 @@ struct PacketRingBufferChunkSpoolTests {
 
     @Test("The resident floor is nil until eviction moves the span, then tracks the oldest keyframe")
     func residentFloorFollowsEviction() throws {
-        let ring = try PacketRingBuffer(windowSeconds: .infinity, scratch: makeScratch(), byteBudget: 4 << 20)
+        let dirs = ScratchDirs()
+        let ring = try PacketRingBuffer(windowSeconds: .infinity, scratch: makeScratch(dirs), byteBudget: 4 << 20)
         defer { ring.close() }
         let size = 128 << 10
         try ring.append(pts: 100, isKeyframe: true, isVideo: true, bytes: Data(repeating: 0, count: size))
@@ -206,8 +208,8 @@ struct PacketRingBufferChunkSpoolTests {
         }
     }
 
-    private func flakyRing(disk: FlakyDisk, byteBudget: Int = .max) throws -> PacketRingBuffer {
-        let ring = try PacketRingBuffer(windowSeconds: .infinity, scratch: makeScratch(),
+    private func flakyRing(disk: FlakyDisk, dirs: ScratchDirs, byteBudget: Int = .max) throws -> PacketRingBuffer {
+        let ring = try PacketRingBuffer(windowSeconds: .infinity, scratch: makeScratch(dirs),
                                         byteBudget: byteBudget, chunkTargetBytes: 64 << 10,
                                         writeAll: disk.writer)
         disk.ring = ring
@@ -216,8 +218,9 @@ struct PacketRingBufferChunkSpoolTests {
 
     @Test("A write that fails once is retried after the oldest chunk is freed, and nothing is dropped")
     func failedWriteMakesRoomAndRetries() throws {
+        let dirs = ScratchDirs()
         let disk = FlakyDisk()
-        let ring = try flakyRing(disk: disk)
+        let ring = try flakyRing(disk: disk, dirs: dirs)
         defer { ring.close() }
         let body = Data(repeating: 7, count: 32 << 10)
         for i in 0..<10 {
@@ -237,9 +240,10 @@ struct PacketRingBufferChunkSpoolTests {
 
     @Test("A full volume shrinks the rewind window and the live feed keeps flowing")
     func fullVolumeKeepsFeedingWithAShrinkingWindow() throws {
+        let dirs = ScratchDirs()
         let disk = FlakyDisk()
         disk.setCapacity(1 << 20)
-        let ring = try flakyRing(disk: disk)
+        let ring = try flakyRing(disk: disk, dirs: dirs)
         defer { ring.close() }
         let body = { (i: Int) in Data(repeating: UInt8(truncatingIfNeeded: i), count: 16 << 10) }
         for i in 0..<500 {
@@ -257,8 +261,9 @@ struct PacketRingBufferChunkSpoolTests {
 
     @Test("With nothing reclaimable the append throws cleanly, and the ring recovers when space returns")
     func nothingToFreeThrowsWithoutCorruption() throws {
+        let dirs = ScratchDirs()
         let disk = FlakyDisk()
-        let ring = try flakyRing(disk: disk)
+        let ring = try flakyRing(disk: disk, dirs: dirs)
         defer { ring.close() }
         let body = { (i: Int) in Data(repeating: UInt8(truncatingIfNeeded: i), count: 4 << 10) }
         try ring.append(pts: 0, isKeyframe: true, isVideo: true, bytes: body(0))
@@ -279,8 +284,9 @@ struct PacketRingBufferChunkSpoolTests {
 
     @Test("An incoming keyframe may replace a retained span that cannot otherwise make room")
     func incomingKeyframeReplacesATailOnlySpan() throws {
+        let dirs = ScratchDirs()
         let disk = FlakyDisk()
-        let ring = try flakyRing(disk: disk)
+        let ring = try flakyRing(disk: disk, dirs: dirs)
         defer { ring.close() }
         let body = Data(repeating: 5, count: 4 << 10)
         for i in 0..<3 {
@@ -300,7 +306,8 @@ struct PacketRingBufferChunkSpoolTests {
 
     @Test("Readers racing eviction only ever see the bytes of the sequence they asked for")
     func concurrentReadersSeeConsistentBytes() async throws {
-        let ring = try PacketRingBuffer(windowSeconds: .infinity, scratch: makeScratch(),
+        let dirs = ScratchDirs()
+        let ring = try PacketRingBuffer(windowSeconds: .infinity, scratch: makeScratch(dirs),
                                         byteBudget: 2 << 20, chunkTargetBytes: 128 << 10)
         defer { ring.close() }
         let total = 6000
@@ -342,7 +349,8 @@ struct PacketRingBufferChunkSpoolTests {
 
     @Test("isVideo(atSeq:) answers from the index: resident kinds, nil outside the span")
     func isVideoAnswersFromTheIndex() throws {
-        let ring = try PacketRingBuffer(windowSeconds: .infinity, scratch: makeScratch(), byteBudget: 1 << 20)
+        let dirs = ScratchDirs()
+        let ring = try PacketRingBuffer(windowSeconds: .infinity, scratch: makeScratch(dirs), byteBudget: 1 << 20)
         defer { ring.close() }
         #expect(ring.isVideo(atSeq: 0) == nil)
         for i in 0..<300 {
@@ -360,7 +368,8 @@ struct PacketRingBufferChunkSpoolTests {
 
     @Test("A chunk file that vanished reads as an unreadable packet, not a crash")
     func missingChunkFileIsAnUnreadablePacket() throws {
-        let scratch = makeScratch()
+        let dirs = ScratchDirs()
+        let scratch = makeScratch(dirs)
         let ring = try PacketRingBuffer(windowSeconds: .infinity, scratch: scratch, chunkTargetBytes: 64 << 10)
         defer { ring.close() }
         for i in 0..<60 {
@@ -380,4 +389,19 @@ private final class Counter: @unchecked Sendable {
     private var n = 0
     var value: Int { lock.lock(); defer { lock.unlock() }; return n }
     func add(_ d: Int) { lock.lock(); n += d; lock.unlock() }
+}
+
+/// Removes every directory it handed out when the test that owns it ends. `PacketRingBuffer.close()`
+/// unlinks in the background, which a finished test process does not wait for.
+private final class ScratchDirs: @unchecked Sendable {
+    private let lock = NSLock()
+    private var dirs: [URL] = []
+    func make(prefix: String) -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        lock.lock(); dirs.append(dir); lock.unlock()
+        return dir
+    }
+    deinit { for dir in dirs { try? FileManager.default.removeItem(at: dir) } }
 }
