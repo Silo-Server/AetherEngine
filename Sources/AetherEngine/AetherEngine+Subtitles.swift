@@ -1017,9 +1017,10 @@ extension AetherEngine {
                 memcpy(dst, base, size)
             }
         }
-        pkt.pointee.pts = Int64((entry.ptsSeconds * 1000).rounded())
+        // Audit FEA-101: the store bounds these, but an entry is a plain value and the conversion traps.
+        pkt.pointee.pts = SourceTimestampBounds.roundedTicks(entry.ptsSeconds * 1000) ?? Int64.min
         pkt.pointee.dts = pkt.pointee.pts
-        pkt.pointee.duration = Int64((entry.durationSeconds * 1000).rounded())
+        pkt.pointee.duration = max(0, SourceTimestampBounds.roundedTicks(entry.durationSeconds * 1000) ?? 0)
         pkt.pointee.flags = entry.flags
         // #233: WebVTT placement lives in side data, not in the payload, so it has to be put back.
         if let settings = entry.webvttSettings {

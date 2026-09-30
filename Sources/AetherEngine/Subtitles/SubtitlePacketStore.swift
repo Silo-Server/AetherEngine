@@ -305,6 +305,12 @@ final class SubtitlePacketStore: @unchecked Sendable {
     func harvestChunk(streamIndex: Int32, ptsSeconds: Double?, durationSeconds: Double,
                       flags: Int32, payload: Data, assembleSplitDisplaySets: Bool,
                       writer: Writer = .pump, webvttSettings: String? = nil) {
+        // Audit FEA-101: the pump, the software-host tap and the prefetcher all store through here,
+        // and the drain scales these seconds back into Int64 milliseconds. Same rule as the
+        // demuxer's bound: an implausible time is unset, an implausible duration is 0.
+        let bound = SourceTimestampBounds.maxPlausibleSeconds
+        let ptsSeconds = ptsSeconds.flatMap { $0.isFinite && abs($0) < bound ? $0 : nil }
+        let durationSeconds = durationSeconds.isFinite && durationSeconds < bound ? Swift.max(0, durationSeconds) : 0
         lock.lock(); defer { lock.unlock() }
         // #416: a harvested packet is a position its writer demonstrably read, so the run reaches
         // it. This is what gives the pump the forward lookahead its playhead-based note cannot
