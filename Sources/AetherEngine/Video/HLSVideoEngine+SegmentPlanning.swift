@@ -76,11 +76,12 @@ extension HLSVideoEngine {
               videoTimeBase.num > 0, videoTimeBase.den > 0 else { return false }
         let tb = Double(videoTimeBase.num) / Double(videoTimeBase.den)
         let sorted = keyframes.sorted()
-        let coverageSeconds = Double(sorted[sorted.count - 1] - sorted[0]) * tb
+        // In Double: an index spanning both Int64 extremes overflows the integer difference (audit HLS-102).
+        let coverageSeconds = (Double(sorted[sorted.count - 1]) - Double(sorted[0])) * tb
         guard coverageSeconds >= minCoverageSeconds else { return false }
         var largestGapSeconds = 0.0
         for i in 1..<sorted.count {
-            let gapSeconds = Double(sorted[i] - sorted[i - 1]) * tb
+            let gapSeconds = (Double(sorted[i]) - Double(sorted[i - 1])) * tb
             if gapSeconds > largestGapSeconds { largestGapSeconds = gapSeconds }
         }
         return largestGapSeconds <= maxTrustedGapSeconds
@@ -182,6 +183,19 @@ extension HLSVideoEngine {
         return firstKeyframe != nil ? .singleKeyframeInSource(budget) : .unknown
     }
 
+    /// Most segments any plan builder emits (audit HLS-102). A week at the 4 s target is 151,200.
+    static let maxPlanSegments = 200_000
+
+    /// `base + seconds / tb` in ticks, nil when the result leaves the tick range (audit HLS-102): the
+    /// builders are fed container durations and manifest sums, and `Int64(_:)` traps on NaN, infinity
+    /// and anything past `Int64`. Truncates like the plain conversion it replaces.
+    static func planPts(_ base: Int64, plusSeconds seconds: Double, timeBase tb: Double) -> Int64? {
+        let ticks = seconds / tb
+        guard ticks.isFinite, abs(ticks) < Demuxer.maxPlausibleIndexTicks else { return nil }
+        let (pts, overflow) = base.addingReportingOverflow(Int64(ticks))
+        return overflow ? nil : pts
+    }
+
     /// Uniform-duration fallback plan when the keyframe index is too sparse. Source-axis boundaries are
     /// anchored at `startPts0` (the first keyframe PTS), exactly like the keyframe-aligned plan, so segment 0
     /// begins at the content start rather than at source PTS 0. A title whose content starts late (e.g. a
@@ -196,9 +210,14 @@ extension HLSVideoEngine {
         startPts0: Int64 = 0,
         strideSeconds: Double = HLSVideoEngine.targetSegmentDuration
     ) -> [Segment] {
-        guard sourceDurationSeconds > 0 else { return [] }
-        let stride = strideSeconds.isFinite && strideSeconds > 0 ? strideSeconds : Self.targetSegmentDuration
-        let count = max(1, Int(ceil(sourceDurationSeconds / stride)))
+        guard sourceDurationSeconds > 0, sourceDurationSeconds.isFinite else { return [] }
+        var stride = strideSeconds.isFinite && strideSeconds > 0 ? strideSeconds : Self.targetSegmentDuration
+        // Audit HLS-102: a stride this fine over a header-stated duration asked for trillions of
+        // segments. Widen it instead, so the plan still covers the whole duration.
+        if sourceDurationSeconds / stride > Double(maxPlanSegments) {
+            stride = sourceDurationSeconds / Double(maxPlanSegments)
+        }
+        let count = min(maxPlanSegments, max(1, Int(ceil(sourceDurationSeconds / stride))))
         let tb = Double(videoTimeBase.num) / Double(videoTimeBase.den)
         guard tb > 0 else { return [] }
 
@@ -206,9 +225,10 @@ extension HLSVideoEngine {
         plan.reserveCapacity(count)
         for i in 0..<count {
             let startSeconds = Double(i) * stride
-            let endSeconds = min(sourceDurationSeconds, Double(i + 1) * stride)
-            let startPts = startPts0 + Int64(startSeconds / tb)
-            let endPts = startPts0 + Int64(endSeconds / tb)
+            let endSeconds = i + 1 == count
+                ? sourceDurationSeconds : min(sourceDurationSeconds, Double(i + 1) * stride)
+            guard let startPts = planPts(startPts0, plusSeconds: startSeconds, timeBase: tb),
+                  let endPts = planPts(startPts0, plusSeconds: endSeconds, timeBase: tb) else { return [] }
             plan.append(Segment(
                 startPts: startPts,
                 endPts: endPts,
@@ -274,17 +294,21 @@ extension HLSVideoEngine {
 
         // Segment 0 keeps the content start itself: there is nothing below it to back off toward, and
         // the head-of-stream gate has no restart target anyway.
-        func boundaryPts(_ i: Int) -> Int64 {
-            i == 0 ? startPts0 : startPts0 + Int64((starts[i] - backoff) / tb)
+        func boundaryPts(_ i: Int) -> Int64? {
+            i == 0 ? startPts0 : planPts(startPts0, plusSeconds: starts[i] - backoff, timeBase: tb)
         }
 
         var plan: [Segment] = []
         plan.reserveCapacity(starts.count)
         for i in 0..<starts.count {
             let endSeconds = i + 1 < starts.count ? starts[i + 1] : end
+            guard let startPts = boundaryPts(i),
+                  let endPts = i + 1 < starts.count
+                    ? boundaryPts(i + 1) : planPts(startPts0, plusSeconds: end, timeBase: tb)
+            else { return [] }
             plan.append(Segment(
-                startPts: boundaryPts(i),
-                endPts: i + 1 < starts.count ? boundaryPts(i + 1) : startPts0 + Int64(end / tb),
+                startPts: startPts,
+                endPts: endPts,
                 startSeconds: starts[i],
                 durationSeconds: Swift.max(0.001, endSeconds - starts[i])
             ))
@@ -310,6 +334,8 @@ extension HLSVideoEngine {
         plan.reserveCapacity(sorted.count)
         var i = 0
         var segIdx = 0
+        // Audit HLS-102: the index spread must fit `Int64` for the offsets below.
+        guard !sorted[sorted.count - 1].subtractingReportingOverflow(startPts0).overflow else { return [] }
         while i < sorted.count {
             let segStartPts = sorted[i]
             let segStartSeconds = Double(segStartPts - startPts0) * tb
@@ -330,7 +356,10 @@ extension HLSVideoEngine {
             } else {
                 segEndSeconds = sourceDurationSeconds
                 // GOTCHA: final endPts is startPts0-anchored; consumers must not use it raw: segmentIndex() clamps past-the-end PTS into the last segment.
-                segEndPts = startPts0 + Int64(sourceDurationSeconds / tb)
+                guard let finalEndPts = planPts(startPts0, plusSeconds: sourceDurationSeconds, timeBase: tb) else {
+                    return []
+                }
+                segEndPts = finalEndPts
             }
 
             plan.append(Segment(

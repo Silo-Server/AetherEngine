@@ -406,13 +406,43 @@ public final class Demuxer: @unchecked Sendable {
 
     /// Fold a raw timestamp onto the contiguous presentation timeline given its byte position and time base.
     /// Must be called under `accessLock`.
-    private func normalizedTimestamp(_ ts: Int64, pos: Int64, timeBase: AVRational) -> Int64 {
+    private func normalizedTimestamp(_ ts: Int64, pos: Int64, timeBase: AVRational) -> Int64? {
         guard ts != Int64.min, !clipTimeline.isEmpty else { return ts }
-        let sub = clipSubtractSeconds(forPos: pos)
-        guard sub != 0, timeBase.num > 0, timeBase.den > 0 else { return ts }
-        let subTicks = Int64((sub * Double(timeBase.den) / Double(timeBase.num)).rounded())
-        return ts &- subTicks
+        return Self.foldedIndexTimestamp(ts, subtractSeconds: clipSubtractSeconds(forPos: pos), timeBase: timeBase)
     }
+
+    /// The AE#105 fold of one index entry, nil when the shift or the result leaves the tick range. The
+    /// shift comes from the disc's own playlist, and a wrapped entry is worse than a missing one: the
+    /// plan built from it lands wherever the wrap put it (audit HLS-102).
+    static func foldedIndexTimestamp(_ ts: Int64, subtractSeconds sub: Double, timeBase: AVRational) -> Int64? {
+        guard sub != 0, timeBase.num > 0, timeBase.den > 0 else { return ts }
+        let subTicks = (sub * Double(timeBase.den) / Double(timeBase.num)).rounded()
+        guard subTicks.isFinite, abs(subTicks) < Self.maxPlausibleIndexTicks else { return nil }
+        let (folded, overflow) = ts.subtractingReportingOverflow(Int64(subTicks))
+        return overflow ? nil : folded
+    }
+
+    /// The #409 decode-ladder offset applied to one index entry, nil on overflow (audit HLS-102).
+    static func offsetIndexTimestamp(_ ts: Int64, by offset: Int64?) -> Int64? {
+        guard let offset else { return ts }
+        let (placed, overflow) = ts.addingReportingOverflow(offset)
+        return overflow ? nil : placed
+    }
+
+    /// Whether an index entry can be a real position (audit HLS-102): under 2^62 ticks, so any
+    /// difference of two entries fits `Int64`, and under 4e9 s on its own time base. libavformat
+    /// rejects only NOPTS and the relative-timestamp band near `Int64.max`; entries near `Int64.min`
+    /// and just below the band reach the plan builders otherwise. Epoch-anchored sources stay inside
+    /// both limits (1.79e18 ns in 2026 is under 2^62 until about 2116, 1.79e9 epoch seconds under 4e9
+    /// until about 2096).
+    static func isPlausibleIndexTimestamp(_ ts: Int64, timeBase: AVRational) -> Bool {
+        guard ts != Int64.min, ts.magnitude < UInt64(1) << 62,
+              timeBase.num > 0, timeBase.den > 0 else { return false }
+        return abs(Double(ts) * Double(timeBase.num) / Double(timeBase.den)) < maxPlausibleIndexSeconds
+    }
+
+    static let maxPlausibleIndexTicks: Double = 0x1p62
+    static let maxPlausibleIndexSeconds: Double = 4e9
 
     /// True once a disc structure (BD/DVD/UDF) was recognized at open. Disc sources concat
     /// MPEG-TS / VOB clips and have no EOF cue index, so the MKV cue-index prewarm seek is
@@ -451,12 +481,23 @@ public final class Demuxer: @unchecked Sendable {
     /// everything - the non-seekable pb ran no tail estimate, so the container value is 0 or
     /// garbage from fabricated range data - then a custom time-seekable reader's own duration,
     /// then the disc/container resolution above.
+    ///
+    /// The result is clamped to `[0, MediaDurationCeiling.seconds]` (audit HLS-102): a corrupt header
+    /// can state about 9.2e12 s, which the segment plan turned into a trapping tick conversion or a
+    /// multi-terabyte reservation. Clamped rather than zeroed, so a slightly broken header still plays.
     static func effectiveDurationSeconds(
         declared: Double?, readerDuration: Double?, discTitle: Double?, container: Double
     ) -> Double {
-        if let declared, declared > 0 { return declared }
-        if let readerDuration, readerDuration > 0 { return readerDuration }
-        return effectiveDurationSeconds(discTitle: discTitle, container: container)
+        let resolved: Double
+        if let declared, declared > 0 {
+            resolved = declared
+        } else if let readerDuration, readerDuration > 0 {
+            resolved = readerDuration
+        } else {
+            resolved = effectiveDurationSeconds(discTitle: discTitle, container: container)
+        }
+        guard resolved.isFinite, resolved > 0 else { return 0 }
+        return min(resolved, MediaDurationCeiling.seconds)
     }
 
     /// Open a media URL and probe its streams.
@@ -1510,18 +1551,17 @@ public final class Demuxer: @unchecked Sendable {
         guard count > 0 else { return [] }
         let tb = stream.pointee.time_base
         var result: [Int64] = []
-        result.reserveCapacity(Int(count))
         for i in 0..<count {
-            guard let entry = avformat_index_get_entry(stream, i) else { continue }
-            // AVINDEX_KEYFRAME = 0x0001
-            if entry.pointee.flags & 0x0001 != 0,
-               entry.pointee.timestamp != Int64.min {
-                // Fold each entry onto the contiguous timeline (multi-clip disc) so the segment plan
-                // built from these IRAP positions matches the normalized packets (AE#105), then onto
-                // the repaired decode ladder if #409 moved it.
-                let folded = normalizedTimestamp(entry.pointee.timestamp, pos: entry.pointee.pos, timeBase: tb)
-                result.append(compositionOffset.map { folded &+ $0 } ?? folded)
-            }
+            // AVINDEX_KEYFRAME = 0x0001. Fold each entry onto the contiguous timeline (multi-clip disc)
+            // so the segment plan built from these IRAP positions matches the normalized packets
+            // (AE#105), then onto the repaired decode ladder if #409 moved it.
+            guard let entry = avformat_index_get_entry(stream, i),
+                  entry.pointee.flags & 0x0001 != 0,
+                  Self.isPlausibleIndexTimestamp(entry.pointee.timestamp, timeBase: tb),
+                  let folded = normalizedTimestamp(entry.pointee.timestamp, pos: entry.pointee.pos, timeBase: tb),
+                  let placed = Self.offsetIndexTimestamp(folded, by: compositionOffset)
+            else { continue }
+            result.append(placed)
         }
         return result
     }
@@ -1618,7 +1658,9 @@ public final class Demuxer: @unchecked Sendable {
     /// when this demuxer opened mid-file. Int64.min when the container has no index yet.
     private func firstIndexedTimestamp(of stream: UnsafeMutablePointer<AVStream>) -> Int64 {
         guard avformat_index_get_entries_count(stream) > 0,
-              let entry = avformat_index_get_entry(stream, 0) else { return Int64.min }
+              let entry = avformat_index_get_entry(stream, 0),
+              Self.isPlausibleIndexTimestamp(entry.pointee.timestamp, timeBase: stream.pointee.time_base)
+        else { return Int64.min }
         return entry.pointee.timestamp
     }
 
