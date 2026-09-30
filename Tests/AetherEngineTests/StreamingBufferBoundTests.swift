@@ -23,11 +23,14 @@ struct StreamingBufferBoundTests {
     @Test("a transport that delivers past the hard cap ends the read with a typed cause",
           .timeLimit(.minutes(1)))
     func hardCapIsTyped() throws {
-        let maybe = ThrottledOriginServer(totalSize: 8 * 1024 * 1024, throttleUs: 0)
+        let body = 64 * 1024 * 1024
+        let maybe = ThrottledOriginServer(totalSize: Int64(body), throttleUs: 0)
         let server = try #require(maybe)
         defer { server.stop() }
         // One delivery is larger than twice this, so the cap is passed without depending on
-        // whether the transport honours the pause that comes first.
+        // whether the transport honours the pause that comes first. The peak is then about one
+        // URLSession delivery, which measured 2.4 MB on a CI runner, so the bound is a quarter of
+        // the body rather than a guess at the delivery size.
         let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/archive.ts")!,
                                 sequentialOnly: true, streamHighWater: 1024)
         defer { reader.markClosed(); reader.close() }
@@ -36,8 +39,8 @@ struct StreamingBufferBoundTests {
         let result = drain(reader)
         #expect(result.last == FFmpegErr.eio, "a source ended at the cap is lost, not finished")
         #expect(reader.lastReadFailure == .originIgnoresFlowControl)
-        #expect(result.read < 8 * 1024 * 1024, "the cap let the whole body through")
-        #expect(reader.streamPeakBufferBytesForTesting < 2 * 1024 * 1024,
+        #expect(result.read < body, "the cap let the whole body through")
+        #expect(reader.streamPeakBufferBytesForTesting < body / 4,
                 "the buffer held \(reader.streamPeakBufferBytesForTesting / 1024) KB")
     }
 
