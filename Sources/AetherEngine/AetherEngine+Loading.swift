@@ -2523,7 +2523,8 @@ extension AetherEngine {
                         formatKnown: true,
                         effectiveFormat: videoFormat
                     ),
-                    settleCap: loadedOptions.isLive ? .standard : .awaitObservedEnd)
+                    settleCap: loadedOptions.isLive ? .standard : .awaitObservedEnd,
+                    isCurrent: { self.loadGeneration == gen })
                 try checkLoadCurrent(gen)
                 if resumesPlaying { nativeHost?.play() }
             }

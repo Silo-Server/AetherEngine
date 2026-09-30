@@ -4488,7 +4488,8 @@ public final class AetherEngine: ObservableObject {
                 didSwitchPanel = true
                 // #339: consumesRecord: false, the play gate after loadNative is entitled to the same
                 // start/end timestamps; spending them here made it pay Stage 1's grace for a settled switch.
-                await displayCriteria.waitForSwitch(consumesRecord: false)
+                await displayCriteria.waitForSwitch(consumesRecord: false,
+                                                    isCurrent: { self.loadGeneration == gen })
                 // Superseded during panel handshake: close local probe and unwind.
                 if loadGeneration != gen {
                     probe.markClosed()
@@ -4553,7 +4554,8 @@ public final class AetherEngine: ObservableObject {
                 "[DisplayCriteria] unproven HDR master waits for the running switch to end before it is "
                 + "served (#667)",
                 category: .session)
-            await displayCriteria.waitForSwitch(consumesRecord: false, settleCap: .awaitObservedEnd)
+            await displayCriteria.waitForSwitch(consumesRecord: false, settleCap: .awaitObservedEnd,
+                                                isCurrent: { self.loadGeneration == gen })
             if loadGeneration != gen {
                 probe.markClosed()
                 if probeOpened {
@@ -4992,7 +4994,8 @@ public final class AetherEngine: ObservableObject {
                     // Sodalite#49: this gate runs after the item is ready, so waiting out an observed switch
                     // blocks nothing else, and the panel is dark until it ends either way. Live keeps the
                     // standard cap: a zap must not sit behind a panel handshake.
-                    settleCap: options.isLive ? .standard : .awaitObservedEnd)
+                    settleCap: options.isLive ? .standard : .awaitObservedEnd,
+                    isCurrent: { self.loadGeneration == gen })
                 try checkLoadCurrent(gen)
                 // automaticallyWaitsToMinimizeStalling=true (default) handles play-before-ready.
                 // #35: on a real SDR->HDR switch while serving a VOD master, drive the bounded
