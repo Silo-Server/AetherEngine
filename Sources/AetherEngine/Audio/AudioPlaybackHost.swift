@@ -438,6 +438,9 @@ final class AudioPlaybackHost {
                 if stopRequested() { return false }
             }
 
+            // Audit DEC-106: read before the packet, so a flush landing anywhere after this retires every
+            // buffer decided on below, inside `enqueue`, where the comparison is atomic with the enqueue.
+            let epochBeforeRead = audioOutput?.epoch ?? 0
             let packet: UnsafeMutablePointer<AVPacket>?
             do {
                 packet = try demuxer.readPacket()
@@ -456,8 +459,14 @@ final class AudioPlaybackHost {
                     // Audit DEC-2: a seek's flush can land inside the drain, as in `decode` below.
                     let drained = aDec.drain()
                     let tail = seekGeneration() == seenSeekGeneration ? drained : []
-                    for buf in tail { aOut.enqueue(sampleBuffer: buf) }
-                    if let last = tail.last {
+                    var tailAccepted = true
+                    for buf in tail {
+                        guard aOut.enqueue(sampleBuffer: buf, ifEpoch: epochBeforeRead) else {
+                            tailAccepted = false
+                            break
+                        }
+                    }
+                    if tailAccepted, let last = tail.last {
                         let end = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(last))
                             + CMTimeGetSeconds(CMSampleBufferGetDuration(last))
                         if end.isFinite, end > lastEnqueuedEnd { lastEnqueuedEnd = end }
@@ -505,7 +514,11 @@ final class AudioPlaybackHost {
                     return true
                 }
                 for buf in buffers {
-                    aOut.enqueue(sampleBuffer: buf)
+                    guard aOut.enqueue(sampleBuffer: buf, ifEpoch: epochBeforeRead) else {
+                        av_packet_unref(packet)
+                        av_packet_free_safe(packet)
+                        return true
+                    }
                 }
                 if let last = buffers.last {
                     let end = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(last))
