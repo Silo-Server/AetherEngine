@@ -843,7 +843,11 @@ way with `.ended(.sessionEnded)`; a recording never outlives its session.
 
 `.ended` is published once the file is closed. The queued tail and the trailer are written off the
 main actor, so it can arrive a moment after the call that ended the recording; `stopRecording()`
-returns only after it, and a `startRecording(to:)` issued in that moment waits for it first.
+returns only after it, and a `startRecording(to:)` issued in that moment waits for it first. If a
+`stopRecording()` or a new `load()` overtakes that wait, the start throws `CancellationError` and
+records nothing. A stop that lands while the writer is already tearing itself down after a failure
+(`.writeTooSlow`, `.diskFull`, `.writeFailed`) waits for that teardown and publishes the failure, not
+`.ended`.
 
 **Not implemented: recording from the start of what is already buffered.** A recording begins at the
 call, not at the back of the DVR window. On `.loopback` what is retained is remuxed fMP4 with

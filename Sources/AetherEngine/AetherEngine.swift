@@ -1383,6 +1383,10 @@ public final class AetherEngine: ObservableObject {
     /// The ended recording's drain and trailer, run off the main actor (audit REC-1).
     var recordingFinish: Task<Void, Never>?
 
+    /// Bumped by every `stopRecording()`, so a `startRecording` that was waiting on `recordingFinish`
+    /// can tell that a stop overtook it (audit FEA-106).
+    var recordingStopSerial: UInt64 = 0
+
     /// Republishes `recordingState` progress at 1 Hz while a recording runs.
     var recordingProgressTimer: Timer?
 
@@ -2424,9 +2428,11 @@ public final class AetherEngine: ObservableObject {
     /// until its teardown claims it (see `claimSoftwarePathTakeover`).
     var softwarePathRebuild: Task<Void, Error>?
     var softwarePathTakeoverArm: UInt64?
-    /// AE#641: the live audio stream whose bridge decoded nothing in this session. It outlives the
-    /// session's own rebuilds, which is what keeps them video-only, and a host load clears it.
-    var undecodableLiveAudioStreamIndex: Int32?
+    /// AE#641: the live audio streams whose bridge decoded nothing in this session. They outlive the
+    /// session's own rebuilds, which is what keeps them video-only, and a host load clears them. A set,
+    /// not a slot (audit FEA-103): a channel with two undecodable tracks would otherwise re-hang on the
+    /// second one, after the viewer's pick, with nothing surfaced.
+    var undecodableLiveAudioStreamIndices: Set<Int32> = []
     /// #65 final rung, storm shape: on a frozen live playlist each stage-2 reload replays the tail,
     /// re-stalls within seconds, and the fresh stall SUPERSEDES the ladder task before its
     /// post-reload rung can run, so the reload cycle alone would loop forever. This gate persists
@@ -3955,8 +3961,8 @@ public final class AetherEngine: ObservableObject {
         itemDeathReviveGate = ItemDeathReviveGate(maxAttempts: 3)
         stallReloadReviveGate = ItemDeathReviveGate(maxAttempts: 2)
         softwarePathEscalationBudget = SoftwarePathEscalation.Budget()
-        undecodableLiveAudioStreamIndex = Self.undecodableAudioStreamIndexAcrossLoad(
-            undecodableLiveAudioStreamIndex, sessionPreservingReload: sessionPreservingReloadInFlight)
+        undecodableLiveAudioStreamIndices = Self.undecodableAudioStreamIndicesAcrossLoad(
+            undecodableLiveAudioStreamIndices, sessionPreservingReload: sessionPreservingReloadInFlight)
         masterFallbackUsed = false
         nativeSubtitleReanchorTask?.cancel()
         nativeSubtitleReanchorTask = nil

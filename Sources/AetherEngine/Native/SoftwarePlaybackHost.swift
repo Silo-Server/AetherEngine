@@ -2653,6 +2653,8 @@ final class SoftwarePlaybackHost {
             // inside the decoder rather than leaving the caller to re-check a value it cannot hold
             // across the call.
             var epochBeforeRead = videoDecoder.feedEpoch
+            // Audit DEC-106: the audio side of the same rule, compared under the output's lock by `enqueue`.
+            let audioEpochBeforeRead = audioOutput?.epoch ?? 0
             let packet: UnsafeMutablePointer<AVPacket>?
             do {
                 if let readAhead {
@@ -2921,8 +2923,12 @@ final class SoftwarePlaybackHost {
                     return true
                 }
                 for buf in buffers {
-                    tapSink?(buf)   // #95: mirror before enqueue
-                    aOut.enqueue(sampleBuffer: buf)
+                    guard aOut.enqueue(sampleBuffer: buf, ifEpoch: audioEpochBeforeRead) else {
+                        av_packet_unref(packet)
+                        av_packet_free_safe(packet)
+                        return true
+                    }
+                    tapSink?(buf)   // #95: mirrored behind the accept, so a refused buffer is not transcribed
                 }
                 if decoupleAudio, let last = buffers.last {
                     let pts = CMSampleBufferGetPresentationTimeStamp(last)

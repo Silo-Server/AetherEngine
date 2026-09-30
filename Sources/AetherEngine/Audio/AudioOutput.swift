@@ -19,6 +19,16 @@ final class AudioOutput: @unchecked Sendable {
     /// One line per offset change, not per buffer. Reset by `setPresentationOffset`.
     private var loggedOffsetInEffect = false
 
+    /// Audit DEC-106: retired by every `flush()` and `stop()`, under `lock`. A feed loop reads it before
+    /// it reads a packet and enqueues through `enqueue(sampleBuffer:ifEpoch:)`, which compares under the
+    /// same lock, so a buffer decided on before a seek's flush can no longer land after it.
+    private var _epoch: UInt64 = 0
+    var epoch: UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return _epoch
+    }
+
     init() {
         renderer = AVSampleBufferAudioRenderer()
         synchronizer = AVSampleBufferRenderSynchronizer()
@@ -155,13 +165,38 @@ final class AudioOutput: @unchecked Sendable {
     /// Enqueue a decoded audio CMSampleBuffer. Always enqueues (renderer buffers internally); gating on
     /// isReadyForMoreMediaData dropped early samples before the synchronizer started, giving silence.
     ///
+    /// Audit DEC-106: with `epoch`, the buffer is enqueued only if no flush has retired that epoch, and the
+    /// comparison and the enqueue happen under the lock `flush` takes. Returns false, enqueuing nothing,
+    /// for a buffer that predates a flush.
+    ///
     /// AE#464: this is where a lip-sync offset is applied, and the position is the point. It is past
     /// the audio tap (whose `sourceTime` is documented as the SOURCE axis and feeds transcription),
     /// past the decoder's gapless clock (which would absorb a sub-100 ms offset as rounding), and
     /// past the caller's `lastEnqueuedAudioPtsSec` bookkeeping (whose lead is measured against the
     /// synchronizer clock, i.e. against the source axis too). Only the renderer sees the shift.
-    func enqueue(sampleBuffer: CMSampleBuffer) {
-        renderer.enqueue(retimed(sampleBuffer))
+    @discardableResult
+    func enqueue(sampleBuffer: CMSampleBuffer, ifEpoch epoch: UInt64? = nil) -> Bool {
+        lock.lock()
+        if let epoch, epoch != _epoch {
+            lock.unlock()
+            return false
+        }
+        let offset = presentationOffset
+        let delivered = offset == .zero ? sampleBuffer : Self.retimed(sampleBuffer, by: offset)
+        var offsetLine: String?
+        if offset != .zero, !loggedOffsetInEffect, delivered !== sampleBuffer {
+            loggedOffsetInEffect = true
+            // Release-visible, once per offset change: an offset that was set and an offset that is being
+            // DELIVERED are different claims, and without this line the difference is only measurable with
+            // a capture card. The two timestamps are the whole proof.
+            let source = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
+            offsetLine = "[AudioOutput] AE#464 audio delay in effect: "
+                + String(format: "%+.0f ms", offset.seconds * 1000)
+                + String(format: " (sample at %.3fs delivered at %.3fs)", source, source + offset.seconds)
+        }
+        renderer.enqueue(delivered)
+        lock.unlock()
+        if let offsetLine { EngineLog.emit(offsetLine, category: .swPlayback) }
 
         #if DEBUG
         // Once per session: first enqueue + any renderer rejection, to distinguish "nothing enqueued" from
@@ -180,6 +215,7 @@ final class AudioOutput: @unchecked Sendable {
             EngineLog.emit("[AudioOutput] renderer error: \(err)", category: .swPlayback)
         }
         #endif
+        return true
     }
 
     #if DEBUG
@@ -187,36 +223,10 @@ final class AudioOutput: @unchecked Sendable {
     private var _loggedRendererError = false
     #endif
 
-    /// A copy of `sampleBuffer` shifted by the current offset, or the buffer itself when there is
-    /// none (the overwhelmingly common case, and one that must not cost an allocation). A copy that
-    /// cannot be made is delivered unshifted: an audible lip-sync error is a far better outcome than
-    /// a dropped buffer, which is silence.
-    private func retimed(_ sampleBuffer: CMSampleBuffer) -> CMSampleBuffer {
-        lock.lock()
-        let offset = presentationOffset
-        lock.unlock()
-        guard offset != .zero else { return sampleBuffer }
-        let shifted = Self.retimed(sampleBuffer, by: offset)
-
-        // Release-visible, once per offset change: an offset that was set and an offset that is being
-        // DELIVERED are different claims, and without this line the difference is only measurable with
-        // a capture card. The two timestamps are the whole proof.
-        if !loggedOffsetInEffect, shifted !== sampleBuffer {
-            loggedOffsetInEffect = true
-            let source = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
-            EngineLog.emit(
-                "[AudioOutput] AE#464 audio delay in effect: "
-                + String(format: "%+.0f ms", offset.seconds * 1000)
-                + String(format: " (sample at %.3fs delivered at %.3fs)", source, source + offset.seconds),
-                category: .swPlayback
-            )
-        }
-        return shifted
-    }
-
-    /// The timing half, pure so the shift can be checked without a renderer. Every timing entry moves
+    /// The shift itself, pure so it can be checked without a renderer. Every timing entry moves
     /// by `offset`, presentation and decode alike; an entry with no valid presentation stamp is left
-    /// alone rather than given one.
+    /// alone rather than given one. A copy that cannot be made is delivered unshifted: an audible
+    /// lip-sync error is a far better outcome than a dropped buffer, which is silence.
     static func retimed(_ sampleBuffer: CMSampleBuffer, by offset: CMTime) -> CMSampleBuffer {
         guard offset != .zero else { return sampleBuffer }
         var count: CMItemCount = 0
@@ -268,12 +278,14 @@ final class AudioOutput: @unchecked Sendable {
     func flush() {
         lock.lock()
         defer { lock.unlock() }
+        _epoch &+= 1
         renderer.flush()
     }
 
     func stop() {
         lock.lock()
         defer { lock.unlock() }
+        _epoch &+= 1
         synchronizer.setRate(0.0, time: .zero)
         renderer.flush()
     }
