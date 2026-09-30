@@ -1559,7 +1559,7 @@ final class SoftwarePlaybackHost {
                 memcpy(dst, base, pkt.bytes.count)
             }
         }
-        p.pointee.pts = Int64((pkt.pts / tbSec).rounded())
+        p.pointee.pts = SourceTimestampBounds.roundedTicks(pkt.pts / tbSec) ?? Int64.min
         p.pointee.dts = p.pointee.pts
         p.pointee.flags = pkt.isKeyframe ? AV_PKT_FLAG_KEY : 0
         p.pointee.stream_index = pkt.isVideo ? videoStreamIndex : audioStreamIndex
@@ -1987,9 +1987,11 @@ final class SoftwarePlaybackHost {
                 let tbSec = (streamIdx == videoStreamIndex)
                     ? videoTimeBaseSeconds : audioTimeBaseSeconds
                 if tbSec > 0 {
-                    let offsetTicks = Int64((discontinuityOffsetSec / tbSec).rounded())
-                    if packet.pointee.pts != Int64.min { packet.pointee.pts -= offsetTicks }
-                    if packet.pointee.dts != Int64.min { packet.pointee.dts -= offsetTicks }
+                    // Audit NAT-101: the offset spans twice the input range and converts per stream
+                    // base, so a packet on the far side of a seam can still leave Int64.
+                    let offsetTicks = SourceTimestampBounds.roundedTicks(discontinuityOffsetSec / tbSec)
+                    packet.pointee.pts = SourceTimestampBounds.shifted(packet.pointee.pts, back: offsetTicks)
+                    packet.pointee.dts = SourceTimestampBounds.shifted(packet.pointee.dts, back: offsetTicks)
                 }
             }
 
@@ -2750,9 +2752,11 @@ final class SoftwarePlaybackHost {
                 let tbSec = (streamIdx == videoStreamIndex)
                     ? videoTimeBaseSeconds : audioTimeBaseSeconds
                 if tbSec > 0 {
-                    let offsetTicks = Int64((discontinuityOffsetSec / tbSec).rounded())
-                    if packet.pointee.pts != Int64.min { packet.pointee.pts -= offsetTicks }
-                    if packet.pointee.dts != Int64.min { packet.pointee.dts -= offsetTicks }
+                    // Audit NAT-101: the offset spans twice the input range and converts per stream
+                    // base, so a packet on the far side of a seam can still leave Int64.
+                    let offsetTicks = SourceTimestampBounds.roundedTicks(discontinuityOffsetSec / tbSec)
+                    packet.pointee.pts = SourceTimestampBounds.shifted(packet.pointee.pts, back: offsetTicks)
+                    packet.pointee.dts = SourceTimestampBounds.shifted(packet.pointee.dts, back: offsetTicks)
                 }
             }
 

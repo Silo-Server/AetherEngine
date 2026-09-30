@@ -385,12 +385,9 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     }
 
     private func emitInner(_ f: UnsafeMutablePointer<AVFrame>, timeBase tb: AVRational) {
-        if let threshold = skipUntilPTS, f.pointee.pts != Int64.min {
-            let framePTS = CMTimeMake(
-                value: f.pointee.pts * Int64(tb.num),
-                timescale: Int32(tb.den)
-            )
-            if CMTimeCompare(framePTS, threshold) < 0 {
+        let cmPTS = SourceTimestampBounds.cmTime(ticks: f.pointee.pts, timeBase: tb)
+        if let threshold = skipUntilPTS, cmPTS.isValid {
+            if CMTimeCompare(cmPTS, threshold) < 0 {
                 return
             }
             // Compare-and-clear: a concurrent seek can install a new threshold; blindly nil-ing would discard it.
@@ -427,17 +424,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
 
         reportDecodedFormat(pixelBuffer: pixelBuffer)
-
-        let pts = f.pointee.pts
-        let cmPTS: CMTime
-        if pts != Int64.min {
-            cmPTS = CMTimeMake(
-                value: pts * Int64(tb.num),
-                timescale: Int32(tb.den)
-            )
-        } else {
-            cmPTS = .invalid
-        }
 
         // HDR10+: read dynamic metadata from post-decode AVFrame side data (T.35 SEI bytes).
         // Can't reuse the VT path's packet-side stash; this decoder owns its own packet flow.

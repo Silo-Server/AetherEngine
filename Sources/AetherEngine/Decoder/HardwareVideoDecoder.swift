@@ -261,19 +261,10 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             copied.deallocate()
             return
         }
-        let ptsRaw = packet.pointee.pts
-        let dtsRaw = packet.pointee.dts
-        let durRaw = packet.pointee.duration
-        let timescale = max(timeBase.den, 1)
-
-        let pts = (ptsRaw != Int64.min)
-            ? CMTimeMake(value: ptsRaw * Int64(timeBase.num), timescale: timescale)
-            : CMTime.invalid
-        let dts = (dtsRaw != Int64.min)
-            ? CMTimeMake(value: dtsRaw * Int64(timeBase.num), timescale: timescale)
-            : CMTime.invalid
-        let dur = (durRaw > 0)
-            ? CMTimeMake(value: durRaw * Int64(timeBase.num), timescale: timescale)
+        let pts = SourceTimestampBounds.cmTime(ticks: packet.pointee.pts, timeBase: timeBase)
+        let dts = SourceTimestampBounds.cmTime(ticks: packet.pointee.dts, timeBase: timeBase)
+        let dur = packet.pointee.duration > 0
+            ? SourceTimestampBounds.cmTime(ticks: packet.pointee.duration, timeBase: timeBase)
             : CMTime.invalid
 
         var timing = CMSampleTimingInfo(duration: dur, presentationTimeStamp: pts, decodeTimeStamp: dts)
@@ -330,7 +321,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         lock.unlock()
         if decodeStatus != noErr {
             EngineLog.emit(
-                "[HardwareVideoDecoder] decode error \(decodeStatus) at pts=\(ptsRaw)",
+                "[HardwareVideoDecoder] decode error \(decodeStatus) at pts=\(packet.pointee.pts)",
                 category: .swPlayback
             )
         }

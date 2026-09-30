@@ -1537,16 +1537,18 @@ public final class Demuxer: @unchecked Sendable {
             // new read, so the container's own order survives the verdict. Checked every pass, not
             // once on entry: the packet that completes the sample flips the phase, and the queue
             // behind it has to drain before the read that follows it is emitted.
-            if let held = compositionRepair?.dequeue() { return held }
+            // Every exit is bounded again: #409 rewrites pts/dts after the funnel in
+            // `readDemuxedPacketLocked`, with wrapping arithmetic.
+            if let held = compositionRepair?.dequeue() { return boundTimestampsLocked(held) }
             guard let packet = try readPacketLocked() else {
                 // EOF can arrive mid-sample on a very short source; the verdict has to be reached
                 // now or the held packets would never be delivered.
                 compositionRepair?.endOfStream()
-                if let held = compositionRepair?.dequeue() { return held }
+                if let held = compositionRepair?.dequeue() { return boundTimestampsLocked(held) }
                 return nil
             }
-            guard let repair = armCompositionRepairIfNeeded() else { return packet }
-            if !repair.ingest(packet) { return packet }
+            guard let repair = armCompositionRepairIfNeeded() else { return boundTimestampsLocked(packet) }
+            if !repair.ingest(packet) { return boundTimestampsLocked(packet) }
         }
     }
 
@@ -1667,6 +1669,32 @@ public final class Demuxer: @unchecked Sendable {
         for key in subpictureAssemblers.keys { subpictureAssemblers[key]?.reset() }
     }
 
+    /// An out-of-range source timestamp was logged once for this demuxer. Guarded by `accessLock`.
+    private var implausibleTimestampLogged = false
+
+    /// Audit NAT-101 / DEC-101 / FEA-101 / SUB-105 / SEG-101: libavformat hands back whatever the
+    /// container wrote (matroskadec stores a uint64 cluster time into an int64 pts and clamps
+    /// BlockDuration to INT64_MAX, a live fMP4 tfdt is the origin's choice), and every consumer of
+    /// this demuxer does tick arithmetic on it. One bound here covers them all. Caller holds
+    /// `accessLock`.
+    @discardableResult
+    private func boundTimestampsLocked(_ packet: UnsafeMutablePointer<AVPacket>) -> UnsafeMutablePointer<AVPacket> {
+        guard let ctx = formatContext else { return packet }
+        let index = Int(packet.pointee.stream_index)
+        let timeBase = index >= 0 && index < Int(ctx.pointee.nb_streams)
+            ? ctx.pointee.streams[index]?.pointee.time_base : nil
+        let pts = packet.pointee.pts, dts = packet.pointee.dts, duration = packet.pointee.duration
+        guard SourceTimestampBounds.sanitize(packet, timeBase: timeBase ?? AVRational(num: 0, den: 0)),
+              !implausibleTimestampLogged else { return packet }
+        implausibleTimestampLogged = true
+        EngineLog.emit(
+            "[Demuxer] stream \(index) carries an out-of-range timestamp "
+            + "(pts=\(pts) dts=\(dts) duration=\(duration)), treated as unset",
+            category: .demux
+        )
+        return packet
+    }
+
     /// One `av_read_frame`, as libavformat delivers it. Caller holds `accessLock`.
     private func readDemuxedPacketLocked() throws -> UnsafeMutablePointer<AVPacket>? {
         guard let ctx = formatContext else { return nil }
@@ -1690,6 +1718,7 @@ public final class Demuxer: @unchecked Sendable {
             }
             throw DemuxerError.readFailed(code: ret)
         }
+        if let pkt = packet { boundTimestampsLocked(pkt) }
         // #407: before anything reads a timestamp off this packet. The PTS on these streams was
         // invented by `+genpts` out of decode order and transposes every B/P pair; dropping it leaves
         // the decoder's own reorder to place the picture. See `VFWDecodeOrderPTSRepair`.

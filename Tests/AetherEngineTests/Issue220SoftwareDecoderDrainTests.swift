@@ -91,7 +91,7 @@ struct Issue220SoftwareDecoderDrainTests {
     ///   ffmpeg -f lavfi -i "color=c=red:s=128x96:r=10:d=4" -c:v libx264 -preset ultrafast \
     ///     -tune zerolatency -bf 0 -pix_fmt yuv420p -x264-params keyint=10 -movflags +faststart swdec.mp4
     ///   base64 -i swdec.mp4
-    private static let fixtureBase64 = """
+    static let fixtureBase64 = """
         AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAPPbW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAD6AAAQAA
         AQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         AAAAAgAAAvl0cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAD6AAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAA
