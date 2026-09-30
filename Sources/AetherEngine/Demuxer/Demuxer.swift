@@ -1816,6 +1816,18 @@ public final class Demuxer: @unchecked Sendable {
         return packet
     }
 
+    /// What a failed `av_read_frame` means for a demuxer in this state: the code to throw, or nil for
+    /// the source's own end of file.
+    ///
+    /// Audit SEG-104: the abort of a parked read (`markClosed()`) reaches some demuxers as end of
+    /// file, and "the source ended" is a verdict every consumer acts on (tail adopt, bridge flush,
+    /// `onSequentialSourceEnded`). A closed demuxer has no verdict to give, so an EOF it reports is
+    /// the abort, and it says so.
+    static func readFailureCode(_ ret: Int32, closeRequested: Bool) -> Int32? {
+        guard ret == FFmpegErr.eof else { return ret }
+        return closeRequested ? FFmpegErr.exit : nil
+    }
+
     /// One `av_read_frame`, as libavformat delivers it. Caller holds `accessLock`.
     private func readDemuxedPacketLocked() throws -> UnsafeMutablePointer<AVPacket>? {
         guard let ctx = formatContext else { return nil }
@@ -1833,11 +1845,8 @@ public final class Demuxer: @unchecked Sendable {
         }
         if ret < 0 {
             trackedPacketFree(&packet)
-            let isEOF = (ret == FFmpegErr.eof)
-            if isEOF {
-                return nil
-            }
-            throw DemuxerError.readFailed(code: ret)
+            guard let code = Self.readFailureCode(ret, closeRequested: isCloseRequested) else { return nil }
+            throw DemuxerError.readFailed(code: code)
         }
         if let pkt = packet { boundTimestampsLocked(pkt) }
         // #407: before anything reads a timestamp off this packet. The PTS on these streams was
