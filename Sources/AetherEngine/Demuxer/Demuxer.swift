@@ -1684,14 +1684,15 @@ public final class Demuxer: @unchecked Sendable {
             guard let read = try readDemuxedPacketLocked() else { return nil }
             var packet: UnsafeMutablePointer<AVPacket>? = read
             let index = read.pointee.stream_index
-            guard var assembler = subpictureAssemblers[index] else { return read }
+            guard subpictureAssemblers[index] != nil else { return read }
             let timing = DVDSubpictureAssembler.Timing(
                 pts: read.pointee.pts, dts: read.pointee.dts,
                 pos: read.pointee.pos, duration: read.pointee.duration)
-            let unit = assembler.ingest(
+            // In place (audit DMX-106): a copied-out assembler shares the dictionary's buffer, so
+            // every fragment's append copied the whole partial unit.
+            let unit = subpictureAssemblers[index]?.ingest(
                 UnsafeRawBufferPointer(start: read.pointee.data, count: Int(max(0, read.pointee.size))),
                 timing: timing)
-            subpictureAssemblers[index] = assembler
             guard let unit else {
                 trackedPacketFree(&packet)
                 continue
@@ -1700,7 +1701,8 @@ public final class Demuxer: @unchecked Sendable {
             guard let joined = trackedPacketAlloc() else { trackedPacketFree(&packet); return nil }
             var out: UnsafeMutablePointer<AVPacket>? = joined
             // `av_new_packet` resets every prop, so the copy comes after it.
-            guard av_new_packet(joined, Int32(unit.data.count)) >= 0,
+            guard let joinedSize = Int32(exactly: unit.data.count),
+                  av_new_packet(joined, joinedSize) >= 0,
                   av_packet_copy_props(joined, read) >= 0 else {
                 trackedPacketFree(&out)
                 trackedPacketFree(&packet)
