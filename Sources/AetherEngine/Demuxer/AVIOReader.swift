@@ -697,6 +697,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     // playback fast path never enters this code, so it carries zero overhead.
     private static let detourBlockSize = 4 * 1024 * 1024
     private static let detourMaxBlocks = 8                       // ~32 MB LRU ceiling
+    /// Audit PERF-108: a detour block nobody has read or filled for this long is a scrub's leftover,
+    /// not a parse's working set (a parser revisits its region within seconds).
+    private static let detourBlockIdleSecondsDefault: TimeInterval = 30
     // Once detour reads turn sequential past this much, re-anchor the streaming connection
     // there so sustained playback returns to the cheap window path (e.g. after a backward scrub).
     private static let detourReanchorBytes: Int64 = 8 * 1024 * 1024
@@ -809,6 +812,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         defer { streamLock.unlock() }
         return streamFailureCause
     }
+
+    /// Detour blocks currently resident.
+    var detourResidentBlocksForTesting: Int { detourCache.residentCount }
 
     /// The most the forward-only streaming buffer has held at once.
     var streamPeakBufferBytesForTesting: Int {
@@ -935,6 +941,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// math lives on the cache and is unit-tested without any network.
     private let detourCache = DetourBlockCache(blockSize: AVIOReader.detourBlockSize,
                                                maxBlocks: AVIOReader.detourMaxBlocks)
+    /// When the detour cache was last swept for idle blocks (audit PERF-108). Demux-thread-only.
+    private var lastDetourIdleSweepNs: UInt64 = 0
+    /// How long a detour block may sit unread before the sweep releases it. An init parameter for
+    /// the same reason `connStallTimeout` is one: a process-wide hook would leak into whatever suite
+    /// runs concurrently.
+    private let detourBlockIdleSeconds: TimeInterval
     // Re-anchor run tracking (demux-thread-only): the file offset the next sequential detour read
     // would continue from, and how many contiguous bytes the current detour run has served.
     private var detourRunNextExpected: Int64 = -1
@@ -1086,7 +1098,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private let probeDrainLock = NSLock()
     private var drainingProbeRequest = false
 
-    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, windowHighWater: Int? = nil, streamHighWater: Int? = nil, heldConnection: Bool = false, probeControl: ProbeControl? = nil, probeRequestSession: URLSession? = nil) {
+    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, windowHighWater: Int? = nil, streamHighWater: Int? = nil, detourIdleSeconds: TimeInterval? = nil, heldConnection: Bool = false, probeControl: ProbeControl? = nil, probeRequestSession: URLSession? = nil) {
         self.probeControl = probeControl
         self.probeRequestSession = probeControl == nil ? nil : probeRequestSession
         self.url = url
@@ -1106,6 +1118,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         self.winHighWater = max(1, windowHighWater
             ?? (isLive ? Self.liveWinHighWaterDefault : Self.winHighWaterDefault))
         self.streamHighWater = max(1, streamHighWater ?? Self.streamHighWaterDefault)
+        self.detourBlockIdleSeconds = detourIdleSeconds ?? Self.detourBlockIdleSecondsDefault
         self.heldConnectionEnabled = heldConnection
     }
 
@@ -1933,6 +1946,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private func readPersistent(into buf: UnsafeMutablePointer<UInt8>, size: Int32) -> Int32 {
         let requestSize = Int(size)
         var totalRead = 0
+        sweepIdleDetourBlocks()
 
         // #93 restart latency: accumulate where THIS read spends its time; one summary line fires
         // on completion when the whole call exceeded the threshold (see SlowReadDiagnostics).
@@ -2131,6 +2145,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     // the cheap window path instead of fetching 4 MB blocks forever.
                     if curPosition == detourRunNextExpected && detourRunBytes >= Self.detourReanchorBytes {
                         detourResetRun()
+                        sweepIdleDetourBlocks(force: true)
                         timedReconnect(seek: true, at: curPosition)
                         continue
                     }
@@ -2665,6 +2680,21 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             return .ok(data)
         } catch {
             return .failed
+        }
+    }
+
+    /// Audit PERF-108: release detour blocks nothing has touched for `detourBlockIdleSeconds`, at most
+    /// once a second from the read path and unconditionally when playback re-anchors, which is the
+    /// moment a scrub's blocks stop being anyone's working set. Demux-thread-only.
+    private func sweepIdleDetourBlocks(force: Bool = false) {
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard force || now &- lastDetourIdleSweepNs >= 1_000_000_000 else { return }
+        lastDetourIdleSweepNs = now
+        let evicted = detourCache.evictIdle(olderThan: detourBlockIdleSeconds)
+        if evicted > 0 {
+            EngineLog.emit(
+                "[AVIOReader] \(label) released \(evicted) idle detour block(s) "
+                + "(\(detourCache.residentCount) resident)", category: .demux, level: .verbose)
         }
     }
 
@@ -4429,12 +4459,18 @@ final class DetourBlockCache: @unchecked Sendable {
     private let lock = NSLock()
     private var blocks: [Int64: Data] = [:]
     private var lru: [Int64] = []
+    /// When each resident block was last inserted or served, on `now`'s clock (audit PERF-108).
+    private var lastHit: [Int64: TimeInterval] = [:]
     private let maxBlocks: Int
+    private let now: @Sendable () -> TimeInterval
     let blockSize: Int
 
-    init(blockSize: Int, maxBlocks: Int) {
+    /// `now` is injectable so the idle test moves a clock instead of waiting one out.
+    init(blockSize: Int, maxBlocks: Int,
+         now: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.blockSize = blockSize
         self.maxBlocks = maxBlocks
+        self.now = now
     }
 
     /// Returns the resident block for `idx` and bumps its recency, or nil on a miss.
@@ -4445,6 +4481,7 @@ final class DetourBlockCache: @unchecked Sendable {
             lru.remove(at: i)
             lru.append(idx)
         }
+        lastHit[idx] = now()
         return data
     }
 
@@ -4453,15 +4490,38 @@ final class DetourBlockCache: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         if blocks[idx] == nil { lru.append(idx) }
         blocks[idx] = data
+        lastHit[idx] = now()
         while lru.count > maxBlocks {
-            blocks.removeValue(forKey: lru.removeFirst())
+            let evicted = lru.removeFirst()
+            blocks.removeValue(forKey: evicted)
+            lastHit[evicted] = nil
         }
+    }
+
+    /// Drops every block nothing has read or filled for `seconds`, and returns how many went. The
+    /// cache is otherwise only emptied at close, so the blocks of a backward scrub (up to 32 MB)
+    /// outlived the scrub for the whole session (audit PERF-108). Age rather than a clear at the
+    /// re-anchor, because a parser ping-ponging through a region keeps hitting its blocks.
+    @discardableResult
+    func evictIdle(olderThan seconds: TimeInterval) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        let cutoff = now() - seconds
+        let idle = lru.filter { (lastHit[$0] ?? 0) < cutoff }
+        guard !idle.isEmpty else { return 0 }
+        let gone = Set(idle)
+        lru.removeAll { gone.contains($0) }
+        for idx in idle {
+            blocks.removeValue(forKey: idx)
+            lastHit[idx] = nil
+        }
+        return idle.count
     }
 
     func clear() {
         lock.lock()
         blocks.removeAll()
         lru.removeAll()
+        lastHit.removeAll()
         lock.unlock()
     }
 
