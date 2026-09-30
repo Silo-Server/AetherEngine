@@ -10,45 +10,21 @@
 import XCTest
 @testable import AetherEngine
 
-private final class Issue377FoldLogTap: @unchecked Sendable {
-    private let lock = NSLock()
-    private var lines: [String] = []
-    private let previous: ((String) -> Void)?
-
-    init() {
-        previous = EngineLog.handler
-        let sink = { [self] (line: String) in
-            lock.lock()
-            lines.append(line)
-            lock.unlock()
-        }
-        EngineLog.handler = sink
-    }
-
-    func restore() { EngineLog.handler = previous }
-
-    func matching(_ needle: String) -> [String] {
-        lock.lock()
-        defer { lock.unlock() }
-        return lines.filter { $0.contains(needle) }
-    }
-}
-
 final class Issue377FoldWitnessTests: XCTestCase {
 
     private let source = URL(string: "https://proxy.example.dev/stream/abc?token=one")!
     private let target = URL(string: "https://nexus-097.cdn.example.st/file.mkv?sig=aaa")!
 
-    private var tap: Issue377FoldLogTap!
+    private var tap: EngineLogCapture!
 
     override func setUp() {
         super.setUp()
         OriginRequestBudget.shared.resetForTesting()
-        tap = Issue377FoldLogTap()
+        tap = EngineLogCapture()
     }
 
     override func tearDown() {
-        tap.restore()
+        tap.end()
         tap = nil
         OriginRequestBudget.shared.resetForTesting()
         super.tearDown()
