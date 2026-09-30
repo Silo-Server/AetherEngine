@@ -5,7 +5,7 @@ import AetherEngine
 
 /// Load a source through the audio-only path and play it, printing the synchronizer clock once a second. Smoke-tests FFmpeg decode -> AVSampleBufferAudioRenderer on macOS.
 func runAudio(url: URL, seconds playSeconds: Double) -> Int32 {
-    print("aetherctl audio: \(url.absoluteString) (play \(playSeconds)s)")
+    print(EngineLog.redacted("aetherctl audio: \(url.absoluteString) (play \(playSeconds)s)"))
     // Must use CFRunLoopRun, not a blocking semaphore: AetherEngine is @MainActor, so parking the main thread would deadlock the executor.
     let box = UncheckedBox<Int32?>(nil)
     Task { @MainActor in

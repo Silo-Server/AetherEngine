@@ -84,7 +84,7 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
 
     print("")
     print("=== SEEKTEST (issue #35 rapid-seek burst) ===")
-    print("  url=\(url.absoluteString) seeks=\(seeks) gapMs=\(gapMs) settle=\(settleSeconds)s")
+    print(EngineLog.redacted("  url=\(url.absoluteString) seeks=\(seeks) gapMs=\(gapMs) settle=\(settleSeconds)s"))
 
     let engine: AetherEngine
     do {

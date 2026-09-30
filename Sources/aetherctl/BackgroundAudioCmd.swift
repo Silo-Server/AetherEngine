@@ -9,7 +9,7 @@ import AetherEngine
 /// (the macOS stand-in for the iOS background lifecycle) and verify audio keeps advancing while video is
 /// dropped, then resumes on foreground return. Exercises the real runDemuxLoop background branch headless.
 func runBackgroundAudio(url: URL, fgSeconds: Double, bgSeconds: Double) -> Int32 {
-    print("aetherctl bgaudio: \(url.absoluteString) (fg=\(fgSeconds)s bg=\(bgSeconds)s)")
+    print(EngineLog.redacted("aetherctl bgaudio: \(url.absoluteString) (fg=\(fgSeconds)s bg=\(bgSeconds)s)"))
     // Must use CFRunLoopRun, not a blocking semaphore: AetherEngine is @MainActor, so parking the main thread
     // would deadlock the executor. The run loop also lets the host's time timer + Combine sinks fire.
     let box = UncheckedBox<Int32?>(nil)

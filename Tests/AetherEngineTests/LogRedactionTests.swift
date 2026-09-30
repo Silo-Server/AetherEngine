@@ -383,6 +383,14 @@ struct LogRedactionTests {
         #expect(LogRedaction.redact(line) == line)
     }
 
+    /// Audit OPS-106: aetherctl printed the source URL in its own banner, outside the funnel, so the
+    /// first line of a pasted transcript undid the redaction of every engine line below it.
+    @Test("a line a tool prints itself gets the funnel's redaction")
+    func redactedForATool() {
+        #expect(EngineLog.redacted("aetherctl probe: http://h:8080/live/john/S3cretPass/1.ts?api_key=\(token)")
+                == "aetherctl probe: http://h:8080/live/john/<redacted>/1.ts?api_key=<redacted>")
+    }
+
     /// The point of putting this in EngineLog rather than in each host: the handler a host installs
     /// must never see the raw token, whether or not that host scrubs its own log.
     @Test("the host handler receives the redacted line")

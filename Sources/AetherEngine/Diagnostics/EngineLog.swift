@@ -46,6 +46,13 @@ public enum EngineLog {
         LogRedaction.unregister(value)
     }
 
+    /// The line as `emit` would deliver it, with credentials stripped. For a tool or a host that prints
+    /// a line of its own next to the engine's, such as aetherctl's banners, so the line it composes does
+    /// not carry the token the engine's lines hide (audit OPS-106).
+    public static func redacted(_ line: String) -> String {
+        LogRedaction.redact(line)
+    }
+
     public static let subsystem: String = "de.superuser404.AetherEngine"
 
     private static let loggers: [Category: Logger] = {

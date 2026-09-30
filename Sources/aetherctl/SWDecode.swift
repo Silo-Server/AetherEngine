@@ -5,7 +5,7 @@ import AetherEngine
 
 func runSWDecode(url: URL, maxPackets: Int) -> Int32 {
     EngineLog.handler = { print($0) }
-    print("aetherctl swdecode: \(url.absoluteString) (maxPackets=\(maxPackets))")
+    print(EngineLog.redacted("aetherctl swdecode: \(url.absoluteString) (maxPackets=\(maxPackets))"))
     print("")
 
     let result: SoftwareDecodeProbeResult
