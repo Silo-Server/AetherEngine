@@ -1540,6 +1540,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 category: .session
             )
         }
+        // Audit BIT-104: one framing verdict for the session, seeded only by a measurement (#365).
+        // The extradata-derived framing is a claim, not a measurement.
+        var framingMeasuredLengthPrefixed = false
+        if case .lengthPrefixed? = measuredVideoNALFraming { framingMeasuredLengthPrefixed = true }
         let videoConfig = HLSSegmentProducer.StreamConfig(
             codecpar: UnsafePointer(ownedVideoParams.ptr),
             timeBase: videoTimeBase,
@@ -1548,7 +1552,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             convertP7ToProfile81: convertP7ToProfile81,
             colorOverride: p5ColorOverride,
             extradataOverride: hevcExtradataOverride,
-            nalFramingOverride: measuredVideoNALFraming
+            nalFramingOverride: measuredVideoNALFraming,
+            nalFramingLatch: NALFramingLatch(confirmed: framingMeasuredLengthPrefixed)
         )
         self.videoStreamIndex = videoIndex
         self.savedVideoConfig = videoConfig
