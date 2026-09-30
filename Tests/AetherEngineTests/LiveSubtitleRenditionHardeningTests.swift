@@ -151,8 +151,12 @@ struct LiveSubtitleRenditionHardeningTests {
         short form
         """)))
         #expect(parsed.cues.count == 2)
-        #expect(abs(parsed.cues[0].start - (164 * 3600 + 4 * 60 + 24)) < 0.001)
-        #expect(abs(parsed.cues[1].start - 62.5) < 0.001)
+        // Typed apart: Swift 6.2 cannot type-check the literal sum inside the macro in time.
+        let longClock: Double = 164 * 3600 + 4 * 60 + 24
+        let longClockError: Double = abs(parsed.cues[0].start - longClock)
+        let shortFormError: Double = abs(parsed.cues[1].start - 62.5)
+        #expect(longClockError < 0.001)
+        #expect(shortFormError < 0.001)
     }
 
     @Test("a segment holds at most 4096 cues")
