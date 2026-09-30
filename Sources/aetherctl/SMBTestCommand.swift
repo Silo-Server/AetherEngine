@@ -23,6 +23,20 @@ private func smbTestRun(_ args: [String]) async -> Int32 {
         let total = reader.seek(offset: 0, whence: 65536) // AVSEEK_SIZE
         print("connected: \(u.path) size=\(total) bytes")
 
+        // The random-seek offsets are drawn first so the sequential pass can record the bytes that
+        // belong at each of them: the seeked reads are then compared against what the file holds, not
+        // against a second read of the same path (audit OPS-105).
+        struct Probe { let offset: Int64; let length: Int; var reference: [UInt8] }
+        var rng = SystemRandomNumberGenerator()
+        var probes: [Probe] = []
+        if total > 0 {
+            for _ in 0..<randomReads {
+                let off = Int64.random(in: 0..<max(1, total - 16), using: &rng)
+                let length = Int(min(16, total - off))
+                probes.append(Probe(offset: off, length: length, reference: [UInt8](repeating: 0, count: length)))
+            }
+        }
+
         let chunk = 1 << 20 // 1 MiB sequential read
         var buf = [UInt8](repeating: 0, count: chunk)
         var readBytes: Int64 = 0
@@ -31,7 +45,16 @@ private func smbTestRun(_ args: [String]) async -> Int32 {
         while true {
             let n = buf.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: Int32(chunk)) }
             if n <= 0 { break }
-            readBytes += Int64(n)
+            let chunkEnd = readBytes + Int64(n)
+            for i in probes.indices {
+                let lo = max(probes[i].offset, readBytes)
+                let hi = min(probes[i].offset + Int64(probes[i].length), chunkEnd)
+                guard lo < hi else { continue }
+                for position in lo..<hi {
+                    probes[i].reference[Int(position - probes[i].offset)] = buf[Int(position - readBytes)]
+                }
+            }
+            readBytes = chunkEnd
         }
         let seqElapsed = ProcessInfo.processInfo.systemUptime - seqStart
         let mibps = seqElapsed > 0 ? Double(readBytes) / 1_048_576.0 / seqElapsed : 0
@@ -42,18 +65,23 @@ private func smbTestRun(_ args: [String]) async -> Int32 {
             return 1
         }
 
-        // Random-seek correctness: two reads at each random offset must agree (deterministic content).
-        var rng = SystemRandomNumberGenerator()
-        for _ in 0..<randomReads {
-            let off = Int64.random(in: 0..<max(1, total - 16), using: &rng)
-            let a = smbReadAt(reader, off, 16)
-            let b = smbReadAt(reader, off, 16)
-            if a != b {
-                print("FAIL: random reads at \(off) disagree")
-                return 1
+        // Random-seek correctness: each seeked read must come back whole and equal to the bytes the
+        // sequential pass saw at that offset. A failed read is 0 or -1 bytes, which used to compare
+        // equal to another failed read.
+        for probe in probes {
+            for attempt in 1...2 {
+                let got = smbReadAt(reader, probe.offset, probe.length)
+                guard got.count == probe.length else {
+                    print("FAIL: random read \(attempt) at \(probe.offset) returned \(got.count) of \(probe.length) bytes")
+                    return 1
+                }
+                guard [UInt8](got) == probe.reference else {
+                    print("FAIL: random read \(attempt) at \(probe.offset) differs from the sequential pass")
+                    return 1
+                }
             }
         }
-        print("random-seek: \(randomReads) offsets consistent")
+        print("random-seek: \(probes.count) offsets match the sequential pass")
 
         reader.close()
         let wall = ProcessInfo.processInfo.systemUptime - started
@@ -65,11 +93,18 @@ private func smbTestRun(_ args: [String]) async -> Int32 {
     }
 }
 
+/// Reads until `length` bytes arrived, so a legitimate short read is not taken for a failure; a read that
+/// returns 0 (EOF) or -1 (error) ends it short, and the caller sees the shortfall.
 private func smbReadAt(_ reader: SMBIOReader, _ offset: Int64, _ length: Int) -> Data {
     _ = reader.seek(offset: offset, whence: Int32(SEEK_SET))
+    var out = Data()
     var buf = [UInt8](repeating: 0, count: length)
-    let n = buf.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: Int32(length)) }
-    return Data(buf.prefix(Int(max(n, 0))))
+    while out.count < length {
+        let n = buf.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: Int32(length - out.count)) }
+        if n <= 0 { break }
+        out.append(contentsOf: buf.prefix(Int(n)))
+    }
+    return out
 }
 
 private func smbParseIntFlag(_ args: [String], _ flag: String) -> Int? {

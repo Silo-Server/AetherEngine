@@ -46,6 +46,10 @@ protocol LiveIngestSourceInfo: AnyObject, Sendable {
     /// flows, like `companionAudioReader`, so it is final once the load reads it.
     var subtitleRenditions: [LiveSubtitleRenditionInfo] { get }
 
+    /// The URL the host gave the reader's headers for. A sibling rendition fetch sends the credential
+    /// headers only to this origin, like the reader's own fetches (audit Vcred-101).
+    var credentialOrigin: URL { get }
+
     /// EXT-X-PROGRAM-DATE-TIME of the segment this reader joined at, nil when the upstream carries no
     /// PDT. Together with the engine's clock at session start this is the wall-to-player mapping a
     /// sibling rendition needs (AE#359).

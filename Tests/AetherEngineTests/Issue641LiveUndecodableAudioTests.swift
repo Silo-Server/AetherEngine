@@ -101,11 +101,34 @@ struct Issue641LiveUndecodableAudioTests {
         #expect(calls.all.isEmpty)
     }
 
-    @Test("the session's own rebuild keeps the stream marked, a host load starts clean")
+    @Test("the session's own rebuild keeps every marked stream, a host load starts clean")
     func markSurvivesOnlyTheSessionsOwnRebuild() {
-        #expect(AetherEngine.undecodableAudioStreamIndexAcrossLoad(1, sessionPreservingReload: true) == 1)
-        #expect(AetherEngine.undecodableAudioStreamIndexAcrossLoad(1, sessionPreservingReload: false) == nil)
-        #expect(AetherEngine.undecodableAudioStreamIndexAcrossLoad(nil, sessionPreservingReload: true) == nil)
+        #expect(AetherEngine.undecodableAudioStreamIndicesAcrossLoad([1, 2], sessionPreservingReload: true) == [1, 2])
+        #expect(AetherEngine.undecodableAudioStreamIndicesAcrossLoad([1, 2], sessionPreservingReload: false).isEmpty)
+        #expect(AetherEngine.undecodableAudioStreamIndicesAcrossLoad([], sessionPreservingReload: true).isEmpty)
+    }
+
+    /// Audit FEA-103: the mark was a single slot, so a second undecodable stream was refused silently
+    /// and its pick left the session serving a bridge that never carries a sample.
+    @Test("a second undecodable stream is marked as well, and a repeat report changes nothing")
+    @MainActor
+    func secondUndecodableStreamIsMarked() async throws {
+        let engine = try AetherEngine()
+        await engine.dropUndecodableLiveAudio(streamIndex: 1, bridgeSummary: "fed=64 decoded=0")
+        #expect(engine.undecodableLiveAudioStreamIndices == [1])
+        await engine.dropUndecodableLiveAudio(streamIndex: 2, bridgeSummary: "fed=64 decoded=0")
+        #expect(engine.undecodableLiveAudioStreamIndices == [1, 2])
+        await engine.dropUndecodableLiveAudio(streamIndex: 2, bridgeSummary: "fed=128 decoded=0")
+        #expect(engine.undecodableLiveAudioStreamIndices == [1, 2])
+    }
+
+    @Test("the cascade skips every marked stream and only those")
+    func cascadeSkipsEveryMarkedStream() {
+        #expect(HLSVideoEngine.isKnownUndecodable([1, 2], sourceAudioStreamIndex: 1))
+        #expect(HLSVideoEngine.isKnownUndecodable([1, 2], sourceAudioStreamIndex: 2))
+        #expect(!HLSVideoEngine.isKnownUndecodable([1, 2], sourceAudioStreamIndex: 3))
+        #expect(!HLSVideoEngine.isKnownUndecodable([], sourceAudioStreamIndex: 1))
+        #expect(!HLSVideoEngine.isKnownUndecodable([0], sourceAudioStreamIndex: -1))
     }
 
     // MARK: - Where the verdict goes

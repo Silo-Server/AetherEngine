@@ -127,7 +127,7 @@ func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liv
         print("[aetherctl] audio switch: selectAudioTrack(index: \(audioSwitch.index)) "
               + "\(audioSwitch.delayMilliseconds) ms after the load returns")
     }
-    print("aetherctl play: \(url.absoluteString) (seconds=\(seconds) live=\(live) nativeHLS=\(nativeHLS) liveIngest=\(liveIngest) dvrWindow=\(dvrWindow.map { String($0) } ?? "nil") subs=\(subsPick ?? "off") hostCalls=\(hostCalls.isEmpty ? "none" : hostCalls.joined(separator: "+")) audioStats=\(audioStats) seekEvery=\(seekEvery.map { String($0) } ?? "off") seekCount=\(seekCount.map { String($0) } ?? "unbounded") seekPattern=\(seekPattern.isEmpty ? "off" : seekPattern.map { String($0) }.joined(separator: "/")) startPosition=\(startPosition.map { String($0) } ?? "0"))")
+    print(EngineLog.redacted("aetherctl play: \(url.absoluteString) (seconds=\(seconds) live=\(live) nativeHLS=\(nativeHLS) liveIngest=\(liveIngest) dvrWindow=\(dvrWindow.map { String($0) } ?? "nil") subs=\(subsPick ?? "off") hostCalls=\(hostCalls.isEmpty ? "none" : hostCalls.joined(separator: "+")) audioStats=\(audioStats) seekEvery=\(seekEvery.map { String($0) } ?? "off") seekCount=\(seekCount.map { String($0) } ?? "unbounded") seekPattern=\(seekPattern.isEmpty ? "off" : seekPattern.map { String($0) }.joined(separator: "/")) startPosition=\(startPosition.map { String($0) } ?? "0"))"))
     print("")
     // CFRunLoopRun, not a blocking semaphore: AetherEngine is @MainActor, so parking the main thread would deadlock the executor.
     let box = UncheckedBox<Int32?>(nil)
@@ -759,7 +759,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
     for (delay, group) in Dictionary(grouping: audioDelaySwitches, by: \.delayMilliseconds)
         .sorted(by: { $0.key < $1.key }) {
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: UInt64(max(0, delay)) * 1_000_000)
+            try? await Task.sleep(nanoseconds: sleepNanoseconds(milliseconds: delay))
             for audioDelaySwitch in group {
                 print("  HOSTCALL setAudioDelay(\(audioDelaySwitch.milliseconds) ms) at "
                       + "+\(delay) ms "
@@ -772,7 +772,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
 
     if let teletextSwitch {
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: UInt64(max(0, teletextSwitch.delayMilliseconds)) * 1_000_000)
+            try? await Task.sleep(nanoseconds: sleepNanoseconds(milliseconds: teletextSwitch.delayMilliseconds))
             let target = teletextSwitch.page.map(String.init) ?? "auto"
             print("  HOSTCALL setTeletextPage(\(target)) at +\(teletextSwitch.delayMilliseconds) ms "
                   + "(was \(engine.teletextPage.map(String.init) ?? "auto"))")
@@ -786,7 +786,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
     // exactly the pair a host's recovery ladder has to tell apart.
     if let optionCorrection {
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: UInt64(max(0, optionCorrection.delayMilliseconds)) * 1_000_000)
+            try? await Task.sleep(nanoseconds: sleepNanoseconds(milliseconds: optionCorrection.delayMilliseconds))
             let labels = optionCorrection.changes.map(\.label).joined(separator: ", ")
             let before = engine.currentTime
             print("  HOSTCALL reloadAtCurrentPosition(applying: \(labels)) at +\(optionCorrection.delayMilliseconds) ms "
@@ -825,7 +825,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
     if let audioSwitch {
         let mon = monitor
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: UInt64(max(0, audioSwitch.delayMilliseconds)) * 1_000_000)
+            try? await Task.sleep(nanoseconds: sleepNanoseconds(milliseconds: audioSwitch.delayMilliseconds))
             print("  HOSTCALL selectAudioTrack(index: \(audioSwitch.index)) "
                   + "at +\(audioSwitch.delayMilliseconds) ms (was \(engine.activeAudioTrackIndex.map(String.init) ?? "none"))")
             engine.selectAudioTrack(index: audioSwitch.index)

@@ -253,6 +253,13 @@ enum RemoteHLSStreamDescription {
 
     /// The published list: one entry per audio track AVPlayer built, ids from `audioTrackIDBase` in item
     /// order, the enabled one as the active index. Named the way the probe path names an untitled track.
+    /// A parsed `mSampleRate` as a whole number, 0 when it cannot be one (audit NAT-106). A QuickTime
+    /// SoundDescriptionV2 carries the rate as a Float64 verbatim, so on the bypass the origin controls
+    /// it, and `Int(_:)` traps on NaN, infinity and anything past `Int`.
+    static func wholeSampleRate(_ rate: Double) -> Int {
+        rate.isFinite && rate >= 0 && rate < 1e9 ? Int(rate) : 0
+    }
+
     static func audioTracks(_ readings: [AudioReading]) -> (tracks: [TrackInfo], activeID: Int?) {
         var tracks: [TrackInfo] = []
         var activeID: Int?
@@ -267,7 +274,7 @@ enum RemoteHLSStreamDescription {
             tracks.append(TrackInfo(
                 id: id, name: name, codec: codec.name, language: language,
                 channels: reading.channels, isDefault: reading.isEnabled, isAtmos: reading.carriesJOC,
-                sampleRate: reading.sampleRate.isFinite ? Int(reading.sampleRate) : 0,
+                sampleRate: wholeSampleRate(reading.sampleRate),
                 bitsPerSample: reading.bitsPerChannel, profile: profile))
             if reading.isEnabled, activeID == nil { activeID = id }
         }

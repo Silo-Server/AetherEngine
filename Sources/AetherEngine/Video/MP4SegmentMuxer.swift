@@ -72,6 +72,8 @@ final class MP4SegmentMuxer {
         /// has numOfArrays=0 (in-band parameter sets) and the engine rebuilt a proper hvcC with
         /// VPS/SPS/PPS arrays; the mp4 muxer writes extradata directly into the hvcC/avcC box.
         let extradataOverride: [UInt8]?
+        /// The session's framing verdict for this track (audit BIT-104); nil gives the muxer its own.
+        let nalFramingLatch: NALFramingLatch?
 
         init(
             codecpar: UnsafePointer<AVCodecParameters>,
@@ -79,7 +81,8 @@ final class MP4SegmentMuxer {
             codecTagOverride: String?,
             doviConfig: DoviConfigPolicy = .keep,
             colorOverride: ColorOverride? = nil,
-            extradataOverride: [UInt8]? = nil
+            extradataOverride: [UInt8]? = nil,
+            nalFramingLatch: NALFramingLatch? = nil
         ) {
             self.codecpar = codecpar
             self.timeBase = timeBase
@@ -87,6 +90,7 @@ final class MP4SegmentMuxer {
             self.doviConfig = doviConfig
             self.colorOverride = colorOverride
             self.extradataOverride = extradataOverride
+            self.nalFramingLatch = nalFramingLatch
         }
     }
 
@@ -173,17 +177,19 @@ final class MP4SegmentMuxer {
     static let nalChainSanitizerDisabled =
         ProcessInfo.processInfo.environment["AETHER_DISABLE_NAL_SANITIZER"] != nil
     /// How many video samples the AE#561 sanitizer has had to cut, over this muxer's life.
-    private var truncatedVideoSamples: Int = 0
+    private(set) var truncatedVideoSamples: Int = 0
     /// Audit BIT-1: a video sample of this track walked exactly as a length-prefixed chain, so a
-    /// `00 00 01` head is a 256-511 byte length from here on, not an Annex B start code.
-    private var videoNALFramingConfirmed = false
+    /// `00 00 01` head is a 256-511 byte length from here on, not an Annex B start code. The
+    /// session's latch when it passed one (audit BIT-104), so a rebuilt muxer keeps the verdict.
+    private let videoNALFraming: NALFramingLatch
 
     private func sanitizerCut(_ bytes: UnsafeRawBufferPointer, lengthPrefixSize: Int) -> Int? {
+        let confirmed = videoNALFraming.isConfirmed
         let cut = NALUnitChain.completeRunLength(
-            bytes, lengthPrefixSize: lengthPrefixSize, framingConfirmed: videoNALFramingConfirmed)
-        if cut == nil, !videoNALFramingConfirmed,
+            bytes, lengthPrefixSize: lengthPrefixSize, framingConfirmed: confirmed)
+        if cut == nil, !confirmed,
            NALUnitChain.walksExactly(bytes, lengthPrefixSize: lengthPrefixSize) {
-            videoNALFramingConfirmed = true
+            videoNALFraming.confirm()
         }
         return cut
     }
@@ -263,6 +269,7 @@ final class MP4SegmentMuxer {
         self.audioDelaySeconds = audioDelaySeconds
         self.audioNeedsParsedPacketForMoov =
             audio.map { Self.audioNeedsParsedPacketForMoov($0.codecpar.pointee.codec_id) } ?? false
+        self.videoNALFraming = video.nalFramingLatch ?? NALFramingLatch()
         // AE#561: the override, when there is one, is the record that reaches the sample entry. Both
         // carry the same width (the #19 rebuild keeps the source header's first 22 bytes), so this
         // only matters for a source whose own extradata is missing or Annex B.
@@ -421,7 +428,8 @@ final class MP4SegmentMuxer {
     /// (a DTS reset) never triggers; boundTicks <= 0 disables the bound.
     static func bufferedTicksExceedsBound(firstDts: Int64, currentDts: Int64, boundTicks: Int64) -> Bool {
         guard boundTicks > 0, firstDts != Int64.min, currentDts >= firstDts else { return false }
-        return (currentDts - firstDts) >= boundTicks
+        let (span, overflow) = currentDts.subtractingReportingOverflow(firstDts)
+        return overflow || span >= boundTicks
     }
 
     // MARK: - Diagnostic probes
@@ -598,11 +606,14 @@ final class MP4SegmentMuxer {
             if packet.pointee.dts != Int64.min { packet.pointee.dts &+= audioDelayTicks }
         }
 
-        let clean = timestampSanitizer.sanitize(
+        guard let clean = timestampSanitizer.sanitize(
             streamIndex: packet.pointee.stream_index,
             pts: packet.pointee.pts,
             dts: packet.pointee.dts
-        )
+        ) else {
+            av_packet_unref(packet)
+            return (0, .none)
+        }
         packet.pointee.pts = clean.pts
         packet.pointee.dts = clean.dts
 

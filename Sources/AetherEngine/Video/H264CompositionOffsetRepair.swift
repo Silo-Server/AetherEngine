@@ -195,7 +195,8 @@ enum H264CompositionOffsetRepair {
         decodeLead: Int64
     ) -> Int64 {
         guard streamStartTime != Int64.min, ladderStart != Int64.min, decodeLead > 0 else { return 0 }
-        let raw = streamStartTime - ladderStart
+        let (raw, overflow) = streamStartTime.subtractingReportingOverflow(ladderStart)
+        guard !overflow else { return 0 }
         return min(max(raw, 0), decodeLead)
     }
 
@@ -463,7 +464,14 @@ enum H264CompositionOffsetRepair {
                     return nil
                 }
                 let landingIndex = pictureOrderCount / plan.pocStep
-                sequenceAnchorDTS = dts - landingIndex * plan.step
+                // Audit BIT-101: a 64-bit `tfdt` step and a landing order near -2^31 leave Int64.
+                let (landingTicks, productOverflow) = landingIndex.multipliedReportingOverflow(by: plan.step)
+                let (anchor, anchorOverflow) = dts.subtractingReportingOverflow(landingTicks)
+                guard !productOverflow, !anchorOverflow else {
+                    unrepairedPictures += 1
+                    return nil
+                }
+                sequenceAnchorDTS = anchor
                 sequenceBaseOrdinal = plan.presentationOrdinal(ladderTimestamp: dts)
                     .flatMap { ordinal -> Int64? in
                         let (base, overflow) = ordinal.subtractingReportingOverflow(landingIndex)

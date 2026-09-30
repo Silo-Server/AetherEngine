@@ -177,6 +177,29 @@ struct H264CompositionOffsetRepairTests {
         #expect(landingDTS == 498498)
     }
 
+    /// Audit BIT-101: in fragmented MP4 the step comes from `tfdt` (64-bit) and a landing picture
+    /// order can sit near -2^31 through `delta_pic_order_cnt_bottom`, so the re-anchor product
+    /// leaves Int64. The picture stays unrepaired and the next keyframe gets another chance.
+    @Test("a re-anchor whose arithmetic leaves Int64 is refused, not trapped on")
+    func reanchorOverflowIsRefused() {
+        var rewriter = H264CompositionOffsetRepair.Rewriter(
+            plan: H264CompositionOffsetRepair.Plan(step: 1 << 34, decodeLead: 1 << 35, shift: 0, pocStep: 2))
+        rewriter.noteSeek()
+        #expect(rewriter.rewrite(dts: 1 << 40, pictureOrderCount: -2_147_482_646, isKeyframe: true) == nil)
+        #expect(rewriter.unrepairedPictures == 1)
+        #expect(rewriter.sequenceAnchorDTS == nil)
+        let landing = rewriter.rewrite(dts: 1 << 40, pictureOrderCount: 0, isKeyframe: true)
+        #expect(landing?.pts == 1 << 40)
+    }
+
+    @Test("a presentation shift between opposite ends of Int64 falls back to no shift")
+    func presentationShiftOverflow() {
+        #expect(H264CompositionOffsetRepair.presentationShift(
+            streamStartTime: Int64.max - 1, ladderStart: -(Int64.max - 1), decodeLead: 2002) == 0)
+        #expect(H264CompositionOffsetRepair.presentationShift(
+            streamStartTime: -(Int64.max - 1), ladderStart: Int64.max - 1, decodeLead: 2002) == 0)
+    }
+
     @Test("without an anchor a picture is emitted untouched rather than guessed at")
     func passesThroughWithoutAnchor() {
         var rewriter = H264CompositionOffsetRepair.Rewriter(plan: plan)

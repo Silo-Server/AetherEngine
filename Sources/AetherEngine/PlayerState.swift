@@ -528,7 +528,7 @@ public struct LoadOptions: Sendable, Equatable {
     /// Lean audio-only path (FFmpeg + AVSampleBufferAudioRenderer): skips video probe, display-criteria handshake, HLS/muxer/loopback stack. Also set automatically when the probe finds no video stream. Default `false`.
     public var audioOnly: Bool
 
-    /// DVR rewind window in seconds; nil = live-only (seek is a no-op). Engine retains roughly this much past content disk-backed. Suggested default: 1800. Ignored when `isLive == false`. Default nil.
+    /// DVR rewind window in seconds; nil = live-only (seek is a no-op). Engine retains roughly this much past content disk-backed, bounded by the session disk budget (a quarter of the free space, at most 2 GiB), so a long window on a high-bitrate channel or a small volume holds less than it asks for. Suggested default: 1800. Ignored when `isLive == false`. Default nil.
     public var dvrWindowSeconds: Double?
 
     /// LL-HLS blocking-reload (`#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD`) override for live loopback sessions.

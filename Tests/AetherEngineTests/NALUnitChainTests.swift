@@ -140,4 +140,66 @@ struct NALUnitChainTests {
     }
 
     private enum Codec { case hevc, h264, av1 }
+
+    // MARK: - The verdict outlives the muxer (audit BIT-104)
+
+    /// Audit BIT-104: every seek, restart and reload builds a fresh muxer, and the sample a restart
+    /// lands on is that muxer's first. With the BIT-1 verdict held per muxer, exactly that sample was
+    /// judged by the head test alone, so a damaged IRAP with a 256-511 byte first NAL reached movenc
+    /// uncut on every retry of the restart.
+    @Test("A muxer rebuilt mid-session inherits the track's confirmed framing")
+    func rebuiltMuxerInheritsConfirmedFraming() throws {
+        let data = try #require(Data(base64Encoded: AtmosDetectionProbeIntegrationTests.videoOnlyBase64,
+                                     options: .ignoreUnknownCharacters))
+        let demuxer = Demuxer()
+        try demuxer.open(reader: DataIOReader(data: data), formatHint: "mp4")
+        defer { demuxer.close() }
+        let stream = try #require(demuxer.stream(at: demuxer.videoStreamIndex))
+        let sessionDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("bit104-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: sessionDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sessionDir) }
+
+        func makeMuxer(_ index: Int, latch: NALFramingLatch?) throws -> MP4SegmentMuxer {
+            try MP4SegmentMuxer(
+                initialSegmentIndex: index, sessionDir: sessionDir,
+                video: .init(codecpar: UnsafePointer(stream.pointee.codecpar),
+                             timeBase: stream.pointee.time_base, codecTagOverride: nil,
+                             nalFramingLatch: latch),
+                audio: nil, onInitCaptured: { _ in })
+        }
+        func write(_ bytes: [UInt8], to muxer: MP4SegmentMuxer) throws {
+            var packet: UnsafeMutablePointer<AVPacket>? = try #require(trackedPacketAlloc())
+            defer { trackedPacketFree(&packet) }
+            let pkt = packet!
+            #expect(av_new_packet(pkt, Int32(bytes.count)) >= 0)
+            bytes.withUnsafeBytes { _ = memcpy(pkt.pointee.data, $0.baseAddress, bytes.count) }
+            pkt.pointee.pts = 0
+            pkt.pointee.dts = 0
+            pkt.pointee.duration = 512
+            pkt.pointee.flags |= AV_PKT_FLAG_KEY
+            pkt.pointee.stream_index = muxer.videoOutputStreamIndex
+            _ = muxer.writePacket(pkt)
+        }
+
+        // What the restart lands on: a first NAL whose 4-byte length reads `00 00 01 40`, then a
+        // length far past the end of the sample.
+        let first = Self.nal([0x65, 0x88] + [UInt8](repeating: 0x5A, count: 318))
+        #expect(Array(first.prefix(4)) == [0x00, 0x00, 0x01, 0x40])
+        let damaged = first + [0x16, 0xE5, 0x7A, 0xB3] + [UInt8](repeating: 0x5A, count: 96)
+
+        let session = NALFramingLatch()
+        let earlier = try makeMuxer(0, latch: session)
+        try write(Self.nal([0x65, 0x88, 0x84, 0x00]), to: earlier)   // walks exactly
+        #expect(session.isConfirmed)
+
+        let rebuilt = try makeMuxer(7, latch: session)
+        try write(damaged, to: rebuilt)
+        #expect(rebuilt.truncatedVideoSamples == 1, "the rebuilt muxer passed the overrun through uncut")
+
+        // A track nobody has confirmed keeps the Annex B head guard.
+        let unconfirmed = try makeMuxer(7, latch: nil)
+        try write(damaged, to: unconfirmed)
+        #expect(unconfirmed.truncatedVideoSamples == 0)
+    }
 }

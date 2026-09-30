@@ -3,11 +3,13 @@ import AetherEngine
 
 // MARK: - dovitest
 
-/// Validate DoviRpuConverter.convertPacketToProfile81 against dovi_tool ground truth. Walks the HEVC stream, converts DV P7 -> P8.1, writes Annex-B to aetherctl-dovitest.hevc in the run's private temporary directory.
-func runDoviTest(url: URL) -> Int32 {
-    let outputPath = debugOutputPath("aetherctl-dovitest.hevc")
-    let rpuPath = debugOutputPath("host.rpu")
-    print("aetherctl dovitest: \(url.absoluteString)")
+/// Validate DoviRpuConverter.convertPacketToProfile81 against dovi_tool ground truth. Walks the HEVC stream, converts DV P7 -> P8.1, writes Annex-B to `outputPath`, by default aetherctl-dovitest.hevc in the per-user private temporary directory (overwritten by the next run).
+func runDoviTest(url: URL, outputPath: String? = nil) -> Int32 {
+    let outputPath = outputPath ?? debugOutputPath("aetherctl-dovitest.hevc")
+    let rpuPath = outputPath.hasSuffix(".hevc")
+        ? String(outputPath.dropLast(".hevc".count)) + ".rpu"
+        : outputPath + ".rpu"
+    print(EngineLog.redacted("aetherctl dovitest: \(url.absoluteString)"))
     print("output: \(outputPath)")
     print("")
 

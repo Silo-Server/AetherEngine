@@ -94,6 +94,41 @@ struct HLSLocalServerSlowPeerTests {
         #expect(tap.matching("[HLSLocalServer] stop: port 0 released").isEmpty)
     }
 
+    /// Audit NET-111: every tokenless request cost the host's log two unthrottled lines, so a LAN
+    /// peer looping short connections could scroll a 300-line ring in a fraction of a second.
+    @Test("A flood of tokenless requests costs the log a handful of lines")
+    func tokenlessFloodIsThrottled() async throws {
+        let tap = LineTap()
+        defer { tap.restore() }
+        let server = HLSLocalServer(provider: StubProvider())
+        try server.start()
+        defer { server.stop() }
+        let marker = "flood-\(UUID().uuidString)"
+        let port = server.port
+
+        let answered = await Self.onOwnThread { () -> Int in
+            var answered = 0
+            for _ in 0 ..< 1000 {
+                guard let fd = Self.connect(port: port, host: "127.0.0.1") else { continue }
+                if Self.requestStatus(fd: fd, path: "/\(marker)/media.m3u8") == 404 { answered += 1 }
+                close(fd)
+            }
+            return answered
+        }
+        #expect(answered == 1000)
+        #expect(tap.matching(marker).count <= 3, "\(tap.matching(marker).count) lines for 1000 requests")
+    }
+
+    @Test("Attacker text is logged with its control characters escaped")
+    func controlCharactersAreEscaped() {
+        #expect(HLSLocalServer.escapedForLog("GET /x\n[HLSLocalServer] GET /forged HTTP/1.1")
+                == "GET /x\\x0A[HLSLocalServer] GET /forged HTTP/1.1")
+        #expect(HLSLocalServer.escapedForLog("a\u{7F}b\tc\u{0}") == "a\\x7Fb\\x09c\\x00")
+        #expect(HLSLocalServer.escapedForLog("GET /seg_1.m4s HTTP/1.1") == "GET /seg_1.m4s HTTP/1.1")
+        #expect(HLSLocalServer.escapedForLog(String(repeating: "a", count: 300), limit: 256)
+                == String(repeating: "a", count: 256) + "...")
+    }
+
     @Test("A repeating failure line goes out once per interval with a tally of the rest")
     func throttleCountsWhatItHeldBack() {
         var throttle = LogThrottle(interval: 5)

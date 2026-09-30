@@ -68,20 +68,9 @@ final class SegmentCache: @unchecked Sendable {
 
     let sessionDir: URL
 
-    /// AE#451: an flock(2) held on `sessionDir/session.lock` for as long as this cache lives.
-    /// This is the liveness half of the stale-session sweep: the age check alone cannot tell a
-    /// session an hour into a film from one that crashed an hour ago, because the directory's
-    /// creation date IS the session's start time.
-    ///
-    /// flock and not fcntl: flock locks belong to the open file description, so a second cache in
-    /// the SAME process fails to take it too, which is the case the report is about. fcntl locks
-    /// are per-process and a process never blocks itself.
-    ///
-    /// The kernel drops it when the process dies, so a crashed session leaves an unheld marker and
-    /// sweeps exactly as before. -1 means unheld (open or flock failed); such a session is swept
-    /// like today's, which is the pre-AE#451 behaviour rather than a new failure.
+    /// AE#451: the `SessionDirectoryLiveness` marker held for as long as this cache lives. -1 means
+    /// unheld (open or flock failed); such a session is swept by age like before AE#451.
     private var lockFD: Int32 = -1
-    private static let liveMarkerName = "session.lock"
 
     private var _totalBytes: Int = 0
 
@@ -149,20 +138,7 @@ final class SegmentCache: @unchecked Sendable {
     }
 
     private static func acquireLiveMarker(sessionDir: URL) -> Int32 {
-        let path = sessionDir.appendingPathComponent(liveMarkerName).path
-        let fd = open(path, O_CREAT | O_RDWR, 0o600)
-        guard fd >= 0 else {
-            EngineLog.emit("[SegmentCache] live marker open failed at \(path): errno=\(errno)",
-                           category: .session)
-            return -1
-        }
-        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
-            EngineLog.emit("[SegmentCache] live marker lock failed at \(path): errno=\(errno)",
-                           category: .session)
-            Darwin.close(fd)
-            return -1
-        }
-        return fd
+        SessionDirectoryLiveness.acquire(sessionDir: sessionDir, logPrefix: "[SegmentCache]")
     }
 
     private func releaseLiveMarker() {
@@ -171,20 +147,6 @@ final class SegmentCache: @unchecked Sendable {
         lockFD = -1
         condition.unlock()
         if fd >= 0 { Darwin.close(fd) }
-    }
-
-    /// Whether some open file description still holds `entry`'s marker. A missing marker answers
-    /// false: it is a directory from a build without one, and the age check decides it as before.
-    private static func isSessionDirLive(_ entry: URL) -> Bool {
-        let path = entry.appendingPathComponent(liveMarkerName).path
-        let fd = open(path, O_RDONLY)
-        guard fd >= 0 else { return false }
-        defer { Darwin.close(fd) }
-        if flock(fd, LOCK_EX | LOCK_NB) == 0 {
-            flock(fd, LOCK_UN)
-            return false
-        }
-        return true
     }
 
     private static func sweepStaleSessionDirs(baseDir: URL, currentSession: String) {
@@ -199,7 +161,7 @@ final class SegmentCache: @unchecked Sendable {
             let created = (try? entry.resourceValues(forKeys: [.creationDateKey]))?.creationDate
             guard created == nil || created! < cutoff else { continue }
             // AE#451: age says how long it has been there, not whether anyone is still using it.
-            if isSessionDirLive(entry) {
+            if SessionDirectoryLiveness.isLive(entry) {
                 EngineLog.emit("[SegmentCache] sweep spared live session dir \(entry.lastPathComponent)",
                                category: .session)
                 continue

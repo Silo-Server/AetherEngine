@@ -20,7 +20,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     private let httpHeaders: [String: String]
     /// The URL the host gave `httpHeaders` for. A companion inherits its parent's, since its own
     /// playlist URL is one the master named (audit NET-7).
-    private let credentialOrigin: URL
+    let credentialOrigin: URL
     private let role: Role
     private let fifo = ByteFIFO(capacity: 16 * 1024 * 1024)
     /// Wider than the VOD reader's 2 MB: a live window with hours of DVR at short segments is a
@@ -291,7 +291,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                     }
                     let backlog = fresh.reduce(0.0) { $0 + $1.duration }
                     EngineLog.emit(
-                        "[HLSIngest] joined \(fresh.count) segment(s), ~\(Int(backlog))s behind the live edge"
+                        "[HLSIngest] joined \(fresh.count) segment(s), ~\(String(format: "%.0f", backlog))s behind the live edge"
                         + " pdt=\(fresh.first?.programDateTime.map { "\($0)" } ?? "nil")",
                         category: .engine
                     )
@@ -394,7 +394,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         mediaURL: URL
     ) {
         group.addTask {
-            let fetched = try await self.fetchSegment(item.url)
+            let fetched = try await self.fetchSegment(item.url, duration: item.segment.duration)
             guard !fetched.isEmpty, let crypt = item.segment.crypt else { return (index, fetched) }
             return (index, try await self.decryptSegment(fetched, crypt: crypt, against: mediaURL))
         }
@@ -581,12 +581,19 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         return (try HLSPlaylistParser.parse(text), response.url ?? url)
     }
 
-    private func fetchSegment(_ url: URL) async throws -> Data {
+    private func fetchSegment(_ url: URL, duration: Double) async throws -> Data {
         var lastStatus = -1
+        let limit = BoundedFetch.segmentLimit(forDuration: duration)
         for attempt in 0..<3 {
             if Task.isCancelled { throw CancellationError() }
             do {
-                let (data, response) = try await session.data(for: makeRequest(url))
+                let (data, response): (Data, URLResponse)
+                do {
+                    (data, response) = try await BoundedFetch.data(for: makeRequest(url), session: session, limit: limit)
+                } catch is BoundedFetch.Exceeded {
+                    // Audit NET-112: an endless body is the origin's answer, not a blip to retry.
+                    throw HLSIngestError.playlistInvalid(reason: "segment exceeds \(limit) bytes")
+                }
                 lastStatus = (response as? HTTPURLResponse)?.statusCode ?? -1
                 if (200..<300).contains(lastStatus) { return data }
                 if lastStatus == 404 { return Data() } // slid out of provider window; tracker advances regardless
@@ -619,7 +626,14 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         let cacheKey = url.absoluteString
         if let cached = keyCacheLock.withLock({ keyCache[cacheKey] }) { return cached }
 
-        let (data, response) = try await session.data(for: makeRequest(url))
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await BoundedFetch.data(
+                for: makeRequest(url), session: session, limit: BoundedFetch.keyLimit)
+        } catch is BoundedFetch.Exceeded {
+            throw HLSIngestError.segmentDecryptFailed(reason: "key exceeds \(BoundedFetch.keyLimit) bytes")
+        }
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard (200..<300).contains(status) else {
             throw HLSIngestError.segmentDecryptFailed(reason: "key fetch HTTP \(status)")

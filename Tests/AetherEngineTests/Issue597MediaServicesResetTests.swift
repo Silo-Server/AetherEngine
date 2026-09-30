@@ -49,6 +49,44 @@ struct Issue597MediaServicesResetTests {
         #expect(!engine.consumeMediaServicesReset())
     }
 
+    /// Audit LIF-104: `reloadWithAudioOverride` (the audio pick, the disc-title pick, the custom-source
+    /// reload) keeps the native host on the native route, and it never read the flag, so the first
+    /// rebuild after a reset mounted the item on the invalidated AVPlayer while the flag stayed up.
+    @Test("a custom-source rebuild after a reset builds a fresh native player and consumes the reset",
+          .timeLimit(.minutes(2)))
+    @MainActor
+    func customRebuildConsumesTheReset() async throws {
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        _ = try await engine.load(
+            source: .custom(DataIOReader(data: try ProbeTestFixtures.hdr10Plus()), formatHint: "mp4"))
+        let invalidated = try #require(engine.nativeHost)
+        engine.audioAVPlayerHost = AudioAVPlayerHost()
+        engine.noteMediaServicesReset(lost: false)
+
+        try await engine.reloadAtCurrentPosition()
+
+        #expect(engine.nativeHost != nil)
+        #expect(engine.nativeHost !== invalidated)
+        #expect(engine.audioAVPlayerHost == nil)
+        #expect(!engine.consumeMediaServicesReset())
+    }
+
+    @Test("without a reset a custom-source rebuild keeps its native player (issue #15)",
+          .timeLimit(.minutes(2)))
+    @MainActor
+    func customRebuildKeepsTheHostWithoutAReset() async throws {
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        _ = try await engine.load(
+            source: .custom(DataIOReader(data: try ProbeTestFixtures.hdr10Plus()), formatHint: "mp4"))
+        let host = try #require(engine.nativeHost)
+
+        try await engine.reloadAtCurrentPosition()
+
+        #expect(engine.nativeHost === host)
+    }
+
     @Test("without a reset the audio-only player survives a load, as its Now Playing session must")
     @MainActor
     func audioOnlyPlayerSurvivesWithoutAReset() async throws {

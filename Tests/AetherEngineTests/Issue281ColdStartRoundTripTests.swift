@@ -300,7 +300,7 @@ struct Issue281ColdStartRoundTripTests {
     /// itself is still a second connection opened at the same instant as the data connection whose
     /// first byte IS the cold start, and paid again on every open, against a server that has already
     /// shown it cannot serve it.
-    @Test("an origin that declined a suffix range is not asked again")
+    @Test("an origin that declined a suffix range is not asked again", .timeLimit(.minutes(1)))
     func declinedSuffixRangesAreNotRetried() async throws {
         let declared: Int64 = 4 * 1024 * 1024 * 1024
         let server = try #require(ScriptedOriginServer { recorded in
@@ -317,9 +317,7 @@ struct Issue281ColdStartRoundTripTests {
 
         let first = AVIOReader(url: url)
         try first.open()
-        for _ in 0..<100 where SuffixRangeSupport.shared.denialReason(for: url) == nil {
-            try? await Task.sleep(nanoseconds: 20_000_000)
-        }
+        try await waitFor { SuffixRangeSupport.shared.denialReason(for: url) != nil }
         first.markClosed(); first.close()
 
         let reason = try #require(SuffixRangeSupport.shared.denialReason(for: url),

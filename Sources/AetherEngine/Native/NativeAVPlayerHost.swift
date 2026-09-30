@@ -643,6 +643,10 @@ final class NativeAVPlayerHost {
                         self.avPlayer.play()
                     }
                     if self.timeControlStatus == .playing {
+                        // Audit NAT-103: a carried `.playing` that never changes status on its way to
+                        // motion is this item's roll from here, as for the AE#440 one-shot.
+                        self.hasEverPlayed = true
+                        self.inPlaceSwapMountPending = false
                         self.startLiveJoinImmediatelyIfHolding(waitingReason: "-")
                     }
                     // #168: publish the item's real dynamic range for the probe-free remote-HLS badge.
@@ -701,7 +705,11 @@ final class NativeAVPlayerHost {
                 self.timeControlStatus = status
                 self.startLiveJoinImmediatelyIfHolding(waitingReason: reason)
                 // First .playing: re-sample route after 2.5s settle -- AVKit only negotiates HDMI format on playback start (issue #24).
-                if status == .playing {
+                // Audit NAT-103: an in-place swap reuses a player that is still `.playing`, and that status
+                // reaches the fresh item before it is ready. Taken as a roll it released the AE#629 hold
+                // before the mount seek landed and latched #50's "has played" for an item that had not.
+                if status == .playing,
+                   Self.playingIsThisItemsRoll(itemIsReadyToPlay: self.playerItem?.status == .readyToPlay) {
                     self.hasEverPlayed = true
                     self.inPlaceSwapMountPending = false
                 }
@@ -1292,7 +1300,7 @@ final class NativeAVPlayerHost {
     private func startLiveJoinImmediatelyIfHolding(waitingReason: String) {
         guard liveJoinStartsImmediately, !liveJoinImmediateStartSpent else { return }
         if timeControlStatus == .playing {
-            if Self.playingSpendsLiveJoinOneShot(itemIsReadyToPlay: playerItem?.status == .readyToPlay) {
+            if Self.playingIsThisItemsRoll(itemIsReadyToPlay: playerItem?.status == .readyToPlay) {
                 liveJoinImmediateStartSpent = true
             }
             return
@@ -1380,15 +1388,15 @@ final class NativeAVPlayerHost {
         }
     }
 
-    /// Whether a `.playing` transport status is this item's rate rolling, the event that spends the
-    /// AE#440 one-shot.
+    /// Whether a `.playing` transport status is this item's rate rolling: the event that spends the
+    /// AE#440 one-shot, latches #50's `hasEverPlayed` and releases the AE#629 swap hold (audit NAT-103).
     ///
     /// An in-place swap reuses a player that is still `.playing`, and that status reaches the fresh
     /// item as its first edge, before the item can play anything. Spent there, the one-shot was gone
     /// before the join's own `ToMinimizeStalls` hold began, so a #446 rejoin produced no decision and no
     /// line. An item cannot roll before it is ready, so readiness is what separates the carry from the
     /// roll. The readyToPlay sink asks again, for a carry that never changes status on its way to motion.
-    nonisolated static func playingSpendsLiveJoinOneShot(itemIsReadyToPlay: Bool) -> Bool {
+    nonisolated static func playingIsThisItemsRoll(itemIsReadyToPlay: Bool) -> Bool {
         itemIsReadyToPlay
     }
 
@@ -2082,6 +2090,9 @@ final class NativeAVPlayerHost {
         notificationObservers.removeAll()
         // Clear terminal flags: keepNativeHost reload reuses the host and @Published replays on subscribe; stale failure/didReachEnd corrupt the new session (issue #15).
         failure = nil
+        // Audit Vcore-102: the same replay would hand the successor's sinks this item's refusal.
+        pendingDisplayRejection = nil
+        pendingSoftwarePathEscalation = nil
         didReachEnd = false
         // #315: same reason. The layer itself still reads true for a few tens of ms past this point
         // (AVFoundation clears it after the swap), so the published value leads the layer here on
@@ -2666,7 +2677,7 @@ final class NativeAVPlayerHost {
         var parts: [String] = []
         if let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(fmt) {
             let asbd = asbdPtr.pointee
-            parts.append("sr=\(Int(asbd.mSampleRate))")
+            parts.append("sr=\(RemoteHLSStreamDescription.wholeSampleRate(asbd.mSampleRate))")
             parts.append("ch=\(asbd.mChannelsPerFrame)")
             parts.append(String(format: "bits=%d", asbd.mBitsPerChannel))
             parts.append("fmt=\(fourccString(asbd.mFormatID))")

@@ -77,16 +77,29 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Caller-chosen audio stream index; nil falls back to `av_find_best_stream`. Enables
     /// host-driven track switching via `AetherEngine.selectAudioTrack(index:)` reload.
     private let audioSourceStreamIndexOverride: Int32?
-    /// AE#641: a source audio stream this session already found undecodable (its bridge decoded
-    /// nothing). When the pick lands on it again, the cascade goes straight to its video-only tail.
-    let undecodableAudioStreamIndex: Int32?
+    /// AE#641: the source audio streams this session already found undecodable (their bridge decoded
+    /// nothing). When the pick lands on one again, the cascade goes straight to its video-only tail.
+    let undecodableAudioStreamIndices: Set<Int32>
+
+    /// Whether the cascade has to skip the stream it is about to build a pipeline for.
+    nonisolated static func isKnownUndecodable(_ indices: Set<Int32>, sourceAudioStreamIndex: Int32) -> Bool {
+        sourceAudioStreamIndex >= 0 && indices.contains(sourceAudioStreamIndex)
+    }
 
     /// AE#443: whoever REPLACES one of these two mid-session owes the session the totals the outgoing
     /// instance held (`retireDemuxer` / `retireProducer` below). They carry the session's byte and
     /// restart counters, and a fresh instance starts them at zero.
     var demuxer: Demuxer?
     var cache: SegmentCache?   // internal for the teardown-partial witness test
-    var producer: HLSSegmentProducer?
+    var producer: HLSSegmentProducer? {
+        didSet {
+            // Audit SEG-104: a gate open is checked against this under `anchorShiftLock`, atomically
+            // with what it records, so a producer that was replaced cannot record after.
+            anchorShiftLock.lock()
+            installedProducerEpoch = producer?.epoch
+            anchorShiftLock.unlock()
+        }
+    }
     private var server: HLSLocalServer?
     var provider: VideoSegmentProvider?
 
@@ -285,14 +298,19 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// #112 rework: build an overlay decoder for any embedded subtitle stream (text or
     /// bitmap), seeded exactly like the tap routes. The drainer owns the returned decoder.
     func makeOverlayDecoder(streamIndex: Int32) -> EmbeddedSubtitleDecoder? {
-        guard let dem = demuxer, let stream = dem.stream(at: streamIndex) else { return nil }
+        guard let dem = demuxer else { return nil }
         let w = savedVideoConfig.map { Int32($0.codecpar.pointee.width) } ?? 1920
         let h = savedVideoConfig.map { Int32($0.codecpar.pointee.height) } ?? 1080
-        return EmbeddedSubtitleDecoder(stream: stream,
-                                       sourceVideoWidth: w > 0 ? w : 1920,
-                                       sourceVideoHeight: h > 0 ? h : 1080,
-                                       preserveASSMarkup: preserveASSMarkupForSubtitleTap,
-                                       teletextPage: teletextPageForSubtitleTap)
+        // Audit DMX-108: the decoder copies what it needs out of the stream inside the call, so a
+        // live reopen's close() cannot free the stream underneath it.
+        let made = dem.withStream(at: streamIndex) { stream in
+            EmbeddedSubtitleDecoder(stream: stream,
+                                    sourceVideoWidth: w > 0 ? w : 1920,
+                                    sourceVideoHeight: h > 0 ? h : 1080,
+                                    preserveASSMarkup: preserveASSMarkupForSubtitleTap,
+                                    teletextPage: teletextPageForSubtitleTap)
+        }
+        return made ?? nil
     }
 
     /// Sodalite#32 Phase 2: tap decoders honor the host's markup preference so the overlay can render
@@ -364,14 +382,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let w = savedVideoConfig.map { Int32($0.codecpar.pointee.width) } ?? 1920
         let h = savedVideoConfig.map { Int32($0.codecpar.pointee.height) } ?? 1080
         for (ordinal, sidx) in nativeSubtitleSourceStreamIndicesForSession.enumerated() {
-            guard let sidx, ordinal < nativeSubtitleCueStoresForSession.count,
-                  let stream = dem.stream(at: sidx),
-                  let decoder = EmbeddedSubtitleDecoder(stream: stream,
-                                                        sourceVideoWidth: w > 0 ? w : 1920,
-                                                        sourceVideoHeight: h > 0 ? h : 1080,
-                                                        preserveASSMarkup: preserveASSMarkupForSubtitleTap,
-                                                        teletextPage: teletextPageForSubtitleTap)
-            else { continue }
+            guard let sidx, ordinal < nativeSubtitleCueStoresForSession.count else { continue }
+            // Audit DMX-108: see `makeOverlayDecoder`.
+            let made = dem.withStream(at: sidx) { stream in
+                EmbeddedSubtitleDecoder(stream: stream,
+                                        sourceVideoWidth: w > 0 ? w : 1920,
+                                        sourceVideoHeight: h > 0 ? h : 1080,
+                                        preserveASSMarkup: preserveASSMarkupForSubtitleTap,
+                                        teletextPage: teletextPageForSubtitleTap)
+            }
+            guard let decoder = made ?? nil else { continue }
             subtitleTapRoutes[sidx] = (decoder, nativeSubtitleCueStoresForSession[ordinal])
         }
         if !subtitleTapRoutes.isEmpty {
@@ -480,7 +500,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// AE#418 round 2 + PR #533: what each epoch left at the index it opened on, both what its first
     /// segment adds to the axis and what all of its bytes carry. See `EpochAxisTable`.
     private let anchorShiftLock = NSLock()
-    private var epochAxisByIndex = EpochAxisTable()
+    private(set) var epochAxisByIndex = EpochAxisTable()   // internal read for the superseded-producer tests
     /// PR #533 round 2: how far AVPlayer's OWN timeline is displaced from the playlist, which is the
     /// quantity every AE#418 rule is about.
     ///
@@ -532,7 +552,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// `play --picture-probe`: `axisErr` 0.000 at offsets of 1, 5 and 9 s), so its distance to its
     /// advertised start is not an axis offset and must not compose into one. Guarded by
     /// `anchorShiftLock`, alongside the table it keeps entries out of.
-    private var recutIndices: Set<Int> = []
+    private var recutMark: RecutMark?
+    /// Epoch of `producer`, mirrored under `anchorShiftLock` (audit SEG-104).
+    private var installedProducerEpoch: UInt64?
     private let shiftLock = NSLock()
     private var _playlistShiftSeconds: Double = 0
 
@@ -884,7 +906,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         audioSourceStreamIndexOverride: Int32? = nil,
-        undecodableAudioStreamIndex: Int32? = nil,
+        undecodableAudioStreamIndices: Set<Int32> = [],
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         isLiveSession: Bool = false,
         dvrWindowSeconds: Double? = nil,
@@ -929,7 +951,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
         self.audioSourceStreamIndexOverride = audioSourceStreamIndexOverride
-        self.undecodableAudioStreamIndex = undecodableAudioStreamIndex
+        self.undecodableAudioStreamIndices = undecodableAudioStreamIndices
         self.audioBridgeMode = audioBridgeMode
         self.isLiveSession = isLiveSession
         self.dvrWindowSeconds = dvrWindowSeconds
@@ -1530,6 +1552,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 category: .session
             )
         }
+        // Audit BIT-104: one framing verdict for the session, seeded only by a measurement (#365).
+        // The extradata-derived framing is a claim, not a measurement.
+        var framingMeasuredLengthPrefixed = false
+        if case .lengthPrefixed? = measuredVideoNALFraming { framingMeasuredLengthPrefixed = true }
         let videoConfig = HLSSegmentProducer.StreamConfig(
             codecpar: UnsafePointer(ownedVideoParams.ptr),
             timeBase: videoTimeBase,
@@ -1538,7 +1564,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             convertP7ToProfile81: convertP7ToProfile81,
             colorOverride: p5ColorOverride,
             extradataOverride: hevcExtradataOverride,
-            nalFramingOverride: measuredVideoNALFraming
+            nalFramingOverride: measuredVideoNALFraming,
+            nalFramingLatch: NALFramingLatch(confirmed: framingMeasuredLengthPrefixed)
         )
         self.videoStreamIndex = videoIndex
         self.savedVideoConfig = videoConfig
@@ -1951,22 +1978,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // AE#520 round 2: the close reads it on the playlist-build thread, so it is a closure over a
         // mirror rather than a read of the item.
         prov.consumerBufferedSecondsProvider = consumerBufferedSecondsProvider
-        if isLiveSession {
-            prod.onLiveSegmentFinalized = { [weak prov] index, durationSeconds, startPtsSeconds, discontinuous in
-                prov?.appendLiveSegment(index: index,
-                                        startSeconds: startPtsSeconds,
-                                        durationSeconds: durationSeconds,
-                                        discontinuous: discontinuous)
-            }
-            // AE#443: the runaway park has to sit above the window this session actually serves, or it
-            // bounds the window instead of backstopping it, and its enforcement (a sleeping read
-            // thread) stops the origin from being drained.
-            prod.liveResidentCapProvider = { [weak prov] in prov?.liveResidentParkCap() ?? 0 }
-        } else if sequentialOrigin {
-            prod.onSequentialSegmentFinalized = { [weak prov] index, durationSeconds in
-                prov?.appendSequentialSegmentDuration(index: index, durationSeconds: durationSeconds)
-            }
-        }
+        wireProviderCallbacks(prod, to: prov)
 
         EngineLog.emit(
             "[HLSVideoEngine] prepared: codec=\(manifestCodecs)"
@@ -2588,6 +2600,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             segmentBoundaries.append(last.endPts)
         }
 
+        let producerEpoch = nextProducerEpoch()
         let prod = try HLSSegmentProducer(
             demuxer: dem,
             videoStreamIndex: videoStreamIndex,
@@ -2627,7 +2640,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             // AE#464: read here rather than pushed, so every producer this session builds (seek
             // restart, live reopen, #99 revive) cuts with the offset currently in force.
             audioDelaySeconds: audioDelaySeconds,
-            epoch: nextProducerEpoch()
+            epoch: producerEpoch
         )
         // #240: threaded onto every producer (initial + restart), like the wedge-detector providers
         // below. The side readers read one gate for the whole session, so a restart must not leave
@@ -2640,10 +2653,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
         prod.onVideoShiftKnown = { [weak self] shiftPts, firstItemTfdtPts, normalizationShiftPts in
             self?.handleVideoShiftKnown(
                 shiftPts, firstItemTfdtPts: firstItemTfdtPts,
-                normalizationShiftPts: normalizationShiftPts)
+                normalizationShiftPts: normalizationShiftPts, producerEpoch: producerEpoch)
         }
         prod.onLiveTimelineRebase = { [weak self] shiftPts, seamOutputSeconds in
-            self?.handleLiveTimelineRebase(shiftPts, seamOutputSeconds: seamOutputSeconds)
+            self?.handleLiveTimelineRebase(shiftPts, seamOutputSeconds: seamOutputSeconds,
+                                           producerEpoch: producerEpoch)
         }
         prod.onPumpFinished = { [weak self, weak prod] reason in
             guard let self, let prod else { return }
@@ -2681,7 +2695,33 @@ public final class HLSVideoEngine: @unchecked Sendable {
             rebuildSubtitleTapRoutes()
         }
         armSubtitleTap(on: prod)
+        // Audit HLS-101: the first producer is built before the provider exists and `start()` wires
+        // it; every later one (live reopen, in-place rebuild, AE#222 rebuild) is wired here.
+        if let prov = provider {
+            wireProviderCallbacks(prod, to: prov)
+        }
         return prod
+    }
+
+    /// The producer-to-provider reports the playlist is built from. A live producer without them
+    /// cuts segments the playlist never lists (audit HLS-101).
+    func wireProviderCallbacks(_ prod: HLSSegmentProducer, to prov: VideoSegmentProvider) {
+        if isLiveSession {
+            prod.onLiveSegmentFinalized = { [weak prov] index, durationSeconds, startPtsSeconds, discontinuous in
+                prov?.appendLiveSegment(index: index,
+                                        startSeconds: startPtsSeconds,
+                                        durationSeconds: durationSeconds,
+                                        discontinuous: discontinuous)
+            }
+            // AE#443: the runaway park has to sit above the window this session actually serves, or it
+            // bounds the window instead of backstopping it, and its enforcement (a sleeping read
+            // thread) stops the origin from being drained.
+            prod.liveResidentCapProvider = { [weak prov] in prov?.liveResidentParkCap() ?? 0 }
+        } else if sequentialOrigin {
+            prod.onSequentialSegmentFinalized = { [weak prov] index, durationSeconds in
+                prov?.appendSequentialSegmentDuration(index: index, durationSeconds: durationSeconds)
+            }
+        }
     }
 
     // MARK: - Live source-loss recovery
@@ -2704,12 +2744,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
     static let maxLiveMuxerRebuildCycles = 3
 
     private func handleVideoShiftKnown(_ shiftPts: Int64, firstItemTfdtPts: Int64,
-                                      normalizationShiftPts: Int64) {
+                                      normalizationShiftPts: Int64, producerEpoch: UInt64) {
         let seconds = shiftPts == Int64.min ? 0 : Double(shiftPts) * sourceVideoTbSeconds
         let seamItemSeconds = Double(firstItemTfdtPts) * sourceVideoTbSeconds
         // Live rebases the whole timeline at a program boundary and nothing older comes back on
         // screen, so its axis is the epoch's own and it publishes here as it always has.
         guard !isLiveSession else {
+            guard isInstalledProducer(producerEpoch) else { return }
             // Live has no placement model: the epoch's shift IS the axis, so the displacement this
             // session tracks for VOD stays where it is (nothing below reads it on a live session).
             publishPlaylistShift(seconds, seamItemSeconds: seamItemSeconds)
@@ -2720,10 +2761,21 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // epoch AVPlayer never fetches from must not move the clock at all.
         let index = segmentIndexForPlaylistTime(seamItemSeconds)
         anchorShiftLock.lock()
+        // Audit SEG-104: a restart that was replaced while its first read was in flight can still
+        // open its gate. Its epoch describes bytes nobody will store, and recording it would drop
+        // the entries at and above its index.
+        guard installedProducerEpoch == producerEpoch else {
+            anchorShiftLock.unlock()
+            EngineLog.emit(
+                "[HLSVideoEngine] gate open at seg\(index) from a superseded producer, ignored",
+                category: .session)
+            return
+        }
         // AE#412: a re-cut opens below its boundary on purpose, and AVPlayer places what it produces
         // at its own tfdt, so the epoch is worth nothing to the axis. Recording zero still drops the
         // entries at and above it, which is what the rewrite calls for.
-        let isRecut = recutIndices.remove(index) != nil
+        let isRecut = recutMark?.isOpened(byProducerEpoch: producerEpoch, at: index) == true
+        if isRecut { recutMark = nil }
         // PR #533: the run keeps the source-to-item normalization its bytes were written with, even
         // where its opening segment has no placement offset left to carry. Those are the same number
         // only on a source whose timestamps start at zero.
@@ -3496,6 +3548,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// already within reach below the target, or a re-cut whose gate did not open in time.
     func preparedSeekLanding(itemSeconds: Double) -> Double {
         guard !isLiveSession, let provider else { return itemSeconds }
+        dropUnstartedRecut()
         let index = segmentIndexForPlaylistTime(itemSeconds)
         guard let reach = provider.videoReach(at: index) else { return itemSeconds }
         guard let advertised = advertisedStartSeconds(index) else { return itemSeconds }
@@ -3511,22 +3564,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
             + "and no random-access point is within reach below it; re-cutting from the covering one",
             category: .session
         )
-        gateOpenCondition.lock()
-        lastGateOpen = nil
-        gateOpenCondition.unlock()
-        anchorShiftLock.lock()
-        recutIndices.insert(index)
-        anchorShiftLock.unlock()
+        markRecut(at: index)
         // Audit HLS-4: off this task, so the gate wait below bounds the whole re-cut. Inline, an idle
         // coalescer ran the restart here (a 5 s stop wait, a #79 reopen, the demuxer seek) before the
         // wait began, all outside the seek's 8 s landing bound.
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.requestRestart(at: index, authoritative: true)
         }
+        // Audit HLS-105: a timeout leaves the mark with the restart, whose gate may open later.
         guard let opened = awaitGateOpen(forIndex: index, timeout: Self.recutGateWaitSeconds) else {
-            anchorShiftLock.lock()
-            recutIndices.remove(index)
-            anchorShiftLock.unlock()
             EngineLog.emit(
                 "[HLSVideoEngine] #412 seg\(index) re-cut did not open a gate within "
                 + "\(String(format: "%.1f", Self.recutGateWaitSeconds))s; seeking on the uncorrected position",
@@ -3544,6 +3590,54 @@ public final class HLSVideoEngine: @unchecked Sendable {
             category: .session
         )
         return itemSeconds
+    }
+
+    /// Audit HLS-105: an AE#412 re-cut, owned by the restart that performs it rather than by the seek
+    /// waiting on it. The restart binds its producer's epoch at install, and only that producer's gate
+    /// open is the re-cut; the seek's wait timing out leaves it alone.
+    struct RecutMark: Equatable {
+        let index: Int
+        private(set) var producerEpoch: UInt64?
+
+        init(index: Int) { self.index = index }
+
+        /// The mark that survives a restart installing `producerEpoch` at `restartIndex`: bound when
+        /// it is the marked index, kept while the marked restart has yet to run, dropped once the
+        /// restart it was bound to has been replaced by one elsewhere.
+        func installing(producerEpoch epoch: UInt64, at restartIndex: Int) -> RecutMark? {
+            guard restartIndex == index else { return producerEpoch == nil ? self : nil }
+            var bound = self
+            bound.producerEpoch = epoch
+            return bound
+        }
+
+        func isOpened(byProducerEpoch epoch: UInt64, at gateIndex: Int) -> Bool {
+            producerEpoch == epoch && gateIndex == index
+        }
+    }
+
+    func markRecut(at index: Int) {
+        gateOpenCondition.lock()
+        lastGateOpen = nil
+        gateOpenCondition.unlock()
+        anchorShiftLock.lock()
+        recutMark = RecutMark(index: index)
+        anchorShiftLock.unlock()
+    }
+
+    /// A newer seek supersedes a re-cut whose restart never installed a producer (dropped with the
+    /// coalescer's superseded slot, or failed), so a later unrelated restart at that index does not
+    /// inherit the mark.
+    private func dropUnstartedRecut() {
+        anchorShiftLock.lock()
+        if recutMark?.producerEpoch == nil { recutMark = nil }
+        anchorShiftLock.unlock()
+    }
+
+    private func isInstalledProducer(_ epoch: UInt64) -> Bool {
+        anchorShiftLock.lock()
+        defer { anchorShiftLock.unlock() }
+        return installedProducerEpoch == epoch
     }
 
     /// AE#412 pure decision: whether the segment a cold seek lands in has to be re-cut before the
@@ -3643,7 +3737,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// AVPlayer renders at ~buffer+holdback behind the producer edge, so the host must keep the OLD shift
     /// until playback crosses `seamOutputSeconds`. Internal `playlistShiftSeconds` tracks the edge immediately.
     /// #368: sequential chunk-seam rebases arrive here too, deliberately; same deferred-shift contract.
-    func handleLiveTimelineRebase(_ shiftPts: Int64, seamOutputSeconds: Double) {
+    func handleLiveTimelineRebase(_ shiftPts: Int64, seamOutputSeconds: Double, producerEpoch: UInt64) {
+        guard isInstalledProducer(producerEpoch) else { return }
         let seconds = shiftPts == Int64.min ? 0 : Double(shiftPts) * sourceVideoTbSeconds
         setPlaylistShiftSeconds(seconds)
         onPlaylistShiftRebased?(seconds, seamOutputSeconds)
@@ -4021,6 +4116,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         do {
             let newProd = try makeProducer(baseIndex: idx)
             producer = newProd
+            anchorShiftLock.lock()
+            recutMark = recutMark?.installing(producerEpoch: newProd.epoch, at: idx)
+            anchorShiftLock.unlock()
             restartLock.unlock()
             newProd.start()
         } catch {

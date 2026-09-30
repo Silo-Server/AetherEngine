@@ -7,6 +7,7 @@ final class PacketRingBufferTests: XCTestCase {
         let d = FileManager.default.temporaryDirectory
             .appendingPathComponent("prbtest-\(ProcessInfo.processInfo.globallyUniqueString)")
         try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: d) }
         return d
     }
     func testAppendAndKeyframeSeek() throws {

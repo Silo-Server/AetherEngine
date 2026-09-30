@@ -459,14 +459,14 @@ struct Issue440LiveJoinRollTests {
     /// that followed 15 ms later reached no decision and no line.
     @Test("a playing status carried onto an item that is not ready yet does not spend the one-shot")
     func carriedPlayingDoesNotSpend() {
-        #expect(!NativeAVPlayerHost.playingSpendsLiveJoinOneShot(itemIsReadyToPlay: false))
+        #expect(!NativeAVPlayerHost.playingIsThisItemsRoll(itemIsReadyToPlay: false))
     }
 
     /// The reason the spend exists stays intact: once the item's own rate has rolled, every later hold
     /// is a mid-stream rebuffer and keeps AVPlayer's stall policy.
     @Test("a playing status on a ready item is the roll, and spends it")
     func realRollSpends() {
-        #expect(NativeAVPlayerHost.playingSpendsLiveJoinOneShot(itemIsReadyToPlay: true))
+        #expect(NativeAVPlayerHost.playingIsThisItemsRoll(itemIsReadyToPlay: true))
     }
 
     // MARK: - What `ahead 0.00s` was hiding (AE#447 follow-up)

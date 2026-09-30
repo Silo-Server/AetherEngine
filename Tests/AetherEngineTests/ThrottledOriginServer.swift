@@ -33,6 +33,9 @@ final class ThrottledOriginServer: @unchecked Sendable {
         /// Audit DMX-5: a 206 that starts `start` rather than where it was asked, the way an edge
         /// that aligns ranges to its own chunk boundary answers. The body is that range's.
         case serve206From(start: Int64)
+        /// Audit DMX-101: a server that cannot address bytes. Whatever range was asked for, the
+        /// answer is a 200 with the whole source from byte 0 and its full Content-Length.
+        case serve200
     }
 
     let port: UInt16
@@ -314,9 +317,13 @@ final class ThrottledOriginServer: @unchecked Sendable {
 
         var silentAfter: Int64? = nil
         var dropAfter: Int64? = nil
+        var answersWholeSource = false
         switch respond(requestIndex, offset, path) {
         case .serve206:
             break
+        case .serve200:
+            answersWholeSource = true
+            offset = 0
         case .serve206From(let start):
             offset = max(0, min(start, totalSize - 1))
         case .serveThenGoSilent(let afterBytes):
@@ -348,15 +355,19 @@ final class ThrottledOriginServer: @unchecked Sendable {
             pendingDelay -= slice
         }
 
-        let last = (ignoreRangeEnd ? nil : rangeEnd) ?? (totalSize - 1)
+        let last = answersWholeSource ? totalSize - 1 : (ignoreRangeEnd ? nil : rangeEnd) ?? (totalSize - 1)
         let remaining = last - offset + 1
         // Keep-alive, not close: a bounded range that tears the socket down would make every
         // refill a fresh connection and would hide exactly the pooling question under test.
-        let header = "HTTP/1.1 206 Partial Content\r\n"
-            + "Content-Range: bytes \(offset)-\(last)/\(totalSize)\r\n"
-            + "Content-Length: \(remaining)\r\n"
-            + "Accept-Ranges: bytes\r\n"
-            + "Connection: keep-alive\r\n\r\n"
+        let header = answersWholeSource
+            ? "HTTP/1.1 200 OK\r\n"
+                + "Content-Length: \(remaining)\r\n"
+                + "Connection: keep-alive\r\n\r\n"
+            : "HTTP/1.1 206 Partial Content\r\n"
+                + "Content-Range: bytes \(offset)-\(last)/\(totalSize)\r\n"
+                + "Content-Length: \(remaining)\r\n"
+                + "Accept-Ranges: bytes\r\n"
+                + "Connection: keep-alive\r\n\r\n"
         guard writeFully(fd, Array(header.utf8)) else { return false }
 
         let chunk = [UInt8](repeating: 0x55, count: chunkBytes)

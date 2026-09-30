@@ -77,6 +77,42 @@ struct Issue651DeclaredSubpictureTests {
         #expect(!a.isAssembling)
     }
 
+    // Audit NET-104 / DMX-106: the 32-bit form reserved whatever it stated, up to 4 GiB, and then
+    // swallowed every later fragment of the stream.
+    @Test("a 32-bit size past 1 MiB drops the unit without reserving it")
+    func hostileThirtyTwoBitSizeDrops() {
+        var a = DVDSubpictureAssembler()
+        let bytes: [UInt8] = [0, 0, 0xFF, 0xFF, 0xFF, 0xFF] + [UInt8](repeating: 0xAB, count: 2000)
+        #expect(ingest(&a, bytes, 1) == nil)
+        #expect(!a.isAssembling)
+        #expect(a.reservedCapacity < 128 * 1024)
+        #expect(ingest(&a, unit(40), 2)?.timing.pts == 2)
+    }
+
+    @Test("a unit of exactly 1 MiB still joins, reserving about 64 KiB up front")
+    func megabyteUnitJoins() {
+        var a = DVDSubpictureAssembler()
+        let size = 1 << 20
+        var bytes: [UInt8] = [0, 0, 0x00, 0x10, 0x00, 0x00]
+        bytes += [UInt8](repeating: 0x5A, count: size - bytes.count)
+        #expect(ingest(&a, Array(bytes[0..<2048]), 1) == nil)
+        // The allocator rounds a 64 KiB request up; the point is that 1 MiB is not reserved.
+        #expect(a.reservedCapacity < 128 * 1024)
+        #expect(ingest(&a, Array(bytes[2048...]), Int64.min)?.data.count == size)
+    }
+
+    @Test("a 60 KB unit across 30 fragments yields one unit")
+    func sixtyKilobytesInThirtyFragments() {
+        var a = DVDSubpictureAssembler()
+        let bytes = unit(60_000)
+        var units: [DVDSubpictureAssembler.Unit] = []
+        for k in 0..<30 {
+            let fragment = Array(bytes[(k * 2000)..<((k + 1) * 2000)])
+            if let joined = ingest(&a, fragment, k == 0 ? 5 : Int64.min) { units.append(joined) }
+        }
+        #expect(units == [.init(data: bytes, timing: timing(5))])
+    }
+
     // MARK: - IFO
 
     /// A VTS IFO without a PGCIT declaring `count` subpictures, the first `withLanguage` of them with

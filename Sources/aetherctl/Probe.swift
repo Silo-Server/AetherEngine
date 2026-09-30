@@ -5,7 +5,7 @@ import AetherEngine
 
 func runProbe(url: URL, detecting: ProbeDetail = []) -> Int32 {
     EngineLog.handler = { print($0) }
-    print("aetherctl probe: \(url.absoluteString)")
+    print(EngineLog.redacted("aetherctl probe: \(url.absoluteString)"))
     if !detecting.isEmpty {
         var passes: [String] = []
         if detecting.contains(.hdr10Plus) { passes.append("hdr10plus (packet scan)") }
