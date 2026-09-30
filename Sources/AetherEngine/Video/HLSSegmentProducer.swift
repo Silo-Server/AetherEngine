@@ -50,6 +50,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
         /// which is only correct while the two agree; on a source where they do not, every walker
         /// downstream (A53 captions, the DV P7 RPU rewrite) reads the packet at the wrong offsets.
         let nalFramingOverride: VideoNALFraming?
+        /// The session's BIT-1 framing verdict, handed to every muxer this producer builds for the
+        /// program's own track (audit BIT-104).
+        let nalFramingLatch: NALFramingLatch?
 
         init(
             codecpar: UnsafePointer<AVCodecParameters>,
@@ -59,7 +62,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
             convertP7ToProfile81: Bool = false,
             colorOverride: MP4SegmentMuxer.ColorOverride? = nil,
             extradataOverride: [UInt8]? = nil,
-            nalFramingOverride: VideoNALFraming? = nil
+            nalFramingOverride: VideoNALFraming? = nil,
+            nalFramingLatch: NALFramingLatch? = nil
         ) {
             self.codecpar = codecpar
             self.timeBase = timeBase
@@ -69,6 +73,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             self.colorOverride = colorOverride
             self.extradataOverride = extradataOverride
             self.nalFramingOverride = nalFramingOverride
+            self.nalFramingLatch = nalFramingLatch
         }
     }
 
@@ -2100,7 +2105,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
             // parameter-set change is still the same program, so it keeps them (isAdCreative false).
             doviConfig: isAdCreative ? .keep : videoConfig.doviConfig,
             colorOverride: isAdCreative ? nil : videoConfig.colorOverride,
-            extradataOverride: isAdCreative ? nil : videoConfig.extradataOverride
+            extradataOverride: isAdCreative ? nil : videoConfig.extradataOverride,
+            nalFramingLatch: isAdCreative ? nil : videoConfig.nalFramingLatch
         )
         let muxerAudio: MP4SegmentMuxer.AudioConfig? = audioConfig.map { a in
             MP4SegmentMuxer.AudioConfig(codecpar: a.codecpar, timeBase: a.inputTimeBase, language: a.language)
@@ -2629,6 +2635,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
     // MARK: - Public API
 
     func start() {
+        assert(!isLive || onLiveSegmentFinalized != nil,
+               "a live producer started without its provider reports cuts segments no playlist lists (audit HLS-101)")
         stateLock.lock()
         guard !pumpStarted else { stateLock.unlock(); return }
         pumpStarted = true
@@ -3027,6 +3035,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     pregateAudioBufferBytes -= Int(packet.pointee.size)
                 } else {
                     guard let read = try readNextSourcePacket() else {
+                        break readLoop
+                    }
+                    // Audit SEG-104: a stop that landed while this read was parked means the session
+                    // has already replaced this pump, so what the read returned is not its to act on.
+                    if checkShouldStop() {
+                        var stale: UnsafeMutablePointer<AVPacket>? = read.packet
+                        trackedPacketFree(&stale)
+                        exitReason = .stopRequested
                         break readLoop
                     }
                     packet = read.packet
@@ -4109,21 +4125,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                 trackedPacketFree(&fpVar)
                                 continue
                             }
-                            // Rescale FLAC pts to source video TB for segment lookup; live and
-                            // sequential audio follow the video cutter.
-                            let fpSeg: Int
-                            if isLive {
-                                fpSeg = liveCurrentSegmentIndex
-                            } else if audioFollowsVideoCut {
-                                fpSeg = vodCutter.current
-                            } else {
-                                let fpPtsInVideoTb = av_rescale_q(
-                                    fp.pointee.pts,
-                                    audio.inputTimeBase,
-                                    sourceVideoTimeBase
-                                )
-                                fpSeg = segmentIndex(forSourcePts: fpPtsInVideoTb)
-                            }
+                            let fpSeg = bridgedAudioSegmentIndex(fp, audio: audio)
                             guard let muxer = ensureMuxer(forSegmentIndex: fpSeg) else {
                                 trackedPacketFree(&fpVar)
                                 bridgedMuxerGone = true
@@ -4202,6 +4204,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
             if case .stopRequested = exitReason {} else { exitReason = .segmentStall }
         }
 
+        // Audit SEG-104: the abort of a parked read surfaces as end of file, which is not the source's.
+        if case .eof = exitReason, checkShouldStop() {
+            exitReason = .stopRequested
+        }
+
         // muxerFailed from a backpressure break is a wedge (host re-anchors) or a stop (teardown), not a real failure.
         if case .muxerFailed = exitReason {
             stateLock.lock()
@@ -4269,17 +4276,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // EOF tail flush for bridge audio: drains ~100-200 ms remainder (per-feed only emits full frames).
         if case .eof = exitReason, let audio = audioConfig, let bridge = audio.bridge {
             for fp in bridge.flush() {
-                let fpSeg: Int
-                if isLive {
-                    fpSeg = liveCurrentSegmentIndex
-                } else {
-                    let fpPtsInVideoTb = av_rescale_q(
-                        fp.pointee.pts,
-                        audio.inputTimeBase,
-                        sourceVideoTimeBase
-                    )
-                    fpSeg = segmentIndex(forSourcePts: fpPtsInVideoTb)
-                }
+                let fpSeg = bridgedAudioSegmentIndex(fp, audio: audio)
                 if let muxer = ensureMuxer(forSegmentIndex: fpSeg) {
                     fp.pointee.stream_index = muxer.audioOutputStreamIndex
                     av_packet_rescale_ts(fp, audio.inputTimeBase, muxer.muxerAudioTimeBase)
@@ -4310,6 +4307,16 @@ final class HLSSegmentProducer: @unchecked Sendable {
         finishCondition.unlock()
 
         onPumpFinished?(exitReason)
+    }
+
+    /// The segment a bridged audio packet belongs to. Live and sequential audio follow the video
+    /// cutter; everything else is routed by the packet's own time against the plan. One helper for the
+    /// per-feed and the end-of-file flush, because the flush missing the sequential rule opened a plan
+    /// index the cutter never reached and cost the archive its final segment (audit SEG-103).
+    private func bridgedAudioSegmentIndex(_ packet: UnsafeMutablePointer<AVPacket>, audio: AudioConfig) -> Int {
+        if isLive { return liveCurrentSegmentIndex }
+        if audioFollowsVideoCut { return vodCutter.current }
+        return segmentIndex(forSourcePts: av_rescale_q(packet.pointee.pts, audio.inputTimeBase, sourceVideoTimeBase))
     }
 
     // MARK: - Look-behind finalize helpers
