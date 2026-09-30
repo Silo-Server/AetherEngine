@@ -741,6 +741,22 @@ final class SoftwarePlaybackHost {
         ) == .stop
     }
 
+    /// How long the parked demux loop waits before it re-checks the renderer, in seconds. The renderer
+    /// drains at frame cadence and the audio lead shrinks with the clock, and nothing signals either,
+    /// so this is a timed wait (audit PERF-110: the fixed 5 ms sleep was 200 wakeups a second in every
+    /// software VOD session). It is bounded by the time the read gate needs to open (the lead's excess
+    /// over its target at the playback rate), never below 5 ms, and never above 20 ms: a renderer queue
+    /// of about ten frames cannot drain in that, so the parked video still reaches the decoder in time.
+    nonisolated static func parkedRendererWaitSeconds(
+        clockArmed: Bool, lastAudioPts: Double, clockSeconds: Double, rate: Float
+    ) -> TimeInterval {
+        let floor = 0.005, ceiling = 0.020
+        guard clockArmed, lastAudioPts.isFinite, clockSeconds.isFinite, rate > 0 else { return floor }
+        let untilGateOpens = (lastAudioPts - clockSeconds - AudioLookaheadPolicy.targetLeadSeconds) / Double(rate)
+        guard untilGateOpens.isFinite else { return floor }
+        return min(max(untilGateOpens, floor), ceiling)
+    }
+
     // MARK: - Load
 
     func load(
@@ -2552,7 +2568,18 @@ final class SoftwarePlaybackHost {
                 diag?.update(lastAudioPts: lastEnqueuedAudioPtsSec,
                              parked: parkedVideo.count, rebuffering: rebuffering,
                              generation: parkedSeekGeneration)
-                if stillWaiting() { Thread.sleep(forTimeInterval: 0.005) }
+                if stillWaiting() {
+                    // The condition is broadcast on play, stop, background, seek-settled and feed-cursor
+                    // changes, so those cut the wait short where the sleep used to ride them out.
+                    let wait = Self.parkedRendererWaitSeconds(
+                        clockArmed: clockArmed(), lastAudioPts: lastEnqueuedAudioPtsSec,
+                        clockSeconds: audioOutput?.currentTimeSeconds ?? .nan, rate: currentRate())
+                    condition.lock()
+                    autoreleasepool {
+                        _ = condition.wait(until: Date(timeIntervalSinceNow: wait))
+                    }
+                    condition.unlock()
+                }
             }
         }
 
