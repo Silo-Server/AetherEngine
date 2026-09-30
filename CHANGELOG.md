@@ -12,6 +12,12 @@ the public-API contract.
 
 _Nothing yet._
 
+## [7.23.2] - 2026-09-30
+
+### Fixed
+
+- **A Dolby Vision master was refused when the source stated HEVC level 5.2 (#674).** Encoders stamp level 5.2 (156) on 1080p24 streams, the level went into the master's `CODECS` verbatim, and an Apple TV 4K screens a declared level against the device: the DV master and the reduced HDR master both failed with -11848 / CoreMedia -15517, and the session ended on the media playlist with Dolby Vision dropped. The declared level is now capped at 5.1 (`L153`, which covers 2160p60), for the hvcC-derived string and the fallback alike; the init's hvcC keeps the stated level. The DV routes (P8.1, P8.4, P7) also derive their `CODECS` from the hvcC now, so they carry its constraint bytes like the plain HEVC route has since AE#187. Contributed by @gonkowonko (#677).
+
 ## [7.23.1] - 2026-09-30
 
 ### Fixed
