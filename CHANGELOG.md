@@ -10,6 +10,10 @@ the public-API contract.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [7.23.0] - 2026-09-30
+
 Second full audit of the engine (2026-09-29, against 7.22.2): about 107 verified defects (3 High, 35 Medium), including regressions and incomplete fixes the first audit's patches left behind. All but three performance items are fixed here, each with a regression test that failed before it; the embedded-subtitle double download (PERF-103), the byte-bounded fragment flush (PERF-105) and the audio tap readers' cost (DEC-108) need a device round or a larger redesign and are deferred.
 
 ### Added
