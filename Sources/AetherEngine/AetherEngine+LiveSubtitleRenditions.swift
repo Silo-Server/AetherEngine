@@ -113,7 +113,7 @@ extension AetherEngine {
             do {
                 let text = try await Self.fetchText(rendition.playlistURL, headers: headers)
                 guard case .media(let media) = try HLSPlaylistParser.parse(text) else { return }
-                pollInterval = max(1, media.targetDuration)
+                pollInterval = Self.liveSubtitlePollInterval(targetDuration: media.targetDuration)
                 // Anchor the work at the playhead, not at the start of the playlist. A rendition
                 // playlist is not a handful of segments: MDR publishes its whole two hour DVR window,
                 // 3600 entries, and walking it from the front means thousands of fetches for content
@@ -170,6 +170,13 @@ extension AetherEngine {
             }
             try? await Task.sleep(nanoseconds: UInt64(pollInterval * 1_000_000_000))
         }
+    }
+
+    /// Audit FEA-102: a week-long TARGETDURATION would put the loop to sleep for a week and end the
+    /// subtitles; past about 2e10 s it trapped `UInt64(_:)` outright.
+    nonisolated static func liveSubtitlePollInterval(targetDuration: Double) -> Double {
+        guard !targetDuration.isNaN else { return 1 }
+        return min(max(1, targetDuration), 30)
     }
 
     /// Keep the published array bounded: a channel left running for hours would otherwise carry every

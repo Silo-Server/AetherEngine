@@ -291,7 +291,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                     }
                     let backlog = fresh.reduce(0.0) { $0 + $1.duration }
                     EngineLog.emit(
-                        "[HLSIngest] joined \(fresh.count) segment(s), ~\(Int(backlog))s behind the live edge"
+                        "[HLSIngest] joined \(fresh.count) segment(s), ~\(String(format: "%.0f", backlog))s behind the live edge"
                         + " pdt=\(fresh.first?.programDateTime.map { "\($0)" } ?? "nil")",
                         category: .engine
                     )

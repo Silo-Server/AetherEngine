@@ -481,22 +481,33 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         guard !media.hasUnsupportedEncryption else {
             throw HLSIngestError.encryptedNotSupported
         }
+        let timeline = try Self.segmentTimeline(media.segments)
+        return ResolvedMedia(
+            url: mediaURL,
+            segments: media.segments,
+            starts: timeline.starts,
+            duration: timeline.duration
+        )
+    }
+
+    static func segmentTimeline(_ segments: [HLSMediaSegment]) throws -> (starts: [Double], duration: Double) {
         var starts: [Double] = []
-        starts.reserveCapacity(media.segments.count)
+        starts.reserveCapacity(segments.count)
         var duration = 0.0
-        for segment in media.segments {
+        for segment in segments {
             guard segment.duration.isFinite, segment.duration > 0 else {
                 throw HLSIngestError.playlistInvalid(reason: "segment duration must be positive")
             }
             starts.append(duration)
             duration += segment.duration
         }
-        return ResolvedMedia(
-            url: mediaURL,
-            segments: media.segments,
-            starts: starts,
-            duration: duration
-        )
+        // Audit HLS-102: each entry is inside the parser's ceiling, the sum need not be. A tiny entry
+        // after a large sum also leaves the total unmoved, the starts stop being monotonic, and the
+        // uniform fallback plans the whole sum.
+        guard duration <= MediaDurationCeiling.seconds else {
+            throw HLSIngestError.playlistInvalid(reason: "program duration exceeds \(MediaDurationCeiling.seconds)s")
+        }
+        return (starts, duration)
     }
 
     /// Credentials only where the host's playlist is (audit NET-7).
