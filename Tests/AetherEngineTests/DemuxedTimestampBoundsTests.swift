@@ -137,8 +137,8 @@ struct DemuxedTimestampBoundsTests {
             .init(cluster: 2000, duration: UInt64.max),
             .init(cluster: 5_000_000_000_000, duration: 500),
         ])
-        let url = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-            .appendingPathComponent(".hostile-timestamps-\(UUID().uuidString).mkv")
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hostile-timestamps-\(UUID().uuidString).mkv")
         defer { try? FileManager.default.removeItem(at: url) }
         try data.write(to: url)
         let cues = try await SubtitleDecoder.decodeFile(url: url).cues
