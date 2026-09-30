@@ -31,12 +31,6 @@ jobs:
       - name: swift build
         run: swift build
 
-      # Every other Swift step here is Debug, and aetherctl is not a product, so no consumer compiles
-      # it either: a DEBUG-only engine hook called without a guard kept Release broken from 7.6.0 to
-      # 7.14.0 without anything noticing (AE#610).
-      - name: swift build -c release (aetherctl)
-        run: swift build -c release --product aetherctl
-
       # A test process that dies mid-run reads as exit 1 with no ✘, no backtrace and no swift-testing
       # summary: `swift test` collapses every abnormal child exit to a plain 1, and a signal takes the
       # buffered tail of the event stream with it. What was in flight is whatever the log still lists
@@ -66,7 +60,7 @@ jobs:
         run: swift build --build-tests --package-path Probes/TransportProbe
 
   build-tvos:
-    name: xcodebuild (tvOS Simulator)
+    name: xcodebuild (tvOS + visionOS Simulator)
     runs-on: macos-15
     timeout-minutes: 30
     steps:
@@ -76,14 +70,6 @@ jobs:
         with:
           xcode-version: latest-stable
 
-      - name: Build for tvOS Simulator
-        run: |
-          xcodebuild build \
-            -scheme AetherEngine \
-            -destination 'generic/platform=tvOS Simulator' \
-            -derivedDataPath .build/xcode-tvos \
-            CODE_SIGNING_ALLOWED=NO
-
       # The test target is the only place a platform gate in TEST code is ever checked. `swift test`
       # on macOS compiles the macOS side of every `#if`, so a gate put around a helper instead of
       # around the tests that call it looks complete there and costs nothing until someone builds
@@ -92,12 +78,16 @@ jobs:
       #
       # EXCLUDED_ARCHS because a generic simulator destination builds both slices and `libdovi.a`
       # ships arm64 only, so the x86_64 link fails and says nothing about this repo.
+      #
+      # This step also compiles the library, so no separate `xcodebuild build` of the AetherEngine
+      # scheme runs first: that doubled every simulator job's compile, and the x86_64 slice it added
+      # is one no app can link anyway.
       - name: Build the tests for tvOS Simulator
         run: |
           xcodebuild build-for-testing \
             -scheme AetherEngineTests \
             -destination 'generic/platform=tvOS Simulator' \
-            -derivedDataPath .build/xcode-tvos-tests \
+            -derivedDataPath .build/xcode-tvos \
             EXCLUDED_ARCHS=x86_64 \
             CODE_SIGNING_ALLOWED=NO
 
@@ -114,8 +104,22 @@ jobs:
             -derivedDataPath .build/xcode-probe \
             CODE_SIGNING_ALLOWED=NO
 
+      # #344: the package has declared visionOS since 6.0.0 and nothing here compiled for it, so an
+      # availability list that named tvOS/iOS/macOS and then fell through to `*` broke the visionOS
+      # build silently. `*` resolves to the declared visionOS floor (1.0), so any API newer than that
+      # is a compile error on visionOS and on no other platform. Nobody here owns a Vision Pro, which
+      # makes this step the only place the platform is exercised at all. It rides in this job so CI
+      # stays within the account's concurrent macOS runners instead of queueing a sixth job.
+      - name: Build for visionOS Simulator
+        run: |
+          xcodebuild build \
+            -scheme AetherEngine \
+            -destination 'generic/platform=visionOS Simulator' \
+            -derivedDataPath .build/xcode-visionos \
+            CODE_SIGNING_ALLOWED=NO
+
   build-ios:
-    name: xcodebuild (iOS Simulator)
+    name: xcodebuild (iOS Simulator) + release aetherctl
     runs-on: macos-15
     timeout-minutes: 30
     steps:
@@ -124,14 +128,6 @@ jobs:
       - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
         with:
           xcode-version: latest-stable
-
-      - name: Build for iOS Simulator
-        run: |
-          xcodebuild build \
-            -scheme AetherEngine \
-            -destination 'generic/platform=iOS Simulator' \
-            -derivedDataPath .build/xcode-ios \
-            CODE_SIGNING_ALLOWED=NO
 
       # The other half of the gate check above; see the tvOS job for why the test target needs its
       # own build and why x86_64 is excluded.
@@ -140,33 +136,15 @@ jobs:
           xcodebuild build-for-testing \
             -scheme AetherEngineTests \
             -destination 'generic/platform=iOS Simulator' \
-            -derivedDataPath .build/xcode-ios-tests \
+            -derivedDataPath .build/xcode-ios \
             EXCLUDED_ARCHS=x86_64 \
             CODE_SIGNING_ALLOWED=NO
 
-  # #344: the package has declared visionOS since 6.0.0 and nothing here compiled for it, so an
-  # availability list that named tvOS/iOS/macOS and then fell through to `*` broke the visionOS
-  # build silently. `*` resolves to the declared visionOS floor (1.0), so any API newer than that
-  # is a compile error on visionOS and on no other platform. Nobody here owns a Vision Pro, which
-  # makes this job the only place the platform is exercised at all.
-  build-visionos:
-    name: xcodebuild (visionOS Simulator)
-    runs-on: macos-15
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
-        with:
-          xcode-version: latest-stable
-
-      - name: Build for visionOS Simulator
-        run: |
-          xcodebuild build \
-            -scheme AetherEngine \
-            -destination 'generic/platform=visionOS Simulator' \
-            -derivedDataPath .build/xcode-visionos \
-            CODE_SIGNING_ALLOWED=NO
+      # Every other Swift step in CI is Debug, and aetherctl is not a product, so no consumer compiles
+      # it either: a DEBUG-only engine hook called without a guard kept Release broken from 7.6.0 to
+      # 7.14.0 without anything noticing (AE#610). Off the `swift test` job's critical path.
+      - name: swift build -c release (aetherctl)
+        run: swift build -c release --product aetherctl
 
   # The Xcode 27 lane. Every job above resolves `latest-stable` on macos-15, which is Xcode 26.3,
   # while the engine is consumed and released from Xcode 27, and Swift 6.4 rejects isolation shapes
@@ -205,21 +183,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Build for tvOS Simulator
-        run: |
-          xcodebuild build \
-            -scheme AetherEngine \
-            -destination 'generic/platform=tvOS Simulator' \
-            -derivedDataPath .build/xcode-tvos \
-            CODE_SIGNING_ALLOWED=NO
-
       # See the tvOS job above for why the test target needs its own build and why x86_64 is excluded.
       - name: Build the tests for tvOS Simulator
         run: |
           xcodebuild build-for-testing \
             -scheme AetherEngineTests \
             -destination 'generic/platform=tvOS Simulator' \
-            -derivedDataPath .build/xcode-tvos-tests \
+            -derivedDataPath .build/xcode-tvos \
             EXCLUDED_ARCHS=x86_64 \
             CODE_SIGNING_ALLOWED=NO
 
