@@ -189,11 +189,9 @@ struct SequentialBridgedTailPlaylistTests {
         defer { engine.stop() }
         let mediaURL = try #require(engine.mediaPlaylistURL)
 
-        var playlist = ""
-        try await waitFor {
-            playlist = (try? String(contentsOf: mediaURL, encoding: .utf8)) ?? ""
-            return playlist.contains("#EXT-X-ENDLIST")
-        }
+        func playlistText() -> String { (try? String(contentsOf: mediaURL, encoding: .utf8)) ?? "" }
+        try await waitFor { playlistText().contains("#EXT-X-ENDLIST") }
+        let playlist = playlistText()
 
         let lines = playlist.split(whereSeparator: \.isNewline).map(String.init)
         let durations = lines.filter { $0.hasPrefix("#EXTINF:") }
