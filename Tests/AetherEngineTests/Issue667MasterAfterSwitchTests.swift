@@ -60,7 +60,7 @@ struct Issue667MasterAfterSwitchTests {
         let text = try #require(try? String(contentsOf: source, encoding: .utf8))
         let gate = try #require(text.range(of: "Self.unprovenMasterAwaitsSwitchEnd("))
         let after = text[gate.upperBound...]
-        let wait = try #require(after.range(of: "waitForSwitch(consumesRecord: false, settleCap: .awaitObservedEnd)"))
+        let wait = try #require(after.range(of: "waitForSwitch(consumesRecord: false, settleCap: .awaitObservedEnd"))
         let reroute = try #require(after.range(of: "routingPanelHDR = Self.sessionRoutesAsHDRPanel("))
         let serve = try #require(after.range(of: "panelIsInHDRMode: routingPanelHDR"))
         #expect(wait.lowerBound < reroute.lowerBound)

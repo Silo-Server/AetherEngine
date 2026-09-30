@@ -92,7 +92,8 @@ struct SoftwarePathEscalationTests {
         let escalation = Task { @MainActor in
             await engine.escalateToSoftwarePath(SoftwarePathEscalation.Request(
                 domain: SoftwarePathEscalation.mediaErrorDomain, code: 0,
-                message: "item death at a frozen position", positionSeconds: 0))
+                message: "item death at a frozen position", positionSeconds: 0),
+                expectedGeneration: engine.loadGeneration)
         }
         // The rebuild's probe is parked on the origin, so the stop lands inside the load.
         try await waitFor { origin.blocked.entered }
@@ -132,7 +133,7 @@ struct SoftwarePathEscalationTests {
         let sub = engine.softwarePathEscalations.sink { events.append($0) }
         defer { sub.cancel() }
 
-        await engine.escalateToSoftwarePath(Self.mediaFailure)
+        await engine.escalateToSoftwarePath(Self.mediaFailure, expectedGeneration: engine.loadGeneration)
 
         #expect(events.isEmpty)
         #expect(!engine.softwarePathEscalationBudget.isSpent)
@@ -157,7 +158,7 @@ struct SoftwarePathEscalationTests {
         let sub = engine.softwarePathEscalations.sink { events.append($0) }
         defer { sub.cancel() }
 
-        let escalation = Task { @MainActor in await engine.escalateToSoftwarePath(Self.mediaFailure) }
+        let escalation = Task { @MainActor in await engine.escalateToSoftwarePath(Self.mediaFailure, expectedGeneration: engine.loadGeneration) }
         try await waitFor { origin.blocked.entered }
         engine.stop()
         origin.stop()
@@ -186,7 +187,7 @@ struct SoftwarePathEscalationTests {
         }
         defer { sub.cancel() }
 
-        await engine.escalateToSoftwarePath(Self.mediaFailure)
+        await engine.escalateToSoftwarePath(Self.mediaFailure, expectedGeneration: engine.loadGeneration)
 
         #expect(errors.count == 1)
         #expect(errors.first??.kind != .nativeItemFailed)
@@ -267,7 +268,7 @@ struct SoftwarePathEscalationTests {
         }
         try await waitFor { reader.entered }
 
-        await engine.escalateToSoftwarePath(Self.mediaFailure)
+        await engine.escalateToSoftwarePath(Self.mediaFailure, expectedGeneration: engine.loadGeneration)
         #expect(events.map(\.duringStartup) == [true])
         #expect(engine.softwarePathTakeover == nil)
         #expect(engine.softwarePathTakeoverArm == nil)

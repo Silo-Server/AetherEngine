@@ -28,7 +28,9 @@ extension AetherEngine {
         // just left, and the window's edge is a running maximum a single wrong sample latches.
         if liveItemPlacementPending { return }
         // Newest seam at or before the raw clock wins: activates seams on forward play, re-applies pre-seam shift on backward DVR seeks.
-        if let active = presentationAxis.shiftSeconds(atItemSeconds: value) {
+        // Audit PERF-106: published on the engine, so an unchanged write would fire its
+        // objectWillChange on every 10 Hz tick (the reason `clock` exists).
+        if let active = presentationAxis.shiftSeconds(atItemSeconds: value), active != playlistShiftSeconds {
             playlistShiftSeconds = active
         }
         if pendingRecoverySeekClockTarget == nil {
@@ -857,11 +859,12 @@ extension AetherEngine {
         session.sideReaderLinkGate = sideReaderLinkGate
         // #260: an observer installed before load has to reach this session's producers too.
         session.setNativeVideoFrameTimeObserver(nativeVideoFrameTimeObserver)
+        // Audit Vcore-101: every hop below is dropped once this session has ended (`hop(for:)`).
         session.onFirstHDR10PlusDetected = { [weak self] in
-            Task { @MainActor in self?.handleHDR10PlusDetected() }
+            self?.hop(for: generation) { [weak self] in self?.handleHDR10PlusDetected() }
         }
         session.onPlaylistShiftChanged = { [weak self] seconds, seamItemSeconds in
-            Task { @MainActor in
+            self?.hop(for: generation) { [weak self] in
                 guard let self = self else { return }
                 let prevShift = self.playlistShiftSeconds
                 let delta = seconds - prevShift
@@ -891,7 +894,7 @@ extension AetherEngine {
                 // Fold with the shift in effect AT the raw clock, not with the newest one: while old-epoch buffer
                 // is still on screen those differ, and the picture is what the clock has to describe.
                 let activeShift = self.presentationAxis.shiftSeconds(atItemSeconds: self.nativeClockSeconds) ?? seconds
-                self.playlistShiftSeconds = activeShift
+                if activeShift != self.playlistShiftSeconds { self.playlistShiftSeconds = activeShift }
                 // The cache did not move, but the fold onto the display axis did. Re-publish the band
                 // from the raw spans so it does not carry the retired epoch's offset until the next
                 // segment lands (AE#468 follow-up).
@@ -925,7 +928,7 @@ extension AetherEngine {
             }
         }
         session.onSeekStateChanged = { [weak self] inFlight, playlistTime in
-            Task { @MainActor in
+            self?.hop(for: generation) { [weak self] in
                 guard let self = self else { return }
                 // Fold playlist-axis segment time onto the published display axis (#38); the origin keeps a disc
                 // scrub target 0-based like currentTime (0 off disc). nil clears without disturbing the last value.
@@ -941,7 +944,7 @@ extension AetherEngine {
             }
         }
         session.onNetworkPhaseChanged = { [weak self] phase in
-            Task { @MainActor in self?.setReaderNetworkPhase(phase) }
+            self?.hop(for: generation) { [weak self] in self?.setReaderNetworkPhase(phase) }
         }
         // #65: let the producer read AVPlayer's real position off-main when it re-anchors on a backpressure wedge.
         session.currentPlaybackPositionProvider = { [renderedPositionMirror] in renderedPositionMirror.get() }
@@ -964,7 +967,7 @@ extension AetherEngine {
         // pipeline (the effect a manual back-out had). Opens the spurious-pause window too, since
         // the nudge can bounce the transport state.
         session.onConsumerReengageNeeded = { [weak self] position in
-            Task { @MainActor [weak self] in
+            self?.hop(for: generation) { [weak self] in
                 guard let self else { return }
                 self.reengageStalledConsumer(position: position, trigger: "wedge re-anchor")
                 // #93 startup: a loader that died BEFORE the first frame never posts
@@ -991,7 +994,7 @@ extension AetherEngine {
             }
         }
         session.onPlaylistShiftRebased = { [weak self] seconds, seamOutputSeconds in
-            Task { @MainActor in
+            self?.hop(for: generation) { [weak self] in
                 guard let self = self else { return }
                 // Program boundary: producer rebased but AVPlayer is still rendering old program (buffer + holdback). Record the seam so $currentTime resolves the active shift from history, keeping currentTime/sourceTime behind what is on screen. Backward DVR seeks re-apply the pre-seam shift. Seams append in output-timeline order (continuation dts is monotonic).
                 var map = self.presentationAxis
@@ -1059,7 +1062,7 @@ extension AetherEngine {
                     session.giveUpLiveJoinWithoutEntryPoint()
                     return
                 }
-                await self.escalateToSoftwarePath(request)
+                await self.escalateToSoftwarePath(request, expectedGeneration: generation)
             }
         }
         // AE#641: the live bridge decoded nothing, so the served media carries an audio track that
@@ -1689,7 +1692,9 @@ extension AetherEngine {
                             self.publishError(Self.absorbedFailure(request))
                             return
                         }
-                        Task { @MainActor [weak self] in await self?.escalateToSoftwarePath(request) }
+                        self.hop(for: generation) { [weak self] in
+                            await self?.escalateToSoftwarePath(request, expectedGeneration: generation)
+                        }
                         return
                     }
                     EngineLog.emit(
@@ -1707,7 +1712,9 @@ extension AetherEngine {
         host.$pendingDisplayRejection
             .compactMap { $0 }
             .sink { [weak self] rejection in
-                Task { @MainActor [weak self] in self?.fallBackToMediaPlaylist(rejection) }
+                self?.hop(for: generation) { [weak self] in
+                    self?.fallBackToMediaPlaylist(rejection, expectedGeneration: generation)
+                }
             }
             .store(in: &nativeCancellables)
 
@@ -1731,7 +1738,9 @@ extension AetherEngine {
         host.$pendingSoftwarePathEscalation
             .compactMap { $0 }
             .sink { [weak self] request in
-                Task { @MainActor [weak self] in await self?.escalateToSoftwarePath(request) }
+                self?.hop(for: generation) { [weak self] in
+                    await self?.escalateToSoftwarePath(request, expectedGeneration: generation)
+                }
             }
             .store(in: &nativeCancellables)
 
@@ -1976,7 +1985,7 @@ extension AetherEngine {
         let declaredDuration = loadedOptions.declaredDurationSeconds
         // Built on the main actor, captured into the detach: surfaces source stall/reconnect to playbackPhase (#85).
         let networkPhaseSink: @Sendable (ReaderNetworkPhase) -> Void = { [weak self] phase in
-            Task { @MainActor in self?.setReaderNetworkPhase(phase) }
+            self?.hop(for: generation) { [weak self] in self?.setReaderNetworkPhase(phase) }   // audit Vcore-101
         }
         if loadGeneration == generation { recordStartupCheckpoint(.sessionConstructed) }   // #361
         let forwardBufferSegments = loadedOptions.forwardBufferSegments
@@ -2054,7 +2063,7 @@ extension AetherEngine {
         let declaredDuration = loadedOptions.declaredDurationSeconds
         // Built on the main actor, captured into the detach: surfaces source stall/reconnect to playbackPhase (#85).
         let networkPhaseSink: @Sendable (ReaderNetworkPhase) -> Void = { [weak self] phase in
-            Task { @MainActor in self?.setReaderNetworkPhase(phase) }
+            self?.hop(for: generation) { [weak self] in self?.setReaderNetworkPhase(phase) }   // audit Vcore-101
         }
         if loadGeneration == generation { recordStartupCheckpoint(.sessionConstructed) }   // #361
         try await Task.detached(priority: .userInitiated) {
@@ -2175,13 +2184,17 @@ extension AetherEngine {
     /// This path publishes its failure and used to return silently either way, so a caller could
     /// not tell a rebuilt session from a dead one; `reloadAtCurrentPosition(applying:)` is built on
     /// exactly that distinction. Callers that only drive UI keep discarding it.
+    ///
+    /// `resumePlaying` is the transport the rebuild comes back in; nil reads the session's own
+    /// (`sessionRebuildResumesPlaying`, AE#464 round 2), which is what an audio or title pick wants.
     @discardableResult
     func reloadWithAudioOverride(
         url: URL,
         audioStreamIndex: Int32?,
         expectedGeneration: UInt64,
         discTitleIDOverride: Int? = nil,
-        resumeOverride: Double? = nil
+        resumeOverride: Double? = nil,
+        resumePlaying: Bool? = nil
     ) async -> Error? {
         // Liveness guard: a stop()/load() between scheduling and here would resurrect a dismissed session or kill the successor. Generation captured at schedule time; both stop() and load() invalidate it.
         guard loadGeneration == expectedGeneration, loadedURL != nil else {
@@ -2254,13 +2267,16 @@ extension AetherEngine {
             category: .engine
         )
 
+        // Audit LIF-102: read before `.loading`, which is the state this rebuild is about to hide the
+        // session's transport behind. The audio pick never wrote it into `loadedOptions.autoplay`
+        // (that is the mount flag there), so the rebuild used to end in an unconditional `play()`.
+        let resumesPlaying = resumePlaying ?? sessionRebuildResumesPlaying
         state = .loading
         // AE#464 round 2: this branch reaches `loadSoftware` / `loadNative` rather than `load`, so it
         // parks its own rebuild position for anything that stacks behind it. Round 3 parks the
-        // transport beside it; this branch reads `loadedOptions` field by field, and the caller has
-        // already written the session's own transport into it.
+        // transport beside it.
         positionUnderReconstruction = resumeAt
-        transportIntentUnderReconstruction = loadedOptions.autoplay
+        transportIntentUnderReconstruction = resumesPlaying
         let previousAudioIndex = activeAudioTrackIndex
         // Snapshot before stopInternal wipes state. Must reload on the same backend: loadNative on a SW-routed AV1 source throws unsupportedCodec (HLSVideoEngine only accepts HEVC / H.264 / VP9 / probed-AV1).
         let wasOnSoftwarePath = (playbackBackend == .software)
@@ -2294,10 +2310,19 @@ extension AetherEngine {
         // It follows the TARGET route, not the previous one: a rebuild that flips to software renders
         // into its own layer, and a preserved host would leave AVKit bound to a stale player with
         // audio still flowing into the next load (the release `load()` does by hand on that branch).
+        // Audit LIF-104: the AE#597 reset outranks the #15 reuse here exactly as it does in `load`,
+        // or the first rebuild after a reset mounts its item on the invalidated AVPlayer.
+        let mediaServicesWereReset = consumeMediaServicesReset()
         claimSoftwarePathTakeover()   // AE#629
-        stopInternal(resetDisplayCriteria: false, keepNativeHost: !targetSoftwarePath, keepCustomReader: true)
+        stopInternal(resetDisplayCriteria: false,
+                     keepNativeHost: !targetSoftwarePath && !mediaServicesWereReset,
+                     keepCustomReader: true)
+        if mediaServicesWereReset { dropAudioPlayerHostAfterMediaServicesReset() }
         EngineLog.emit("[AetherEngine] reload: stopInternal done (\(elapsedMs(since: reloadStart))ms)", category: .engine)
         let gen = loadGeneration
+        // Audit LIF-101: the same settle point as `load`, for the same readiness waypoint.
+        beginLoadInFlight(gen)
+        defer { endLoadInFlight(gen) }
         loadedURL = url
         lastDetectedVideoCodec = preservedVideoCodec
 
@@ -2411,7 +2436,8 @@ extension AetherEngine {
                     audioTracks: audioTracks, activeIndex: softwareHost?.audioStreamIndex ?? -1
                 )
                 presentCurrentLayer()
-                softwareHost?.play()
+                // #124: not resuming leaves the host paused; its readiness settles `.loading -> .paused`.
+                if resumesPlaying { softwareHost?.play() }
             } else {
                 EngineLog.emit("[AetherEngine] reload: loadNative enter audio=\(audioStreamIndex.map(String.init) ?? "nil") resumeAt=\(String(format: "%.2f", resumeAt))s", category: .engine)
                 // #339: the only write this reload can still produce is a sole-writer host's re-write on the
@@ -2497,12 +2523,13 @@ extension AetherEngine {
                         formatKnown: true,
                         effectiveFormat: videoFormat
                     ),
-                    settleCap: loadedOptions.isLive ? .standard : .awaitObservedEnd)
+                    settleCap: loadedOptions.isLive ? .standard : .awaitObservedEnd,
+                    isCurrent: { self.loadGeneration == gen })
                 try checkLoadCurrent(gen)
-                nativeHost?.play()
+                if resumesPlaying { nativeHost?.play() }
             }
             try checkLoadCurrent(gen)
-            state = .playing
+            if resumesPlaying { state = .playing }
             // Re-arm samplers: stopInternal nilled them, and the reload path bypasses public load() that normally restarts them. Without this, liveTelemetry stays nil and the stats overlay shows "-" after every audio switch.
             startMemoryProbe()
             startLiveTelemetrySampler()
@@ -2514,7 +2541,7 @@ extension AetherEngine {
             if loadedOptions.isLive, !targetSoftwarePath {
                 armLiveReloadWatchdog(generation: gen)
             }
-            EngineLog.emit("[AetherEngine] reload: state=.playing total=\(elapsedMs(since: reloadStart))ms", category: .engine)
+            EngineLog.emit("[AetherEngine] reload: state=\(resumesPlaying ? ".playing" : "paused on readiness") total=\(elapsedMs(since: reloadStart))ms", category: .engine)
         } catch is CancellationError {
             // Superseded by a newer load/stop: it owns the engine state.
             return nil

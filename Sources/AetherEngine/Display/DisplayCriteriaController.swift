@@ -44,6 +44,8 @@ final class DisplayCriteriaController {
     /// #339: armed at the criteria write, not when the play gate opens, so an engine-written switch is
     /// observable end to end instead of having to be guessed at from the in-progress flag.
     private let observation = SwitchObservation()
+    /// DEC-105: what is left of the observed-end wait for the armed switch (`observedEndCap`).
+    private var observedEndBudget: ObservedEndBudget?
     #endif
 
     /// The arm generation whose record has been spent. Only a gate that ends the load's wait spends it, so
@@ -154,6 +156,40 @@ final class DisplayCriteriaController {
     nonisolated static func settleCapMs(cap: SettleCap, startRecorded: Bool) -> Int {
         guard cap == .awaitObservedEnd, startRecorded else { return stage2CapMs }
         return observedEndCapMs
+    }
+
+    /// The observed-end wait left for one armed switch, shared by every gate that waits on it.
+    struct ObservedEndBudget: Equatable {
+        let armGeneration: Int
+        let deadlineNanos: UInt64
+    }
+
+    /// DEC-105: `observedEndCapMs` is one budget per armed switch, not per gate. The #667 wait leaves the
+    /// record unspent for the play gate, so on a panel whose end is never announced (or whose in-progress
+    /// flag sticks) both read the same `.running`, and each used to spend the whole cap on one switch.
+    /// The first gate to wait sets the deadline; a later gate on the same arm gets what is left of it.
+    nonisolated static func observedEndCap(settleCap: SettleCap, startRecorded: Bool, armGeneration: Int,
+                                           nowNanos: UInt64, budget: ObservedEndBudget?)
+        -> (capMs: Int, budget: ObservedEndBudget?) {
+        let capMs = settleCapMs(cap: settleCap, startRecorded: startRecorded)
+        guard capMs == observedEndCapMs, armGeneration != 0 else { return (capMs, budget) }
+        if let budget, budget.armGeneration == armGeneration {
+            return (min(capMs, elapsedMs(fromNanos: nowNanos, toNanos: budget.deadlineNanos)), budget)
+        }
+        let deadline = nowNanos &+ UInt64(capMs) * 1_000_000
+        return (capMs, ObservedEndBudget(armGeneration: armGeneration, deadlineNanos: deadline))
+    }
+
+    /// Audit LIF-106: one poll of a switch wait. False once the load waiting on it is gone: its task
+    /// was cancelled (a cancelled `Task.sleep` returns at once, so the `try?` these loops used turned
+    /// them into a hot spin on the main actor until the cap) or a newer load or stop superseded it.
+    static func gateTick(milliseconds: Int, isCurrent: () -> Bool) async -> Bool {
+        do {
+            try await Task.sleep(for: .milliseconds(milliseconds))
+        } catch {
+            return false
+        }
+        return isCurrent()
     }
 
     /// Both stages spend a deadline, not a poll count. `n` sleeps of `m` ms is only `n * m` on an idle
@@ -881,9 +917,13 @@ final class DisplayCriteriaController {
     /// `consumesRecord: false` leaves the observation readable for the load's second gate. The pre-flight
     /// passes it: it waits an HDR switch out before the item is built, and the play gate that follows is
     /// entitled to the same start/end timestamps (#339).
+    ///
+    /// `isCurrent` answers whether the load this gate holds is still the engine's; the wait is abandoned
+    /// at the next tick once it is not, or once its task is cancelled (audit LIF-106).
     func waitForSwitch(startGrace: StartGrace = .full,
                        consumesRecord: Bool = true,
-                       settleCap: SettleCap = .standard) async {
+                       settleCap: SettleCap = .standard,
+                       isCurrent: () -> Bool = { true }) async {
         #if os(tvOS)
         guard startGrace != .skip else { return }
         guard let window = resolveWindow() else { return }
@@ -987,7 +1027,10 @@ final class DisplayCriteriaController {
                     break
                 }
                 isFirstPoll = false
-                try? await Task.sleep(for: .milliseconds(10))
+                guard await Self.gateTick(milliseconds: 10, isCurrent: isCurrent) else {
+                    EngineLog.emit("[DisplayCriteria] gate abandoned in the start phase after \(Self.elapsedMs(since: entry))ms: the load it held was cancelled or superseded", category: .engine)
+                    return
+                }
             }
             // Time spent, not the budget: the polls carry scheduler overhead, and everything downstream is
             // reported relative to this (#49).
@@ -1006,10 +1049,15 @@ final class DisplayCriteriaController {
         // switch is unobservable to the app can't gate the first frame the way the
         // old fixed 5s poll did.
         // What this gate may spend waiting for the end, given who is waiting on it (`settleCapMs`).
-        let capMs = Self.settleCapMs(
-            cap: settleCap,
-            startRecorded: gateSnapshot.startedAt != nil || observation.hasNewStart(since: gateSnapshot))
         let stage2Entry = DispatchTime.now()
+        let cap = Self.observedEndCap(
+            settleCap: settleCap,
+            startRecorded: gateSnapshot.startedAt != nil || observation.hasNewStart(since: gateSnapshot),
+            armGeneration: gateSnapshot.generation,
+            nowNanos: stage2Entry.uptimeNanoseconds,
+            budget: observedEndBudget)
+        observedEndBudget = cap.budget
+        let capMs = cap.capMs
         func timing() -> String {
             // The panel's own switch duration whenever both notifications were seen. This is the number the
             // `.brief` premise ("engine rate-only writes settle sub-second") has never been checked against
@@ -1027,7 +1075,10 @@ final class DisplayCriteriaController {
         // multiple after a dwell can be asked how long it has actually held it.
         var cadenceHistory = PanelCadenceHistory()
         while !Self.isBudgetSpent(elapsedMs: Self.elapsedMs(since: stage2Entry), budgetMs: capMs) {
-            try? await Task.sleep(for: .milliseconds(50))
+            guard await Self.gateTick(milliseconds: 50, isCurrent: isCurrent) else {
+                EngineLog.emit("[DisplayCriteria] gate abandoned while waiting for the end (\(timing())): the load it held was cancelled or superseded", category: .engine)
+                return
+            }
             let stage2Ms = Self.elapsedMs(since: stage2Entry)
             let relation = panelRelation()
             cadenceHistory = Self.extendCadenceHistory(cadenceHistory, relation: relation, nowMs: stage2Ms)
