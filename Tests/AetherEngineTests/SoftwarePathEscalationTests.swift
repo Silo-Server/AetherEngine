@@ -7,7 +7,9 @@ import Foundation
 import Testing
 @testable import AetherEngine
 
-@Suite("Software-path escalation (AE#561)")
+// Serialized: several tests park a load's reader on a cooperative-pool thread until the test
+// releases it, and the release itself needs a pool thread (see BackgroundDecisionWaitsForLoadTests).
+@Suite("Software-path escalation (AE#561)", .serialized)
 struct SoftwarePathEscalationTests {
 
     private static func availability(

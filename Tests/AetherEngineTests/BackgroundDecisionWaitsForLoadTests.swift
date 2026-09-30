@@ -10,7 +10,10 @@ import Testing
 ///
 /// The lifecycle itself is iOS / tvOS only; the owed funnel is not, so these drive it through
 /// `noteDidEnterBackground()` and a policy seam that performs the same synchronous teardown.
-@Suite("A background decision owed during a load waits for the load to return", .timeLimit(.minutes(2)))
+// Serialized: each test parks a load's reader on a cooperative-pool thread until the test releases
+// it, and the release itself needs a pool thread. Run in parallel, these filled CI's four-thread
+// pool and stalled the whole swift-testing process for about 100 s.
+@Suite("A background decision owed during a load waits for the load to return", .serialized, .timeLimit(.minutes(2)))
 @MainActor
 struct BackgroundDecisionWaitsForLoadTests {
 
