@@ -5,8 +5,8 @@ import CoreVideo
 
 /// Video renderer using AVSampleBufferDisplayLayer for optimal frame pacing.
 ///
-/// Includes a small reorder buffer (4 frames) to handle B-frame decode
-/// order from VTDecompressionSession. Frames are sorted by PTS before
+/// Includes a small reorder buffer to handle B-frame decode order from VTDecompressionSession
+/// (4 frames, see `reorderDepth(forHardwareDecoder:)`). Frames are sorted by PTS before
 /// being enqueued to the display layer in strict presentation order.
 final class SampleBufferRenderer: @unchecked Sendable {
 
@@ -27,10 +27,39 @@ final class SampleBufferRenderer: @unchecked Sendable {
     /// window renders only this layer, the host overlay cannot reach it).
     let subtitleCompositor = SubtitleFrameCompositor()
 
-    /// B-frame reorder buffer (4 frames): collects decoder output, flushes to display layer in ascending PTS order. Third tuple slot carries per-frame HDR10+ T.35 SEI bytes, paired through the reorder to kCMSampleAttachmentKey_HDR10PlusPerFrameData.
+    /// B-frame reorder buffer: collects decoder output, flushes to display layer in ascending PTS order. Third tuple slot carries per-frame HDR10+ T.35 SEI bytes, paired through the reorder to kCMSampleAttachmentKey_HDR10PlusPerFrameData.
     private let reorderLock = NSLock()
     private var reorderBuffer: [(CVPixelBuffer, CMTime, Data?)] = []
-    private let reorderDepth = 4  // handles up to 3 consecutive B-frames
+
+    /// Audit PERF-104: VideoToolbox HEVC with temporal processing emits B-frames out of presentation
+    /// order (19479fc5, -12080 from the layer), so its renderer holds 4 frames, enough for 3
+    /// consecutive B-frames. libavcodec and dav1d emit presentation order, and 3 held frames are 75 MB
+    /// of IOSurface at 4K P010 for nothing. One frame stays held either way: #407 reads each frame's
+    /// duration off its held successor.
+    static let hardwareDecoderReorderDepth = 4
+    static let presentationOrderReorderDepth = 1
+    static func reorderDepth(forHardwareDecoder hardware: Bool) -> Int {
+        hardware ? hardwareDecoderReorderDepth : presentationOrderReorderDepth
+    }
+
+    /// Guarded by `reorderLock`. Starts at the hardware depth, so a renderer nobody configured keeps the
+    /// behaviour it always had.
+    private var reorderDepth = SampleBufferRenderer.hardwareDecoderReorderDepth
+
+    /// Set once by the host when it picks the decoder; a depth below the current one takes effect on
+    /// the next enqueue, which hands the surplus over in order.
+    func setReorderDepth(_ depth: Int) {
+        reorderLock.lock()
+        reorderDepth = max(1, min(depth, Self.hardwareDecoderReorderDepth))
+        reorderLock.unlock()
+    }
+
+    /// Frames waiting for a smaller presentation time. Diagnostics and tests.
+    var heldFrameCount: Int {
+        reorderLock.lock()
+        defer { reorderLock.unlock() }
+        return reorderBuffer.count
+    }
 
     /// Drop frames before this PTS after a seek (prevents keyframe-to-target fast-forward). Cleared after the first passing frame.
     private var skipUntilPTS: CMTime?
@@ -98,6 +127,18 @@ final class SampleBufferRenderer: @unchecked Sendable {
     private var _lastHandedPtsSeconds: Double?
     private var _minHandedDeltaSeconds = Double.infinity
     private var _maxHandedDeltaSeconds = -Double.infinity
+
+    /// Audit PERF-104: frames that arrived after a later one had already been handed over, so they can
+    /// no longer be enqueued in presentation order. Dropped rather than enqueued out of order, and the
+    /// first one raises the depth to the hardware decoder's for the rest of this renderer's life, which
+    /// covers an HEVC stream whose SPS understates its reorder and PTS derived by the demuxer.
+    /// Guarded by `reorderLock`.
+    private var _outOfOrderFramesDropped = 0
+    var outOfOrderFramesDropped: Int {
+        reorderLock.lock()
+        defer { reorderLock.unlock() }
+        return _outOfOrderFramesDropped
+    }
 
     /// #298: frames refused at the enqueue gate for carrying an unschedulable PTS. Guarded by `reorderLock`.
     private var _untimedFramesDropped = 0
@@ -196,7 +237,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
         _minHandedDeltaSeconds = .infinity
         _maxHandedDeltaSeconds = -.infinity
         return Cadence(handedOver: enqueueCount,
-                       lostBeforeLayer: _untimedFramesDropped + _sampleBuildFailures,
+                       lostBeforeLayer: _untimedFramesDropped + _sampleBuildFailures + _outOfOrderFramesDropped,
                        minDeltaSeconds: minD, maxDeltaSeconds: maxD)
     }
 
@@ -314,6 +355,20 @@ final class SampleBufferRenderer: @unchecked Sendable {
         }
 
         let ptsSeconds = CMTimeGetSeconds(pts)
+        if let handed = _lastHandedPtsSeconds, ptsSeconds < handed {
+            _outOfOrderFramesDropped += 1
+            let dropped = _outOfOrderFramesDropped
+            let raised = reorderDepth < Self.hardwareDecoderReorderDepth
+            reorderDepth = Self.hardwareDecoderReorderDepth
+            reorderLock.unlock()
+            if dropped == 1 {
+                EngineLog.emit(
+                    "[Renderer] frame at \(String(format: "%.3f", ptsSeconds))s arrived after \(String(format: "%.3f", handed))s "
+                    + "was handed over; dropped, reorder depth \(raised ? "raised to \(Self.hardwareDecoderReorderDepth)" : "already \(Self.hardwareDecoderReorderDepth)")",
+                    category: .swPlayback)
+            }
+            return
+        }
         // #303: the frontier is the newest timestamp HELD, not the newest handed over. A B-frame run
         // arrives out of order, so taking the last call's timestamp would report a cushion that
         // shrinks and grows with the coding pattern rather than with the buffer.

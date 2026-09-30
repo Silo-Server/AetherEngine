@@ -841,6 +841,9 @@ final class SoftwarePlaybackHost {
             )
         }
 
+        // Audit PERF-104: only the VideoToolbox decoder emits out of presentation order.
+        renderer.setReorderDepth(SampleBufferRenderer.reorderDepth(forHardwareDecoder: videoDecoder is HardwareVideoDecoder))
+
         // Flip display layer into HDR mode before frames arrive; without this preferredDynamicRange stays .standard and PQ/HLG renders desaturated.
         if let codecpar = vStream.pointee.codecpar {
             let trc = codecpar.pointee.color_trc
@@ -867,7 +870,7 @@ final class SoftwarePlaybackHost {
             if self.bumpFramesEnqueued() == 0 {
                 self.noteFirstFrameEnqueuedForDisplayFallback()
                 if self.takePausedBeforeFirstFrame() {
-                    // The reorder buffer holds four frames before it hands one to the layer, and the
+                    // The reorder buffer holds frames before it hands one to the layer, and the
                     // loops park again from here: without the drain the frame never leaves it.
                     self.renderer.drainReorderBuffer()
                     self.presentFirstFrameUnderPause(pts: pts.seconds, generation: self.decodeGeneration)
