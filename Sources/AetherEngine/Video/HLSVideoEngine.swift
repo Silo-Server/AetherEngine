@@ -77,9 +77,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Caller-chosen audio stream index; nil falls back to `av_find_best_stream`. Enables
     /// host-driven track switching via `AetherEngine.selectAudioTrack(index:)` reload.
     private let audioSourceStreamIndexOverride: Int32?
-    /// AE#641: a source audio stream this session already found undecodable (its bridge decoded
-    /// nothing). When the pick lands on it again, the cascade goes straight to its video-only tail.
-    let undecodableAudioStreamIndex: Int32?
+    /// AE#641: the source audio streams this session already found undecodable (their bridge decoded
+    /// nothing). When the pick lands on one again, the cascade goes straight to its video-only tail.
+    let undecodableAudioStreamIndices: Set<Int32>
+
+    /// Whether the cascade has to skip the stream it is about to build a pipeline for.
+    nonisolated static func isKnownUndecodable(_ indices: Set<Int32>, sourceAudioStreamIndex: Int32) -> Bool {
+        sourceAudioStreamIndex >= 0 && indices.contains(sourceAudioStreamIndex)
+    }
 
     /// AE#443: whoever REPLACES one of these two mid-session owes the session the totals the outgoing
     /// instance held (`retireDemuxer` / `retireProducer` below). They carry the session's byte and
@@ -894,7 +899,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         audioSourceStreamIndexOverride: Int32? = nil,
-        undecodableAudioStreamIndex: Int32? = nil,
+        undecodableAudioStreamIndices: Set<Int32> = [],
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         isLiveSession: Bool = false,
         dvrWindowSeconds: Double? = nil,
@@ -939,7 +944,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
         self.audioSourceStreamIndexOverride = audioSourceStreamIndexOverride
-        self.undecodableAudioStreamIndex = undecodableAudioStreamIndex
+        self.undecodableAudioStreamIndices = undecodableAudioStreamIndices
         self.audioBridgeMode = audioBridgeMode
         self.isLiveSession = isLiveSession
         self.dvrWindowSeconds = dvrWindowSeconds
