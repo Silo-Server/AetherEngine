@@ -859,11 +859,12 @@ extension AetherEngine {
         session.sideReaderLinkGate = sideReaderLinkGate
         // #260: an observer installed before load has to reach this session's producers too.
         session.setNativeVideoFrameTimeObserver(nativeVideoFrameTimeObserver)
+        // Audit Vcore-101: every hop below is dropped once this session has ended (`hop(for:)`).
         session.onFirstHDR10PlusDetected = { [weak self] in
-            Task { @MainActor in self?.handleHDR10PlusDetected() }
+            self?.hop(for: generation) { [weak self] in self?.handleHDR10PlusDetected() }
         }
         session.onPlaylistShiftChanged = { [weak self] seconds, seamItemSeconds in
-            Task { @MainActor in
+            self?.hop(for: generation) { [weak self] in
                 guard let self = self else { return }
                 let prevShift = self.playlistShiftSeconds
                 let delta = seconds - prevShift
@@ -927,7 +928,7 @@ extension AetherEngine {
             }
         }
         session.onSeekStateChanged = { [weak self] inFlight, playlistTime in
-            Task { @MainActor in
+            self?.hop(for: generation) { [weak self] in
                 guard let self = self else { return }
                 // Fold playlist-axis segment time onto the published display axis (#38); the origin keeps a disc
                 // scrub target 0-based like currentTime (0 off disc). nil clears without disturbing the last value.
@@ -943,7 +944,7 @@ extension AetherEngine {
             }
         }
         session.onNetworkPhaseChanged = { [weak self] phase in
-            Task { @MainActor in self?.setReaderNetworkPhase(phase) }
+            self?.hop(for: generation) { [weak self] in self?.setReaderNetworkPhase(phase) }
         }
         // #65: let the producer read AVPlayer's real position off-main when it re-anchors on a backpressure wedge.
         session.currentPlaybackPositionProvider = { [renderedPositionMirror] in renderedPositionMirror.get() }
@@ -966,7 +967,7 @@ extension AetherEngine {
         // pipeline (the effect a manual back-out had). Opens the spurious-pause window too, since
         // the nudge can bounce the transport state.
         session.onConsumerReengageNeeded = { [weak self] position in
-            Task { @MainActor [weak self] in
+            self?.hop(for: generation) { [weak self] in
                 guard let self else { return }
                 self.reengageStalledConsumer(position: position, trigger: "wedge re-anchor")
                 // #93 startup: a loader that died BEFORE the first frame never posts
@@ -993,7 +994,7 @@ extension AetherEngine {
             }
         }
         session.onPlaylistShiftRebased = { [weak self] seconds, seamOutputSeconds in
-            Task { @MainActor in
+            self?.hop(for: generation) { [weak self] in
                 guard let self = self else { return }
                 // Program boundary: producer rebased but AVPlayer is still rendering old program (buffer + holdback). Record the seam so $currentTime resolves the active shift from history, keeping currentTime/sourceTime behind what is on screen. Backward DVR seeks re-apply the pre-seam shift. Seams append in output-timeline order (continuation dts is monotonic).
                 var map = self.presentationAxis
@@ -1061,7 +1062,7 @@ extension AetherEngine {
                     session.giveUpLiveJoinWithoutEntryPoint()
                     return
                 }
-                await self.escalateToSoftwarePath(request)
+                await self.escalateToSoftwarePath(request, expectedGeneration: generation)
             }
         }
         // AE#641: the live bridge decoded nothing, so the served media carries an audio track that
@@ -1691,7 +1692,9 @@ extension AetherEngine {
                             self.publishError(Self.absorbedFailure(request))
                             return
                         }
-                        Task { @MainActor [weak self] in await self?.escalateToSoftwarePath(request) }
+                        self.hop(for: generation) { [weak self] in
+                            await self?.escalateToSoftwarePath(request, expectedGeneration: generation)
+                        }
                         return
                     }
                     EngineLog.emit(
@@ -1709,7 +1712,9 @@ extension AetherEngine {
         host.$pendingDisplayRejection
             .compactMap { $0 }
             .sink { [weak self] rejection in
-                Task { @MainActor [weak self] in self?.fallBackToMediaPlaylist(rejection) }
+                self?.hop(for: generation) { [weak self] in
+                    self?.fallBackToMediaPlaylist(rejection, expectedGeneration: generation)
+                }
             }
             .store(in: &nativeCancellables)
 
@@ -1733,7 +1738,9 @@ extension AetherEngine {
         host.$pendingSoftwarePathEscalation
             .compactMap { $0 }
             .sink { [weak self] request in
-                Task { @MainActor [weak self] in await self?.escalateToSoftwarePath(request) }
+                self?.hop(for: generation) { [weak self] in
+                    await self?.escalateToSoftwarePath(request, expectedGeneration: generation)
+                }
             }
             .store(in: &nativeCancellables)
 
@@ -1978,7 +1985,7 @@ extension AetherEngine {
         let declaredDuration = loadedOptions.declaredDurationSeconds
         // Built on the main actor, captured into the detach: surfaces source stall/reconnect to playbackPhase (#85).
         let networkPhaseSink: @Sendable (ReaderNetworkPhase) -> Void = { [weak self] phase in
-            Task { @MainActor in self?.setReaderNetworkPhase(phase) }
+            self?.hop(for: generation) { [weak self] in self?.setReaderNetworkPhase(phase) }   // audit Vcore-101
         }
         if loadGeneration == generation { recordStartupCheckpoint(.sessionConstructed) }   // #361
         let forwardBufferSegments = loadedOptions.forwardBufferSegments
@@ -2056,7 +2063,7 @@ extension AetherEngine {
         let declaredDuration = loadedOptions.declaredDurationSeconds
         // Built on the main actor, captured into the detach: surfaces source stall/reconnect to playbackPhase (#85).
         let networkPhaseSink: @Sendable (ReaderNetworkPhase) -> Void = { [weak self] phase in
-            Task { @MainActor in self?.setReaderNetworkPhase(phase) }
+            self?.hop(for: generation) { [weak self] in self?.setReaderNetworkPhase(phase) }   // audit Vcore-101
         }
         if loadGeneration == generation { recordStartupCheckpoint(.sessionConstructed) }   // #361
         try await Task.detached(priority: .userInitiated) {

@@ -2082,6 +2082,9 @@ final class NativeAVPlayerHost {
         notificationObservers.removeAll()
         // Clear terminal flags: keepNativeHost reload reuses the host and @Published replays on subscribe; stale failure/didReachEnd corrupt the new session (issue #15).
         failure = nil
+        // Audit Vcore-102: the same replay would hand the successor's sinks this item's refusal.
+        pendingDisplayRejection = nil
+        pendingSoftwarePathEscalation = nil
         didReachEnd = false
         // #315: same reason. The layer itself still reads true for a few tens of ms past this point
         // (AVFoundation clears it after the swap), so the published value leads the layer here on

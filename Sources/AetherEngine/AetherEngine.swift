@@ -2046,6 +2046,17 @@ public final class AetherEngine: ObservableObject {
         }
     }
 
+    /// Audit LIF-103, Vcore-101: a session callback's hop onto the main actor, dropped when the session
+    /// that raised it has ended by the time it lands. Only `stopInternal` bumps `loadGeneration` and it
+    /// always ends the session, so the generation is the session's identity on every path, the software
+    /// one included, which has no session object to compare.
+    nonisolated func hop(for generation: UInt64, _ body: @escaping @Sendable @MainActor () async -> Void) {
+        Task { @MainActor [weak self] in
+            guard let self, self.loadGeneration == generation else { return }
+            await body()
+        }
+    }
+
     /// Shift seam history on the item axis. The producer rebases immediately (live program boundary) or starts a
     /// fresh epoch (VOD restart); AVPlayer renders that content ~buffer+holdback later. The currentTime sink
     /// resolves the active shift by looking up the newest seam at or before the raw clock (a history, not a
@@ -2581,7 +2592,9 @@ public final class AetherEngine: ObservableObject {
     /// React to AVPlayer rejecting the served master (#98, #130): if eligible, reload the media
     /// playlist in place (single-variant); otherwise surface the failure normally.
     @MainActor
-    func fallBackToMediaPlaylist(_ rejection: DisplayRejection) {
+    func fallBackToMediaPlaylist(_ rejection: DisplayRejection, expectedGeneration: UInt64) {
+        // Audit LIF-103: a rejection of an ended session's item is not the running session's to act on.
+        guard loadGeneration == expectedGeneration else { return }
         guard let host = nativeHost, let session = nativeVideoSession else {
             publishError(PlaybackErrorInfo(kind: .masterPlaylistRejected, message: rejection.message, underlyingDomain: rejection.domain, underlyingCode: rejection.code))
             return
