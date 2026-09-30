@@ -2622,11 +2622,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     /// Single Range fetch for a detour block over the pooled chunkSession. Surfaces rate limiting with
     /// its Retry-After so the caller can back off in place rather than churn the connection (#71).
+    ///
+    /// The origin ticket is `syncRequest`'s, and only that one (audit DMX-105): a second acquire here
+    /// took the last slot of a two-request origin and left the inner one waiting its whole budget for
+    /// a slot this same fetch was holding, +4 s per block, with a third request on the books.
     private func detourFetchBlock(from offset: Int64, size: Int) -> DetourFetch {
         let budget = Self.effectiveDetourBudget(chunkRequestTimeout: chunkRequestTimeout)
-        let ticket = OriginRequestBudget.shared.acquire(
-            for: requestURL(), label: "\(label) detour", timeout: budget)
-        defer { OriginRequestBudget.shared.release(ticket) }
         let rangeEnd = offset + Int64(size) - 1
         var request = URLRequest(url: requestURL())
         request.setValue("bytes=\(offset)-\(rangeEnd)", forHTTPHeaderField: "Range")
@@ -2635,7 +2636,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         request.timeoutInterval = budget
         applyExtraHeaders(&request)
         do {
-            let (data, response) = try syncRequest(request, budget: budget)
+            let (data, response) = try syncRequest(
+                request, budget: budget, slotLabel: "detour",
+                slotWait: min(budget, Self.shortFetchSlotWaitSeconds))
             if let http = response as? HTTPURLResponse {
                 let status = http.statusCode
                 if Self.isRateLimitStatus(status) {
@@ -4362,13 +4365,15 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         completion.wait()
     }
 
-    private func syncRequest(_ request: URLRequest, budget: TimeInterval = 35) throws -> (Data, URLResponse) {
+    private func syncRequest(_ request: URLRequest, budget: TimeInterval = 35,
+                             slotLabel: String = "fetch",
+                             slotWait: TimeInterval = AVIOReader.shortFetchSlotWaitSeconds) throws -> (Data, URLResponse) {
         // #377: every short fetch the reader makes (detour blocks, size probes, HEAD) funnels
         // through here, so this is the one place that has to take an origin slot for all of them.
         // Scoped to the call: unlike the pump's, this request's life IS this function's.
         let slotURL = request.url ?? url
         let ticket = try requestTicket(
-            for: slotURL, label: "\(label) fetch", timeout: Self.shortFetchSlotWaitSeconds)
+            for: slotURL, label: "\(label) \(slotLabel)", timeout: slotWait)
         defer { OriginRequestBudget.shared.release(ticket) }
 
         let delegate = ChunkFetchDelegate(extraHeaders: headers(for: request.url),
