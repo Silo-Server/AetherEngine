@@ -322,7 +322,7 @@ if first == "--help" || first == "-h" || first == "help" {
 if first == "dvr" {
     var rest = Array(args.dropFirst(2))
     let path    = takeStringFlag("--path",       from: &rest) ?? "both"
-    let seconds = takeDoubleFlag("--seconds",    from: &rest) ?? 120.0
+    let seconds = takeDoubleFlag("--seconds",    in: 0...maxRunSeconds, from: &rest) ?? 120.0
     let dvrWin  = takeDoubleFlag("--dvr-window", from: &rest) ?? 60.0
     guard ["native", "sw", "both"].contains(path) else {
         print("ERROR: --path must be native, sw, or both (got '\(path)')")
@@ -335,8 +335,8 @@ if first == "dvr" {
 // #92 verifier: SW-decode each segment in isolation; framesDecoded==0 => not independently decodable.
 if first == "segverify" {
     var rest = Array(args.dropFirst(2))
-    let fromIdx = takeIntFlag("--from", from: &rest) ?? 0
-    let count   = takeIntFlag("--count", from: &rest) ?? 12
+    let fromIdx = takeIntFlag("--from", in: 0...1_000_000, from: &rest) ?? 0
+    let count   = takeIntFlag("--count", in: 0...1_000_000, from: &rest) ?? 12
     let noDV    = takeFlag("--no-dv", from: &rest)
     let forceDV = takeFlag("--force-dv", from: &rest)
     let dvBaseLayer = takeFlag("--dv-base-layer", from: &rest)
@@ -356,7 +356,7 @@ if first == "segverify" {
 // Rapid-seek burst repro (issue #35).
 if first == "seektest" {
     var rest = Array(args.dropFirst(2))
-    let seeks   = takeIntFlag("--seeks", from: &rest) ?? 40
+    let seeks   = takeIntFlag("--seeks", in: 0...1_000_000, from: &rest) ?? 40
     let gapMs   = takeIntFlag("--gap-ms", from: &rest) ?? 60
     let settle  = takeDoubleFlag("--settle", from: &rest) ?? 5.0
     let throttleKbps = takeIntFlag("--throttle-kbps", from: &rest)
@@ -376,8 +376,8 @@ if first == "seektest" {
 // SW-path background-audio keepalive harness (iOS background audio on the software decode path).
 if first == "bgaudio" {
     var rest = Array(args.dropFirst(2))
-    let fg = takeDoubleFlag("--fg", from: &rest) ?? 3.0
-    let bg = takeDoubleFlag("--bg", from: &rest) ?? 6.0
+    let fg = takeDoubleFlag("--fg", in: 0...maxRunSeconds, from: &rest) ?? 3.0
+    let bg = takeDoubleFlag("--bg", in: 0...maxRunSeconds, from: &rest) ?? 6.0
     guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
         print("ERROR: bgaudio requires a <url> argument")
         print("Usage: aetherctl bgaudio [--fg N] [--bg N] <url>")
@@ -390,7 +390,7 @@ if first == "bgaudio" {
 
 if first == "smbtest" {
     var rest = Array(args.dropFirst(2))
-    let reads = takeIntFlag("--reads", from: &rest) ?? 64
+    let reads = takeIntFlag("--reads", in: 0...1_000_000, from: &rest) ?? 64
     guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
         print("ERROR: smbtest requires a <smb-url> argument")
         exit(64)
@@ -502,7 +502,7 @@ if first == "hlslive" {
 
 if first == "live" {
     var rest = Array(args.dropFirst(2))
-    let seconds = takeDoubleFlag("--seconds", from: &rest) ?? 20.0
+    let seconds = takeDoubleFlag("--seconds", in: 0...maxRunSeconds, from: &rest) ?? 20.0
     let dvrWindow = takeDoubleFlag("--dvr-window", from: &rest)
     let seed = takeStringFlag("--seed", from: &rest)
     let serveOnly = takeFlag("--serve-only", from: &rest)
@@ -592,7 +592,7 @@ if first == "live" {
 
 if first == "play" {
     var rest = Array(args.dropFirst(2))
-    let seconds = takeDoubleFlag("--seconds", from: &rest) ?? 30.0
+    let seconds = takeDoubleFlag("--seconds", in: 0...maxRunSeconds, from: &rest) ?? 30.0
     let live = takeFlag("--live", from: &rest)
     // AE#293: the nativeRemoteHLS bypass, the path the #168 carriage watchdog and the carriage probe
     // live on. Pair with --live; without it the m3u8 goes to the raw live path, which rejects it.
@@ -967,7 +967,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     let switchAudioFlag = takeFlag("--switch-audio", from: &rest)
     let selectSubsFlag = takeFlag("--select-subs", from: &rest)
     let extractFlag = takeFlag("--extract", from: &rest)
-    let secondsFlag = takeDoubleFlag("--seconds", from: &rest)
+    let secondsFlag = takeDoubleFlag("--seconds", in: 0...maxRunSeconds, from: &rest)
     let audioSeconds = secondsFlag ?? 10
     // --native-subs: diagnostics affordance for mov_text subtitle track (#55); serve only.
     let nativeSubsIndex = takeIntFlag("--native-subs", from: &rest)
