@@ -482,13 +482,15 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private static let avioBufferSize: Int32 = 256 * 1024  // 256 KB
     private static let streamTrimThreshold = 1024 * 1024  // 1 MB, keep for small backward seeks
     // Backpressure: suspend the streaming task above highWater, resume below lowWater.
-    private static let streamHighWater = 64 * 1024 * 1024
-    private static let streamLowWater = 32 * 1024 * 1024
+    private static let streamHighWaterDefault = 64 * 1024 * 1024
+    private let streamHighWater: Int
+    private var streamLowWater: Int { streamHighWater / 2 }
     /// Audit DMX-7: the suspend above is advisory (#220 measured 911 MB arriving after one), and
     /// this path cannot re-request at an offset the way the persistent reader does, so a transport
     /// that keeps delivering past twice the high water is ended and the read fails with EIO once
-    /// the buffered bytes are drained.
-    private static let streamHardCap = 2 * streamHighWater
+    /// the buffered bytes are drained. Audit DMX-107: that failure is typed
+    /// (`AVIOReaderError.originIgnoresFlowControl`, `lastReadFailure`), so it reads as what it is.
+    private var streamHardCap: Int { 2 * streamHighWater }
 
     private let bufferLock = NSLock()
     private var currentBuffer = Data()
@@ -522,6 +524,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// `streamHardCap`. Either way the bytes that did not arrive are lost, not absent, so the read
     /// that runs out reports EIO instead of end-of-media. Guarded by `streamLock`.
     private var streamFailed = false
+    /// Audit DMX-107: why the streaming GET was ended by this reader when it was not the transport's
+    /// doing. Guarded by `streamLock`.
+    private var streamFailureCause: AVIOReaderError?
     /// The status the streaming GET was answered with when it was anything but 200/206, 0 while
     /// none. A status is not media: the delegate hangs up at the header, and `open()` fails typed
     /// on it rather than handing FFmpeg an empty stream to misreport as invalid data. Written on
@@ -795,6 +800,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         winCond.lock()
         defer { winCond.unlock() }
         return activeTransfer != nil
+    }
+
+    /// Audit DMX-107: the typed cause of the read error the streaming path reports, nil while the
+    /// source is healthy and for a plain transport loss (which has no cause of ours to name).
+    var lastReadFailure: AVIOReaderError? {
+        streamLock.lock()
+        defer { streamLock.unlock() }
+        return streamFailureCause
     }
 
     /// The most the forward-only streaming buffer has held at once.
@@ -1073,7 +1086,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private let probeDrainLock = NSLock()
     private var drainingProbeRequest = false
 
-    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, windowHighWater: Int? = nil, heldConnection: Bool = false, probeControl: ProbeControl? = nil, probeRequestSession: URLSession? = nil) {
+    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, windowHighWater: Int? = nil, streamHighWater: Int? = nil, heldConnection: Bool = false, probeControl: ProbeControl? = nil, probeRequestSession: URLSession? = nil) {
         self.probeControl = probeControl
         self.probeRequestSession = probeControl == nil ? nil : probeRequestSession
         self.url = url
@@ -1092,6 +1105,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         self.connStallTimeout = max(0.05, connStallTimeout)
         self.winHighWater = max(1, windowHighWater
             ?? (isLive ? Self.liveWinHighWaterDefault : Self.winHighWaterDefault))
+        self.streamHighWater = max(1, streamHighWater ?? Self.streamHighWaterDefault)
         self.heldConnectionEnabled = heldConnection
     }
 
@@ -1851,7 +1865,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     streamBytesRead += Int64(trimAmount)
                 }
                 var toResume: URLSessionDataTask?
-                if streamingTaskSuspended, streamBuffer.count < Self.streamLowWater {
+                if streamingTaskSuspended, streamBuffer.count < streamLowWater {
                     streamingTaskSuspended = false
                     toResume = streamingTask
                 }
@@ -1888,6 +1902,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         streamLock.lock()
         let ended = streamEnded
         let failed = streamFailed
+        let cause = streamFailureCause
         let received = streamBytesRead + Int64(streamBuffer.count)
         let expected = streamExpectedBytes
         streamLock.unlock()
@@ -1899,7 +1914,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         if !ended || failed || (expected > 0 && received < expected) {
             EngineLog.emit(
                 "[AVIOReader] \(label) stream \(!ended ? "stalled out" : failed ? "failed" : "ended short") at "
-                + "\(received)\(expected > 0 ? "/\(expected)" : "") bytes; reporting EIO",
+                + "\(received)\(expected > 0 ? "/\(expected)" : "") bytes"
+                + (cause.map { " (\($0))" } ?? "") + "; reporting EIO",
                 category: .demux
             )
             return FFmpegErr.eio
@@ -3650,8 +3666,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             self.streamBuffer.append(data.withUnsafeBytes { Data($0) })
             self.streamPeakBytes = max(self.streamPeakBytes, self.streamBuffer.count)
             var toCancel: URLSessionDataTask?
-            if self.streamBuffer.count > Self.streamHardCap {
+            if self.streamBuffer.count > self.streamHardCap {
                 self.streamFailed = true
+                self.streamFailureCause = .originIgnoresFlowControl
                 toCancel = self.streamingTask
             }
             // Backpressure: park the transfer once the retained buffer
@@ -3660,15 +3677,17 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // any wait, so a far-forward seek can't deadlock against a
             // suspended producer).
             var toSuspend: URLSessionDataTask?
-            if !self.streamingTaskSuspended, self.streamBuffer.count > Self.streamHighWater {
+            if !self.streamingTaskSuspended, self.streamBuffer.count > self.streamHighWater {
                 self.streamingTaskSuspended = true
                 toSuspend = self.streamingTask
             }
             self.streamLock.unlock()
             if let toCancel {
                 EngineLog.emit(
-                    "[AVIOReader] \(self.label) streaming buffer passed \(Self.streamHardCap / 1024 / 1024)MB "
-                    + "with the transfer suspended; ending it (audit DMX-7)", category: .demux)
+                    "[AVIOReader] \(self.label) streaming buffer passed \(self.streamHardCap / 1024)KB "
+                    + "with the transfer suspended: the origin ignores flow control, so the source is "
+                    + "ended here to keep memory bounded and the read will fail (audit DMX-7, DMX-107)",
+                    category: .demux)
                 toCancel.cancel()
             } else {
                 toSuspend?.suspend()
@@ -5242,6 +5261,10 @@ enum AVIOReaderError: Error, Equatable, CustomStringConvertible, LocalizedError 
     /// fails at the first response head. A plain media URL on such an origin plays forward-only
     /// instead (audit DMX-101).
     case originIgnoresRange
+    /// Audit DMX-107: a forward-only source kept delivering after the reader paused it, past the
+    /// streaming buffer's hard cap, so the source was ended to keep memory bounded. The read that
+    /// follows fails with EIO, and `AVIOReader.lastReadFailure` says why.
+    case originIgnoresFlowControl
 
     var description: String {
         switch self {
@@ -5255,6 +5278,8 @@ enum AVIOReaderError: Error, Equatable, CustomStringConvertible, LocalizedError 
             return TransportSecurityFailure.sentence(for: code)
         case .originIgnoresRange:
             return "The origin ignores HTTP Range requests, which a remote disc image needs"
+        case .originIgnoresFlowControl:
+            return "The origin kept sending after the reader paused it, past the streaming buffer's bound"
         }
     }
 
