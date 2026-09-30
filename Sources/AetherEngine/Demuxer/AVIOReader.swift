@@ -504,6 +504,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     private var streamBuffer = Data()
     private var streamBytesRead: Int64 = 0
+    /// Most bytes `streamBuffer` has held at once, for the bound tests. Guarded by `streamLock`.
+    private var streamPeakBytes = 0
     private var streamEnded = false
     private let streamLock = NSLock()
     private let streamDataReady = DispatchSemaphore(value: 0)
@@ -792,6 +794,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return activeTransfer != nil
     }
 
+    /// The most the forward-only streaming buffer has held at once.
+    var streamPeakBufferBytesForTesting: Int {
+        streamLock.lock()
+        defer { streamLock.unlock() }
+        return streamPeakBytes
+    }
+
     /// Bytes the persistent window holds, behind and ahead of the cursor.
     var windowBytesForTesting: Int {
         winCond.lock()
@@ -834,6 +843,17 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// #220: last byte the live connection was asked for, nil when the request was open-ended
     /// (live sources, and any source whose total size is not resolved yet). winCond-guarded.
     private var connRangeEnd: Int64?
+
+    /// Audit DMX-101: true only while `open()` waits on the cold data connection, so that response
+    /// alone is judged for range support. A 200 later in a session (a CDN cache miss on a refill)
+    /// stays what it always was: rejected and retried, never a verdict on the origin. winCond-guarded.
+    private var rangeVerdictPending = false
+    /// Audit DMX-101: Content-Length of the cold connection's range-ignoring 200, -1 when it stated
+    /// none, nil while the origin has not been caught ignoring. winCond-guarded.
+    private var rangeIgnoredAtOpenLength: Int64?
+    /// Audit DMX-101: the origin cannot address bytes, so this source plays forward-only on the
+    /// streaming path. Written once by `open()` on the demux thread, read by `seek` on the same one.
+    private(set) var originIgnoresRange = false
 
     /// Sodalite#117: contiguous range starts are summarised instead of logged one by one.
     /// winCond-guarded.
@@ -1169,6 +1189,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 gotData = true
                 openPrefix = Array(warm.head.data.prefix(16))
             } else {
+                winCond.lock()
+                rangeVerdictPending = !isLive
+                winCond.unlock()
                 startPersistentConnection(at: 0, boundedTo: boundedInitialFetch)
                 gotData = awaitFirstPersistentData()
                 openPrefix = firstWindowPrefix()
@@ -1203,10 +1226,20 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 // a size; if not, abandon it (generation bump ignores a size landing in the
                 // race window). fileSize is read under the lock because the delegate thread now
                 // writes it (issue #70 review #4/#5).
-                let (haveSize, abandoned, pumpStatus) = resolveOptimisticOpen()
+                let (haveSize, abandoned, pumpStatus, caughtIgnoringRange) = resolveOptimisticOpen()
                 abandoned?.cancelTransfer()
                 abandoned?.releaseOriginTicket()
-                if !haveSize {
+                var ignoredRangeLength = caughtIgnoringRange
+                if let length = caughtIgnoringRange {
+                    tookFallback = true
+                    try probeControl?.check()
+                    if confirmRangeIsIgnored(contentLength: length) == .honoured { ignoredRangeLength = nil }
+                    try probeControl?.check()
+                }
+                if let ignoredRangeLength {
+                    openForwardOnlyBecauseRangeIsIgnored(contentLength: ignoredRangeLength)
+                    try failIfStreamingRefused(fallbackStatus: 0)
+                } else if !haveSize {
                     tookFallback = true
                     // A 401/403/404/410 at byte 0 is the origin's answer to the RESOURCE, not to
                     // the range form: a HEAD or a `bytes=0-1` from the same client is answered
@@ -1401,10 +1434,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// the lock. Demux thread, open-time only; leaves the AVIO context intact (unlike close()).
     /// `pumpStatus` is the HTTP status the abandoned connection was answered with (0 when no
     /// response arrived), so the caller can tell a refused resource from a length-less one.
-    private func resolveOptimisticOpen() -> (haveSize: Bool, abandoned: (any PersistentTransfer)?, pumpStatus: Int) {
+    private func resolveOptimisticOpen() -> (haveSize: Bool, abandoned: (any PersistentTransfer)?,
+                                             pumpStatus: Int, caughtIgnoringRange: Int64?) {
         winCond.lock()
         defer { winCond.unlock() }
-        if fileSize > 0 { return (true, nil, connStatus) }
+        rangeVerdictPending = false
+        let ignoredLength = rangeIgnoredAtOpenLength
+        rangeIgnoredAtOpenLength = nil
+        if fileSize > 0 { return (true, nil, connStatus, nil) }
         let status = connStatus
         connGeneration &+= 1
         let transfer = activeTransfer
@@ -1412,7 +1449,67 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         window.removeAll()
         connEnded = true
         winCond.broadcast()
-        return (false, transfer, status)
+        return (false, transfer, status, ignoredLength)
+    }
+
+    private enum RangeConfirmation { case honoured, ignored }
+
+    /// Audit DMX-101: the cold connection's 200 is one answer. Some CDNs send a 200 on a cache miss
+    /// and a 206 for every request after it, so the verdict waits for a second, one byte request.
+    /// Anything but a 206 that starts where asked (a 200, a refusal, a timeout, a misplaced range)
+    /// leaves the origin judged as it was caught: a source that cannot address bytes. The body a
+    /// 200 answer carries is cut after the one byte the request asked for (`ChunkFetchDelegate`).
+    /// Demux thread, open-time only.
+    private func confirmRangeIsIgnored(contentLength: Int64) -> RangeConfirmation {
+        var request = URLRequest(url: requestURL())
+        request.setValue("bytes=1-1", forHTTPHeaderField: "Range")
+        let budget = min(10, chunkRequestTimeout)
+        request.timeoutInterval = budget
+        applyExtraHeaders(&request)
+        do {
+            let (_, response) = try syncRequest(request, budget: budget)
+            guard let http = response as? HTTPURLResponse else { return .ignored }
+            switch Self.rangeAnswer(http, requestedStart: 1, requestedEnd: 1) {
+            case .honoured:
+                EngineLog.emit(
+                    "[AVIOReader] \(label) the origin answered the ranged open with a 200 "
+                    + "(Content-Length \(contentLength)) but honours a one byte range; "
+                    + "keeping the seekable path (audit DMX-101)", category: .demux)
+                return .honoured
+            case .overWide:
+                // A 206 is the origin addressing bytes, however wide it answered.
+                return .honoured
+            default:
+                return .ignored
+            }
+        } catch {
+            return .ignored
+        }
+    }
+
+    /// Audit DMX-101: an origin that cannot address bytes is played forward-only, exactly what
+    /// `sequentialOnly` does by declaration: one unranged GET, `fileSize` unresolved so the pb is
+    /// non-seekable (#126 below), and the window bounded by the streaming path's high water. The
+    /// Content-Length it stated stays advisory and is what `AVSEEK_SIZE` answers, because FFmpeg
+    /// estimates an MPEG-TS duration from the size and a length-less source reports none.
+    /// Demux thread, open-time only.
+    private func openForwardOnlyBecauseRangeIsIgnored(contentLength: Int64) {
+        EngineLog.emit(
+            "[AVIOReader] \(label) origin does not honour Range (Content-Length \(contentLength)); "
+            + "playing forward-only from one unranged GET (audit DMX-101)", category: .demux)
+        originIgnoresRange = true
+        fileSize = -1
+        streamLock.lock()
+        streamExpectedBytes = contentLength > 0 ? contentLength : -1
+        streamLock.unlock()
+        winCond.lock()
+        let tailTask = tailPrefetchTask
+        tailPrefetchTask = nil
+        tailPrefetchInFlight = false
+        winCond.unlock()
+        tailTask?.cancel()
+        startStreamingDownload()
+        _ = streamDataReady.wait(timeout: .now() + .seconds(15))
     }
 
     // Close flags written on the teardown thread (markClosed / fullyClose) and read on the demux
@@ -3321,6 +3418,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // from byte 0 (silent corruption). Reject it. Live is exempt: transcode
         // reconnect legitimately answers 200 with "from now".
         let requestedOffset = (generation == connGeneration) ? connRequestedOffset : 0
+        // Audit DMX-101: the cold open asked for a bounded range at byte 0. A 200 whose body is not
+        // that range is an origin that cannot address bytes, and this connection is abandoned at the
+        // head: nothing below may adopt its Content-Length as a size the persistent reader could
+        // seek by.
+        var rangeIgnoredAtOpen = false
+        if generation == connGeneration, !isLive, rangeVerdictPending,
+           Self.rangeAnswer(http, requestedStart: requestedOffset, requestedEnd: connRangeEnd) == .ignored {
+            rangeIgnoredAtOpen = true
+            rangeIgnoredAtOpenLength = http.expectedContentLength
+        }
         // #331: the origin just told us its live stream has no byte address to resume at. Latch
         // it, so every later request in this session is the join shape instead of repeating an
         // offset that can only ever be rejected again. Nonzero offsets only: a 416 at zero is a
@@ -3352,7 +3459,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             fileSize = 0
             adoptedWarmSize = nil
         }
-        if generation == connGeneration, !isLive, fileSize <= 0,
+        if generation == connGeneration, !isLive, fileSize <= 0, !rangeIgnoredAtOpen,
            let total = Self.sizeFromResponse(http, requestedOffset: requestedOffset) {
             fileSize = total
             // #112: share this resolved length so a later side demuxer on the same origin can skip a probe that
@@ -3383,6 +3490,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 "[AVIOReader] server ignored Range (200 for offset \(requestedOffset)); rejecting body",
                 category: .demux
             )
+            isOK = false
+        }
+        if rangeIgnoredAtOpen {
+            EngineLog.emit(
+                "[AVIOReader] \(label) origin answered the ranged open with a 200 "
+                + "(Content-Length \(http.expectedContentLength)); hanging up at the head (audit DMX-101)",
+                category: .demux)
             isOK = false
         }
         // Live is exempt for the same reason as above: its offset is bookkeeping, and the append
@@ -3524,6 +3638,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 return
             }
             self.streamBuffer.append(data)
+            self.streamPeakBytes = max(self.streamPeakBytes, self.streamBuffer.count)
             var toCancel: URLSessionDataTask?
             if self.streamBuffer.count > Self.streamHardCap {
                 self.streamFailed = true
@@ -3647,7 +3762,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// the same reason `recordRateLimitAndShouldGiveUp` is not private. Callers outside the file
     /// are tests; production reaches this through `seekCallback`.
     func seek(offset: Int64, whence: Int32) -> Int64 {
-        if whence == AVSEEK_SIZE { return fileSize }
+        if whence == AVSEEK_SIZE {
+            guard fileSize <= 0, originIgnoresRange else { return fileSize }
+            streamLock.lock()
+            defer { streamLock.unlock() }
+            return streamExpectedBytes
+        }
         // For persistent mode, position is shared with the delegate thread;
         // read SEEK_CUR base under the window lock.
         let newPosition: Int64
@@ -3711,14 +3831,18 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return URLSession(configuration: config, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
     }()
 
-    /// Total size from a data-connection response: `Content-Range` total on a 206, or
-    /// `Content-Length` on a from-0 2xx (origins that answer 200 ignoring Range). Nil when
-    /// the origin gave no usable length (chunked, or an unknown `*` total). Issue #70.
     /// Audit DMX-5: where a 206 says its body starts, when that is not where it was asked to.
     /// Every ranged path here places the body at the REQUESTED offset, so a 206 aligned to an
     /// edge's own chunk boundary would shift every later read by the difference. Nil for any other
     /// status and for a Content-Range this cannot read (those keep the lenient historical path).
     static func misplacedRangeStart(_ http: HTTPURLResponse, requestedOffset: Int64) -> Int64? {
+        guard let served = contentRangeSpan(http) else { return nil }
+        return served.start == requestedOffset ? nil : served.start
+    }
+
+    /// First and last byte a 206 says it carries, nil for any other status and for a Content-Range
+    /// this cannot read.
+    static func contentRangeSpan(_ http: HTTPURLResponse) -> (start: Int64, end: Int64?)? {
         guard http.statusCode == 206,
               let value = http.value(forHTTPHeaderField: "Content-Range") else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespaces)
@@ -3726,9 +3850,57 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let span = trimmed.dropFirst("bytes ".count).split(separator: "/", maxSplits: 1).first ?? ""
         guard let dash = span.firstIndex(of: "-"),
               let start = Int64(span[..<dash].trimmingCharacters(in: .whitespaces)) else { return nil }
-        return start == requestedOffset ? nil : start
+        let end = Int64(span[span.index(after: dash)...].trimmingCharacters(in: .whitespaces))
+        return (start, end)
     }
 
+    /// Audit DMX-101, NET-102: what an origin did with `Range: bytes=a-b`, judged from the response
+    /// head alone, so a reader can hang up before a body it would have to throw away. One
+    /// classification for every reader (`HTTPDiscIOReader` uses it too).
+    enum RangeAnswer: Equatable {
+        /// A 206 that starts where asked and stays inside the ask.
+        case honoured
+        /// A 206 that starts where asked but runs past the requested end. The origin CAN address
+        /// bytes, so the caller keeps what it asked for and hangs up (audit DMX-1).
+        case overWide
+        /// A 206 that starts elsewhere, the way an edge that aligns ranges to its own chunks answers.
+        case misplaced(start: Int64)
+        /// A 200 that is not the asked range: the body is the source from byte 0, whatever was
+        /// asked, and its length is not the ask's or is not stated at all.
+        case ignored
+        /// A 200 at offset 0 whose Content-Length fits inside the ask: the whole file, and a small
+        /// one. Nothing was ignored that matters, so the source stays sized and seekable.
+        case wholeFile
+        /// Any other status. It says nothing about range support.
+        case unjudged
+    }
+
+    static func rangeAnswer(_ http: HTTPURLResponse, requestedStart: Int64,
+                            requestedEnd: Int64?) -> RangeAnswer {
+        switch http.statusCode {
+        case 206:
+            if let served = misplacedRangeStart(http, requestedOffset: requestedStart) {
+                return .misplaced(start: served)
+            }
+            if let end = requestedEnd {
+                if let servedEnd = contentRangeSpan(http)?.end, servedEnd > end { return .overWide }
+                if http.expectedContentLength > end - requestedStart + 1 { return .overWide }
+            }
+            return .honoured
+        case 200:
+            guard requestedStart == 0 else { return .ignored }
+            let length = http.expectedContentLength
+            guard length > 0 else { return .ignored }
+            if let end = requestedEnd, length > end + 1 { return .ignored }
+            return .wholeFile
+        default:
+            return .unjudged
+        }
+    }
+
+    /// Total size from a data-connection response: `Content-Range` total on a 206, or
+    /// `Content-Length` on a from-0 2xx (origins that answer 200 ignoring Range). Nil when
+    /// the origin gave no usable length (chunked, or an unknown `*` total). Issue #70.
     static func sizeFromResponse(_ http: HTTPURLResponse, requestedOffset: Int64) -> Int64? {
         // On a 206 the total lives ONLY in Content-Range; Content-Length is the partial span,
         // so a 206 with an unknown (`*`) or unparseable range must report no size, never fall
