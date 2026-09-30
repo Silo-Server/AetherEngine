@@ -134,6 +134,74 @@ struct SoftwareRendererReorderDepthTests {
         #expect(handed.seconds == [0.100, 0.200, 0.300, 0.400, 0.500, 0.600])
     }
 
+    /// Stands in for a second enqueuer (a drain, another decoder thread). The frame-enqueued observer
+    /// runs with no lock held, after a frame reached the layer and before the renderer would have
+    /// recorded it, which is exactly the window a real second thread lands in.
+    private final class SecondEnqueuer: @unchecked Sendable {
+        private let lock = NSLock()
+        private var armed = true
+        var renderer: SampleBufferRenderer?
+        let pixels: CVPixelBuffer
+        let trigger: Double
+        let lateTicks: Int
+        init(pixels: CVPixelBuffer, trigger: Double, lateTicks: Int) {
+            self.pixels = pixels
+            self.trigger = trigger
+            self.lateTicks = lateTicks
+        }
+        func frameReachedTheLayer(_ t: SoftwareVideoFrameTime) {
+            lock.lock()
+            let fire = armed && abs(t.presentation.seconds - trigger) < 1e-9
+            if fire { armed = false }
+            lock.unlock()
+            if fire { renderer?.enqueue(pixelBuffer: pixels, pts: SoftwareRendererReorderDepthTests.time(lateTicks)) }
+        }
+    }
+
+    @Test("A frame that arrives while another is on its way to the layer is judged against that frame")
+    @MainActor
+    func guardCoversAFrameInFlight() {
+        let renderer = SampleBufferRenderer()
+        renderer.setReorderDepth(1)
+        let handed = Handed()
+        let second = SecondEnqueuer(pixels: Self.makePixelBuffer(), trigger: 0.040, lateTicks: 20)
+        second.renderer = renderer
+        renderer.setFrameEnqueuedObserver { t in
+            handed.append(t)
+            second.frameReachedTheLayer(t)
+        }
+        let pixels = Self.makePixelBuffer()
+        // The frame at 40 ms leaves the buffer when 80 ms arrives. While it is on its way the second
+        // enqueuer offers 20 ms, which is already behind it.
+        for t in [0, 40, 80, 120] { renderer.enqueue(pixelBuffer: pixels, pts: Self.time(t)) }
+        renderer.drainReorderBuffer()
+        second.renderer = nil
+        renderer.setFrameEnqueuedObserver(nil)
+
+        #expect(renderer.outOfOrderFramesDropped == 1)
+        #expect(handed.seconds == [0, 0.040, 0.080, 0.120], "the late frame never reached the layer")
+    }
+
+    @Test("A flush while a frame is on its way does not leave the guard standing for the new timeline")
+    @MainActor
+    func flushDuringHandoverDoesNotPoisonTheGuard() {
+        let renderer = SampleBufferRenderer()
+        renderer.setReorderDepth(1)
+        let handed = Handed()
+        let pixels = Self.makePixelBuffer()
+        // A seek lands (flush) while the frame at 5040 is being handed over.
+        renderer.setFrameEnqueuedObserver { t in
+            handed.append(t)
+            if abs(t.presentation.seconds - 5.040) < 1e-9 { renderer.flush(removingDisplayedImage: false) }
+        }
+        for t in [5000, 5040, 5080] { renderer.enqueue(pixelBuffer: pixels, pts: Self.time(t)) }
+        for t in [1000, 1040, 1080] { renderer.enqueue(pixelBuffer: pixels, pts: Self.time(t)) }
+        renderer.drainReorderBuffer()
+        renderer.setFrameEnqueuedObserver(nil)
+        #expect(renderer.outOfOrderFramesDropped == 0, "the seek backwards is not out of order")
+        #expect(handed.seconds == [5.000, 5.040, 1.000, 1.040, 1.080], "and the frames after it reach the layer")
+    }
+
     @Test("A flush forgets what was handed over, so a seek backwards is not out of order")
     @MainActor
     func flushResetsTheGuard() {

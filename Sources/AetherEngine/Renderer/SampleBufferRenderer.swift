@@ -125,6 +125,12 @@ final class SampleBufferRenderer: @unchecked Sendable {
     /// an even 24 fps timeline and for one carrying a doubled or a duplicate interval alike; only the
     /// spacing separates them. Guarded by `reorderLock`, reset by `takeCadence()`.
     private var _lastHandedPtsSeconds: Double?
+    /// Audit PERF-104: the newest timestamp that LEFT the reorder buffer, recorded under the same lock
+    /// that pops it. The late-frame guard reads this, not `_lastHandedPtsSeconds`, which is written
+    /// after the layer enqueue: a second enqueuer (a drain beside the decode thread) landing in that
+    /// gap would be judged against the frame before and slip through out of order. Reset by `flush`.
+    /// Guarded by `reorderLock`.
+    private var _lastReleasedPtsSeconds: Double?
     private var _minHandedDeltaSeconds = Double.infinity
     private var _maxHandedDeltaSeconds = -Double.infinity
 
@@ -355,7 +361,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
         }
 
         let ptsSeconds = CMTimeGetSeconds(pts)
-        if let handed = _lastHandedPtsSeconds, ptsSeconds < handed {
+        if let handed = _lastReleasedPtsSeconds, ptsSeconds < handed {
             _outOfOrderFramesDropped += 1
             let dropped = _outOfOrderFramesDropped
             let raised = reorderDepth < Self.hardwareDecoderReorderDepth
@@ -382,6 +388,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
 
         while reorderBuffer.count > reorderDepth {
             let (pb, t, hdr) = reorderBuffer.removeFirst()
+            _lastReleasedPtsSeconds = CMTimeGetSeconds(t)
             // #407: the successor is already held, so its timestamp is the frame's exact duration at
             // no extra latency. Read before the unlock, since enqueue() runs on the decode thread.
             let next = reorderBuffer.first?.1
@@ -402,6 +409,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
         // #407: the next frame handed over will not follow the last one, so the gap between them is
         // not a cadence measurement. Left standing, every seek would report one enormous interval.
         _lastHandedPtsSeconds = nil
+        _lastReleasedPtsSeconds = nil
         // #303: nothing is held any more, so the frontier is not a frontier. Left standing, a
         // backward seek would keep reporting the pre-seek timestamp and read as a cushion of
         // however far the seek travelled.
@@ -421,6 +429,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
         reorderLock.lock()
         let remaining = reorderBuffer
         reorderBuffer.removeAll()
+        if let newest = remaining.last { _lastReleasedPtsSeconds = CMTimeGetSeconds(newest.1) }
         reorderLock.unlock()
 
         for (i, (pb, t, hdr)) in remaining.enumerated() {
