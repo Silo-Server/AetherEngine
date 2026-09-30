@@ -113,6 +113,7 @@ final class PacketRingBuffer: @unchecked Sendable {
     private var tail: ChunkHandle?
     private var tailOffset = 0
     private var nextChunkID: UInt32 = 0
+    private var loggedOtherWriteFailure = false
 
     // MARK: - Init / close
 
@@ -184,7 +185,13 @@ final class PacketRingBuffer: @unchecked Sendable {
         } catch {
             // Audit VPERF-101: eviction used to run only after a successful write, so once the volume
             // filled, every append failed, nothing was ever freed, and the feeder waited at the live
-            // edge forever. Shrink the window and try once more before dropping the packet.
+            // edge forever. Shrink the window and try once more before dropping the packet. Only for a
+            // full volume or quota: any other failure (no descriptors left, a purged tmp directory)
+            // would evict real history on every packet and still fail.
+            guard Self.isOutOfSpace(error) else {
+                noteWriteFailureOnce(error)
+                throw error
+            }
             guard makeRoomAfterFailedWrite(incomingKeyframe: isVideo && isKeyframe) else { throw error }
             placement = try writeLocked(bytes)
         }
@@ -485,6 +492,22 @@ final class PacketRingBuffer: @unchecked Sendable {
         let doomed = releaseUnreferencedChunksLocked(includingTail: false)
         lock.unlock()
         Self.unlinkAll(doomed)
+    }
+
+    /// A write that failed because the volume or the quota has no room, which freeing a chunk can cure.
+    static func isOutOfSpace(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        return nsError.domain == NSPOSIXErrorDomain
+            && (nsError.code == Int(ENOSPC) || nsError.code == Int(EDQUOT))
+    }
+
+    /// `writeLock` held. A failure that eviction cannot cure drops only its packet, so a steady one
+    /// must not write a line per packet.
+    private func noteWriteFailureOnce(_ error: Error) {
+        guard !loggedOtherWriteFailure, error as? Failure != .closed else { return }
+        loggedOtherWriteFailure = true
+        EngineLog.emit("[PacketRingBuffer] write failed (\(error)); packet dropped, history kept "
+                       + "(logged once)", category: .swPlayback)
     }
 
     /// `writeLock` held. Frees at least one chunk file while keeping the retained span on a keyframe:

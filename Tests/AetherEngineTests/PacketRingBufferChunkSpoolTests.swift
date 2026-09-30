@@ -189,24 +189,28 @@ struct PacketRingBufferChunkSpoolTests {
     private final class FlakyDisk: @unchecked Sendable {
         private let lock = NSLock()
         private var failures = 0
+        private var failureCode = ENOSPC
         private var capacity: Int?
         var ring: PacketRingBuffer?
         private(set) var rejected = 0
 
-        func failNext(_ n: Int) { lock.lock(); failures = n; lock.unlock() }
+        func failNext(_ n: Int, code: Int32 = ENOSPC) {
+            lock.lock(); failures = n; failureCode = code; lock.unlock()
+        }
         func setCapacity(_ bytes: Int?) { lock.lock(); capacity = bytes; lock.unlock() }
 
         var writer: PacketRingBuffer.WriteAll {
             { [self] fd, bytes, offset in
                 lock.lock()
                 var fail = false
-                if failures > 0 { failures -= 1; fail = true }
+                var code = ENOSPC
+                if failures > 0 { failures -= 1; fail = true; code = failureCode }
                 let cap = capacity
                 lock.unlock()
                 if !fail, let cap, let ring, ring.diskBytes + bytes.count > cap { fail = true }
                 if fail {
                     lock.lock(); rejected += 1; lock.unlock()
-                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC))
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(code))
                 }
                 try PacketRingBuffer.pwriteAll(fd, bytes, offset)
             }
@@ -221,8 +225,9 @@ struct PacketRingBufferChunkSpoolTests {
         return ring
     }
 
-    @Test("A write that fails once is retried after the oldest chunk is freed, and nothing is dropped")
-    func failedWriteMakesRoomAndRetries() throws {
+    @Test("A write that fails once for want of space is retried after the oldest chunk is freed, and nothing is dropped",
+          arguments: [ENOSPC, EDQUOT])
+    func failedWriteMakesRoomAndRetries(code: Int32) throws {
         let dirs = ScratchDirs()
         let disk = FlakyDisk()
         let ring = try flakyRing(disk: disk, dirs: dirs)
@@ -232,7 +237,7 @@ struct PacketRingBufferChunkSpoolTests {
             try ring.append(pts: Double(i), isKeyframe: i % 2 == 0, isVideo: true, bytes: body)
         }
         #expect(ring.seqBounds.first == 0)
-        disk.failNext(1)
+        disk.failNext(1, code: code)
         try ring.append(pts: 10, isKeyframe: true, isVideo: true, bytes: body)
 
         let bounds = ring.seqBounds
@@ -241,6 +246,38 @@ struct PacketRingBufferChunkSpoolTests {
         let first = try #require(ring.packet(atSeq: bounds.first))
         #expect(first.isKeyframe)
         #expect(ring.packet(atSeq: 10)?.bytes == body)
+    }
+
+    @Test("A write that fails for any other reason drops that packet and keeps the whole history",
+          arguments: [EMFILE, EIO, ENOENT])
+    func otherWriteFailuresKeepTheWindow(code: Int32) throws {
+        let dirs = ScratchDirs()
+        let disk = FlakyDisk()
+        let ring = try flakyRing(disk: disk, dirs: dirs)
+        defer { ring.close() }
+        let body = { (i: Int) in Data(repeating: UInt8(truncatingIfNeeded: i), count: 32 << 10) }
+        for i in 0..<10 {
+            try ring.append(pts: Double(i), isKeyframe: i % 2 == 0, isVideo: true, bytes: body(i))
+        }
+        let before = ring.seqBounds
+        let diskBefore = ring.diskBytes
+        #expect(before.first == 0)
+
+        for keyframe in [false, true] {
+            disk.failNext(1, code: code)
+            #expect(throws: (any Error).self) {
+                try ring.append(pts: 10, isKeyframe: keyframe, isVideo: true, bytes: body(10))
+            }
+            let after = ring.seqBounds
+            #expect(after.first == before.first && after.end == before.end,
+                    "errno \(code): nothing evicted, nothing indexed (keyframe \(keyframe))")
+            #expect(ring.diskBytes == diskBefore)
+        }
+        for i in 0..<10 { #expect(ring.packet(atSeq: i)?.bytes == body(i)) }
+
+        try ring.append(pts: 10, isKeyframe: false, isVideo: true, bytes: body(10))
+        #expect(ring.seqBounds.end == before.end + 1, "the next write goes through")
+        #expect(ring.seqBounds.first == 0)
     }
 
     @Test("A full volume shrinks the rewind window and the live feed keeps flowing")
