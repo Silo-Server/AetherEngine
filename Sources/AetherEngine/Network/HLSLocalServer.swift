@@ -241,6 +241,16 @@ final class HLSLocalServer: @unchecked Sendable {
         return rest
     }
 
+    /// The request line as it is logged: the route after the session token, never the token itself
+    /// (audit SUB-107).
+    static func requestLineForLog(method: Substring, routePath: String, query: String,
+                                  version: Substring?) -> String {
+        var line = "\(method) \(routePath)"
+        if !query.isEmpty { line += "?\(query)" }
+        if let version { line += " \(version)" }
+        return line
+    }
+
     /// Kernel-assigned ephemeral port. Zero until start() succeeds.
     private(set) var port: UInt16 = 0
 
@@ -329,6 +339,12 @@ final class HLSLocalServer: @unchecked Sendable {
     private var listenFd: Int32 = -1
     private var shouldStop = false
     private var clientFds = Set<Int32>()
+
+    /// Audit SUB-107: whether `pathToken` is registered with the log redactor. The token is the
+    /// capability that keeps LAN strangers off the stream, and every line that prints a server URL
+    /// (`load url=`, `asset.url=`, the #316 serving line) would otherwise hand it to a shared log
+    /// for as long as the session lives.
+    private var tokenRegistered = false
 
     /// Active connection count; engine memory probe watches for unexpectedly rising accumulation (AVPlayer normally holds 1-3 connections).
     var activeConnectionCount: Int {
@@ -536,6 +552,9 @@ final class HLSLocalServer: @unchecked Sendable {
         listenFd = fd
         port = assignedPort
         shouldStop = false
+        if !tokenRegistered {
+            tokenRegistered = LogRedaction.register(pathToken)
+        }
         stateLock.unlock()
 
         EngineLog.emit("[HLSLocalServer] Listening on port \(assignedPort)",
@@ -560,7 +579,12 @@ final class HLSLocalServer: @unchecked Sendable {
         mediaPlaylistBuildCount = 0
         let clients = clientFds
         clientFds.removeAll()
+        let unregisterToken = tokenRegistered
+        tokenRegistered = false
         stateLock.unlock()
+        // Last, so a line still in flight from a connection being shut down is redacted too; the
+        // token opens nothing once the listener is gone.
+        defer { if unregisterToken { LogRedaction.unregister(pathToken) } }
         // AE#597: the one line that says a listener went away. Without it a log cannot tell a
         // server that was released from one that outlived its session on a port of its own.
         EngineLog.emit(
@@ -832,12 +856,15 @@ final class HLSLocalServer: @unchecked Sendable {
             return false
         }
         let normalizedPath = (routePath == "/audio.m3u8") ? "/media.m3u8" : routePath
+        let loggedRequest = Self.requestLineForLog(
+            method: parts[0], routePath: routePath, query: query,
+            version: parts.count > 2 ? parts[2] : nil)
 
         // #50 diag: promoted to .info so the host mirror names the failing path without a verbose build. Revert once #50 is root-caused.
         // AE#446: the fd is what says whether a blocking-reload hold is parking the connection the
         // next segment request needs. Same fd on both, and the segment could not be read until the
         // hold returned; different fds, and the client chose not to fetch.
-        EngineLog.emit("[HLSLocalServer] \(firstLine) fd=\(fd)", category: .hlsServer)
+        EngineLog.emit("[HLSLocalServer] \(loggedRequest) fd=\(fd)", category: .hlsServer)
         // #227 diag: name each distinct client once, so an AirPlay session shows whether the receiver fetches
         // for itself (its own LAN address appears) or the sender pulls everything (only 127.0.0.1 / own IP).
         if let peer = Self.peerAddress(of: fd) {
@@ -845,7 +872,7 @@ final class HLSLocalServer: @unchecked Sendable {
             let isNewPeer = loggedPeers.insert(peer).inserted
             stateLock.unlock()
             if isNewPeer {
-                EngineLog.emit("[HLSLocalServer] #227 client \(peer) first request: \(firstLine)", category: .hlsServer)
+                EngineLog.emit("[HLSLocalServer] #227 client \(peer) first request: \(loggedRequest)", category: .hlsServer)
             }
         }
         // Dump request headers once per session; AVPlayer capability headers (Accept, Range, X-Playback-Session-Id) can influence silent variant rejection.

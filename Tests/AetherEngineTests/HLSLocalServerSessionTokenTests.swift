@@ -69,6 +69,48 @@ struct HLSLocalServerSessionTokenTests {
         #expect(Self.status(port: server.port, path: "/seg0.mp4") == 404)
     }
 
+    // MARK: - The token in the log (audit SUB-107)
+
+    @Test("A running server's token is redacted from every log line, and released on stop")
+    func tokenIsRedactedWhileTheServerRuns() throws {
+        let server = HLSLocalServer(provider: StubProvider())
+        try server.start()
+        let token = server.pathToken
+        let line = "[NativeAVPlayerHost] #2 load url=http://127.0.0.1:\(server.port)/\(token)/master.m3u8"
+        #expect(LogRedaction.isRegistered(token))
+        #expect(!LogRedaction.redact(line).contains(token))
+        #expect(LogRedaction.redact("[HLSLocalServer] GET /\(token)/seg_1.m4s HTTP/1.1")
+                == "[HLSLocalServer] GET /<redacted>/seg_1.m4s HTTP/1.1")
+
+        server.stop()
+        #expect(!LogRedaction.isRegistered(token))
+        server.stop()
+        #expect(!LogRedaction.isRegistered(token))
+    }
+
+    @Test("Stopping one server leaves the other's token redacted")
+    func twoServersKeepTheirOwnRegistration() throws {
+        let first = HLSLocalServer(provider: StubProvider())
+        let second = HLSLocalServer(provider: StubProvider())
+        try first.start()
+        try second.start()
+        defer { second.stop() }
+
+        first.stop()
+        #expect(!LogRedaction.isRegistered(first.pathToken))
+        #expect(LogRedaction.isRegistered(second.pathToken))
+    }
+
+    @Test("The logged request line names the route, not the token")
+    func requestLineOmitsTheToken() {
+        #expect(HLSLocalServer.requestLineForLog(
+            method: "GET", routePath: "/seg_1.m4s", query: "", version: "HTTP/1.1")
+                == "GET /seg_1.m4s HTTP/1.1")
+        #expect(HLSLocalServer.requestLineForLog(
+            method: "GET", routePath: "/media.m3u8", query: "_HLS_msn=12", version: "HTTP/1.1")
+                == "GET /media.m3u8?_HLS_msn=12 HTTP/1.1")
+    }
+
     // MARK: - Helpers
 
     /// Status line of a plain GET, or 0 when the request could not be completed.
