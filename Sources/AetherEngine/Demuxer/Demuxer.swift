@@ -2,6 +2,7 @@ import Foundation
 import AetherLibavformat
 import AetherLibavcodec
 import AetherLibavutil
+import os
 
 
 /// The stages an `open()` passes through, reported as each one finishes (#361). Deliberately the
@@ -265,10 +266,20 @@ public final class Demuxer: @unchecked Sendable {
         reader?.close()
     }
 
+    /// Audit DMX-102: unblocks the disc reader while `DiscReader.wrap` is still reading through it,
+    /// before any provider exists for `markClosed()` to reach.
+    private func cancelOwnedSourceReader() {
+        providerLock.lock()
+        let reader = _ownedSourceReader
+        providerLock.unlock()
+        reader?.cancel()
+    }
+
     /// Audit HLS-2: `markClosed()` before the provider exists used to be a no-op, so a teardown
     /// that raced an in-flight open let it finish its connect and probe.
     private let closeRequestLock = NSLock()
     private var closeRequested = false
+    private var isCloseRequested: Bool { closeRequestLock.withLock { closeRequested } }
     private var openProfile: DemuxerOpenProfile = .playback
 
     /// Audit NAT-7: the stream pointers `stream(at:)` hands out, copied out of `formatContext`
@@ -535,6 +546,7 @@ public final class Demuxer: @unchecked Sendable {
     ///   - extraHeaders: Attached to every HTTP request (ignored for file:// URLs).
     ///   - isLive: Suppresses EOF synthesis and surfaces terminal error on reconnect cap.
     func open(url: URL, extraHeaders: [String: String] = [:], profile: DemuxerOpenProfile = .playback, isLive: Bool = false, selectTitleID: Int? = nil) throws {
+        if isCloseRequested { throw DemuxerError.openFailed(code: -1) }
         self.openProfile = profile
         self.auditSource = isLive ? nil : (url, extraHeaders)
         let isHTTP = url.scheme == "http" || url.scheme == "https"
@@ -592,6 +604,7 @@ public final class Demuxer: @unchecked Sendable {
     /// DVD/BD ISOs to VOB/MPEGTS concat streams unless the reader opts out via
     /// `discImageProbeEnabled`.
     func open(reader: IOReader, formatHint: String? = nil, profile: DemuxerOpenProfile = .playback, isLive: Bool = false, selectTitleID: Int? = nil, discCacheKey: String? = nil) throws {
+        if isCloseRequested { throw DemuxerError.openFailed(code: -1) }
         self.openProfile = profile
         self.auditSource = nil
         if reader.discImageProbeEnabled,
@@ -622,6 +635,10 @@ public final class Demuxer: @unchecked Sendable {
             let warm = HTTPDiscIOReader.takePrewarm(for: url, extraHeaders: extraHeaders)
             if let discReader = HTTPDiscIOReader(url: url, extraHeaders: extraHeaders, prewarmed: warm) {
                 adoptOwnedSourceReader(discReader)
+                if isCloseRequested {
+                    releaseOwnedSourceReader()
+                    throw DemuxerError.openFailed(code: -1)
+                }
                 let discInfo: DiscInfo?
                 do {
                     discInfo = try DiscReader.wrap(discReader, selectTitleID: selectTitleID, cacheKey: url.absoluteString)
@@ -666,6 +683,13 @@ public final class Demuxer: @unchecked Sendable {
         try openWithProvider(reader, isLive: isLive)
     }
 
+    /// A provider that connected (or tried to) for an open that is not going to finish.
+    private func abandonProvider(_ provider: AVIOProvider) {
+        provider.markClosed()
+        provider.close()
+        avioProvider = nil
+    }
+
     /// Common AVIO open path. `inputFormat` forces a demuxer (custom sources with
     /// a format hint). `isLive` suppresses duration-estimate SEEK_END that latches
     /// EOF on unknown-length live sources.
@@ -674,16 +698,25 @@ public final class Demuxer: @unchecked Sendable {
         inputFormat: UnsafePointer<AVInputFormat>? = nil,
         isLive: Bool = false
     ) throws {
+        // Audit DMX-102: the provider is published BEFORE it connects, under the same lock that
+        // decides "already closed", so a `markClosed()` that lands during the connect (up to 15 s on
+        // a live source, longer for a remote disc probe) reaches the provider instead of finding
+        // nothing and leaving the open holding its origin slot.
         closeRequestLock.lock()
         let closedBeforeConnect = closeRequested
+        if !closedBeforeConnect { avioProvider = provider }
         closeRequestLock.unlock()
         if closedBeforeConnect { throw DemuxerError.openFailed(code: -1) }
-        try provider.open()
-        closeRequestLock.lock()
-        avioProvider = provider
-        let closedDuringConnect = closeRequested
-        closeRequestLock.unlock()
-        if closedDuringConnect { provider.markClosed() }
+        do {
+            try provider.open()
+        } catch {
+            abandonProvider(provider)
+            throw error
+        }
+        if isCloseRequested {
+            abandonProvider(provider)
+            throw DemuxerError.openFailed(code: -1)
+        }
         onOpenProgress?(.sourceOpened)   // #361
 
         // AE#460 follow-up: a live source rebuilt on a RETAINED reader resumes where that reader
@@ -2345,11 +2378,13 @@ public final class Demuxer: @unchecked Sendable {
     /// Fast lock-free unblock: AVIO read callback returns -1, av_read_frame returns
     /// at once. No resource freeing. Call before close() when cancelling a pump.
     func markClosed() {
+        interrupt.requestClose()
         closeRequestLock.lock()
         closeRequested = true
         let provider = avioProvider
         closeRequestLock.unlock()
         provider?.markClosed()
+        cancelOwnedSourceReader()
     }
 
     /// Static metadata probes only. Strong ownership outlives the native interrupt callback.
@@ -2391,6 +2426,7 @@ public final class Demuxer: @unchecked Sendable {
     }
 
     func close() {
+        interrupt.requestClose()
         avioProvider?.markClosed()  // unblocks av_read_frame (tvOS suspends threads in background)
         accessLock.lock()
         interrupt.disarmInputCeiling()
@@ -2440,6 +2476,14 @@ private final class DemuxInterrupt: @unchecked Sendable {
     private var ceiling: Int64 = .max
     private(set) var inputCeilingHit = false
 
+    /// Audit DMX-109: set by `Demuxer.markClosed()` from any thread, read by libavformat's callback
+    /// on the demux thread. A provider-backed input stops on its provider's own flag; a local-path
+    /// input has no provider, so this is the only way a close reaches a read parked on a slow volume.
+    private let closeRequested = OSAllocatedUnfairLock<Bool>(initialState: false)
+
+    func requestClose() { closeRequested.withLock { $0 = true } }
+    var isCloseRequested: Bool { closeRequested.withLock { $0 } }
+
     /// Local (URLContext) inputs only: a provider-backed input never consults this callback per read.
     func armInputCeiling(pb: UnsafeMutablePointer<AVIOContext>, bytes: Int64) {
         self.pb = pb
@@ -2454,6 +2498,7 @@ private final class DemuxInterrupt: @unchecked Sendable {
     }
 
     func shouldInterrupt() -> Bool {
+        if isCloseRequested { return true }
         if probeControl?.isStopped == true { return true }
         if let pb, pb.pointee.bytes_read >= ceiling {
             inputCeilingHit = true
