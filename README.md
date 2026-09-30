@@ -644,10 +644,10 @@ Pin to `.upToNextMinor(from: "7.22.2")` for stricter teams that prefer to opt in
 | tvOS | 18.0 |
 | macOS | 15.0 |
 | visionOS | 1.0 |
-| Swift | 6.2 |
-| Xcode | 26.2 |
+| Swift | 6.4 |
+| Xcode | 27.0 |
 
-The Xcode row is the SDK the source compiles against (`VTRegisterSupplementalVideoDecoderIfAvailable` is iOS / tvOS 26.2 API, and an unguarded C symbol has to exist at compile time); the deployment floor above stays iOS / tvOS 18 and macOS 15, with the 26.x calls behind `#available`.
+The Swift and Xcode rows are the toolchain CI builds and tests with (GitHub's `xcode-27` image); older toolchains are not tested. The source needs at least the 26.2 SDK in any case (`VTRegisterSupplementalVideoDecoderIfAvailable` is iOS / tvOS 26.2 API, and an unguarded C symbol has to exist at compile time). The deployment floor above stays iOS / tvOS 18 and macOS 15, with the newer calls behind `#available`.
 
 The 7.x line raised the floor from iOS 16, tvOS 17 and macOS 14. A project that still supports those pins the 6.x line with `.upToNextMajor(from: "6.89.1")`.
 
