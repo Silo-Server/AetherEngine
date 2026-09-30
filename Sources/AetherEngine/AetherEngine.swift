@@ -4097,6 +4097,26 @@ public final class AetherEngine: ObservableObject {
             + (options.panelPresentsDolbyVision ? " (session dv asserted true)" : ""),
             category: .session
         )
+        if options.isLive, !options.nativeRemoteHLS, case .url(let livePlaylistURL) = source,
+           RemoteHLSMediaSelection.isKnownLivePlaylist(livePlaylistURL) {
+            EngineLog.emit(
+                "[AetherEngine] AE#678: known HLS playlist URL on the live path; straight onto the "
+                + "live-ingest reader, no raw probe",
+                category: .engine
+            )
+            continueStartupAcrossReroute()
+            return try await load(
+                source: .custom(
+                    HLSLiveIngestReader(playlistURL: livePlaylistURL,
+                                        httpHeaders: loadedOptions.httpHeaders),
+                    formatHint: "mpegts"
+                ),
+                startPosition: startPosition,
+                options: loadedOptions,
+                audioSourceStreamIndex: audioSourceStreamIndex,
+                discTitleID: discTitleID
+            )
+        }
         let probe = Demuxer()
         // Register so stopInternal can markClosed(): avformat_open_input/find_stream_info can block for the
         // full AVIOReader reconnect budget (device repro: a 500-looping channel kept reconnecting across three
@@ -4265,6 +4285,7 @@ public final class AetherEngine: ObservableObject {
                 + "live-ingest reader (headers ride every fetch)",
                 category: .engine
             )
+            RemoteHLSMediaSelection.noteLivePlaylist(livePlaylistURL)
             // #361: the host is still waiting for the load it asked for, so this is the same startup
             // taking a different route, not a second one.
             continueStartupAcrossReroute()
