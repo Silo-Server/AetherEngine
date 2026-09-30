@@ -1951,22 +1951,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // AE#520 round 2: the close reads it on the playlist-build thread, so it is a closure over a
         // mirror rather than a read of the item.
         prov.consumerBufferedSecondsProvider = consumerBufferedSecondsProvider
-        if isLiveSession {
-            prod.onLiveSegmentFinalized = { [weak prov] index, durationSeconds, startPtsSeconds, discontinuous in
-                prov?.appendLiveSegment(index: index,
-                                        startSeconds: startPtsSeconds,
-                                        durationSeconds: durationSeconds,
-                                        discontinuous: discontinuous)
-            }
-            // AE#443: the runaway park has to sit above the window this session actually serves, or it
-            // bounds the window instead of backstopping it, and its enforcement (a sleeping read
-            // thread) stops the origin from being drained.
-            prod.liveResidentCapProvider = { [weak prov] in prov?.liveResidentParkCap() ?? 0 }
-        } else if sequentialOrigin {
-            prod.onSequentialSegmentFinalized = { [weak prov] index, durationSeconds in
-                prov?.appendSequentialSegmentDuration(index: index, durationSeconds: durationSeconds)
-            }
-        }
+        wireProviderCallbacks(prod, to: prov)
 
         EngineLog.emit(
             "[HLSVideoEngine] prepared: codec=\(manifestCodecs)"
@@ -2681,7 +2666,33 @@ public final class HLSVideoEngine: @unchecked Sendable {
             rebuildSubtitleTapRoutes()
         }
         armSubtitleTap(on: prod)
+        // Audit HLS-101: the first producer is built before the provider exists and `start()` wires
+        // it; every later one (live reopen, in-place rebuild, AE#222 rebuild) is wired here.
+        if let prov = provider {
+            wireProviderCallbacks(prod, to: prov)
+        }
         return prod
+    }
+
+    /// The producer-to-provider reports the playlist is built from. A live producer without them
+    /// cuts segments the playlist never lists (audit HLS-101).
+    func wireProviderCallbacks(_ prod: HLSSegmentProducer, to prov: VideoSegmentProvider) {
+        if isLiveSession {
+            prod.onLiveSegmentFinalized = { [weak prov] index, durationSeconds, startPtsSeconds, discontinuous in
+                prov?.appendLiveSegment(index: index,
+                                        startSeconds: startPtsSeconds,
+                                        durationSeconds: durationSeconds,
+                                        discontinuous: discontinuous)
+            }
+            // AE#443: the runaway park has to sit above the window this session actually serves, or it
+            // bounds the window instead of backstopping it, and its enforcement (a sleeping read
+            // thread) stops the origin from being drained.
+            prod.liveResidentCapProvider = { [weak prov] in prov?.liveResidentParkCap() ?? 0 }
+        } else if sequentialOrigin {
+            prod.onSequentialSegmentFinalized = { [weak prov] index, durationSeconds in
+                prov?.appendSequentialSegmentDuration(index: index, durationSeconds: durationSeconds)
+            }
+        }
     }
 
     // MARK: - Live source-loss recovery

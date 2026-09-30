@@ -2617,6 +2617,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
     // MARK: - Public API
 
     func start() {
+        assert(!isLive || onLiveSegmentFinalized != nil,
+               "a live producer started without its provider reports cuts segments no playlist lists (audit HLS-101)")
         stateLock.lock()
         guard !pumpStarted else { stateLock.unlock(); return }
         pumpStarted = true
