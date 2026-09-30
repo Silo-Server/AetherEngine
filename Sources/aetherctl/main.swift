@@ -106,7 +106,7 @@ func printUsage() {
       aetherctl segverify [--from N] [--count K] [--no-dv] [--force-dv] [--dv-base-layer] [--dump <dir>] <url>
                           (#92: SW-decode each segment in isolation; framesDecoded==0 => not independent)
       aetherctl disc-inspect <disc.iso>
-      aetherctl dovitest <file>
+      aetherctl dovitest [--out PATH.hevc] <file>
       aetherctl extract [--at <sec>] [--snapshot] [--width <px>] [--loops <n>] <url>
       aetherctl audio [--seconds N] <url>
       aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] <url>
@@ -118,8 +118,6 @@ func printUsage() {
                           never EOF, unknown size; prints physFP and its slope against that rate)
       aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--serve-only] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--reload-test] [--sw] [--drop-after N] [--discontinuity-at N] [--realtime] [--realtime-rate X] [--fast-zap] [--preroll N] [--rewind-hold N] [--gen-highbitrate-seed]
                      [--freeze-after N] [--unfreeze-after N] [--rewind-before-freeze N] [--force-recovery-reload-at N] [--live-only] [--no-blocking-reload] [--force-master]
-                     [--freeze-after N] [--unfreeze-after N] [--rewind-before-freeze N] [--force-recovery-reload-at N]
-                     [--no-blocking-reload]
       aetherctl dvr [--path native|sw|both] [--seconds N] [--dvr-window N]
       aetherctl dualsubs <file> --primary <streamIndex> --secondary <streamIndex> [--seek <seconds>]
       aetherctl hlsfixture <input.ts> [--port N] [--segment-seconds N] [--target-duration N] [--window N]
@@ -216,13 +214,16 @@ func printUsage() {
                 mediastreamvalidator / mp4dump / ffprobe from another
                 terminal:
 
-                  curl -i  http://127.0.0.1:<port>/master.m3u8
-                  curl -o  /tmp/init.mp4  http://127.0.0.1:<port>/init.mp4
-                  curl -o  /tmp/seg0.mp4  http://127.0.0.1:<port>/seg0.mp4
-                  mediastreamvalidator http://127.0.0.1:<port>/master.m3u8
+                  curl -i  http://127.0.0.1:<port>/<token>/master.m3u8
+                  curl -o  /tmp/init.mp4  http://127.0.0.1:<port>/<token>/init.mp4
+                  curl -o  /tmp/seg0.mp4  http://127.0.0.1:<port>/<token>/seg0.mp4
+                  mediastreamvalidator http://127.0.0.1:<port>/<token>/master.m3u8
                   mp4dump --verbosity 1 /tmp/init.mp4
                   ffprobe -v debug /tmp/seg0.mp4
-                  open 'http://127.0.0.1:<port>/master.m3u8'
+                  open 'http://127.0.0.1:<port>/<token>/master.m3u8'
+
+                The server answers only paths that start with its
+                per-session token; copy <port>/<token> from the printed URL.
 
                 Ctrl-C to tear down.
 
@@ -235,7 +236,8 @@ func printUsage() {
                 8.1 (and drop the enhancement layer) via
                 DoviRpuConverter, and write the result to
                 aetherctl-dovitest.hevc (Annex-B) in a private
-                per-run temporary directory, printed. Feed
+                per-user temporary directory (printed, reused and
+                overwritten by the next run), or to --out PATH. Feed
                 that to `dovi_tool extract-rpu` + `info` to validate
                 the rewritten RPU against ground truth.
 
@@ -259,7 +261,7 @@ func printUsage() {
                 frame-accurately at full resolution. Use --loops N
                 with `leaks --atExit` to detect memory leaks.
                 Writes the first frame to aetherctl-extract-<mode>.png
-                in a private per-run temporary directory, printed.
+                in a private per-user temporary directory, printed.
 
       audio     Load a source through the engine's audio-only path
                 (LoadOptions.audioOnly=true), play for ~10 seconds,
@@ -443,14 +445,15 @@ if first == "disc-inspect" {
 // DV P7 -> 8.1 converter validation harness.
 if first == "dovitest" {
     var rest = Array(args.dropFirst(2))
+    let outPath = takeStringFlag("--out", from: &rest)
     guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
         print("ERROR: dovitest requires a <file> argument")
-        print("Usage: aetherctl dovitest <file>")
+        print("Usage: aetherctl dovitest [--out PATH.hevc] <file>")
         exit(64)
     }
     rest.removeAll { $0 == urlArg }
     rejectStrayFlags(rest, subcommand: "dovitest")
-    exit(runDoviTest(url: parseSourceURL(urlArg)))
+    exit(runDoviTest(url: parseSourceURL(urlArg), outputPath: outPath))
 }
 
 // #93 post-recovery judder: raw video packet timing per demuxer open profile.

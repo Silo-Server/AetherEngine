@@ -28,7 +28,7 @@ You can expect an initial acknowledgement within a few days. Once a fix is ready
 AetherEngine plays media from servers and local sources and parses untrusted container and codec data. Areas most relevant to security:
 
 - **Media parsing.** Demuxing and decoding of untrusted containers and bitstreams (the FFmpeg / dav1d surface).
-- **Network handling.** The engine's HTTP range reading and its on-device loopback server used to bridge sources into AVPlayer. Nothing is exposed off the device, and there is no external analytics or session reporting.
+- **Network handling.** The engine's HTTP range reading and its local HTTP server used to bridge sources into AVPlayer. The server listens on all interfaces, not only loopback, so that an AirPlay receiver can fetch the stream over the LAN, on an ephemeral port and for the current stream only. Every path it answers starts with a per-session 128-bit random token, and a request without it is answered 404 before it reaches any route. A peer that is not loopback may hold at most 24 of the server's 32 connection slots (the rest stay free for the local player), and a connection that has not presented the token has 10 seconds from accept to deliver a whole request head. The token is also kept out of the diagnostic log. Beyond that listener nothing is exposed off the device, and there is no external analytics or session reporting.
 - **Memory safety.** Crashes or out-of-bounds behavior triggered by crafted input.
 
 Out of scope: vulnerabilities in a host app's own UI or networking (report those on the host app's tracker), and issues in upstream FFmpeg / dav1d themselves (report those upstream, though we are glad to know if a bundled build is affected).

@@ -571,7 +571,7 @@ struct ProbeControlTests {
     func filePrecancelled(_ entry: EntryPoint) {
         let token = ProbeCancellation()
         token.cancel()
-        let missing = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let missing = FileManager.default.temporaryDirectory
             .appendingPathComponent(".missing-probe-\(UUID().uuidString).mp4")
         #expect(throws: CancellationError.self) { try entry.probe(missing, cancellation: token) }
     }

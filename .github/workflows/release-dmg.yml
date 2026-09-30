@@ -49,7 +49,12 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 30
     steps:
+      # workflow_dispatch checks out the ref picked in "Use workflow from"
+      # (normally main), so the tag is pinned explicitly: the DMG is named,
+      # versioned and uploaded for the tag and must be built from it (audit OPS-101).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ github.event.release.tag_name || inputs.tag }}
 
       - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
         with:
@@ -65,6 +70,7 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Building for tag: $TAG"
+          echo "Building commit: $(git rev-parse HEAD)"
 
       - name: Import Developer ID certificate into temporary keychain
         env:

@@ -8,7 +8,7 @@ AetherEngine has three playback pipelines, picked once at `load(url:)`: the audi
 
 ### Native AVPlayer pipeline (default)
 
-Demux the source with libavformat, re-mux the elementary streams on the fly into HLS-fMP4, serve them from a local HTTP server on `127.0.0.1:<port>`, point `AVPlayer` at the playlist. Apple's stack does all decode, all HDR / Dolby Vision signaling over HDMI, all audio routing. This is the path for HEVC and progressive H.264, which is what AVPlayer's HLS-fMP4 pipeline reliably accepts (interlaced H.264 routes to the software path for deinterlacing, #107). Atmos passthrough, DV HDMI handshake, HDR10 / HDR10+ system-side tone-mapping all live on this path.
+Demux the source with libavformat, re-mux the elementary streams on the fly into HLS-fMP4, serve them from a local HTTP server on an ephemeral port (the player is handed `127.0.0.1:<port>/<session-token>/...`; the listener binds all interfaces so an AirPlay receiver can reach it over the LAN, behind the per-session path token, a 32-connection cap with 24 for non-loopback peers, and a 10 s head deadline for unauthenticated connections), point `AVPlayer` at the playlist. Apple's stack does all decode, all HDR / Dolby Vision signaling over HDMI, all audio routing. This is the path for HEVC and progressive H.264, which is what AVPlayer's HLS-fMP4 pipeline reliably accepts (interlaced H.264 routes to the software path for deinterlacing, #107). Atmos passthrough, DV HDMI handshake, HDR10 / HDR10+ system-side tone-mapping all live on this path.
 
 ```
 Source URL ──► Demuxer ──► HLSSegmentProducer ──► SegmentCache ──► HLSLocalServer
@@ -445,7 +445,7 @@ Sources/AetherEngine/
 │   ├── SoftwarePiPSource.swift              Everything a host needs to build an `AVPictureInPictureController` content source around the software path without AVKit entering the engine: the layer plus the four transport answers behind the sample-buffer delegate
 │   └── StartupReadinessGate.swift           Outcome of one startup-readiness attempt: the reloaded item reached a playable state, died, or ran out the settle window without doing either
 ├── Network/
-│   └── HLSLocalServer.swift                 Native path: local HTTP server (127.0.0.1) serving playlist + segments
+│   └── HLSLocalServer.swift                 Native path: local HTTP server (all interfaces for AirPlay, every path behind a per-session token, loopback URLs handed to the local player) serving playlist + segments
 ├── Renderer/
 │   ├── SampleBufferRenderer.swift           SW path: AVSampleBufferDisplayLayer + B-frame reorder, HDR10+ attachments; `flush(removingDisplayedImage:)` holds the last frame through a seek (#90); the decode thread reaches the layer only through its `sampleBufferRenderer`, taken once on the main actor (#351)
 │   └── SubtitleFrameCompositor.swift        Composites active cues into decoded software-path frames while PiP is active, since the system PiP window renders only the sample-buffer layer; playback wins, every failure path returns the original buffer untouched

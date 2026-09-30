@@ -184,4 +184,51 @@ struct DoviRpuConverterTests {
         #expect(DoviRpuConverter.enhancementLayerType(pkt, framing: .annexB) == nil)
         #expect(annexBNALTypes(pkt) == [1, 62])
     }
+
+    // MARK: - aetherctl dovitest output (audit BIT-106)
+
+    /// The probe's writer used to walk every packet as 4-byte-length NALs whatever the source was,
+    /// so an Annex-B packet holding four NALs came out as one 1-byte NAL.
+    @Test("The probe writes every NAL of a packet behind a start code, in either framing")
+    func probeEmitsEveryNALInEitherFraming() {
+        let nals = [hevcNAL(type: 35, payload: [0x50]),
+                    hevcNAL(type: 19, payload: [UInt8](repeating: 0xAA, count: 40)),
+                    hevcNAL(type: 62, payload: [UInt8](repeating: 0x11, count: 9)),
+                    hevcNAL(type: 63, payload: [UInt8](repeating: 0x22, count: 30))]
+        for (framing, build) in [(VideoNALFraming.annexB, annexBPacket),
+                                 (VideoNALFraming.lengthPrefixed(size: 4), avccPacket)] {
+            let pkt = build(nals)
+            defer { var p: UnsafeMutablePointer<AVPacket>? = pkt; av_packet_free(&p) }
+            let out = AetherEngine.doviProbeAnnexB(UnsafePointer(pkt), framing: framing)
+            var emitted: [[UInt8]] = []
+            out.withUnsafeBytes { raw in
+                let base = raw.bindMemory(to: UInt8.self).baseAddress!
+                A53SEIParser.forEachNAL(base, out.count, .annexB) { nal, len in
+                    emitted.append([UInt8](UnsafeBufferPointer(start: nal, count: len)))
+                }
+            }
+            #expect(emitted == nals, "framing \(framing)")
+            #expect(Array(out.prefix(4)) == [0, 0, 0, 1])
+        }
+    }
+
+    @Test("Annex-B extradata is written as it is, hvcC parameter sets are start-coded")
+    func probeParameterSetsFollowTheExtradataFraming() {
+        let annexB: [UInt8] = [0, 0, 0, 1, 0x40, 0x01, 0xAA, 0, 0, 0, 1, 0x42, 0x01, 0xBB]
+        let annexBOut = annexB.withUnsafeBufferPointer {
+            AetherEngine.doviProbeParameterSets(extradata: $0.baseAddress, size: $0.count, framing: .annexB)
+        }
+        #expect([UInt8](annexBOut) == annexB)
+
+        var hvcC = [UInt8](repeating: 0, count: 22)
+        hvcC[0] = 1
+        hvcC[21] = 0x03
+        hvcC.append(1)                                   // numOfArrays
+        hvcC += [0x20, 0x00, 0x01, 0x00, 0x03, 0x40, 0x01, 0xAA]   // VPS array, one NAL of 3 bytes
+        let hvcCOut = hvcC.withUnsafeBufferPointer {
+            AetherEngine.doviProbeParameterSets(extradata: $0.baseAddress, size: $0.count, framing: .lengthPrefixed(size: 4))
+        }
+        #expect([UInt8](hvcCOut) == [0, 0, 0, 1, 0x40, 0x01, 0xAA])
+        #expect(AetherEngine.doviProbeParameterSets(extradata: nil, size: 0, framing: .annexB).isEmpty)
+    }
 }

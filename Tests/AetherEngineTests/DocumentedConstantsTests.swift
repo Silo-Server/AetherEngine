@@ -283,6 +283,18 @@ final class DocumentedConstantsTests: XCTestCase {
             """)
     }
 
+    /// The README's Xcode row is the SDK the source needs, not a taste (audit OPS-103): the engine
+    /// names a 26.2 C symbol unguarded, so an older Xcode cannot compile it. When the symbol goes,
+    /// this fails and the row can come down with it.
+    func testXcodeRequirementIsTheSDKTheSourceCompilesAgainst() throws {
+        let probe = try sourceFile("Sources/AetherEngine/Video/VTCapabilityProbe.swift")
+        XCTAssertTrue(probe.contains("VTRegisterSupplementalVideoDecoderIfAvailable("), """
+            VTCapabilityProbe no longer calls the iOS / tvOS 26.2 symbol that sets the README's Xcode row.
+            Re-derive the SDK requirement and update the Requirements table.
+            """)
+        assertDocumented("| Xcode | 26.2 |", try documentation())
+    }
+
     /// The docs corpus is README + docs/; a claim living in a source docstring is read straight.
     private func sourceFile(_ relativePath: String) throws -> String {
         guard let text = try? String(contentsOf: Self.repoRoot.appendingPathComponent(relativePath),

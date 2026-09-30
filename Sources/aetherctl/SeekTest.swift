@@ -163,13 +163,17 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
     }
     let sawSeeking = probes.contains { $0.seeking }
     let endedCleared = !(probes.last?.seeking ?? true)
+    // A line printed "<-- FAIL" has to reach the exit code too: nothing else a script can gate on (audit OPS-104).
+    var failures: [String] = []
     print("")
     print("=== #37/#38 PROBE (single backward seek, concurrent sampler) ===")
     print(String(format: "  preSeek=%.1f target=%.1f tol=%.1f samples=%d", preSeekCt, probeLo, tol, probes.count))
     print("  #37 clock bounce back through pre-seek after reaching target: "
           + (bounceAfterTarget ? "YES  <-- FAIL" : "no  <-- PASS"))
+    if bounceAfterTarget { failures.append("#37 clock bounce") }
     print("  #38 isSeeking observed in-flight=\(sawSeeking ? "yes" : "NO") ended-cleared=\(endedCleared ? "yes" : "NO")  "
           + ((sawSeeking && endedCleared) ? "<-- PASS" : "<-- FAIL"))
+    if !(sawSeeking && endedCleared) { failures.append("#38 isSeeking window") }
     // #38 follow-up: the falling edge alone cannot say what happened; the probe seek must produce a
     // .began and a matching .landed, and that landing must name a position at the target.
     let probeSeekEvents = seekEvents.value.filter { $0.origin == .programmatic }
@@ -184,6 +188,7 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
     print("  #38 event pair: \(probeBegan.map { "began@\(String(format: "%.1f", $0.target))" } ?? "NONE") -> "
           + (probeTerminator.map { "\($0)" } ?? "NO TERMINATOR")
           + "  " + (probeLandedAtTarget ? "<-- PASS" : "<-- FAIL"))
+    if !probeLandedAtTarget { failures.append("#38 seek event pair") }
 
     struct Sample { let wall: Double; let ct: Double; let src: Double; let playing: Bool }
     var samples: [Sample] = []
@@ -260,10 +265,23 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
     let finalCt = samples.last?.ct ?? engine.currentTime
     let settleError = abs(finalCt - finalTarget)
 
-    let fullRestart   = tally.value["fullRestart"]   ?? 0
-    let coalesced     = tally.value["coalesced"]     ?? 0
-    let settleAdvance = tally.value["settleAdvance"] ?? 0
-    let abandon       = tally.value["abandon"]       ?? 0
+    // The log handler keeps appending from engine threads until `engine.stop()` below, and it mutates
+    // these under `handlerLock`: read them once under the same lock and report from the copy (audit OPS-104).
+    let counters: (tally: [String: Int], publishedShifts: [Double], gateOpenShifts: [Int],
+                   ledgerCount: Int, maxLedgerDriftAbs: Double, parkCount: Int,
+                   liveConsumerParkCount: Int, wedgeBrokenCount: Int, reanchorCount: Int,
+                   seekReconcileCount: Int) = {
+        handlerLock.lock()
+        defer { handlerLock.unlock() }
+        return (tally.value, publishedShifts.value, gateOpenShifts.value, ledgerCount.value,
+                maxLedgerDriftAbs.value, parkCount.value, liveConsumerParkCount.value,
+                wedgeBrokenCount.value, reanchorCount.value, seekReconcileCount.value)
+    }()
+
+    let fullRestart   = counters.tally["fullRestart"]   ?? 0
+    let coalesced     = counters.tally["coalesced"]     ?? 0
+    let settleAdvance = counters.tally["settleAdvance"] ?? 0
+    let abandon       = counters.tally["abandon"]       ?? 0
 
     print("")
     print("=== SEEKTEST RESULTS ===")
@@ -285,8 +303,8 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
     print("  full restarts for the same burst; 'abandoned' should trend to 0.")
 
     // #65 discriminator: did the producer shift VARY across the burst's restart epochs?
-    let pubShifts = publishedShifts.value
-    let rawShifts = gateOpenShifts.value
+    let pubShifts = counters.publishedShifts
+    let rawShifts = counters.gateOpenShifts
     let distinctPub = Set(pubShifts.map { ($0 * 1000).rounded() / 1000 })
     let distinctRaw = Set(rawShifts)
     print("")
@@ -296,11 +314,11 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
                  "[" + pubShifts.map { String(format: "%.3f", $0) }.joined(separator: ", ") + "]",
                  distinctPub.count))
     print("  clockLead settle = \(String(format: "%.2f", settleClockLead))s  (headless ~0 by design; #65 is presented-vs-clock, invisible to ct-src)")
-    print("  ledger segments opened = \(ledgerCount.value)  maxContentDrift = \(String(format: "%.3f", maxLedgerDriftAbs.value))s  (the POSITIVE Root-B signal)")
-    print("  abnormal backpressure parks (VOD wedge signature) = \(parkCount.value)"
-          + "  (of those, \(liveConsumerParkCount.value) with the consumer still fetching, AE#528)")
-    print("  #65 FIX signals: wedge breaks=\(wedgeBrokenCount.value)  producer re-anchors=\(reanchorCount.value)  seek-deadline reconciles=\(seekReconcileCount.value)")
-    let fixEngaged = wedgeBrokenCount.value > 0 || reanchorCount.value > 0 || seekReconcileCount.value > 0
+    print("  ledger segments opened = \(counters.ledgerCount)  maxContentDrift = \(String(format: "%.3f", counters.maxLedgerDriftAbs))s  (the POSITIVE Root-B signal)")
+    print("  abnormal backpressure parks (VOD wedge signature) = \(counters.parkCount)"
+          + "  (of those, \(counters.liveConsumerParkCount) with the consumer still fetching, AE#528)")
+    print("  #65 FIX signals: wedge breaks=\(counters.wedgeBrokenCount)  producer re-anchors=\(counters.reanchorCount)  seek-deadline reconciles=\(counters.seekReconcileCount)")
+    let fixEngaged = counters.wedgeBrokenCount > 0 || counters.reanchorCount > 0 || counters.seekReconcileCount > 0
     if fixEngaged {
         print("  >> #65 FIX ENGAGED: the VOD wedge breaker / seek-deadline reconcile fired during the burst. A")
         print("     non-zero break+re-anchor with playback resuming afterward (clock advancing, no sustained PARK")
@@ -310,28 +328,29 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
         print("  >> INCONCLUSIVE: 0 producer restarts. The file was fully produced before the burst, so")
         print("     every seek hit the cache and the cross-epoch cascade never fired. Re-run with a LONGER")
         print("     file (seek targets must land beyond the producer write head) to exercise #65.")
-    } else if maxLedgerDriftAbs.value >= 0.5 {
+    } else if counters.maxLedgerDriftAbs >= 0.5 {
         print("  >> ROOT B CONFIRMED (content-vs-clock): a segment was muxed with source content offset")
-        print("     \(String(format: "%.2f", maxLedgerDriftAbs.value))s from its planned/EXTINF position, so the presented frame leads the")
+        print("     \(String(format: "%.2f", counters.maxLedgerDriftAbs))s from its planned/EXTINF position, so the presented frame leads the")
         print("     clock by that much. Fix the content-drift source (off-plan seek landing / uniform-plan stride),")
         print("     NOT a seam port. Grep '#65 ledger' for the exact seg/epoch.")
     } else if distinctRaw.count > 1 || distinctPub.count > 1 {
         print("  >> ROOT A (cross-epoch shift divergence): the producer published MORE THAN ONE shift across")
         print("     the burst. Buffered bytes from a superseded epoch fold with the latest scalar -> picture")
         print("     leads the clock. The live seam-history port is the fix.")
-    } else if parkCount.value > 0, parkCount.value == liveConsumerParkCount.value, !fixEngaged {
-        print("  >> PARKED BEHIND A LIVE CONSUMER (not a wedge): \(parkCount.value) park(s), every one of them")
+    } else if counters.parkCount > 0, counters.parkCount == counters.liveConsumerParkCount, !fixEngaged {
+        print("  >> PARKED BEHIND A LIVE CONSUMER (not a wedge): \(counters.parkCount) park(s), every one of them")
         print("     logged idle=0s, so the consumer kept declaring fetch targets or kept rendering the whole")
         print("     time. The breaker staying quiet here is AE#528 working; a wedge is a park whose idle= climbs.")
-    } else if parkCount.value > 0 {
+    } else if counters.parkCount > 0 {
         if fixEngaged {
-            print("  >> PRODUCER WEDGE DETECTED AND BROKEN: \(parkCount.value) abnormal park(s) but the breaker fired")
-            print("     (\(wedgeBrokenCount.value) break(s), \(reanchorCount.value) re-anchor(s), \(seekReconcileCount.value) seek reconcile(s)).")
+            print("  >> PRODUCER WEDGE DETECTED AND BROKEN: \(counters.parkCount) abnormal park(s) but the breaker fired")
+            print("     (\(counters.wedgeBrokenCount) break(s), \(counters.reanchorCount) re-anchor(s), \(counters.seekReconcileCount) seek reconcile(s)).")
             print("     This is the #65 fix recovering the livelock; verify on device that playback actually resumes.")
         } else {
-            print("  >> PRODUCER WEDGE (UNRECOVERED): invariant shift AND ~zero ledger drift, but \(parkCount.value) abnormal")
+            print("  >> PRODUCER WEDGE (UNRECOVERED): invariant shift AND ~zero ledger drift, but \(counters.parkCount) abnormal")
             print("     backpressure park(s) and the breaker did NOT fire. The 6s symptom is the frozen-clock/stall")
             print("     artifact. Either the park stayed under the break threshold or the fix is not in this build.")
+            failures.append("producer wedge unrecovered")
         }
     } else {
         print("  >> NO ENGINE-LEVEL DIVERGENCE REPRODUCED: invariant shift, ledger drift ~0, no wedge. The headless")
@@ -359,6 +378,7 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
           + "late-landings=\(lateLandings.count)")
     let unpaired = begun.subtracting(terminated).sorted()
     print("  unpaired begans: " + (unpaired.isEmpty ? "none  <-- PASS" : "\(unpaired)  <-- FAIL"))
+    if !unpaired.isEmpty { failures.append("unpaired seek begans \(unpaired)") }
     // AE#534: began -> first terminal, per seek, in issue order. Quote the median and the MAX: the
     // read this measures is an XPC round trip to a media server that is least likely to answer during
     // a seek, so a mean would bury exactly the case the question is about.
@@ -379,6 +399,10 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
     }
     for event in events.suffix(12) { print("    \(event)") }
     print("")
+    if !failures.isEmpty {
+        print("VERDICT: seektest FAIL: " + failures.joined(separator: "; "))
+        return 1
+    }
     print("VERDICT: seektest DONE (comparison harness; compare tallies old vs new build)")
     return 0
 }
