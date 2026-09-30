@@ -42,12 +42,13 @@ struct DetourOriginTicketTests {
         // that opens the detour block holding 4 to 8 MB.
         let target = Int64(5 * 1024 * 1024)
         #expect(reader.seek(offset: target, whence: Int32(SEEK_SET)) == target)
-        let start = ContinuousClock.now
         let served = reader.read(into: buf, size: Int32(chunk))
-        let elapsed = ContinuousClock.now - start
 
         #expect(served > 0)
-        #expect(elapsed < .seconds(2), "the detour took \(elapsed): it waited on a slot it already held")
+        // The witness is the pump still on the link, not a clock: with the old double acquire the
+        // second ticket waited out its 4 s budget, by which time the pump's range had ended (checked
+        // by reverting 0fd16c57). A wall-clock bound on this read measured 2.0 to 2.3 s on a loaded
+        // CI runner for a correct detour.
         #expect(reader.hasLiveConnectionForTesting,
                 "the detour only got its slot once the pump's range had finished")
         let books = try #require(OriginRequestBudget.shared.snapshot(for: url))
