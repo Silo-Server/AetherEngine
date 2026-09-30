@@ -287,9 +287,32 @@ public final class Demuxer: @unchecked Sendable {
     /// `streams` array, so a caller on another thread must not index the live array while a read
     /// holds the lock. The `AVStream`s themselves live until `avformat_close_input`. Guarded by
     /// `streamTableLock`, a leaf lock; `streamTableSize` is its length, guarded by `accessLock`.
-    private let streamTableLock = NSLock()
+    ///
+    /// Audit DMX-108: also the gate `withStream` and `close()` meet at. A caller inside
+    /// `withStream` counts itself in `streamUsers`, and `close()` empties the table (so no new one
+    /// can start) and waits for the count to reach zero before `avformat_close_input` frees the
+    /// `AVStream`s. The condition is on the leaf lock, so the wait never holds `accessLock`'s
+    /// network reads against anyone.
+    private let streamTableLock = NSCondition()
     private var streamTable: [UnsafeMutablePointer<AVStream>] = []
     private var streamTableSize = 0
+    private var streamUsers = 0
+
+    /// Audit DMX-108: what the track accessors answer with when a read holds `accessLock`.
+    /// MPEG-TS adds streams inside `av_read_frame`, which reallocates `streams`, so the accessors
+    /// walk the live array only under the lock, and the lock can be held for a whole network read.
+    /// An accessor that finds it busy answers from the last snapshot instead of waiting, the same
+    /// contract NAT-7 gave `stream(at:)`. Guarded by `streamTableLock`.
+    private struct TrackSnapshot {
+        var videoStreamIndex: Int32 = -1
+        var audioStreamIndex: Int32 = -1
+        var firstAudioStreamIndexByType: Int32 = -1
+        var audioTracks: [TrackInfo] = []
+        var subtitleTracks: [TrackInfo] = []
+        var subtitleStreamIndices: Set<Int32> = []
+        var splitDisplaySetSubtitleStreamIndices: Set<Int32> = []
+    }
+    private var trackSnapshot = TrackSnapshot()
 
     /// The URL and headers this demuxer was opened from, kept for the recordless Dolby Vision audit's
     /// second open. nil for a custom reader (no second open to give) and for a live source.
@@ -1084,7 +1107,7 @@ public final class Demuxer: @unchecked Sendable {
         guard let ctx = formatContext else { return }
         reclassifyAttachedPictures(ctx)
         _ = avformat_find_stream_info(ctx, nil)
-        refreshStreamTableLocked()
+        refreshStreamTableLocked(rebuildTracks: true)
     }
 
     /// True if the stream at `index` is missing or carries no resolved codec yet (`AV_CODEC_ID_NONE`).
@@ -1151,8 +1174,7 @@ public final class Demuxer: @unchecked Sendable {
     /// Clamped: av_find_best_stream returns AVERROR_STREAM_NOT_FOUND (-1381258232)
     /// on failure, not -1; normalize to -1 to avoid garbage in logs.
     var videoStreamIndex: Int32 {
-        guard let ctx = formatContext else { return -1 }
-        return max(-1, av_find_best_stream(ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0))
+        answeredFromStreams(\.videoStreamIndex) { Self.bestStreamIndex($0, AVMEDIA_TYPE_VIDEO) }
     }
 
     /// True if `index` names a video stream. Live producer uses this to detect
@@ -1169,15 +1191,51 @@ public final class Demuxer: @unchecked Sendable {
     /// GOTCHA: av_find_best_stream skips streams with no channels/sample_rate (live MPEG-TS
     /// probe may leave them that way). Use `firstAudioStreamIndexByType` as fallback.
     var audioStreamIndex: Int32 {
-        guard let ctx = formatContext else { return -1 }
-        return max(-1, av_find_best_stream(ctx, AVMEDIA_TYPE_AUDIO, -1, -1, nil, 0))
+        answeredFromStreams(\.audioStreamIndex) { Self.bestStreamIndex($0, AVMEDIA_TYPE_AUDIO) }
     }
 
     /// First audio stream by codec_type regardless of codecpar completeness.
     /// Fallback for live MPEG-TS where av_find_best_stream skips empty-codecpar
     /// streams; the engine's live AAC codecpar repair fills them downstream.
     var firstAudioStreamIndexByType: Int32 {
-        guard let ctx = formatContext else { return -1 }
+        answeredFromStreams(\.firstAudioStreamIndexByType) { Self.firstAudioStreamIndexByType($0) }
+    }
+
+    func audioTrackInfos() -> [TrackInfo] {
+        answeredFromStreams(\.audioTracks) { trackInfos(in: $0, ofType: AVMEDIA_TYPE_AUDIO) }
+    }
+
+    func subtitleTrackInfos() -> [TrackInfo] {
+        answeredFromStreams(\.subtitleTracks) { trackInfos(in: $0, ofType: AVMEDIA_TYPE_SUBTITLE) }
+    }
+
+    /// Runs `compute` over the live format context under `accessLock` when the lock is free, and
+    /// remembers the answer; answers from the last snapshot when a read holds it (audit DMX-108).
+    /// `try`, not `lock`, for the reason `stream(at:)` gives: a caller on the main actor must not
+    /// wait out a network read.
+    private func answeredFromStreams<T>(
+        _ field: WritableKeyPath<TrackSnapshot, T>,
+        _ compute: (UnsafeMutablePointer<AVFormatContext>) -> T
+    ) -> T {
+        if accessLock.try() {
+            defer { accessLock.unlock() }
+            let answer = formatContext.map(compute) ?? TrackSnapshot()[keyPath: field]
+            streamTableLock.lock()
+            trackSnapshot[keyPath: field] = answer
+            streamTableLock.unlock()
+            return answer
+        }
+        streamTableLock.lock()
+        defer { streamTableLock.unlock() }
+        return trackSnapshot[keyPath: field]
+    }
+
+    private static func bestStreamIndex(_ ctx: UnsafeMutablePointer<AVFormatContext>,
+                                        _ type: AVMediaType) -> Int32 {
+        max(-1, av_find_best_stream(ctx, type, -1, -1, nil, 0))
+    }
+
+    private static func firstAudioStreamIndexByType(_ ctx: UnsafeMutablePointer<AVFormatContext>) -> Int32 {
         for i in 0..<Int(ctx.pointee.nb_streams) {
             guard let stream = ctx.pointee.streams[i],
                   let codecpar = stream.pointee.codecpar,
@@ -1187,28 +1245,57 @@ public final class Demuxer: @unchecked Sendable {
         return -1
     }
 
-    func audioTrackInfos() -> [TrackInfo] {
-        guard let ctx = formatContext else { return [] }
+    private func trackInfos(in ctx: UnsafeMutablePointer<AVFormatContext>,
+                            ofType type: AVMediaType) -> [TrackInfo] {
         var tracks: [TrackInfo] = []
         for i in 0..<Int(ctx.pointee.nb_streams) {
             guard let stream = ctx.pointee.streams[i],
                   let codecpar = stream.pointee.codecpar,
-                  codecpar.pointee.codec_type == AVMEDIA_TYPE_AUDIO else { continue }
+                  codecpar.pointee.codec_type == type else { continue }
             tracks.append(trackInfo(from: stream, index: i))
         }
         return tracks
     }
 
-    func subtitleTrackInfos() -> [TrackInfo] {
-        guard let ctx = formatContext else { return [] }
-        var tracks: [TrackInfo] = []
+    private static func subtitleStreamIndices(in ctx: UnsafeMutablePointer<AVFormatContext>) -> Set<Int32> {
+        var indices: Set<Int32> = []
         for i in 0..<Int(ctx.pointee.nb_streams) {
             guard let stream = ctx.pointee.streams[i],
                   let codecpar = stream.pointee.codecpar,
                   codecpar.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE else { continue }
-            tracks.append(trackInfo(from: stream, index: i))
+            indices.insert(Int32(i))
         }
-        return tracks
+        return indices
+    }
+
+    private static func splitDisplaySetSubtitleStreamIndices(
+        in ctx: UnsafeMutablePointer<AVFormatContext>
+    ) -> Set<Int32> {
+        guard let formatName = ctx.pointee.iformat?.pointee.name,
+              String(cString: formatName).split(separator: ",").contains("mpegts")
+        else { return [] }
+        var indices: Set<Int32> = []
+        for i in 0..<Int(ctx.pointee.nb_streams) {
+            guard let stream = ctx.pointee.streams[i],
+                  let codecpar = stream.pointee.codecpar,
+                  codecpar.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE,
+                  codecpar.pointee.codec_id == AV_CODEC_ID_HDMV_PGS_SUBTITLE else { continue }
+            indices.insert(Int32(i))
+        }
+        return indices
+    }
+
+    /// Caller holds `accessLock`.
+    private func buildTrackSnapshotLocked() -> TrackSnapshot {
+        guard let ctx = formatContext else { return TrackSnapshot() }
+        return TrackSnapshot(
+            videoStreamIndex: Self.bestStreamIndex(ctx, AVMEDIA_TYPE_VIDEO),
+            audioStreamIndex: Self.bestStreamIndex(ctx, AVMEDIA_TYPE_AUDIO),
+            firstAudioStreamIndexByType: Self.firstAudioStreamIndexByType(ctx),
+            audioTracks: trackInfos(in: ctx, ofType: AVMEDIA_TYPE_AUDIO),
+            subtitleTracks: trackInfos(in: ctx, ofType: AVMEDIA_TYPE_SUBTITLE),
+            subtitleStreamIndices: Self.subtitleStreamIndices(in: ctx),
+            splitDisplaySetSubtitleStreamIndices: Self.splitDisplaySetSubtitleStreamIndices(in: ctx))
     }
 
     /// #112: PGS subtitle streams whose display sets arrive split across PES packets and need
@@ -1218,15 +1305,7 @@ public final class Demuxer: @unchecked Sendable {
     /// the trailing END, which the decoder's synthetic-END flush rescues per packet).
     /// #151: every AVMEDIA_TYPE_SUBTITLE stream index; the forward prefetcher's route + keep set.
     func subtitleStreamIndices() -> Set<Int32> {
-        guard let ctx = formatContext else { return [] }
-        var indices: Set<Int32> = []
-        for i in 0..<Int(ctx.pointee.nb_streams) {
-            guard let stream = ctx.pointee.streams[i],
-                  let codecpar = stream.pointee.codecpar,
-                  codecpar.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE else { continue }
-            indices.insert(Int32(i))
-        }
-        return indices
+        answeredFromStreams(\.subtitleStreamIndices) { Self.subtitleStreamIndices(in: $0) }
     }
 
     /// #230: the stream whose packets pace the subtitle side reader's forward park, or -1.
@@ -1276,22 +1355,16 @@ public final class Demuxer: @unchecked Sendable {
     }
 
     func splitDisplaySetSubtitleStreamIndices() -> Set<Int32> {
-        guard let ctx = formatContext,
-              let formatName = ctx.pointee.iformat?.pointee.name,
-              String(cString: formatName).split(separator: ",").contains("mpegts")
-        else { return [] }
-        var indices: Set<Int32> = []
-        for i in 0..<Int(ctx.pointee.nb_streams) {
-            guard let stream = ctx.pointee.streams[i],
-                  let codecpar = stream.pointee.codecpar,
-                  codecpar.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE,
-                  codecpar.pointee.codec_id == AV_CODEC_ID_HDMV_PGS_SUBTITLE else { continue }
-            indices.insert(Int32(i))
+        answeredFromStreams(\.splitDisplaySetSubtitleStreamIndices) {
+            Self.splitDisplaySetSubtitleStreamIndices(in: $0)
         }
-        return indices
     }
 
+    /// Load-time only (the probe demuxer has no reader yet), so it takes `accessLock` outright
+    /// rather than answering from a snapshot: it reads the attached picture's bytes.
     func mediaMetadata() -> MediaMetadata {
+        accessLock.lock()
+        defer { accessLock.unlock() }
         guard let ctx = formatContext else {
             return MediaMetadata(title: nil, artist: nil, album: nil, artworkData: nil)
         }
@@ -1500,6 +1573,8 @@ public final class Demuxer: @unchecked Sendable {
     /// MKV font attachments. Payload in codec extradata; filename/MIME in stream metadata.
     /// Non-font attachments filtered by isFontPayload.
     func fontAttachmentInfos() -> [FontAttachment] {
+        accessLock.lock()
+        defer { accessLock.unlock() }
         guard let ctx = formatContext else { return [] }
         var fonts: [FontAttachment] = []
         for i in 0..<Int(ctx.pointee.nb_streams) {
@@ -1568,8 +1643,10 @@ public final class Demuxer: @unchecked Sendable {
         return Int(index) < streamTable.count ? streamTable[Int(index)] : nil
     }
 
-    /// Caller holds `accessLock`.
-    private func refreshStreamTableLocked() {
+    /// Caller holds `accessLock`. The track snapshot is rebuilt when the stream count changed, when
+    /// the context is gone, and when the caller says codec parameters moved under an unchanged count
+    /// (`rebuildTracks`, after a `find_stream_info`).
+    private func refreshStreamTableLocked(rebuildTracks: Bool = false) {
         var table: [UnsafeMutablePointer<AVStream>] = []
         if let ctx = formatContext, let streams = ctx.pointee.streams {
             let count = Int(ctx.pointee.nb_streams)
@@ -1579,10 +1656,38 @@ public final class Demuxer: @unchecked Sendable {
                 table.append(stream)
             }
         }
+        let snapshot = (rebuildTracks || table.count != streamTableSize || formatContext == nil)
+            ? buildTrackSnapshotLocked() : nil
         streamTableSize = table.count
         streamTableLock.lock()
         streamTable = table
+        if let snapshot { trackSnapshot = snapshot }
         streamTableLock.unlock()
+    }
+
+    /// The stream at `index`, for the length of `body` only (audit DMX-108). `stream(at:)` hands out
+    /// a raw `AVStream*`, and a live reopen's `close()` frees every stream the moment it runs, so a
+    /// caller on another thread that holds one across that point reads freed memory. A caller in
+    /// here is counted, `close()` waits for the count to drain before it frees anything, and once
+    /// `close()` has started no new caller gets a stream. Never waits on `accessLock`, so it cannot
+    /// wait out a network read either. `body` must be short and must not call back into the demuxer.
+    func withStream<T>(at index: Int32, _ body: (UnsafeMutablePointer<AVStream>) -> T) -> T? {
+        guard index >= 0 else { return nil }
+        streamTableLock.lock()
+        guard Int(index) < streamTable.count else {
+            streamTableLock.unlock()
+            return nil
+        }
+        let stream = streamTable[Int(index)]
+        streamUsers += 1
+        streamTableLock.unlock()
+        defer {
+            streamTableLock.lock()
+            streamUsers -= 1
+            if streamUsers == 0 { streamTableLock.broadcast() }
+            streamTableLock.unlock()
+        }
+        return body(stream)
     }
 
     /// Sets AVDISCARD_ALL on streams outside `keep`. Without this, matroska reads
@@ -2439,6 +2544,13 @@ public final class Demuxer: @unchecked Sendable {
         avioProvider?.markClosed()  // unblocks av_read_frame (tvOS suspends threads in background)
         accessLock.lock()
         interrupt.disarmInputCeiling()
+        // Audit DMX-108: the table is emptied BEFORE the streams are freed, and close waits for
+        // every `withStream` caller already inside, so no thread is left holding a freed `AVStream*`.
+        streamTableLock.lock()
+        streamTable = []
+        trackSnapshot = TrackSnapshot()
+        while streamUsers > 0 { streamTableLock.wait() }
+        streamTableLock.unlock()
         if formatContext != nil {
             avformat_close_input(&formatContext)
         }
