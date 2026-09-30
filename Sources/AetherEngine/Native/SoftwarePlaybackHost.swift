@@ -319,6 +319,17 @@ final class SoftwarePlaybackHost {
         return max(0, newestSourcePts - sessionStartPts)
     }
 
+    /// The DVR ring's rewind floor on the session axis once byte or time eviction has moved it past
+    /// the start; nil before that and when no ring is armed. Published as the resident floor so the
+    /// seekable range follows what the ring still holds (audit VPERF-101).
+    nonisolated var dvrResidentFloorSessionSeconds: Double? {
+        guard let ring = dvrRing else { return nil }
+        liveEdgeLock.lock()
+        let start = sessionStartPts
+        liveEdgeLock.unlock()
+        return ring.residentFloorSessionSeconds(sessionStartPts: start)
+    }
+
     // MARK: - Live reader/feeder split (DVR sessions)
     //
     // DVR live sessions: reader (demuxQueue) fills ring regardless of play/pause; feeder (feedQueue) decodes from ring cursor with renderer back-pressure.
@@ -762,8 +773,13 @@ final class SoftwarePlaybackHost {
             let scratch = baseDir.appendingPathComponent("dvr-\(UUID().uuidString)", isDirectory: true)
             do {
                 try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
-                self.dvrRing = try PacketRingBuffer(windowSeconds: window, scratch: scratch)
-                EngineLog.emit("[SWHost] DVR ring armed window=\(String(format: "%.0f", window))s scratch=\(scratch.lastPathComponent)", category: .swPlayback)
+                // Audit VPERF-101: the same allowance the native path gives this session, so a long
+                // window on a small volume shrinks instead of filling the disk.
+                let available = (try? baseDir.resourceValues(forKeys: [.volumeAvailableCapacityKey]))?
+                    .volumeAvailableCapacity.map(Int64.init)
+                let budget = PacketRingBuffer.liveByteBudget(volumeAvailableBytes: available)
+                self.dvrRing = try PacketRingBuffer(windowSeconds: window, scratch: scratch, byteBudget: budget)
+                EngineLog.emit("[SWHost] DVR ring armed window=\(String(format: "%.0f", window))s budget=\(budget >> 20)MiB scratch=\(scratch.lastPathComponent)", category: .swPlayback)
             } catch {
                 EngineLog.emit("[SWHost] DVR ring create failed (\(error)); live-only fallback", category: .swPlayback)
                 self.dvrRing = nil
@@ -2005,11 +2021,11 @@ final class SoftwarePlaybackHost {
                     noteEdge(ptsSec)
                     playedMedia?.record(isVideo ? .video : .audio, pts: ptsSec, bytes: Int(packet.pointee.size))
                     if let data = packet.pointee.data, packet.pointee.size > 0 {
-                        let bytes = Data(bytes: data, count: Int(packet.pointee.size))
                         let isKey = isVideo && (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
                         // Best-effort: a write failure just shrinks the
                         // rewind window, it must not stall the reader.
-                        try? ring.append(pts: ptsSec, isKeyframe: isKey, isVideo: isVideo, bytes: bytes)
+                        try? ring.append(pts: ptsSec, isKeyframe: isKey, isVideo: isVideo,
+                                         bytes: UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size)))
                         condition.lock()
                         condition.broadcast()
                         condition.unlock()
@@ -2085,13 +2101,10 @@ final class SoftwarePlaybackHost {
                     clockSeconds: aOut.currentTimeSeconds
                 ) == .feed else { return false }
                 guard seq < ring.seqBounds.end else { return false }  // live edge: nothing to pump yet
-                guard let pkt = ring.packet(atSeq: seq) else {
-                    // Evicted/unreadable under the pump: skip, same as the combined loop.
-                    guard audioLookahead.advance(from: seq, fedPTS: nil) else { return false }
-                    seq += 1
-                    return true
-                }
-                if pkt.isVideo {
+                // Audit PERF-101: the kind is in the index, so the video packets this pump skips are
+                // never read off the disk (the feeder reads each of them once, for decode).
+                guard ring.isVideo(atSeq: seq) == false, let pkt = ring.packet(atSeq: seq) else {
+                    // Video, or evicted/unreadable under the pump: skip, same as the combined loop.
                     guard audioLookahead.advance(from: seq, fedPTS: nil) else { return false }
                     seq += 1
                     return true
@@ -2204,6 +2217,12 @@ final class SoftwarePlaybackHost {
                     category: .swPlayback
                 )
                 clampCursor(cursor, bounds.first)
+                return true
+            }
+            // Audio the pump already delivered: consume the slot without reading it back, the
+            // pump read it once already (audit PERF-101).
+            if cursor < audioLookahead.current, ring.isVideo(atSeq: cursor) == false {
+                advanceCursor(cursor)
                 return true
             }
             guard let pkt = ring.packet(atSeq: cursor) else {
@@ -2783,13 +2802,13 @@ final class SoftwarePlaybackHost {
                         if let ring {
                             let isKey = isVideo && (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
                             if let data = packet.pointee.data, packet.pointee.size > 0 {
-                                let bytes = Data(bytes: data, count: Int(packet.pointee.size))
                                 // Append is a small file write; off-main and
                                 // internally locked, so it never touches the
                                 // decoders' state. Best-effort: a write failure
                                 // just shrinks the rewind window, it must not
                                 // stall live playback.
-                                try? ring.append(pts: ptsSec, isKeyframe: isKey, isVideo: isVideo, bytes: bytes)
+                                try? ring.append(pts: ptsSec, isKeyframe: isKey, isVideo: isVideo,
+                                                 bytes: UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size)))
                             }
                         }
                     }
