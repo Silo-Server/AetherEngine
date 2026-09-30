@@ -3898,6 +3898,10 @@ public final class AetherEngine: ObservableObject {
         // later reopen of the same source are bound by it too.
         if !isCustomSource {
             OriginRequestBudget.shared.setHostLimit(options.maxConcurrentSourceRequests, for: url)
+        } else if let ingest = customReader as? HLSLiveIngestReader {
+            // AE#678: the ingest fetches from the playlist's origin, not from `aether-custom://`.
+            OriginRequestBudget.shared.setHostLimit(
+                options.maxConcurrentSourceRequests, for: ingest.budgetOriginURL)
         }
         // #170: the carryover is consumed by THIS load only (registration site below, or never on
         // the branches that return before it); it must not persist into loadedOptions where a later
