@@ -725,6 +725,17 @@ still not read. What it gets is bounded three ways:
   (`of which the join pays 5s of 6s (16.000s cut of the 18.000s it listed)`), and "the join has no
   more to give" is a fact the reader states (its join batch is handed over and its consumer is
   waiting), not arithmetic on EXTINF, which a playlist that rounds its durations up would fail.
+  With a demuxed audio rendition the fact is the cutter's rather than one reader's: both join
+  batches handed over and the cutter waiting on either of them, because an audio rendition whose
+  segments end a little before the video's runs dry first and the video reader is then never the
+  one being waited on (three runs per arm on three listed segments, audio aligned and audio 0.2 s
+  short: first picture 0.18 to 0.21 s against 0.17 to 0.36 s on 7.25.1, TD 5 on 6 s and 9 on 10 s
+  under both profiles). A join that is SLOWER than the `.fastZap` grace, a single-connection
+  provider or a slow link, takes the bounded start before it is spent and then seals the full
+  value (6 or 10, not 5 or 9) over a window shorter than its holdback, which AVPlayer notes with a
+  `-16832` warning at the start; measured one request at a time behind a 4 to 5 Mbit/s link that
+  start is not worse than 7.25.1's (first picture 5.05 to 6.08 s against 7.05 to 8.26 s, no
+  `-12888` where 7.25.1 drew 1 to 3).
 - **By a ceiling.** Segments longer than 10 s (`LiveEdgePolicy.upstreamSegmentSealCeilingSeconds`) are
   not asked for whole: a 20 s one seals 14, as it did before, because the live-only window is 60 s.
 - **Never under what it was.** Where the old value already covered the segment nothing moves: 2 s
