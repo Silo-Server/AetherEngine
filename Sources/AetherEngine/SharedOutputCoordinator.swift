@@ -31,7 +31,7 @@ final class SharedOutputCoordinator {
     /// it, the engine that opted in could leave first and the one that did not would close the round.
     private var releaseOwed = false
     /// Criteria writers that stopped while others still played. Keyed by engine, so one that loads
-    /// again drops its own reset instead of having it wipe the criteria it has just written.
+    /// again as `.primary` drops its own reset instead of having it wipe the criteria it has just written.
     private var deferredCriteriaResets: [ObjectIdentifier: @MainActor () -> Void] = [:]
     private var lastTransition: Task<Void, Never>?
 
@@ -61,7 +61,8 @@ final class SharedOutputCoordinator {
     func join(_ id: ObjectIdentifier, role: SharedOutputRole, tag: String?, owner: AnyObject? = nil) {
         let channels = members[id]?.sourceChannels
         members[id] = Member(role: role, tag: tag, sourceChannels: channels, owner: owner, tracksOwner: owner != nil)
-        deferredCriteriaResets[id] = nil
+        // A secondary never writes criteria the pending reset could wipe, so it keeps the reset owed.
+        if role == .primary { deferredCriteriaResets[id] = nil }
     }
 
     func noteSourceChannels(_ channels: Int?, for id: ObjectIdentifier) {

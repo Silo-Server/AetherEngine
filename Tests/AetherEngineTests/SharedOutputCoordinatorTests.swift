@@ -121,6 +121,21 @@ struct SharedOutputCoordinatorTests {
         #expect(resets == 0)
     }
 
+    @Test("a secondary rejoin keeps the deferred reset")
+    func secondaryRejoinKeepsDeferredReset() {
+        let c = SharedOutputCoordinator()
+        var resets = 0
+        c.join(a, role: .primary, tag: nil)
+        c.join(b, role: .primary, tag: nil)
+        _ = c.leave(a, releasesSession: true)
+        c.deferCriteriaReset(for: a) { resets += 1 }
+        c.join(a, role: .secondary, tag: nil)
+        _ = c.leave(b, releasesSession: true)
+        #expect(resets == 0)
+        _ = c.leave(a, releasesSession: true)
+        #expect(resets == 1)
+    }
+
     @Test("a reset deferred when nobody else is playing runs at once instead of leaking into a later round")
     func deferWithNobodyLeftRunsImmediately() {
         let c = SharedOutputCoordinator()

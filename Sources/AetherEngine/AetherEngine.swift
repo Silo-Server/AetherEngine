@@ -4428,7 +4428,7 @@ public final class AetherEngine: ObservableObject {
             // apply(), so clear a criteria the previous video session left applied. The engine is a
             // process-wide singleton; without this, music playback keeps the panel in DV/HDR.
             if Self.loadDisplayCriteriaAction(suppressDisplayCriteria: options.suppressDisplayCriteria, audioOnlyPath: true) == .clearStale {
-                displayCriteria.reset()
+                resetDisplayCriteriaRespectingOthers()
             }
             // Read codec before closing the probe; custom sources always use FFmpeg (AVPlayer can't consume a custom demuxer).
             let audioCodecID: AVCodecID = (probeOpened && resolvedInitialAudio >= 0)
@@ -4545,7 +4545,7 @@ public final class AetherEngine: ObservableObject {
             // Suppressed host: the load seam preserved the criteria (#128 follow-up), and AVKit writes its
             // own from the AVPlayerItem formatDescription later. Clear a leftover engine criteria now
             // (didApply-gated no-op for hosts that always suppress) so the two writers can't fight.
-            displayCriteria.reset()
+            resetDisplayCriteriaRespectingOthers()
             // #339: AVKit's write lands inside loadNative, so the observation has to be armed before the
             // load rather than when the play gate opens. After reset(), so a switch back to the default
             // mode is not recorded as this session's. Audio-only loads reach clearStale too and have no
@@ -5027,7 +5027,8 @@ public final class AetherEngine: ObservableObject {
                         criteriaUnchanged: criteriaUnchanged,
                         engineIsCriteriaWriter: !options.suppressDisplayCriteria,
                         formatKnown: probeOpened,
-                        effectiveFormat: effectiveFormat
+                        effectiveFormat: effectiveFormat,
+                        noWriterExpected: options.sharedOutputRole == .secondary
                     ),
                     // Sodalite#49: this gate runs after the item is ready, so waiting out an observed switch
                     // blocks nothing else, and the panel is dark until it ends either way. Live keeps the
@@ -7002,6 +7003,17 @@ public final class AetherEngine: ObservableObject {
     }
     #endif
 
+    /// Sodalite#175: the panel mode belongs to every engine still playing, so a reset waits for the last one out.
+    private func resetDisplayCriteriaRespectingOthers() {
+        let id = ObjectIdentifier(self)
+        if SharedOutputCoordinator.shared.othersActive(besides: id) {
+            let controller = displayCriteria
+            SharedOutputCoordinator.shared.deferCriteriaReset(for: id) { controller.reset() }
+        } else {
+            displayCriteria.reset()
+        }
+    }
+
     /// - Parameter resetDisplayCriteria: When `true` (default), release
     ///   the `AVDisplayManager.preferredDisplayCriteria` so the panel
     ///   returns to its default mode. Used by `load()` and the public
@@ -7186,14 +7198,7 @@ public final class AetherEngine: ObservableObject {
         }
 
         if resetDisplayCriteria {
-            let id = ObjectIdentifier(self)
-            if SharedOutputCoordinator.shared.othersActive(besides: id) {
-                // Sodalite#175: the panel mode belongs to every engine still playing; reset once the last one goes.
-                let controller = displayCriteria
-                SharedOutputCoordinator.shared.deferCriteriaReset(for: id) { controller.reset() }
-            } else {
-                displayCriteria.reset()
-            }
+            resetDisplayCriteriaRespectingOthers()
         }
         playbackBackend = .none
         activeVideoDecoder = nil
