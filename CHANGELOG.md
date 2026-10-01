@@ -12,6 +12,14 @@ the public-API contract.
 
 _Nothing yet._
 
+## [7.25.1] - 2026-10-01
+
+### Fixed
+
+- **Cancelling the task that awaits `load()` now ends the load at once (Sodalite#173, #683).** A `.custom(HLSLiveIngestReader)` load against an unreachable provider kept running for 19 s (`open_input 18987ms` while the ingest retried its playlist), and a host that cancelled it to tune the next channel had to wait it out. The load now throws `CancellationError` within tens of milliseconds for URL and `.custom` sources, and leaves the engine the way a newer load would: `.idle`, native host and AVPlayer kept for the next load, display criteria and audio-session membership untouched; a host that leaves on cancel calls `stop()`. Generation-guarded, so a cancel never touches a session a newer `load()` or `stop()` started. A cancelled AE#629 follower also ends the software-path rebuild, nested reroutes included.
+- **A superseded custom-source `reloadAtCurrentPosition()` throws `CancellationError`** like the URL branch already did, instead of returning normally and logging a false "rebuilt on the software path".
+- **A closed `AVIOReader` no longer waits out the 0.75 s probe-fallback delay** (about 0.03 s now), which also shortens `stop()` during a URL open.
+
 ## [7.25.0] - 2026-10-01
 
 ### Added
