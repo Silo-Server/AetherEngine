@@ -719,7 +719,7 @@ The stall half needs a field capture or an origin that reproduces the seek, not 
 
 ### An origin that delivers late (AE#684)
 
-`hlsfixture` publishes on a metronome, and a metronome is the one thing an IPTV origin is not. The defect AE#684 reported only exists when a delivery arrives later than the segment is long, so it could be read off a device log and reproduced nowhere. `Scripts/hls-burst-origin.py` serves a sliding playlist over pre-cut segments and publishes segment k at `end of k - prefill + delays[k % n]`: the MEAN cadence stays the segment duration (the origin never falls behind real time) while the gap between two deliveries follows the cycle. `--freeze-at K --freeze-seconds F` is an outage with the backlog landing at once, `--durs 6,4` alternates segment lengths, and `--rate-kbps` / `--latency-ms` are a link shared by every in-flight response. Its docstring carries the fixture command: 720x576 at 25 fps, 2 s GOPs, 6 s segments, and a white frame plus a 40 ms beep on every whole second, which is what makes the sound measurable against the picture afterwards.
+`hlsfixture` publishes on a metronome, and a metronome is the one thing an IPTV origin is not. The defect AE#684 reported only exists when a delivery arrives later than the segment is long, so it could be read off a device log and reproduced nowhere. `Scripts/hls-burst-origin.py` serves a sliding playlist over pre-cut segments and publishes segment k at `end of k - prefill + delays[k % n]`: the MEAN cadence stays the segment duration (the origin never falls behind real time) while the gap between two deliveries follows the cycle. `--freeze-at K --freeze-seconds F` is an outage with the backlog landing at once, `--durs 6,4` alternates segment lengths, `--dur 6.3` over 6 s of media is a playlist that rounds its EXTINF up, `--window` / `--prefill` set how many segments the upstream lists, and `--rate-kbps` / `--latency-ms` are a link shared by every in-flight response. Its docstring carries the fixture command: 720x576 at 25 fps, 2 s GOPs, 6 s segments, and a white frame plus a 40 ms beep on every whole second, which is what makes the sound measurable against the picture afterwards.
 
 ```bash
 Scripts/hls-burst-origin.py --dir seg6 --delays 0,0.3,2.6,0.2,0.6,2.4,0.1,0.5 &
@@ -728,34 +728,31 @@ aetherctl play --live --live-ingest --fast-zap --seconds 180 http://127.0.0.1:86
 
 That cycle makes the origin's own gaps run 3.6 to 8.3 s. On the loopback they arrive 3.0 to 9.3 s apart, because the ingest reloads the upstream playlist every half segment and a delivery that just missed a reload waits for the next: **the served window changes once per UPSTREAM segment, up to one and a half of them apart, however finely the engine re-cuts it.** Under `.fastZap` the cut is the 2 s GOP, `max EXTINF` reads 2.000 s, and through 7.25.1 the upstream's 6 s entered only through the cadence floor, as `ceil(6 / 1.5)` = 4. That division is right for a MEASURED gap, which is a robust maximum; a segment duration is the other end of the distribution, the period the source delivers at when nothing is late. So the client's patience (`1.5 x 4` = 6.0 s) was exactly one period, and the 12 s holdback left 2.7 s at the low point of the sawtooth.
 
-What that costs is not the `-12888` itself but what AVPlayer does next: it skips a reload. Measured here and on an Apple TV alike, polls every 2.00 s, then 4.00 s (macOS) or 5.03 s (tvOS) of nothing after the error, and the stall lands inside that hole with the next delivery already listed 1.9 to 2.6 s earlier. Three 180 s runs per arm, arms alternated:
+What that costs is not the `-12888` itself but what AVPlayer does next: it skips a reload. Measured here and on an Apple TV alike, polls every 2.00 s, then 4.00 s (macOS) or 5.03 s (tvOS) of nothing after the error, and the stall lands inside that hole with the next delivery already listed 1.9 to 2.6 s earlier.
 
-| | sealed | join | `-12888` | `playbackStalled` |
-|---|---|---|---|---|
-| 7.25.1 | TD 4, holdback 12 s | 3 segments | 5 / 4 / 6 | 2 / 2 / 3 |
-| with the upstream segment in the seal | TD 6, holdback 18 s | 4 segments | 0 / 0 / 0 | 0 / 0 / 0 |
-
-Both arms saw the same deliveries (four to six gaps of 9.0 to 9.3 s per run), and they differ in two things, not one: the sealed value and the join it sizes (three segments against four). Zero is this origin's number, not a promise. Its worst gap is 9.3 s, which a patience of 9.0 s plus one 3 s poll absorbs; the device capture this came from had 10 of its 110 gaps above 9 s and 5 above 12 s, so the field expectation is far fewer `-12888`, not none. The seal line states the new term, and the advert is still only reported:
+The seal now asks for the upstream segment whole and takes as much of it as the join pays for. The join itself is not deepened (one more upstream segment would be one more download before the first picture on every zap, which AE#678 measured and declined), so three 6 s segments are 18 s joined, 16 s cut, and a seal of 5:
 
 ```
-[HLSVideoEngine] live TARGETDURATION sealed at 6s (holdback 18.000s): max EXTINF 2.000s,
+[HLSVideoEngine] live TARGETDURATION sealed at 5s (holdback 15.000s): max EXTINF 2.000s,
   1.5 x cut target 0.750s, measured floor 6.000s needs 4s of patience,
-  upstream segment 6.000s (one delivery, however finely it is cut here);
-  upstream advertises 6.000s (reported, not used)
+  upstream segment 6.000s (one delivery, however finely it is cut here), of which the join
+  pays 5s of 6s (16.000s cut of the 18.000s it listed); upstream advertises 6.000s (reported, not used)
 ```
 
-Controls and prices, same harness. A 2 s upstream advertising a padded 3 (AE#447's shape) seals 2 and a 6 s holdback in both arms. Alternating 6 s / 4 s segments with under a second of jitter (`--durs 6,4`, the reporting channel's shape) draws one `-12888` and no stall in 180 s before and nothing after, which is why the field capture looks healthy between its outliers. An outage on top (`--freeze-at 14 --freeze-seconds 10`, about 12 s on the loopback) costs 2 to 3 stalls before and the one stall that IS the outage after: 18 s of holdback absorbs lateness, not a freeze longer than its low point of 8.7 s. And the join deepens by one upstream segment wherever a segment is longer than 4 s, which behind a link is one more download before the first picture: `--rate-kbps 8000 --latency-ms 30`, five runs per arm, **3.81 s before and 4.98 s after** (median), the 1.13 MB segment and nothing else. At memory speed it does not show (0.22 to 0.30 s against 0.23 to 0.55 s).
+One 180 s run per arm on that origin, same deliveries (four gaps above 9.0 s in each):
 
-**`--window 3` is the arm that keeps a seal honest.** An upstream that lists three or four segments can be joined 18 s deep and no deeper, 16 s of which are cut before the next delivery, so a seal of 6 asks for a holdback the first window cannot hold. Two things were hiding in that start. The gate held the SECOND playlist request as well as the first (AVPlayer opens with two, each re-enters `waitForFirstLiveSegment`, and on a bounded start each waited its own grace: `GET /media.m3u8` at 2.81 s, `GET /init.mp4` at 4.83 s), which is the "+2.07 s at the picture" the AE#594 table above priced without naming; and the grace itself waited for content the join could not deliver. One run per row, 6 s segments, `--window 3 --prefill 3`:
+| | sealed | join | `-12888` | `playbackStalled` | `#524` running thin |
+|---|---|---|---|---|---|
+| 7.25.1 | TD 4, holdback 12 s | 3 segments | 5 | 1 | 4 |
+| join-bound seal | TD 5, holdback 15 s | 3 segments | 3 | 0 | 0 |
 
-| | sealed | first manifest | first picture |
-|---|---|---|---|
-| 7.25.1 | TD 4 | at once | 0.18 s |
-| the upstream segment taken whole, nothing else | TD 6 | 2.011 s, bounded start after 2.000 s grace | 4.47 s |
-| + the gate opens once a manifest has gone out | TD 6 | 2.011 s, bounded | 2.24 s |
-| + an exhausted join seals what its window covers | TD 5 | at once | 0.32 s |
+That is fewer, not none, and it is the honest size of what a seal one second higher buys: 7.5 s of patience still loses to a 9 s gap, but the 15 s holdback leaves 5.7 s at the low point where 12 s left 2.7 s, which is the difference between surviving AVPlayer's skipped reload and not. A join one segment deeper (TD 6, holdback 18 s) drew none of either in three such runs and was not shipped: it cost 3.81 s against 4.98 s to the first picture behind an 8 Mbit/s link. The device capture this came from had 10 of its 110 gaps above 9 s and 5 above 12 s, so the field expectation is fewer `-12888` and far fewer stalls, not zero.
 
-The full matrix (6 s and 10 s segments, windows of 3, 4 and 8, both profiles, three runs per arm) is in `api.md` under the live join; `.standard` drops `--fast-zap` from the `play` line.
+**Whether a join is spent is a fact, not arithmetic.** The seal may only be taken short once the join has nothing more to give, and "cut content plus one segment reaches the summed EXTINF" is not that fact: `--dur 6.3` over 6 s of media never adds up, and a first version built on the sum sealed the full value there and took the bounded start (2.23 s to first picture against 0.20 s). The reader states it instead: the whole join batch is committed, its FIFO is empty, and the cutter is parked waiting for the next delivery. Three runs per arm on each inflated shape with three segments listed: served at once in all six (0.000 to 0.034 s of hold), TD 5 on 6 s media and TD 9 on 10 s.
+
+**The gate held the second playlist request too.** AVPlayer opens with two `/media.m3u8` requests, each re-enters `waitForFirstLiveSegment`, and on a bounded start each waited its own grace (`GET /media.m3u8` at 2.81 s, `GET /init.mp4` at 4.83 s). On an ingest the gate now opens for good once a manifest has gone out. On a source the engine cuts itself it does not: that second grace is the "+2.07 s at the picture" of the AE#594 table above, and removing it there also leaves the session up to 2 s closer to the producing edge, which is that issue's open question. The raw-TS control (`live --fast-zap --realtime --preroll 0`, two seeds, two runs per arm) reads the same in both arms: first manifest at 3.84 to 3.96 s, `init.mp4` at 6.11 to 6.33 s, first picture at 6.20 to 6.58 s, playhead 6.3 to 6.8 s behind the wall clock. The AE#594 table stands as printed.
+
+The full matrix (6 s and 10 s segments, 3, 4 and 8 listed, both profiles, three runs per arm) is in `api.md` under the live join; `.standard` drops `--fast-zap` from the `play` line.
 
 **The same fixture measures sound against picture, in the bytes.** `play --served-url` hands over the init segment, the cache holds the rest, and decoding their concatenation gives the presentation time of every flash and every beep onset: 147 of 148 seconds of a served session read **-0.3 ms** (the very first beep reads +19.7 ms, the decoder starting), across a 12 s outage, with no audio frame of any duration but 1024 samples and no gap at any segment seam. A fresh item re-fetches the same cached segments, so a rebuild cannot change that. What a rebuild does change is which segment the item starts on and where in it, and a segment's sound does not begin where its picture does: the cut is taken on the video keyframe and a transport stream interleaves audio behind video, so on this fixture the sound opens between 11 ms after and 208 ms before the picture, segment by segment. Each item now says what it started on,
 

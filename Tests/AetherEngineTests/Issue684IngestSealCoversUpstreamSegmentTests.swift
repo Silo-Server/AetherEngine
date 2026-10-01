@@ -11,8 +11,9 @@
 // been listed.
 //
 // The upstream delivers in whole segments however finely they are re-cut here, so the served playlist
-// changes once per upstream segment and has to promise what a playlist of those segments promises:
-// TARGETDURATION >= the longest upstream segment.
+// changes once per upstream segment and the seal asks for what a playlist of those segments promises:
+// TARGETDURATION >= the longest upstream segment. These pin what is ASKED. What is sealed is that,
+// as far as the join pays for it (`Issue684JoinBoundSealTests`), and the join is not deepened.
 import XCTest
 @testable import AetherEngine
 
@@ -136,9 +137,10 @@ final class Issue684IngestSealCoversUpstreamSegmentTests: XCTestCase {
     // MARK: - `.standard`, which the term reaches above 6 s
 
     /// `.standard` re-cuts too (4 s cut target), so a provider above its `1.5 x cut target` floor is
-    /// delivered in units longer than anything the floor covers. Measured on a 10 s origin with
-    /// jittered deliveries, three 60 s runs per arm and per window depth: at TD 7 one -12888 and one
-    /// item rebuild in every run, at TD 10 (or 9 where the join pays for no more) neither.
+    /// delivered in units longer than anything the floor covers. This is what the terms ASK for; the
+    /// three-segment join then pays 9 of the 10 (`Issue684JoinBoundSealTests`). Measured on a 10 s
+    /// origin with jittered deliveries, three 60 s runs per arm and window depth: at TD 7 the item
+    /// was rebuilt in 6 of 6 runs, at TD 9 in none.
     func testStandardProfileSealsLongUpstreamSegmentsWhole() {
         func seal(_ upstream: Double) -> Int {
             LiveEdgePolicy.targetDurationSeconds(maxSegmentDuration: 4.0,
