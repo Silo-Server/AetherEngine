@@ -42,11 +42,26 @@ struct Issue684LiveJoinNotReadyTests {
     @Test("a not-ready refusal asks once more when the item turned ready under it")
     func asksAgainOnceWhenTheItemTurnedReady() {
         #expect(NativeAVPlayerHost.liveJoinAsksAgainAfterNotReadyRefusal(
-            itemIsReadyNow: true, alreadyAskedAgain: false))
+            readingWasNotReady: true, itemIsReadyNow: true, alreadyAskedAgain: false))
         #expect(!NativeAVPlayerHost.liveJoinAsksAgainAfterNotReadyRefusal(
-            itemIsReadyNow: false, alreadyAskedAgain: false))
+            readingWasNotReady: true, itemIsReadyNow: false, alreadyAskedAgain: false))
         #expect(!NativeAVPlayerHost.liveJoinAsksAgainAfterNotReadyRefusal(
-            itemIsReadyNow: true, alreadyAskedAgain: true))
+            readingWasNotReady: true, itemIsReadyNow: true, alreadyAskedAgain: true))
+    }
+
+    /// A reading that is both thin and not ready is no less stale than a deep one: the item it was
+    /// taken on could not say where it starts. It keeps the thin-buffer line and still asks again.
+    @Test("a thin reading on a not-ready item asks again too, and a refusal on a ready item does not")
+    func thinAndNotReadyStillAsksAgain() {
+        let thin = NativeAVPlayerHost.LiveJoinBufferReading(
+            bufferEmpty: true, aheadSeconds: 0, playheadSeconds: 48.0,
+            loadedRangeCount: 0, nearestRangeOffsetSeconds: nil, itemStatus: .unknown)
+        #expect(NativeAVPlayerHost.liveJoinNotReadyRefusal(reading: thin) == nil)
+        #expect(NativeAVPlayerHost.liveJoinAsksAgainAfterNotReadyRefusal(
+            readingWasNotReady: thin.itemStatus != .readyToPlay, itemIsReadyNow: true,
+            alreadyAskedAgain: false))
+        #expect(!NativeAVPlayerHost.liveJoinAsksAgainAfterNotReadyRefusal(
+            readingWasNotReady: false, itemIsReadyNow: true, alreadyAskedAgain: false))
     }
 
     @Test("the refusal names the playhead the cushion was read from")
