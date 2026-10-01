@@ -99,7 +99,7 @@ enum LoadOptionChange {
 /// and log every overlay cue that arrives. Repro harness for "loads but never
 /// plays" reports and for live teletext end-to-end validation (#107).
 func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liveIngest: Bool = false, fastZap: Bool = false, liveStartImmediately: Bool = true, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool = false, seekEvery: Double? = nil, seekPattern: [Double] = [], seekCount: Int? = nil, startPosition: Double? = nil, mallocCensus: Bool = false, forceSoftware: Bool = false, softwareEscalation: Bool = true,
-                    censusThresholdMB: Int? = nil, censusHz: Double? = nil, frameTimes: Bool = false, presentTimes: Bool = false, pictureProbe: Bool = false, pictureOrigin: Double = 0,
+                    censusThresholdMB: Int? = nil, censusHz: Double? = nil, frameTimes: Bool = false, presentTimes: Bool = false, servedURL: Bool = false, pictureProbe: Bool = false, pictureOrigin: Double = 0,
                     sidecars: [ExternalSubtitleTrack] = [], audioSwitch: AudioSwitchRequest? = nil,
                     teletextPage: Int? = nil, teletextSwitch: TeletextPageSwitchRequest? = nil,
                     audioDelayMs: Int = 0, audioDelaySwitches: [AudioDelaySwitchRequest] = [],
@@ -132,7 +132,7 @@ func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liv
     // CFRunLoopRun, not a blocking semaphore: AetherEngine is @MainActor, so parking the main thread would deadlock the executor.
     let box = UncheckedBox<Int32?>(nil)
     Task { @MainActor in
-        box.value = await playSmokeTest(url: url, seconds: seconds, live: live, forceSoftware: forceSoftware, softwareEscalation: softwareEscalation, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: fastZap, liveStartImmediately: liveStartImmediately, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: startPosition, frameTimes: frameTimes, presentTimes: presentTimes, pictureProbe: pictureProbe, pictureOrigin: pictureOrigin, sidecars: sidecars, audioSwitch: audioSwitch, teletextPage: teletextPage, teletextSwitch: teletextSwitch, audioDelayMs: audioDelayMs, audioDelaySwitches: audioDelaySwitches, pausedMount: pausedMount, optionCorrection: optionCorrection, sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests, heldConnection: heldConnection, declaredDuration: declaredDuration, httpHeaders: httpHeaders, deinterlaceFieldRate: deinterlaceFieldRate, assertDolbyVision: assertDolbyVision, preserveASSMarkup: preserveASSMarkup, dolbyVisionHandling: dolbyVisionHandling, record: record)
+        box.value = await playSmokeTest(url: url, seconds: seconds, live: live, forceSoftware: forceSoftware, softwareEscalation: softwareEscalation, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: fastZap, liveStartImmediately: liveStartImmediately, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: startPosition, frameTimes: frameTimes, presentTimes: presentTimes, servedURL: servedURL, pictureProbe: pictureProbe, pictureOrigin: pictureOrigin, sidecars: sidecars, audioSwitch: audioSwitch, teletextPage: teletextPage, teletextSwitch: teletextSwitch, audioDelayMs: audioDelayMs, audioDelaySwitches: audioDelaySwitches, pausedMount: pausedMount, optionCorrection: optionCorrection, sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests, heldConnection: heldConnection, declaredDuration: declaredDuration, httpHeaders: httpHeaders, deinterlaceFieldRate: deinterlaceFieldRate, assertDolbyVision: assertDolbyVision, preserveASSMarkup: preserveASSMarkup, dolbyVisionHandling: dolbyVisionHandling, record: record)
         CFRunLoopStop(CFRunLoopGetMain())
     }
     CFRunLoopRun()
@@ -453,7 +453,7 @@ private func seekIntentDrill(
 }
 
 @MainActor
-private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware: Bool = false, softwareEscalation: Bool = true, nativeHLS: Bool = false, liveIngest: Bool = false, fastZap: Bool = false, liveStartImmediately: Bool = true, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool, seekEvery: Double? = nil, seekPattern: [Double] = [], seekCount: Int? = nil, startPosition: Double? = nil, frameTimes: Bool = false, presentTimes: Bool = false, pictureProbe: Bool = false, pictureOrigin: Double = 0, sidecars: [ExternalSubtitleTrack] = [], audioSwitch: AudioSwitchRequest? = nil, teletextPage: Int? = nil, teletextSwitch: TeletextPageSwitchRequest? = nil, audioDelayMs: Int = 0, audioDelaySwitches: [AudioDelaySwitchRequest] = [], pausedMount: Bool = false, optionCorrection: LoadOptionCorrectionRequest? = nil, sequentialOrigin: Bool = false, maxConcurrentRequests: Int? = nil, heldConnection: Bool = false, declaredDuration: Double? = nil, httpHeaders: [String: String] = [:], deinterlaceFieldRate: DeinterlaceFieldRate = .field, assertDolbyVision: Bool = false, preserveASSMarkup: Bool = false, dolbyVisionHandling: DolbyVisionHandling = .automatic, record: URL? = nil) async -> Int32 {
+private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware: Bool = false, softwareEscalation: Bool = true, nativeHLS: Bool = false, liveIngest: Bool = false, fastZap: Bool = false, liveStartImmediately: Bool = true, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool, seekEvery: Double? = nil, seekPattern: [Double] = [], seekCount: Int? = nil, startPosition: Double? = nil, frameTimes: Bool = false, presentTimes: Bool = false, servedURL: Bool = false, pictureProbe: Bool = false, pictureOrigin: Double = 0, sidecars: [ExternalSubtitleTrack] = [], audioSwitch: AudioSwitchRequest? = nil, teletextPage: Int? = nil, teletextSwitch: TeletextPageSwitchRequest? = nil, audioDelayMs: Int = 0, audioDelaySwitches: [AudioDelaySwitchRequest] = [], pausedMount: Bool = false, optionCorrection: LoadOptionCorrectionRequest? = nil, sequentialOrigin: Bool = false, maxConcurrentRequests: Int? = nil, heldConnection: Bool = false, declaredDuration: Double? = nil, httpHeaders: [String: String] = [:], deinterlaceFieldRate: DeinterlaceFieldRate = .field, assertDolbyVision: Bool = false, preserveASSMarkup: Bool = false, dolbyVisionHandling: DolbyVisionHandling = .automatic, record: URL? = nil) async -> Int32 {
     let engine: AetherEngine
     do {
         engine = try AetherEngine()
@@ -605,6 +605,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
     // which is the documented usage and the part a host would otherwise have to re-do per load.
     let frameProbe = frameTimes ? FrameTimeProbe() : nil
     let presentProbe = presentTimes ? PresentedFrameProbe() : nil
+    var servedURLItem: ObjectIdentifier?
     let picture = pictureProbe ? PictureProbe(sourceOrigin: pictureOrigin) : nil
     if let frameProbe {
         engine.setSoftwareVideoFrameTimeObserver { [weak frameProbe] frame in
@@ -943,6 +944,12 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         if let presentProbe {
             presentProbe.attachIfNeeded(engine.currentAVPlayerItem)
             line += " pres=\(presentProbe.drainTick())"
+        }
+        if servedURL, let item = engine.currentAVPlayerItem, ObjectIdentifier(item) != servedURLItem,
+           let asset = item.asset as? AVURLAsset {
+            servedURLItem = ObjectIdentifier(item)
+            // Deliberately unredacted: the path token is the only way in, and this is a local harness.
+            FileHandle.standardOutput.write(Data("  SERVED \(asset.url.absoluteString)\n".utf8))
         }
         // AE#441: the live rewind surfaces a host actually scales its strip on. Sampling them needed a
         // patched copy of this CLI before, which is how an over-promising lower bound stayed unseen.
