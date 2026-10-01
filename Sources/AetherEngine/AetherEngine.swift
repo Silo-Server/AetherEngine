@@ -3808,6 +3808,7 @@ public final class AetherEngine: ObservableObject {
     ) async throws -> SourceProbe? {
         var source = source
         var options = options
+        options = Self.applyingSharedOutputRole(options)
         // #436: a speed the host set belongs to the item it was set on. The rebuilds a session makes
         // on its own (reload at position, audio-track switch, AirPlay LAN swap, background return)
         // reopen the same source and keep it; a different item starts at 1.0, so a host whose speed

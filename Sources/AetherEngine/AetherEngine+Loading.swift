@@ -320,7 +320,8 @@ extension AetherEngine {
     /// which is the point, since re-creating it is what breaks AVKit's MediaRemote registration.
     func makeNativeHost() -> NativeAVPlayerHost {
         #if os(tvOS) || os(iOS)
-        return NativeAVPlayerHost(ownsNowPlayingSession: ownsVideoNowPlayingSession)
+        return NativeAVPlayerHost(ownsNowPlayingSession: Self.ownsNowPlaying(
+            hostOptIn: ownsVideoNowPlayingSession, role: loadedOptions.sharedOutputRole))
         #else
         return NativeAVPlayerHost()
         #endif

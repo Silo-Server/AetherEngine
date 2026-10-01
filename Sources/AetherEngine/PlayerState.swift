@@ -859,6 +859,9 @@ public struct LoadOptions: Sendable, Equatable {
     /// A tuning field: correctable on a playing session through `reloadAtCurrentPosition(applying:)`.
     public var escalatesToSoftwarePath: Bool = true
 
+    /// Sodalite#175: `.secondary` for an engine running beside the one that owns the panel. Default `.primary`.
+    public var sharedOutputRole: SharedOutputRole
+
     /// ENGINE-INTERNAL: marks this load as a live REJOIN (`reloadAtCurrentPosition`). Not settable from the public initializer. When true, the native load path skips its explicit initial seek so AVPlayer picks edge-minus-holdback (see `LiveReloadPolicy`); without it the reloaded item can wedge in `waitingToPlay` against Jellyfin's re-served backlog. Meaningful only when `isLive` is true.
     var isLiveRejoin: Bool = false
 
@@ -911,7 +914,8 @@ public struct LoadOptions: Sendable, Equatable {
         deinterlaceMode: DeinterlaceMode = .auto,
         deinterlaceFieldRate: DeinterlaceFieldRate = .field,
         preferredDecodePath: DecodePath = .automatic,
-        escalatesToSoftwarePath: Bool = true
+        escalatesToSoftwarePath: Bool = true,
+        sharedOutputRole: SharedOutputRole = .primary
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
@@ -955,6 +959,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.deinterlaceFieldRate = deinterlaceFieldRate
         self.preferredDecodePath = preferredDecodePath
         self.escalatesToSoftwarePath = escalatesToSoftwarePath
+        self.sharedOutputRole = sharedOutputRole
     }
 }
 
