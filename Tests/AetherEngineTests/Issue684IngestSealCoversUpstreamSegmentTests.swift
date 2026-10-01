@@ -183,14 +183,6 @@ final class Issue684IngestSealCoversUpstreamSegmentTests: XCTestCase {
                                  LiveWindowSizing.liveOnlyFloorSeconds / 2)
     }
 
-    /// The owner's switch: where the ceiling sits is the whole difference between this fix on 10 s
-    /// providers and 7.24.0's answer (AE#678). Pinned so moving it is a decision and not a side effect.
-    func testCeilingIsTheOneSwitchForLongSegmentProviders() {
-        XCTAssertEqual(LiveEdgePolicy.upstreamSegmentSealCeilingSeconds, 10)
-        XCTAssertEqual(LiveEdgePolicy.targetDurationForIngestedSegment(10.0), 10)
-        XCTAssertEqual(LiveEdgePolicy.targetDurationForCadence(10.0), 7, "what 7.24.0 sealed")
-    }
-
     /// A fractional segment costs a whole second, like every other term (AE#447 round 2).
     func testFractionalSegmentCost() {
         let td = LiveEdgePolicy.targetDurationSeconds(maxSegmentDuration: 2.0,
@@ -202,7 +194,8 @@ final class Issue684IngestSealCoversUpstreamSegmentTests: XCTestCase {
         let coverage = HLSPlaylistTracker.loopbackCushionCoverageSeconds(segments: (0..<8).map { _ in
             HLSMediaSegment(uri: "s", duration: 6.006, discontinuityBefore: false)
         })
-        XCTAssertEqual(coverage, 25.0, accuracy: 1e-9, "21 s of holdback and 4 s of open GOP: five segments")
+        XCTAssertEqual(coverage, 19.0, accuracy: 1e-9,
+                       "the join is not sized from the seal: ceil(6.006 / 1.5) = 5, 15 s and a 4 s GOP")
     }
 
     // MARK: - As far as the join can pay
@@ -227,18 +220,6 @@ final class Issue684IngestSealCoversUpstreamSegmentTests: XCTestCase {
             full: 6, withoutUpstreamSegment: 4, finalizedSeconds: .infinity), 4)
     }
 
-    func testJoinExhaustionIsTheOpenSegmentAndNothingElse() {
-        XCTAssertTrue(LiveEdgePolicy.joinIsExhausted(
-            finalizedSeconds: 16, longestCutSegmentSeconds: 2, joinBacklogSeconds: 18))
-        XCTAssertFalse(LiveEdgePolicy.joinIsExhausted(
-            finalizedSeconds: 12, longestCutSegmentSeconds: 2, joinBacklogSeconds: 18),
-            "two more GOPs of the join are still to be cut")
-        XCTAssertFalse(LiveEdgePolicy.joinIsExhausted(
-            finalizedSeconds: 0, longestCutSegmentSeconds: 0, joinBacklogSeconds: 18))
-        XCTAssertFalse(LiveEdgePolicy.joinIsExhausted(
-            finalizedSeconds: 16, longestCutSegmentSeconds: 2, joinBacklogSeconds: 0))
-    }
-
     // MARK: - Where the term comes from
 
     /// Measured, not advertised: the longest segment the upstream actually served.
@@ -255,18 +236,32 @@ final class Issue684IngestSealCoversUpstreamSegmentTests: XCTestCase {
                        "monotonic, like the floor it sits beside")
     }
 
-    // MARK: - The join carries the cushion the seal asks for
+    // MARK: - The join keeps its depth
 
-    func testJoinCoversTheDeeperHoldback() {
+    /// Owner's rule: the join is never extended for the upstream-segment term. One more upstream
+    /// segment is one more download before the first picture on every zap (AE#678 declined it), so
+    /// the coverage is what 7.24.0 sized it to and the seal rises only as far as that pays.
+    func testJoinIsNotExtendedForTheUpstreamSegmentTerm() {
         func coverage(_ durations: [Double]) -> Double {
             HLSPlaylistTracker.loopbackCushionCoverageSeconds(segments: durations.map {
                 HLSMediaSegment(uri: "s", duration: $0, discontinuityBefore: false)
             })
         }
-        XCTAssertEqual(coverage([6, 6, 6]), 22)     // TD 6, 18 s holdback, 4 s of open GOP
-        XCTAssertEqual(coverage([6, 4, 6, 4]), 22)  // the field shape, sealed from the longest
-        XCTAssertEqual(coverage([2, 2, 2]), 8)      // AE#447's shape, unchanged
-        XCTAssertEqual(coverage([20, 20, 20]), 46)  // above the ceiling: TD 14, as before the term
+        XCTAssertEqual(coverage([6, 6, 6]), 16)     // ceil(6 / 1.5) = 4, 12 s and a 4 s GOP: three segments
+        XCTAssertEqual(coverage([10, 10, 10]), 25)  // 7, 21 s + 4 s: three segments
+        XCTAssertEqual(coverage([2, 2, 2]), 8)
+        XCTAssertEqual(coverage([20, 20, 20]), 46)
+        var tracker = HLSPlaylistTracker()
+        let uris = ["a", "b", "c", "d", "e", "f", "g", "h"]
+        let joined = tracker.newSegments(in: HLSMediaPlaylist(
+            targetDuration: 6,
+            mediaSequence: 0,
+            segments: uris.map { HLSMediaSegment(uri: $0, duration: 6, discontinuityBefore: false) },
+            hasEndList: false,
+            isEncrypted: false,
+            hasUnsupportedEncryption: false,
+            hasMap: false))
+        XCTAssertEqual(joined.map(\.uri), ["f", "g", "h"], "three 6 s segments, as before this issue")
     }
 
     // MARK: - The seal says why

@@ -9,6 +9,9 @@ struct LiveCadenceEvidence: Sendable, Equatable {
     var servedSegmentDurationSeconds: Double?
     /// AE#684: the media the join took, summed EXTINF, nil until it has joined.
     var joinBacklogSeconds: Double? = nil
+    /// AE#684: the reader has handed over the whole join and its consumer is waiting on it for more.
+    /// nil where nothing can say.
+    var joinIsSpent: Bool? = nil
 }
 
 /// Turns the OBSERVED arrival cadence of a live ingest source (`LiveArrivalCadenceMeter`, surfaced by the
@@ -59,6 +62,8 @@ final class LiveCadencePolicy: @unchecked Sendable {
     private var longestUpstreamSegmentSeconds: Double = 0
     /// AE#684: what the join took. First value wins: a reopen joins again, and its seal is long taken.
     private var joinedBacklogSeconds: Double?
+    /// AE#684: latched once true, so a later delivery that fills the reader again cannot unspend it.
+    private var joinSpent: Bool?
 
     /// - Parameters:
     ///   - observe: reader's current `observedLiveCadenceSeconds`; nil until the first upstream arrival.
@@ -107,6 +112,9 @@ final class LiveCadencePolicy: @unchecked Sendable {
             if joinedBacklogSeconds == nil, let joined = evidence.joinBacklogSeconds, joined > 0 {
                 joinedBacklogSeconds = joined
             }
+            if let spent = evidence.joinIsSpent, joinSpent != true {
+                joinSpent = spent
+            }
             if let closed = evidence.closedCadenceSeconds, closed > 0 {
                 measuredFloorSeconds = max(measuredFloorSeconds, closed)
             }
@@ -139,8 +147,15 @@ final class LiveCadencePolicy: @unchecked Sendable {
         return longestUpstreamSegmentSeconds > 0 ? longestUpstreamSegmentSeconds : nil
     }
 
-    /// AE#684 review: the media the join took, so the first-serve gate can tell a join that has
-    /// handed over everything from one still arriving. nil until the reader has joined.
+    /// AE#684: whether the join has been handed over and consumed, bar the GOP the next upstream
+    /// delivery will close. A fact from the reader, nil where there is none to ask.
+    var joinIsSpent: Bool? {
+        lock.lock(); defer { lock.unlock() }
+        advanceLocked()
+        return joinSpent
+    }
+
+    /// AE#684: the media the join listed (summed EXTINF), for the seal line. nil until it has joined.
     var joinBacklogSeconds: Double? {
         lock.lock(); defer { lock.unlock() }
         advanceLocked()

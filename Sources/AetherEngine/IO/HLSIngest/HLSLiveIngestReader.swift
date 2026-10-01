@@ -43,6 +43,9 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     private var _upstreamSegmentDurationSeconds: Double?
     /// AE#684: summed EXTINF of the join batch. Written with the join line, before its bytes flow.
     private var _joinBacklogSeconds: Double?
+    /// AE#684: the join batch has been committed to the FIFO in full / has been seen consumed.
+    private var _joinBatchCommitted = false
+    private var _joinSpent = false
     /// Installed by the resolver before the first FIFO byte; nil = muxed audio.
     private var _companionAudioReader: HLSLiveIngestReader?
     /// AE#359: SUBTITLES renditions of the picked variant, resolved to absolute URLs. Metadata only.
@@ -100,6 +103,14 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
 
     var joinBacklogSeconds: Double? {
         startLock.withLock { _joinBacklogSeconds }
+    }
+
+    var joinIsSpent: Bool {
+        let (spent, committed) = startLock.withLock { (_joinSpent, _joinBatchCommitted) }
+        if spent { return true }
+        guard committed, fifo.isEmptyWithReaderParked else { return false }
+        startLock.withLock { _joinSpent = true }
+        return true
     }
 
     public var closedLiveCadenceSeconds: Double? {
@@ -319,6 +330,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                     guard try await ingestSegmentBatch(fresh, mediaURL: mediaURL) else {
                         return // FIFO closed underneath us
                     }
+                    if isJoin { startLock.withLock { _joinBatchCommitted = true } }
                 }
 
                 if media.hasEndList {

@@ -917,6 +917,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         liveClosedCadenceObservation: (@Sendable () -> Double?)? = nil,
         liveUpstreamSegmentDurationObservation: (@Sendable () -> Double?)? = nil,
         liveJoinBacklogObservation: (@Sendable () -> Double?)? = nil,
+        liveJoinSpentObservation: (@Sendable () -> Bool?)? = nil,
         upstreamSelfReportedTargetDuration: Double? = nil,
         preopenedDemuxer: Demuxer? = nil,
         sourceReopenableByURL: Bool = true,
@@ -975,7 +976,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     LiveCadenceEvidence(
                         closedCadenceSeconds: liveClosedCadenceObservation?(),
                         servedSegmentDurationSeconds: liveUpstreamSegmentDurationObservation?(),
-                        joinBacklogSeconds: liveJoinBacklogObservation?()
+                        joinBacklogSeconds: liveJoinBacklogObservation?(),
+                        joinIsSpent: liveJoinSpentObservation?()
                     )
                 },
                 selfReportedTargetDurationSeconds: upstreamSelfReportedTargetDuration

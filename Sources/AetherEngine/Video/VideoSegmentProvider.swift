@@ -299,49 +299,31 @@ enum LiveEdgePolicy {
         return wholeSecondsCovering(Swift.min(segmentSeconds, upstreamSegmentSealCeilingSeconds))
     }
 
-    /// AE#684: the longest upstream segment the seal takes whole. The ONE place that separates
-    /// "seal over the upstream segment" from "keep `ceil(segment / 1.5)`".
+    /// AE#684: the longest upstream segment the seal takes whole.
     ///
-    /// It is a ceiling for two reasons. A holdback is `3 x` the value, and the live-only window is
-    /// 60 s (`LiveWindowSizing.liveOnlyFloorSeconds`): a 20 s segment taken whole would ask the client
-    /// to sit a whole window behind an edge that window can barely list. And the deeper join it buys
-    /// is one more upstream segment before the first picture, which grows with the segment: AE#678
-    /// measured that on a 10 s provider and declined it. At 10, segments up to 10 s seal whole (TD 10,
-    /// 30 s holdback) and a 20 s one seals 14, as it did before. At 6, a 10 s provider seals 7 again,
-    /// exactly as 7.24.0 did, and 6 s providers keep the fix.
+    /// A holdback is `3 x` the value, and the live-only window is 60 s
+    /// (`LiveWindowSizing.liveOnlyFloorSeconds`): a 20 s segment taken whole would ask the client to
+    /// sit a whole window behind an edge that window can barely list. At 10, segments up to 10 s are
+    /// asked for whole and a 20 s one seals 14, as it did before the term existed. What is asked for
+    /// is then paid only as far as the join reaches (`targetDurationTheJoinCanPay`), and the join is
+    /// not deepened for it, so in practice a 10 s provider lands at 9.
     static let upstreamSegmentSealCeilingSeconds: Double = 10
 
-    /// Everything an ingested segment length asks of the seal, both terms. What the join sizes its
-    /// cushion from, so the two cannot drift.
-    static func targetDurationForIngestedSegment(_ segmentSeconds: Double) -> Int {
-        Swift.max(targetDurationForCadence(segmentSeconds), targetDurationForUpstreamSegment(segmentSeconds))
-    }
-
-    /// AE#684 review: has the join handed over everything it will, bar the segment still open?
-    ///
-    /// The last GOP of a join stays open until the next upstream delivery brings the keyframe that
-    /// closes it, so once the cut content plus one segment reaches what was joined, nothing more
-    /// finalizes before that delivery, and waiting for a deeper cushion is waiting one upstream
-    /// segment of wall clock. The tolerance covers an upstream whose EXTINF and media disagree by a
-    /// frame or two.
-    static func joinIsExhausted(finalizedSeconds: Double, longestCutSegmentSeconds: Double,
-                                joinBacklogSeconds: Double) -> Bool {
-        guard joinBacklogSeconds > 0, finalizedSeconds > 0 else { return false }
-        return finalizedSeconds + longestCutSegmentSeconds + joinExhaustionToleranceSeconds
-            >= joinBacklogSeconds
-    }
-
-    static let joinExhaustionToleranceSeconds: Double = 0.5
-
-    /// AE#684 review: the upstream-segment seal, as far as the join can pay for it.
+    /// AE#684: the upstream-segment seal, as far as the join can pay for it.
     ///
     /// A seal is a holdback of `3 x` itself, and a holdback the first window cannot hold is not
-    /// protection, it is a start the client spends waiting: an upstream that lists three 6 s segments
-    /// joins 18 s, cuts 16, and against an 18 s holdback took the bounded start after its grace
-    /// (measured 4.25 s to first picture where 7.25.1 took 0.18 s). So an exhausted join seals the
-    /// largest value its cut content covers, never under what the seal was without the upstream
-    /// term and never over the full one: 16 s of window pays for 5, a patience of 7.5 s where the old
-    /// rule gave 6.0 s and the full one 9.0 s.
+    /// protection, it is a start the client spends waiting. The join is three upstream segments on
+    /// anything longer than about 5 s and stays that deep (one more would be one more download on
+    /// every zap, AE#678), and its last GOP stays open until the next upstream delivery: three 6 s
+    /// segments are 18 s joined and 16 s cut, against the 18 s a seal of 6 asks for. So once the
+    /// reader has handed the whole join over and the cutter has nothing left to read, the seal is the
+    /// largest value that cut content covers, never under what it was without the upstream term and
+    /// never over the full one: 16 s pays for 5 (patience 7.5 s where the old rule gave 6.0 s), 28 s
+    /// of a 10 s provider for 9.
+    ///
+    /// Whether the join is spent is a FACT the reader states (`joinIsSpent`), not arithmetic on
+    /// EXTINF: a playlist that rounds its durations up (6.3 for 6 s of media) never adds up to what
+    /// was cut, and a tolerance on the sum decided every such start wrongly.
     static func targetDurationTheJoinCanPay(full: Int, withoutUpstreamSegment base: Int,
                                             finalizedSeconds: Double) -> Int {
         guard finalizedSeconds.isFinite, finalizedSeconds > 0 else { return Swift.max(base, 0) }
@@ -644,7 +626,7 @@ struct LiveTargetDurationDerivation {
         if let joinBound {
             text += ", of which the join pays \(value)s of \(joinBound.full)s "
                 + "(\(LiveEdgePolicy.seconds(joinBound.finalizedSeconds))s cut of the "
-                + "\(LiveEdgePolicy.seconds(joinBound.backlogSeconds))s it held)"
+                + "\(LiveEdgePolicy.seconds(joinBound.backlogSeconds))s it listed)"
         }
         return text
     }
@@ -2470,12 +2452,10 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     ) -> LiveTargetDurationDerivation {
         var derivation = currentLiveTargetDuration(maxSegmentDuration: snap.maxDuration)
         guard derivation.upstreamSegment != nil,
-              let backlog = liveCadencePolicy?.joinBacklogSeconds,
               snap.count >= LiveEdgePolicy.minStartupSegments,
-              LiveEdgePolicy.joinIsExhausted(finalizedSeconds: snap.summed,
-                                             longestCutSegmentSeconds: snap.maxDuration,
-                                             joinBacklogSeconds: backlog)
+              liveCadencePolicy?.joinIsSpent == true
         else { return derivation }
+        let backlog = liveCadencePolicy?.joinBacklogSeconds ?? 0
         let base = LiveEdgePolicy.targetDurationSeconds(
             maxSegmentDuration: snap.maxDuration,
             cutTargetSeconds: derivation.cutTargetFloor,
@@ -2600,7 +2580,12 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                 degradedGrace = grace
                 degradedDeadline = Date().addingTimeInterval(grace)
             }
-            let effectiveDeadline = degradedDeadline.map { min(deadline, $0) } ?? deadline
+            var effectiveDeadline = degradedDeadline.map { min(deadline, $0) } ?? deadline
+            // AE#684: a join becomes spent when the cutter parks on an empty reader, which is no
+            // event this condition hears. While that is still to come, look again shortly.
+            if liveCadencePolicy?.joinIsSpent == false {
+                effectiveDeadline = min(effectiveDeadline, Date().addingTimeInterval(Self.joinSpentPollSeconds))
+            }
             if !firstSegmentCondition.wait(until: effectiveDeadline) {
                 // Re-read after the timed-out wait: an append racing the deadline would otherwise be judged
                 // on the stale snapshot (waitForLiveSegment below already does this).
@@ -2649,6 +2634,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             }
         }
     }
+
+    /// How often the gate asks an ingest whether its join is spent. Well under a frame of start latency.
+    static let joinSpentPollSeconds: TimeInterval = 0.025
 
     /// AE#374: one account per live session, emitted at whichever exit ends the first-serve gate.
     ///

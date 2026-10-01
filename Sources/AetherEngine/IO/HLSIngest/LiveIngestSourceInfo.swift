@@ -33,9 +33,16 @@ protocol LiveIngestSourceInfo: AnyObject, Sendable {
     /// source delivers in, which the served TARGETDURATION covers whole (AE#684).
     var upstreamSegmentDurationSeconds: Double? { get }
 
-    /// Summed EXTINF of the segments this reader joined with, nil until it has joined. What the
-    /// first-serve gate measures the cut content against to know the join is spent (AE#684).
+    /// Summed EXTINF of the segments this reader joined with, nil until it has joined. Reported in
+    /// the seal line; nothing is decided from it, because an upstream's EXTINF and its media need
+    /// not agree (AE#684).
     var joinBacklogSeconds: Double? { get }
+
+    /// Whether the join has been handed over in full AND consumed: every byte of the join batch has
+    /// been committed to the reader, the reader is empty, and its consumer is parked waiting for the
+    /// next upstream delivery. From then on nothing more can be cut until that delivery, which is
+    /// what the first-serve gate needs to know before it waits for a deeper cushion (AE#684).
+    var joinIsSpent: Bool { get }
 
     /// OBSERVED upstream segment-arrival cadence in seconds (recent max inter-arrival interval, widened by
     /// the currently-open gap), nil until the first arrival. Unlike `upstreamTargetDuration` this reflects

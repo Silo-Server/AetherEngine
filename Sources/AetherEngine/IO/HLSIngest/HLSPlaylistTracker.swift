@@ -36,19 +36,20 @@ struct HLSPlaylistTracker {
 
     /// AE#678: the join has to carry the cushion the loopback's first serve will ask for, or every zap
     /// ends at the bounded start's grace. The served TARGETDURATION is floored by the longest upstream
-    /// segment, the whole of it up to a ceiling (AE#684; `ceil(longest / 1.5)` when this was written), so the gate
-    /// wants `3 x` that. The last joined segment's final GOP also stays open downstream until the next
-    /// upstream segment arrives, so one GOP of margin on top, bounded by the segment and by
-    /// `openGOPMarginSeconds`. A whole segment of margin would be the strict bound, and it is one
-    /// download more than the start needs.
+    /// segment (`ceil(longest / 1.5)`, AE#447), so the gate wants `3 x` that, and `1.5 x TD` alone is
+    /// always a hair short of it: two 10 s segments are 20 s against a 21 s holdback. The last joined
+    /// segment's final GOP also stays open downstream until the next upstream segment arrives, so one
+    /// GOP of margin on top, bounded by the segment and by `openGOPMarginSeconds`. A whole segment of
+    /// margin would be the strict bound, and on a 10 s provider it is a fourth 10 s download the start
+    /// then waits for on a shared link (measured 3.7 s to first picture against 40 Mbit/s).
     ///
-    /// The depth is four upstream segments wherever a segment is longer than the margin. AE#678 measured
-    /// the fourth on a 10 s provider at 3.7 s to first picture against 2.8 s on a 40 Mbit/s link and
-    /// declined it as MARGIN. AE#684 takes it as HOLDBACK: the three it kept left the client a patience
-    /// of one upstream segment, which every ordinary delivery overran.
+    /// AE#684: the seal now also covers the upstream segment whole, and this coverage deliberately
+    /// does NOT follow it. A join one segment deeper is one more download before the first picture on
+    /// every zap (the fourth segment AE#678 declined above), so the join keeps this depth and the seal
+    /// rises only as far as what was joined can pay (`LiveEdgePolicy.targetDurationTheJoinCanPay`).
     static func loopbackCushionCoverageSeconds(segments: [HLSMediaSegment]) -> Double {
         guard let longest = segments.map(\.duration).max(), longest > 0 else { return 0 }
-        let targetDuration = LiveEdgePolicy.targetDurationForIngestedSegment(longest)
+        let targetDuration = LiveEdgePolicy.targetDurationForCadence(longest)
         return LiveEdgePolicy.holdBackSeconds(targetDuration: targetDuration)
             + min(longest, openGOPMarginSeconds)
     }

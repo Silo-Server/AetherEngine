@@ -789,8 +789,10 @@ extension AetherEngine {
         let liveClosedCadenceObservation: (@Sendable () -> Double?)?
         let liveUpstreamSegmentDurationObservation: (@Sendable () -> Double?)?
         let liveJoinBacklogObservation: (@Sendable () -> Double?)?
+        let liveJoinSpentObservation: (@Sendable () -> Bool?)?
         if let liveIngest {
             liveJoinBacklogObservation = { [weak liveIngest] in liveIngest?.joinBacklogSeconds }
+            liveJoinSpentObservation = { [weak liveIngest] in liveIngest?.joinIsSpent }
             liveClosedCadenceObservation = { [weak liveIngest] in liveIngest?.closedLiveCadenceSeconds }
             liveUpstreamSegmentDurationObservation = { [weak liveIngest] in
                 liveIngest?.upstreamSegmentDurationSeconds
@@ -799,6 +801,7 @@ extension AetherEngine {
             liveClosedCadenceObservation = nil
             liveUpstreamSegmentDurationObservation = nil
             liveJoinBacklogObservation = nil
+            liveJoinSpentObservation = nil
         }
         let upstreamSelfReportedTargetDuration = liveIngest?.upstreamTargetDuration
         // #199: in-engine reopen transport for live ingest sessions. Only HLSLiveIngestReader main
@@ -843,6 +846,7 @@ extension AetherEngine {
             liveClosedCadenceObservation: liveClosedCadenceObservation,
             liveUpstreamSegmentDurationObservation: liveUpstreamSegmentDurationObservation,
             liveJoinBacklogObservation: liveJoinBacklogObservation,
+            liveJoinSpentObservation: liveJoinSpentObservation,
             upstreamSelfReportedTargetDuration: upstreamSelfReportedTargetDuration,
             preopenedDemuxer: preopenedDemuxer,
             sourceReopenableByURL: !isCustomSource,
