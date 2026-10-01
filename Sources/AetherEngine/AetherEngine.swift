@@ -3798,12 +3798,14 @@ public final class AetherEngine: ObservableObject {
             EngineLog.emit(
                 "[AetherEngine] #629 load (gen \(generation)) follows the engine's own rebuild "
                 + "instead of unwinding", category: .engine)
-            // Sodalite#173: a cancelled follower ends the rebuild's generation, not the rebuild's Task, so
-            // the rebuild unwinds at its own checkpoints on either branch (load() or the retained reader).
+            // Sodalite#173: a cancelled follower cancels the rebuild's Task, which ends a load() rebuild and
+            // any reroute nested in it through their own handlers, and ends the rebuild's generation, which
+            // the retained-reader branch observes only at its checkpoints. Both are generation-guarded.
             do {
                 try await withTaskCancellationHandler {
                     try await takeover.rebuild.value
                 } onCancel: {
+                    takeover.rebuild.cancel()
                     Task { @MainActor [weak self] in self?.abandonFollowedRebuild(takeover, follower: attempt) }
                 }
             } catch {
@@ -5312,6 +5314,9 @@ public final class AetherEngine: ObservableObject {
                 )
                 throw AetherEngineError.sessionNotReloadable(refusal)
             }
+            // Sodalite#173: the rebuild's own teardown moves the generation by one; anything further is a
+            // stop() or load() that superseded it, which a returned nil does not say.
+            let reloadGeneration = loadGeneration &+ 1
             // Audit LIF-102: the value written above, or the mount flag after a background teardown.
             let failure = await reloadWithAudioOverride(
                 url: placeholderURL,
@@ -5327,6 +5332,7 @@ public final class AetherEngine: ObservableObject {
             // source whose reader read `cancel()` as terminal: the rebuild failed on stream info
             // and the call still returned success.
             if let failure { throw failure }
+            if loadGeneration != reloadGeneration { throw CancellationError() }
             // The reload restores from its own pre-stopInternal snapshot, which a torn-down session
             // no longer had anything in; replay the parked subtitle pick on top of it.
             if resumesTornDownSession {

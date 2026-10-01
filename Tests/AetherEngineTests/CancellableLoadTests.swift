@@ -381,4 +381,103 @@ struct CancellableLoadTests {
         await hostLoad.value
         #expect(engine.state == .idle)
     }
+    @Test("Cancelling a follower ends a rebuild whose load() rerouted into a nested load (AE#629, AE#678)")
+    func cancelledFollowerEndsANestedRerouteRebuild() async throws {
+        let origin = try ProbeHTTPTestOrigin(data: Data("#EXTM3U\n".utf8))
+        origin.holdLaterRequests()
+        defer { origin.stop() }
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        let hostReader = ParkedReader()
+        let (hostLoad, hostBox) = Self.start(engine, .custom(hostReader, formatHint: "mpegts"))
+        try await waitFor { hostReader.entered }
+        let generation = engine.loadGeneration
+
+        let url = try #require(URL(string: "http://127.0.0.1:\(origin.port)/live/index.m3u8"))
+        var options = LoadOptions(isLive: true)
+        options.nativeRemoteHLS = false
+        let rebuild = Task { @MainActor in
+            _ = try await engine.load(source: .url(url), options: options)
+        }
+        engine.softwarePathRebuild = rebuild
+        engine.softwarePathTakeoverArm = generation
+        try await waitFor { !origin.requests.isEmpty }
+        let takeover = try #require(engine.softwarePathTakeover)
+        #expect(engine.loadGeneration != takeover.rebuildGeneration)
+
+        let elapsed = try await Self.cancelAndTime(hostLoad, hostBox)
+        #expect(hostBox.outcome == .cancelled, "ended \(String(describing: hostBox.outcome)) after \(elapsed)")
+        #expect(elapsed < .milliseconds(1500))
+        await #expect(throws: CancellationError.self) { try await rebuild.value }
+        origin.stop()
+        await hostLoad.value
+        #expect(engine.state == .idle)
+    }
+
+    /// Serves the fixture, and once armed parks any read from the head of the file (where a reopen
+    /// starts) until the engine cancels or closes it.
+    final class HeadGatedReader: IOReader, @unchecked Sendable {
+        private let bytes: Data
+        private let condition = NSCondition()
+        private var position = 0
+        private var armed = false
+        private var parkedAtHead = 0
+
+        init(_ bytes: Data) { self.bytes = bytes }
+
+        func arm() { condition.withLock { armed = true } }
+        var parkedCount: Int { condition.withLock { parkedAtHead } }
+
+        func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32 {
+            guard let buffer, size > 0 else { return -1 }
+            condition.lock()
+            defer { condition.unlock() }
+            if armed, position == 0 {
+                parkedAtHead += 1
+                let parked = parkedAtHead
+                let deadline = Date().addingTimeInterval(10)
+                while armed, parkedAtHead == parked, condition.wait(until: deadline) {}
+                return -1
+            }
+            let n = min(Int(size), bytes.count - position)
+            guard n > 0 else { return -1 }
+            bytes.withUnsafeBytes { raw in _ = memcpy(buffer, raw.baseAddress! + position, n) }
+            position += n
+            return Int32(n)
+        }
+        func seek(offset: Int64, whence: Int32) -> Int64 {
+            condition.withLock {
+                switch whence {
+                case 65536: return Int64(bytes.count)
+                case SEEK_SET: position = Int(max(0, min(offset, Int64(bytes.count))))
+                case SEEK_CUR: position = max(0, min(position + Int(offset), bytes.count))
+                case SEEK_END: position = max(0, min(bytes.count + Int(offset), bytes.count))
+                default: return -1
+                }
+                return Int64(position)
+            }
+        }
+        func close() { condition.withLock { armed = false; condition.broadcast() } }
+        func cancel() { condition.withLock { parkedAtHead += 1; condition.broadcast() } }
+        func makeIndependentReader() -> IOReader? { nil }
+        var discImageProbeEnabled: Bool { false }
+    }
+
+    @Test("A custom-source reload a stop() supersedes mid-reopen throws CancellationError and publishes no error")
+    func supersededCustomReloadIsACancellation() async throws {
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        let reader = HeadGatedReader(try Self.fixture())
+        _ = try await engine.load(source: .custom(reader, formatHint: "mp4"))
+        reader.arm()
+        let parkedBefore = reader.parkedCount
+
+        let reload = Task { @MainActor in try await engine.reloadAtCurrentPosition() }
+        try await waitFor { reader.parkedCount > parkedBefore }
+        engine.stop()
+
+        await #expect(throws: CancellationError.self) { try await reload.value }
+        #expect(engine.state == .idle)
+        #expect(engine.errorInfo == nil)
+    }
 }

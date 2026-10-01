@@ -2359,6 +2359,11 @@ extension AetherEngine {
                     return d
                 }.value
             } catch {
+                // Sodalite#173: a reopen a stop() or a cancelled load aborted is not a failed reload.
+                if loadGeneration != gen {
+                    EngineLog.emit("[AetherEngine] reload superseded during custom reader reopen; unwinding", category: .engine)
+                    return nil
+                }
                 EngineLog.emit("[AetherEngine] reload: custom reader reopen failed: \(error)", category: .engine)
                 activeAudioTrackIndex = previousAudioIndex
                 publishError(.reloadFailed, "Reload failed: \(error.localizedDescription)", underlying: error)
@@ -2384,6 +2389,11 @@ extension AetherEngine {
                     return d
                 }.value
             } catch {
+                // Sodalite#173: a reopen a stop() or a cancelled load aborted is not a failed reload.
+                if loadGeneration != gen {
+                    EngineLog.emit("[AetherEngine] reload superseded during disc URL reopen; unwinding", category: .engine)
+                    return nil
+                }
                 EngineLog.emit("[AetherEngine] reload: disc URL reopen failed: \(error)", category: .engine)
                 activeAudioTrackIndex = previousAudioIndex
                 publishError(.reloadFailed, "Reload failed: \(error.localizedDescription)", underlying: error)
