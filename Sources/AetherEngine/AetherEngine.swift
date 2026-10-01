@@ -3766,33 +3766,69 @@ public final class AetherEngine: ObservableObject {
         audioSourceStreamIndex: Int32? = nil,
         discTitleID: Int? = nil
     ) async throws -> SourceProbe? {
+        // Sodalite#173: a task cancelled before the load began has nothing to end; the running session stays.
+        try Task.checkCancellation()
         let attempt = LoadAttempt()
         defer { if let gen = attempt.generation { waitingLoadGenerations.remove(gen) } }
         do {
-            return try await loadSession(
-                source: source, startPosition: startPosition, options: options,
-                audioSourceStreamIndex: audioSourceStreamIndex, discTitleID: discTitleID,
-                attempt: attempt)
+            let probe = try await withTaskCancellationHandler {
+                try await loadSession(
+                    source: source, startPosition: startPosition, options: options,
+                    audioSourceStreamIndex: audioSourceStreamIndex, discTitleID: discTitleID,
+                    attempt: attempt)
+            } onCancel: {
+                Task { @MainActor [weak self] in self?.abandonCancelledLoad(attempt) }
+            }
+            if Task.isCancelled, abandonCancelledLoad(attempt) { throw CancellationError() }
+            return probe
         } catch is CancellationError {
             // AE#629: the engine took this startup over itself (the AE#561 / AE#641 rebuild), so the caller is
             // still waiting for the same thing and gets it, the way a #361 reroute keeps its wait. A
             // load the HOST superseded matches no takeover and unwinds as before.
             guard let generation = attempt.generation,
                   let takeover = softwarePathTakeover,
-                  takeover.supersededGeneration == generation else { throw CancellationError() }
+                  takeover.supersededGeneration == generation else {
+                if Task.isCancelled { abandonCancelledLoad(attempt) }
+                throw CancellationError()
+            }
             EngineLog.emit(
                 "[AetherEngine] #629 load (gen \(generation)) follows the engine's own rebuild "
                 + "instead of unwinding", category: .engine)
-            try await takeover.rebuild.value
+            // Sodalite#173: cancelling the follower cancels the rebuild it follows, whose own load then ends.
+            try await withTaskCancellationHandler {
+                try await takeover.rebuild.value
+            } onCancel: {
+                takeover.rebuild.cancel()
+            }
             return attempt.probe
+        } catch {
+            guard Task.isCancelled else { throw error }
+            abandonCancelledLoad(attempt)
+            throw CancellationError()
         }
     }
 
     /// What `loadSession` tells the public `load` about itself: the generation it ran under and the
     /// probe it assembled, which a load followed across a takeover still returns (AE#629).
+    @MainActor
     final class LoadAttempt {
         var generation: UInt64?
         var probe: SourceProbe?
+    }
+
+    /// Sodalite#173: the caller cancelled the task awaiting this load. Ends it the way a `stop()` would, so
+    /// every blocking open is aborted and the load's next checkpoint throws, but only while this load is
+    /// still the one in flight: a newer load, or a session this one already returned, is not its to end.
+    /// The panel mode is left for the next load, as a load that fails leaves it.
+    @discardableResult
+    func abandonCancelledLoad(_ attempt: LoadAttempt) -> Bool {
+        guard let gen = attempt.generation, loadGeneration == gen,
+              waitingLoadGenerations.contains(gen) else { return false }
+        EngineLog.emit(
+            "[AetherEngine] Sodalite#173: load (gen \(gen)) cancelled by its caller; tearing it down",
+            category: .engine)
+        stop(resetDisplayCriteria: false, finalTeardown: false)
+        return true
     }
 
     private func loadSession(

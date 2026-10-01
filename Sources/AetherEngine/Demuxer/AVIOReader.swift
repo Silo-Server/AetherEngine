@@ -4127,10 +4127,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
         // Budget mirrors a single sequential probe (its own 20-25 s ceiling) plus the stagger;
         // isClosed teardown breaks the individual probes, which then signal outstanding down.
+        // Sodalite#173: the wait polls isClosed itself, since a fallback still asleep in its stagger
+        // would otherwise hold a closed open for up to the full stagger.
         let deadline = Date(timeIntervalSinceNow: Self.sizeProbeStaggerSeconds + min(25, chunkRequestTimeout) + 2)
         state.cond.lock()
-        while state.resolvedSize <= 0 && state.outstanding > 0 {
-            if !state.cond.wait(until: deadline) { break }
+        while state.resolvedSize <= 0 && state.outstanding > 0 && !isClosed {
+            let now = Date()
+            if now >= deadline { break }
+            _ = state.cond.wait(until: min(deadline, now.addingTimeInterval(0.05)))
         }
         let size = state.resolvedSize
         state.cond.unlock()

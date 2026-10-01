@@ -35,6 +35,7 @@ A working shape for the live contracts below, compiled against the engine: [`Exa
 | --- | --- | --- |
 | The source could not be opened, probed, or routed | throws | `.error(message)` is published as well |
 | A newer `load()` or a `stop()` superseded this one | throws `CancellationError` | belongs to the successor, untouched |
+| The Task awaiting it was cancelled while it ran (Sodalite#173) | throws `CancellationError` | `.idle`, as after a `stop()` |
 | AVPlayer refused the media during startup and the engine rebuilt the session on the software path (AE#561) | keeps waiting, then returns (or throws what the rebuild threw) | whatever the rebuilt session reaches; `softwarePathEscalations` fires with `duringStartup` |
 | A custom `IOReader` whose initial probe failed | throws | `.error` |
 | Dolby Vision with no compatible base layer on the software path | throws `AetherEngineError.dolbyVisionUnplayableOnSoftwarePath` | `.error` |
@@ -452,6 +453,8 @@ try await player.reloadAtCurrentPosition()
 | `ProbeCancellation` | Thread-safe, one-shot token: `init()`, `isCancelled`, `cancel()`. Available on every URL/custom header, detail and `probeDetectingAtmos` overload. Cancellation is a request, not a completion notification. |
 | `ProbeError` | `invalidLimits`, `inputLimit`, `packetLimit`, `packetSizeLimit`, `timedOut`, `invalidReaderResult`, `unsupportedURL`, `sourceBusy`; `errorDescription` describes the stop. Explicit caller cancellation throws `CancellationError` instead. |
 | `AetherEngine.externalSubtitleTrackIDBase` | `100_000`. Synthetic ids of external subtitle tracks start here. |
+
+Cancelling the Task that awaits `load()` ends the load at once: it throws `CancellationError` within milliseconds instead of running its connect, open, retry and probe budgets to the end (an unreachable live origin used to hold it for about 19 s). The engine tears the load down the way `stop(resetDisplayCriteria: false, finalTeardown: false)` would, so a blocked network read, `avformat_open_input` / `find_stream_info`, a size probe, an `HLSLiveIngestReader` retry and a custom reader's blocking `read` are all aborted (a custom reader is closed), `state` becomes `.idle`, and the panel keeps its mode for the next load. A cancellation only ends the load it belongs to: one that arrives after a newer `load()` or `stop()` took over, or after the load returned, changes nothing. A `load()` called from a Task that is already cancelled throws before it touches the running session. The same holds for a `reloadAtCurrentPosition()` of a URL source, which goes through `load()`. A load that returned before the cancellation is not undone; on the `nativeRemoteHLS` bypass `load()` returns at the mount, so a host leaving that startup calls `stop()`. Not cancelling changes nothing.
 
 ### Whole-probe limits and cancellation
 
