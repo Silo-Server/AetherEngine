@@ -735,7 +735,7 @@ What that costs is not the `-12888` itself but what AVPlayer does next: it skips
 | 7.25.1 | TD 4, holdback 12 s | 3 segments | 5 / 4 / 6 | 2 / 2 / 3 |
 | with the upstream segment in the seal | TD 6, holdback 18 s | 4 segments | 0 / 0 / 0 | 0 / 0 / 0 |
 
-Both arms saw the same deliveries (four to six gaps of 9.0 to 9.3 s per run). The seal line states the new term, and the advert is still only reported:
+Both arms saw the same deliveries (four to six gaps of 9.0 to 9.3 s per run), and they differ in two things, not one: the sealed value and the join it sizes (three segments against four). Zero is this origin's number, not a promise. Its worst gap is 9.3 s, which a patience of 9.0 s plus one 3 s poll absorbs; the device capture this came from had 10 of its 110 gaps above 9 s and 5 above 12 s, so the field expectation is far fewer `-12888`, not none. The seal line states the new term, and the advert is still only reported:
 
 ```
 [HLSVideoEngine] live TARGETDURATION sealed at 6s (holdback 18.000s): max EXTINF 2.000s,
@@ -745,6 +745,17 @@ Both arms saw the same deliveries (four to six gaps of 9.0 to 9.3 s per run). Th
 ```
 
 Controls and prices, same harness. A 2 s upstream advertising a padded 3 (AE#447's shape) seals 2 and a 6 s holdback in both arms. Alternating 6 s / 4 s segments with under a second of jitter (`--durs 6,4`, the reporting channel's shape) draws one `-12888` and no stall in 180 s before and nothing after, which is why the field capture looks healthy between its outliers. An outage on top (`--freeze-at 14 --freeze-seconds 10`, about 12 s on the loopback) costs 2 to 3 stalls before and the one stall that IS the outage after: 18 s of holdback absorbs lateness, not a freeze longer than its low point of 8.7 s. And the join deepens by one upstream segment wherever a segment is longer than 4 s, which behind a link is one more download before the first picture: `--rate-kbps 8000 --latency-ms 30`, five runs per arm, **3.81 s before and 4.98 s after** (median), the 1.13 MB segment and nothing else. At memory speed it does not show (0.22 to 0.30 s against 0.23 to 0.55 s).
+
+**`--window 3` is the arm that keeps a seal honest.** An upstream that lists three or four segments can be joined 18 s deep and no deeper, 16 s of which are cut before the next delivery, so a seal of 6 asks for a holdback the first window cannot hold. Two things were hiding in that start. The gate held the SECOND playlist request as well as the first (AVPlayer opens with two, each re-enters `waitForFirstLiveSegment`, and on a bounded start each waited its own grace: `GET /media.m3u8` at 2.81 s, `GET /init.mp4` at 4.83 s), which is the "+2.07 s at the picture" the AE#594 table above priced without naming; and the grace itself waited for content the join could not deliver. One run per row, 6 s segments, `--window 3 --prefill 3`:
+
+| | sealed | first manifest | first picture |
+|---|---|---|---|
+| 7.25.1 | TD 4 | at once | 0.18 s |
+| the upstream segment taken whole, nothing else | TD 6 | 2.011 s, bounded start after 2.000 s grace | 4.47 s |
+| + the gate opens once a manifest has gone out | TD 6 | 2.011 s, bounded | 2.24 s |
+| + an exhausted join seals what its window covers | TD 5 | at once | 0.32 s |
+
+The full matrix (6 s and 10 s segments, windows of 3, 4 and 8, both profiles, three runs per arm) is in `api.md` under the live join; `.standard` drops `--fast-zap` from the `play` line.
 
 **The same fixture measures sound against picture, in the bytes.** `play --served-url` hands over the init segment, the cache holds the rest, and decoding their concatenation gives the presentation time of every flash and every beep onset: 147 of 148 seconds of a served session read **-0.3 ms** (the very first beep reads +19.7 ms, the decoder starting), across a 12 s outage, with no audio frame of any duration but 1024 samples and no gap at any segment seam. A fresh item re-fetches the same cached segments, so a rebuild cannot change that. What a rebuild does change is which segment the item starts on and where in it, and a segment's sound does not begin where its picture does: the cut is taken on the video keyframe and a transport stream interleaves audio behind video, so on this fixture the sound opens between 11 ms after and 208 ms before the picture, segment by segment. Each item now says what it started on,
 

@@ -707,12 +707,50 @@ cadence and the holdback follows it down, so the win belongs to the source GOP r
 its runway under either profile. Where the engine cuts the segments itself, each one is a whole GOP and
 the value is sealed from the first few, so it carries `ceil(1.5 x max EXTINF)` of headroom: a broadcast
 whose GOPs run 1.0 to 2.4 s sealed TARGETDURATION 1 on its first three and then broke `EXTINF <= TD`
-on every longer one (AE#670). 1 s GOPs therefore serve TARGETDURATION 2 and a 6 s holdback. An
-ingested HLS upstream is re-cut at its GOPs too, but it still arrives one upstream segment at a
-time, so its floor is the longest segment the upstream has served, whole (AE#684): 2 and a 6 s
-holdback on 2 s segments as before, 6 and 18 s on 6 s ones, where `ceil(6 / 1.5)` used to seal 4 and
-left the client a patience of exactly one delivery. The upstream's advertised target duration is
-still not read.
+on every longer one (AE#670). 1 s GOPs therefore serve TARGETDURATION 2 and a 6 s holdback.
+
+**An ingested HLS upstream seals over the segment it is delivered in, under either profile (AE#684).**
+The engine re-cuts an upstream segment (at its GOPs under `.fastZap`, at about 4 s under `.standard`),
+but the window still changes once per UPSTREAM segment, so the floor is the longest segment the upstream
+has served, whole: 2 and a 6 s holdback on 2 s segments as before, 6 and 18 s on 6 s ones under
+`.fastZap`, where `ceil(6 / 1.5)` used to seal 4 and left the client a patience of exactly one delivery.
+`.standard` already sat at 6 through its `1.5 x cut target` floor, so the term only reaches it above
+6 s: a 10 s provider goes from 7 to 10. The upstream's advertised target duration is still not read.
+Three things bound it:
+
+- **A ceiling.** Segments longer than `LiveEdgePolicy.upstreamSegmentSealCeilingSeconds` (10 s) are not
+  taken whole: a 20 s one seals 14, as it did before, because a holdback is `3 x` the value and the
+  live-only window is 60 s. That constant is also the one place that decides whether 10 s providers get
+  this at all: at 6 they seal 7 again, exactly as 7.24.0 did.
+- **What the join can pay.** A holdback the first window cannot hold is not protection, it is a slow
+  start. An upstream that lists three or four 6 s segments joins 18 s and cuts 16 (the last GOP stays
+  open until the next delivery), so it seals 5, not 6: the largest value whose holdback the window
+  covers, never under what the seal was without the term. The seal line says so (`of which the join
+  pays 5s of 6s (16.000s cut of the 18.000s it held)`). A window deep enough joins one segment more
+  and pays in full.
+- **A whole second per fraction**, like every other term: 6.006 s segments seal 7, a 21 s holdback and
+  a five-segment join.
+
+Measured on loopback against `Scripts/hls-burst-origin.py` (deliveries 3 to 9.3 s apart on 6 s
+segments), 60 s per run, three runs per arm, 7.25.1 against this:
+
+| upstream, profile, window | 7.25.1 | now |
+|---|---|---|
+| 6 s, `.fastZap`, 8 listed | TD 4, first picture 0.18 to 0.20 s, 3 x `-12888` and 2 stalls per run | TD 6, 0.19 to 0.22 s, none |
+| 6 s, `.fastZap`, 3 or 4 listed | TD 4, 0.19 to 0.25 s, 2 to 3 x `-12888`, 1 to 2 stalls | TD 5, 0.19 to 0.22 s, 1 to 2 x `-12888`, no stall |
+| 10 s, `.fastZap`, 8 listed | TD 7, 0.18 to 0.20 s, 1 x `-12888` | TD 10, 0.19 to 0.20 s, none |
+| 10 s, `.fastZap`, 3 or 4 listed | TD 7, 0.18 to 0.21 s, window closed and item rebuilt in 4 of 6 runs | TD 9, 0.18 to 0.20 s, none |
+| 6 s, `.standard`, 8 listed | TD 6, 6.29 to 6.43 s (the join was one segment short of its own holdback) | TD 6, 0.17 to 0.19 s |
+| 6 s, `.standard`, 3 listed | TD 6, 6.23 to 6.41 s | TD 6, 6.27 to 6.37 s (unchanged: nothing to pay down) |
+| 10 s, `.standard`, 3 or 8 listed | TD 7, 0.17 to 0.18 s, item rebuilt in 6 of 6 runs | TD 9 or 10, 0.18 to 0.19 s, none |
+
+What it costs is the join: one more upstream segment before the first picture wherever the window is
+deep enough to offer it and a segment is longer than 4 s. Loopback does not show that. Behind an
+8 Mbit/s link shared by all responses, 1.5 Mbit/s content, median of five: **3.81 s to 4.98 s** on 6 s
+segments and **6.16 s to 8.11 s** on 10 s ones, the segment's bytes over the link rate. And the viewer
+sits one holdback behind the upstream's edge, so 6 s further back on a 6 s provider and 9 s on a 10 s
+one. "None" in the table is a statement about this origin: a real outage longer than the holdback's low
+point still stalls, and the capture that started this had 10 of its 110 delivery gaps above 9 s.
 
 **An HLS source with a window of its own now fills that cushion at the join rather than in wall clock**
 (6.77.0). The ingest used to enter a live playlist three segments behind the edge, and three joined
@@ -723,8 +761,9 @@ short segments is several times three. Measured against `hlsfixture --window 8` 
 --fast-zap`, three runs per row: first picture on a 2 s-segment channel **2.22 s before, 0.20 s after**;
 on 1 s segments **0.41 to 1.22 s before, 0.18 to 0.20 s after**, and the spread is the second half of
 the finding, since before the change the number depended on where in the upstream segment cycle the tune
-landed. A window at the three-segment floor has nothing deeper to offer and is unchanged, and so is a
-long-segment provider, whose coverage target was already met inside the old bound. The deeper entry is
+landed. A window at the three-segment floor has nothing deeper to offer and is unchanged. A
+long-segment provider was unchanged by this too, and is not any more: since AE#684 its join is one
+upstream segment deeper, see above. The deeper entry is
 not paid back later: both arms fetch up to the same upstream segment number at the same wall clock, so
 it is caught up at I/O speed instead of becoming a standing lag behind the live edge. What it does not
 touch is a source with no playlist at all (raw MPEG-TS over HTTP), where there is no window to enter
