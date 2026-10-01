@@ -37,11 +37,16 @@ struct Issue684LiveJoinNotReadyTests {
             itemIsReadyToPlay: true))
     }
 
-    @Test("a caller that states no readiness keeps the decision it had")
-    func defaultIsUnchanged() {
-        #expect(NativeAVPlayerHost.shouldStartLiveJoinImmediately(
-            armed: true, alreadySpent: false, hostWantsToPlay: true,
-            isWaitingToMinimizeStalls: true, playbackBufferEmpty: false, bufferedAheadSeconds: 4.0))
+    /// The reading is asynchronous and the readiness sink's question is dropped while one is in
+    /// flight, so a refusal taken on a stale `unknown` has to notice the item is ready now.
+    @Test("a not-ready refusal asks once more when the item turned ready under it")
+    func asksAgainOnceWhenTheItemTurnedReady() {
+        #expect(NativeAVPlayerHost.liveJoinAsksAgainAfterNotReadyRefusal(
+            itemIsReadyNow: true, alreadyAskedAgain: false))
+        #expect(!NativeAVPlayerHost.liveJoinAsksAgainAfterNotReadyRefusal(
+            itemIsReadyNow: false, alreadyAskedAgain: false))
+        #expect(!NativeAVPlayerHost.liveJoinAsksAgainAfterNotReadyRefusal(
+            itemIsReadyNow: true, alreadyAskedAgain: true))
     }
 
     @Test("the refusal names the playhead the cushion was read from")

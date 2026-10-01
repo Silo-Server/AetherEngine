@@ -93,6 +93,8 @@ final class NativeAVPlayerHost {
     private var liveJoinNoDecisionLogged: Bool = false
     /// AE#684: one line per load for a hold the depth would have cut and the item's status refused.
     private var liveJoinNotReadyLogged: Bool = false
+    /// AE#684: the one repeat a not-ready refusal gets when the item turned ready under it.
+    private var liveJoinNotReadyAskedAgain: Bool = false
     /// AE#440 round 3: one witness per load for a hold that was refused, so the bound is read while the
     /// hold stands and not only at its edges. Observes, never acts (see `startLiveJoinHoldWitness`).
     private var liveJoinHoldWitnessStarted: Bool = false
@@ -476,6 +478,7 @@ final class NativeAVPlayerHost {
         self.liveJoinThinBufferLogged = false
         self.liveJoinNoDecisionLogged = false
         self.liveJoinNotReadyLogged = false
+        self.liveJoinNotReadyAskedAgain = false
         // AE#440 round 4: both of these are per LOAD, and the host is reused across loads on the
         // keepNativeHost path. Left standing, the second live join of a reused host would arm no witness
         // at all and read the previous join's spend reason.
@@ -1289,7 +1292,7 @@ final class NativeAVPlayerHost {
         isWaitingToMinimizeStalls: Bool,
         playbackBufferEmpty: Bool,
         bufferedAheadSeconds: Double,
-        itemIsReadyToPlay: Bool = true
+        itemIsReadyToPlay: Bool
     ) -> Bool {
         guard armed, !alreadySpent, hostWantsToPlay else { return false }
         guard isWaitingToMinimizeStalls else { return false }
@@ -1375,10 +1378,26 @@ final class NativeAVPlayerHost {
                 bufferedAheadSeconds: reading.aheadSeconds,
                 itemIsReadyToPlay: reading.itemStatus == .readyToPlay
             ) else {
-                // AE#684: a refusal the depth alone would have granted says which fact refused it.
-                if let line = Self.liveJoinNotReadyRefusal(reading: reading), !self.liveJoinNotReadyLogged {
-                    self.liveJoinNotReadyLogged = true
-                    EngineLog.emit("[NativeAVPlayerHost] #\(self.sessionID) " + line, category: .engine)
+                // AE#684: a refusal the depth alone would have granted is the item's, not the
+                // cushion's. It has its own line, and the thin-buffer line below would contradict it
+                // (it prints the same depth as the reason for leaving the wait alone).
+                if let line = Self.liveJoinNotReadyRefusal(reading: reading) {
+                    if !self.liveJoinNotReadyLogged {
+                        self.liveJoinNotReadyLogged = true
+                        EngineLog.emit("[NativeAVPlayerHost] #\(self.sessionID) " + line, category: .engine)
+                    }
+                    self.startLiveJoinHoldWitness(item: item)
+                    // The item can turn ready while this reading is in flight. The readiness sink
+                    // asked at that moment and was turned away by the in-flight flag, so the stale
+                    // reading above is the last word unless the question is put again here.
+                    if Self.liveJoinAsksAgainAfterNotReadyRefusal(
+                        itemIsReadyNow: item.status == .readyToPlay,
+                        alreadyAskedAgain: self.liveJoinNotReadyAskedAgain) {
+                        self.liveJoinNotReadyAskedAgain = true
+                        self.startLiveJoinImmediatelyIfHolding(
+                            waitingReason: self.avPlayer.reasonForWaitingToPlay?.rawValue ?? "-")
+                    }
+                    return
                 }
                 // The cushion, not the decision, is what a later report needs: it separates a join
                 // waiting on AVPlayer's rate estimate from one genuinely starved at the edge.
@@ -1687,6 +1706,15 @@ final class NativeAVPlayerHost {
         @unknown default:
             return ""
         }
+    }
+
+    /// AE#684: whether a not-ready refusal puts the question again. Once per load, and only when the
+    /// item has become ready since the reading was taken: the reading is asynchronous, the readiness
+    /// sink's own question is dropped while one is in flight, and without this a hold that outlives
+    /// readiness on that race is never judged on the playhead it starts from.
+    nonisolated static func liveJoinAsksAgainAfterNotReadyRefusal(itemIsReadyNow: Bool,
+                                                                  alreadyAskedAgain: Bool) -> Bool {
+        itemIsReadyNow && !alreadyAskedAgain
     }
 
     /// AE#684: the refusal line for a hold that had the depth and not the item. nil for every other
