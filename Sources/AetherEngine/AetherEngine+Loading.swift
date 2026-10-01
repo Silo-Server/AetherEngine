@@ -1785,6 +1785,10 @@ extension AetherEngine {
         forceNativeLegibleDeselectedUntilHostSelects()
         // AE#458: what AVFoundation makes of the audio rendition this load just served, which is the
         // half of the exchange no log has ever carried.
+        SharedOutputCoordinator.shared.noteSourceChannels(
+            activeAudioTrackIndex.flatMap { index in audioTracks.first { $0.id == index }?.channels }
+                .flatMap { $0 > 0 ? $0 : nil },
+            for: ObjectIdentifier(self))
         logAudibleReadback(host: host)
     }
 
@@ -1810,8 +1814,10 @@ extension AetherEngine {
         } else {
             nil
         }
+        SharedOutputCoordinator.shared.noteSourceChannels(sourceChannels, for: ObjectIdentifier(self))
+        let preferred = SharedOutputCoordinator.shared.preferredSourceChannels ?? sourceChannels
         await enqueueAudioSessionTransition {
-            AetherEngine.applyRendererAudioSession(sourceChannels: sourceChannels)
+            AetherEngine.applyRendererAudioSession(sourceChannels: preferred)
         }.value
         #endif
     }
