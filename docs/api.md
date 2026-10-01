@@ -778,6 +778,17 @@ The depth is the contiguous span ahead of the playhead, so an island past a gap 
 floor is not met the engine says so once per load (`leaving the stall-avoidance wait alone (buffer ahead
 ...s, ...)`), which is what separates the two mechanisms in a report after the fact.
 
+**And the item has to be able to play (AE#684).** The depth is measured from the item's own
+`currentTime()`, and before `readyToPlay` that is where the loader began fetching, not where playback
+will begin. Under an `EXT-X-START` placement, which is how a rejoin lands a fresh item at the place the
+session held, AVPlayer fetches from about 6 s below the target first, so the reading is the lookback
+itself: one device capture shows `buffer ahead 4.00s` from a playhead of 48.00 s on an item placed at
+53.908 s, every second of it behind the start, and `playImmediately` 36 ms before the item was ready. It
+was the one item of five in that capture to be forced and the one its viewer reported out of sync, which
+is a correlation and not yet a mechanism. A hold on an item that cannot play yet is now left alone
+(`leaving the stall-avoidance wait alone on an item that cannot play yet ...; asked again at readiness`)
+and decided again when the item becomes ready, from the playhead it really starts on.
+
 ### The rewind depth a live session really has
 
 `seekableLiveRange` used to be `max(0, edgeTime - dvrWindowSeconds) ... edgeTime`, pure arithmetic that
@@ -975,7 +986,7 @@ All flags default to safe values; the table is the full set. Depth for the media
 | `dvrWindowSeconds` | nil | Timeshift window. nil means live-only and `seek` is a no-op. The window is a ceiling: the disk budget (a quarter of the free space, at most 2 GiB) bounds what is actually kept, so a long window on a high-bitrate channel or a small volume holds less than it asks for. |
 | `liveJoinProfile` | `.standard` | A `LiveJoinProfile`. `.fastZap` collapses TARGETDURATION to 1.5 x the source GOP (AE#670) so an IPTV join costs seconds instead of a full holdback. |
 | `clampsLiveResumeToWindow` | true | Whether `play()` may move a behind-live playhead by itself (edge snap on a live-only source more than 45 s behind, or a landing above the retained floor when a DVR window has slid past it). `false` hands the whole decision to the host, which then also owns the eviction case. |
-| `liveJoinStartsImmediately` | true | Cuts AVPlayer's stall-avoidance wait short once at the live join, over a buffer that is non-empty and at least 1.5 s deep. The join tail no host can otherwise reach; default since 6.55.0 on a device A/B, see the live-join section. |
+| `liveJoinStartsImmediately` | true | Cuts AVPlayer's stall-avoidance wait short once at the live join, over a buffer that is non-empty and at least 1.5 s deep, on an item that has reached `readyToPlay` (AE#684). The join tail no host can otherwise reach; default since 6.55.0 on a device A/B, see the live-join section. |
 | `liveBlockingReload` | nil (auto) | LL-HLS blocking-reload override for loopback live sessions. Auto derives eligibility from observed upstream cadence, which is what keeps a bursty relay off a `-15410` loop. |
 | `nativeRemoteHLS` | false | Hand a remote `master.m3u8` straight to AVPlayer: no demuxer probe, no loopback. Built for `isLive: true`; a remote HLS VOD URL reaches this route regardless (AE#154). The clock here is item time, see `clock.$sourceTime` (AE#616). |
 | `nativeRemoteHLSIngestFallback` | true | The #168 / #293 carriage recovery and the #363 401/403 bypass refusal recovery. Setting it false turns both off. |

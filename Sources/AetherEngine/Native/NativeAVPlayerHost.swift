@@ -91,6 +91,8 @@ final class NativeAVPlayerHost {
     private var liveJoinThinBufferLogged: Bool = false
     /// AE#440 round 5: keeps the "the hold was over before the reading came back" line to one per load.
     private var liveJoinNoDecisionLogged: Bool = false
+    /// AE#684: one line per load for a hold the depth would have cut and the item's status refused.
+    private var liveJoinNotReadyLogged: Bool = false
     /// AE#440 round 3: one witness per load for a hold that was refused, so the bound is read while the
     /// hold stands and not only at its edges. Observes, never acts (see `startLiveJoinHoldWitness`).
     private var liveJoinHoldWitnessStarted: Bool = false
@@ -473,6 +475,7 @@ final class NativeAVPlayerHost {
         self.liveJoinImmediateStartProbeInFlight = false
         self.liveJoinThinBufferLogged = false
         self.liveJoinNoDecisionLogged = false
+        self.liveJoinNotReadyLogged = false
         // AE#440 round 4: both of these are per LOAD, and the host is reused across loads on the
         // keepNativeHost path. Left standing, the second live join of a reused host would arm no witness
         // at all and read the previous join's spend reason.
@@ -648,6 +651,11 @@ final class NativeAVPlayerHost {
                         self.hasEverPlayed = true
                         self.inPlaceSwapMountPending = false
                         self.startLiveJoinImmediatelyIfHolding(waitingReason: "-")
+                    } else if self.timeControlStatus == .waitingToPlayAtSpecifiedRate {
+                        // AE#684: a hold refused for an item that could not play yet is asked again
+                        // now that it can, on the playhead the item actually starts from.
+                        self.startLiveJoinImmediatelyIfHolding(
+                            waitingReason: self.avPlayer.reasonForWaitingToPlay?.rawValue ?? "-")
                     }
                     // #168: publish the item's real dynamic range for the probe-free remote-HLS badge.
                     await self.publishDetectedVideoFormat(from: item)
@@ -1266,16 +1274,26 @@ final class NativeAVPlayerHost {
     ///   behind the same `false` a genuinely starved join holds a fraction of a second, and starting
     ///   there trades a still picture for an immediate stall. The depth is the axis that separates the
     ///   two mechanisms, so it is the one the guard reads.
+    /// - `itemIsReadyToPlay` (AE#684): the depth is measured from `currentTime()`, and until the item
+    ///   is ready that is where the loader started fetching, not where playback will begin. Under an
+    ///   `EXT-X-START` placement AVPlayer fetches from about 6 s below the target first, so the reading
+    ///   is the lookback itself: captured on a rejoin placed at 53.908 s as `buffer ahead 4.00s` from a
+    ///   playhead of 48.00 s, every second of it behind the start point, on an item whose status had
+    ///   not left `unknown`, 36 ms before it did. That is the starved start the depth guard exists to
+    ///   refuse, read as a four-second cushion, and it was the one item of five in that capture to
+    ///   be forced, and the one its viewer reported out of sync. The hold is asked again at readiness.
     nonisolated static func shouldStartLiveJoinImmediately(
         armed: Bool,
         alreadySpent: Bool,
         hostWantsToPlay: Bool,
         isWaitingToMinimizeStalls: Bool,
         playbackBufferEmpty: Bool,
-        bufferedAheadSeconds: Double
+        bufferedAheadSeconds: Double,
+        itemIsReadyToPlay: Bool = true
     ) -> Bool {
         guard armed, !alreadySpent, hostWantsToPlay else { return false }
         guard isWaitingToMinimizeStalls else { return false }
+        guard itemIsReadyToPlay else { return false }
         guard !playbackBufferEmpty else { return false }
         // NaN fails every comparison silently, and an unresolved item's currentTime() is NaN, so an
         // absent reading has to be rejected rather than fall through the bound below.
@@ -1354,8 +1372,14 @@ final class NativeAVPlayerHost {
                 hostWantsToPlay: self.playIntent,
                 isWaitingToMinimizeStalls: true,
                 playbackBufferEmpty: reading.bufferEmpty,
-                bufferedAheadSeconds: reading.aheadSeconds
+                bufferedAheadSeconds: reading.aheadSeconds,
+                itemIsReadyToPlay: reading.itemStatus == .readyToPlay
             ) else {
+                // AE#684: a refusal the depth alone would have granted says which fact refused it.
+                if let line = Self.liveJoinNotReadyRefusal(reading: reading), !self.liveJoinNotReadyLogged {
+                    self.liveJoinNotReadyLogged = true
+                    EngineLog.emit("[NativeAVPlayerHost] #\(self.sessionID) " + line, category: .engine)
+                }
                 // The cushion, not the decision, is what a later report needs: it separates a join
                 // waiting on AVPlayer's rate estimate from one genuinely starved at the edge.
                 if !self.liveJoinThinBufferLogged {
@@ -1461,7 +1485,8 @@ final class NativeAVPlayerHost {
                 guard Self.shouldStartLiveJoinImmediately(
                     armed: true, alreadySpent: false, hostWantsToPlay: true,
                     isWaitingToMinimizeStalls: true,
-                    playbackBufferEmpty: reading.bufferEmpty, bufferedAheadSeconds: reading.aheadSeconds
+                    playbackBufferEmpty: reading.bufferEmpty, bufferedAheadSeconds: reading.aheadSeconds,
+                    itemIsReadyToPlay: reading.itemStatus == .readyToPlay
                 ) else { continue }
                 account(.crossed)
                 return
@@ -1662,6 +1687,21 @@ final class NativeAVPlayerHost {
         @unknown default:
             return ""
         }
+    }
+
+    /// AE#684: the refusal line for a hold that had the depth and not the item. nil for every other
+    /// refusal, which the thin-buffer line already accounts for.
+    nonisolated static func liveJoinNotReadyRefusal(reading: LiveJoinBufferReading) -> String? {
+        guard reading.itemStatus != .readyToPlay, !reading.bufferEmpty,
+              reading.aheadSeconds.isFinite, reading.aheadSeconds >= minimumLiveJoinBufferAhead
+        else { return nil }
+        let head = reading.playheadSeconds.isFinite
+            ? String(format: "%.2f", reading.playheadSeconds) + "s"
+            : "an unreadable position"
+        return "AE#440 live join: leaving the stall-avoidance wait alone on an item that cannot play "
+            + "yet (buffer ahead " + String(format: "%.2f", reading.aheadSeconds) + "s of playhead "
+            + head + ", which until readiness is where the fetch began and not where playback will); "
+            + "asked again at readiness"
     }
 
     /// The placement clause the two accounts below carry when the cushion reads zero. nil when a range
