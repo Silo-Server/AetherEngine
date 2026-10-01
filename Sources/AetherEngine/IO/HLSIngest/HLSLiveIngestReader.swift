@@ -41,6 +41,8 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     /// AE#447: longest EXTINF the upstream has actually served, the measured counterpart to
     /// `_upstreamTargetDuration`. Monotonic; read via `upstreamSegmentDurationSeconds`.
     private var _upstreamSegmentDurationSeconds: Double?
+    /// AE#684: summed EXTINF of the join batch. Written with the join line, before its bytes flow.
+    private var _joinBacklogSeconds: Double?
     /// Installed by the resolver before the first FIFO byte; nil = muxed audio.
     private var _companionAudioReader: HLSLiveIngestReader?
     /// AE#359: SUBTITLES renditions of the picked variant, resolved to absolute URLs. Metadata only.
@@ -94,6 +96,10 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
 
     public var upstreamSegmentDurationSeconds: Double? {
         startLock.withLock { _upstreamSegmentDurationSeconds }
+    }
+
+    var joinBacklogSeconds: Double? {
+        startLock.withLock { _joinBacklogSeconds }
     }
 
     public var closedLiveCadenceSeconds: Double? {
@@ -301,6 +307,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                         startLock.withLock { _joinWallClock = joinDate }
                     }
                     let backlog = fresh.reduce(0.0) { $0 + $1.duration }
+                    startLock.withLock { _joinBacklogSeconds = backlog }
                     EngineLog.emit(
                         "[HLSIngest] joined \(fresh.count) segment(s), ~\(String(format: "%.0f", backlog))s behind the live edge"
                         + " pdt=\(fresh.first?.programDateTime.map { "\($0)" } ?? "nil")",

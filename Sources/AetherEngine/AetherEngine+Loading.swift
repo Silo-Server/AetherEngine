@@ -788,7 +788,9 @@ extension AetherEngine {
         // served), the advert rides along for the seal log only. Both weak, same reason as above.
         let liveClosedCadenceObservation: (@Sendable () -> Double?)?
         let liveUpstreamSegmentDurationObservation: (@Sendable () -> Double?)?
+        let liveJoinBacklogObservation: (@Sendable () -> Double?)?
         if let liveIngest {
+            liveJoinBacklogObservation = { [weak liveIngest] in liveIngest?.joinBacklogSeconds }
             liveClosedCadenceObservation = { [weak liveIngest] in liveIngest?.closedLiveCadenceSeconds }
             liveUpstreamSegmentDurationObservation = { [weak liveIngest] in
                 liveIngest?.upstreamSegmentDurationSeconds
@@ -796,6 +798,7 @@ extension AetherEngine {
         } else {
             liveClosedCadenceObservation = nil
             liveUpstreamSegmentDurationObservation = nil
+            liveJoinBacklogObservation = nil
         }
         let upstreamSelfReportedTargetDuration = liveIngest?.upstreamTargetDuration
         // #199: in-engine reopen transport for live ingest sessions. Only HLSLiveIngestReader main
@@ -839,6 +842,7 @@ extension AetherEngine {
             liveCadenceObservation: liveCadenceObservation,
             liveClosedCadenceObservation: liveClosedCadenceObservation,
             liveUpstreamSegmentDurationObservation: liveUpstreamSegmentDurationObservation,
+            liveJoinBacklogObservation: liveJoinBacklogObservation,
             upstreamSelfReportedTargetDuration: upstreamSelfReportedTargetDuration,
             preopenedDemuxer: preopenedDemuxer,
             sourceReopenableByURL: !isCustomSource,

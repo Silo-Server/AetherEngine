@@ -291,8 +291,62 @@ enum LiveEdgePolicy {
     ///
     /// Re-cutting changes how finely the window is listed, not how often it changes, so the playlist
     /// promises what a playlist of the upstream's segments would: at least their longest duration.
+    ///
+    /// Bounded by `upstreamSegmentSealCeilingSeconds`: above it the term stops growing and
+    /// `targetDurationForCadence` (two thirds of the segment) is the larger one again.
     static func targetDurationForUpstreamSegment(_ segmentSeconds: Double) -> Int {
-        wholeSecondsCovering(segmentSeconds)
+        guard !segmentSeconds.isNaN else { return 0 }
+        return wholeSecondsCovering(Swift.min(segmentSeconds, upstreamSegmentSealCeilingSeconds))
+    }
+
+    /// AE#684: the longest upstream segment the seal takes whole. The ONE place that separates
+    /// "seal over the upstream segment" from "keep `ceil(segment / 1.5)`".
+    ///
+    /// It is a ceiling for two reasons. A holdback is `3 x` the value, and the live-only window is
+    /// 60 s (`LiveWindowSizing.liveOnlyFloorSeconds`): a 20 s segment taken whole would ask the client
+    /// to sit a whole window behind an edge that window can barely list. And the deeper join it buys
+    /// is one more upstream segment before the first picture, which grows with the segment: AE#678
+    /// measured that on a 10 s provider and declined it. At 10, segments up to 10 s seal whole (TD 10,
+    /// 30 s holdback) and a 20 s one seals 14, as it did before. At 6, a 10 s provider seals 7 again,
+    /// exactly as 7.24.0 did, and 6 s providers keep the fix.
+    static let upstreamSegmentSealCeilingSeconds: Double = 10
+
+    /// Everything an ingested segment length asks of the seal, both terms. What the join sizes its
+    /// cushion from, so the two cannot drift.
+    static func targetDurationForIngestedSegment(_ segmentSeconds: Double) -> Int {
+        Swift.max(targetDurationForCadence(segmentSeconds), targetDurationForUpstreamSegment(segmentSeconds))
+    }
+
+    /// AE#684 review: has the join handed over everything it will, bar the segment still open?
+    ///
+    /// The last GOP of a join stays open until the next upstream delivery brings the keyframe that
+    /// closes it, so once the cut content plus one segment reaches what was joined, nothing more
+    /// finalizes before that delivery, and waiting for a deeper cushion is waiting one upstream
+    /// segment of wall clock. The tolerance covers an upstream whose EXTINF and media disagree by a
+    /// frame or two.
+    static func joinIsExhausted(finalizedSeconds: Double, longestCutSegmentSeconds: Double,
+                                joinBacklogSeconds: Double) -> Bool {
+        guard joinBacklogSeconds > 0, finalizedSeconds > 0 else { return false }
+        return finalizedSeconds + longestCutSegmentSeconds + joinExhaustionToleranceSeconds
+            >= joinBacklogSeconds
+    }
+
+    static let joinExhaustionToleranceSeconds: Double = 0.5
+
+    /// AE#684 review: the upstream-segment seal, as far as the join can pay for it.
+    ///
+    /// A seal is a holdback of `3 x` itself, and a holdback the first window cannot hold is not
+    /// protection, it is a start the client spends waiting: an upstream that lists three 6 s segments
+    /// joins 18 s, cuts 16, and against an 18 s holdback took the bounded start after its grace
+    /// (measured 4.25 s to first picture where 7.25.1 took 0.18 s). So an exhausted join seals the
+    /// largest value its cut content covers, never under what the seal was without the upstream
+    /// term and never over the full one: 16 s of window pays for 5, a patience of 7.5 s where the old
+    /// rule gave 6.0 s and the full one 9.0 s.
+    static func targetDurationTheJoinCanPay(full: Int, withoutUpstreamSegment base: Int,
+                                            finalizedSeconds: Double) -> Int {
+        guard finalizedSeconds.isFinite, finalizedSeconds > 0 else { return Swift.max(base, 0) }
+        let affordable = Int((servedSeconds(finalizedSeconds) / 3).rounded(.down))
+        return Swift.max(base, Swift.min(full, affordable))
     }
 
     /// A duration as the playlist actually serves it: `#EXTINF` is written with `%.3f`, so a millisecond
@@ -566,14 +620,34 @@ enum CadenceFloorTerm {
 /// line why the session will hold this value for its whole life. Every term but `selfReported` feeds
 /// the max; `selfReported` is what the upstream CLAIMED, printed beside what was measured.
 struct LiveTargetDurationDerivation {
-    let value: Int
+    var value: Int
     let maxSegmentDuration: Double
     let cutTargetFloor: Double?
     var gopHeadroomApplies = false
     let cadenceFloor: CadenceFloorTerm
     /// AE#684: the longest segment an ingested upstream has served, nil off the ingest path.
     var upstreamSegment: Double? = nil
+    /// AE#684 review: set when the join could not pay for the full upstream-segment seal: what it
+    /// held, what of that is cut, and the value the terms alone would have sealed.
+    var joinBound: (backlogSeconds: Double, finalizedSeconds: Double, full: Int)? = nil
     let selfReported: Double?
+
+    /// The upstream-segment term as both seal lines state it, nil off the ingest path.
+    var upstreamSegmentAccount: String? {
+        guard let upstreamSegment else { return nil }
+        var text = "upstream segment \(LiveEdgePolicy.seconds(upstreamSegment))s "
+            + "(one delivery, however finely it is cut here"
+        if upstreamSegment > LiveEdgePolicy.upstreamSegmentSealCeilingSeconds {
+            text += ", taken up to \(LiveEdgePolicy.seconds(LiveEdgePolicy.upstreamSegmentSealCeilingSeconds))s"
+        }
+        text += ")"
+        if let joinBound {
+            text += ", of which the join pays \(value)s of \(joinBound.full)s "
+                + "(\(LiveEdgePolicy.seconds(joinBound.finalizedSeconds))s cut of the "
+                + "\(LiveEdgePolicy.seconds(joinBound.backlogSeconds))s it held)"
+        }
+        return text
+    }
 
     /// One line, in the order the terms are maxed. Reads as an argument for the number it reports.
     var account: String {
@@ -586,10 +660,7 @@ struct LiveTargetDurationDerivation {
                 + "(each segment is one whole GOP)")
         }
         terms.append(cadenceFloor.account)
-        if let upstreamSegment {
-            terms.append("upstream segment \(LiveEdgePolicy.seconds(upstreamSegment))s "
-                + "(one delivery, however finely it is cut here)")
-        }
+        if let upstreamSegmentAccount { terms.append(upstreamSegmentAccount) }
         let claim = selfReported.map {
             "; upstream advertises \(LiveEdgePolicy.seconds($0))s (reported, not used)"
         } ?? ""
@@ -2391,6 +2462,35 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         )
     }
 
+    /// AE#684 review: the derivation the first-serve gate judges its cushion against, which is the
+    /// full one unless an ingest's join is exhausted short of it
+    /// (`LiveEdgePolicy.targetDurationTheJoinCanPay`). Only the gate asks this: once it has sealed,
+    /// the value is frozen, and a later build's fuller candidate is the drift line's to report.
+    func firstServeTargetDuration(
+        _ snap: (count: Int, summed: Double, maxDuration: Double)
+    ) -> LiveTargetDurationDerivation {
+        var derivation = currentLiveTargetDuration(maxSegmentDuration: snap.maxDuration)
+        guard derivation.upstreamSegment != nil,
+              let backlog = liveCadencePolicy?.joinBacklogSeconds,
+              snap.count >= LiveEdgePolicy.minStartupSegments,
+              LiveEdgePolicy.joinIsExhausted(finalizedSeconds: snap.summed,
+                                             longestCutSegmentSeconds: snap.maxDuration,
+                                             joinBacklogSeconds: backlog)
+        else { return derivation }
+        let base = LiveEdgePolicy.targetDurationSeconds(
+            maxSegmentDuration: snap.maxDuration,
+            cutTargetSeconds: derivation.cutTargetFloor,
+            cadenceFloorSeconds: derivation.cadenceFloor.seconds,
+            segmentsAreCutHere: false,
+            upstreamSegmentSeconds: nil)
+        let paid = LiveEdgePolicy.targetDurationTheJoinCanPay(
+            full: derivation.value, withoutUpstreamSegment: base, finalizedSeconds: snap.summed)
+        guard paid < derivation.value else { return derivation }
+        derivation.joinBound = (backlog, snap.summed, derivation.value)
+        derivation.value = paid
+        return derivation
+    }
+
     /// Takes the seal and, on the call that actually takes it, publishes the derivation. The value is
     /// frozen for the session (RFC 8216 forbids a changing TARGETDURATION, AE#209), so the one line that
     /// explains it has to be emitted here or nowhere: a host reading a 9 s holdback later has no way to
@@ -2420,6 +2520,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                 + "\(resolved.value)s, later candidate \(candidate.value)s "
                 + "(max segment \(String(format: "%.3f", maxSegmentDuration))s, "
                 + candidate.cadenceFloor.account
+                + (candidate.upstreamSegmentAccount.map { ", " + $0 } ?? "")
                 + ")",
                 category: .session
             )
@@ -2478,7 +2579,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             if waitersCancelled { return false }
             if firstManifestServed { return true }
             let snap = liveCushionSnapshot()
-            let target = currentLiveTargetDuration(maxSegmentDuration: snap.maxDuration)
+            let target = firstServeTargetDuration(snap)
             if LiveEdgePolicy.startupCushionSatisfied(segmentCount: snap.count,
                                                        summedDurationSeconds: snap.summed,
                                                        targetDuration: target.value,
@@ -2502,7 +2603,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                 // Re-read after the timed-out wait: an append racing the deadline would otherwise be judged
                 // on the stale snapshot (waitForLiveSegment below already does this).
                 let after = liveCushionSnapshot()
-                let afterTarget = currentLiveTargetDuration(maxSegmentDuration: after.maxDuration)
+                let afterTarget = firstServeTargetDuration(after)
                 if LiveEdgePolicy.startupCushionSatisfied(segmentCount: after.count,
                                                           summedDurationSeconds: after.summed,
                                                           targetDuration: afterTarget.value,

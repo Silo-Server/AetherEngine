@@ -7,6 +7,8 @@ struct LiveCadenceEvidence: Sendable, Equatable {
     var closedCadenceSeconds: Double?
     /// Longest segment duration (EXTINF) the upstream has actually served, nil until the first arrival.
     var servedSegmentDurationSeconds: Double?
+    /// AE#684: the media the join took, summed EXTINF, nil until it has joined.
+    var joinBacklogSeconds: Double? = nil
 }
 
 /// Turns the OBSERVED arrival cadence of a live ingest source (`LiveArrivalCadenceMeter`, surfaced by the
@@ -55,6 +57,8 @@ final class LiveCadencePolicy: @unchecked Sendable {
     private var measuredFloorSeconds: Double
     /// AE#684: the served-segment term of that floor, kept apart. Monotonic like the floor.
     private var longestUpstreamSegmentSeconds: Double = 0
+    /// AE#684: what the join took. First value wins: a reopen joins again, and its seal is long taken.
+    private var joinedBacklogSeconds: Double?
 
     /// - Parameters:
     ///   - observe: reader's current `observedLiveCadenceSeconds`; nil until the first upstream arrival.
@@ -100,6 +104,9 @@ final class LiveCadencePolicy: @unchecked Sendable {
                 measuredFloorSeconds = max(measuredFloorSeconds, served)
                 longestUpstreamSegmentSeconds = max(longestUpstreamSegmentSeconds, served)
             }
+            if joinedBacklogSeconds == nil, let joined = evidence.joinBacklogSeconds, joined > 0 {
+                joinedBacklogSeconds = joined
+            }
             if let closed = evidence.closedCadenceSeconds, closed > 0 {
                 measuredFloorSeconds = max(measuredFloorSeconds, closed)
             }
@@ -130,6 +137,14 @@ final class LiveCadencePolicy: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         advanceLocked()
         return longestUpstreamSegmentSeconds > 0 ? longestUpstreamSegmentSeconds : nil
+    }
+
+    /// AE#684 review: the media the join took, so the first-serve gate can tell a join that has
+    /// handed over everything from one still arriving. nil until the reader has joined.
+    var joinBacklogSeconds: Double? {
+        lock.lock(); defer { lock.unlock() }
+        advanceLocked()
+        return joinedBacklogSeconds
     }
 
     var blockingReloadEnabled: Bool {

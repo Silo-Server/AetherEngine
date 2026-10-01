@@ -171,7 +171,7 @@ final class HLSPlaylistTrackerTests: XCTestCase {
             })
         }
         XCTAssertEqual(coverage([10, 10, 10]), 34)       // TD 10 (AE#684), 30s holdback, 4s margin
-        XCTAssertEqual(coverage([12, 13.5, 12]), 46)     // TD 14 from the longest, 42s + 4s
+        XCTAssertEqual(coverage([12, 13.5, 12]), 34)     // above the 10s ceiling: TD 10, 30s + 4s
         XCTAssertEqual(coverage([2, 2, 2]), 8)           // TD 2, 6s + a 2s GOP bounded by the segment
         XCTAssertEqual(coverage([1, 1, 1]), 4)           // below the 8s floor, which then decides
         XCTAssertEqual(coverage([]), 0)

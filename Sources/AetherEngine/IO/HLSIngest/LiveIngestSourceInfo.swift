@@ -27,10 +27,15 @@ protocol LiveIngestSourceInfo: AnyObject, Sendable {
     var closedLiveCadenceSeconds: Double? { get }
 
     /// Longest segment duration (EXTINF) the upstream has actually SERVED, nil until the first arrival.
-    /// The measured counterpart to `upstreamTargetDuration`, and the term that keeps the served
-    /// TARGETDURATION honest when a join burst makes the arrival intervals look shorter than the steady
-    /// state ever will be: an upstream cutting 4 s segments cannot sustain a 0.5 s cadence (AE#447).
+    /// The measured counterpart to `upstreamTargetDuration`. Two things are read off it: a bound on
+    /// the steady-state cadence when a join burst makes the arrival intervals look shorter than they
+    /// will ever be (an upstream cutting 4 s segments cannot sustain 0.5 s, AE#447), and the unit the
+    /// source delivers in, which the served TARGETDURATION covers whole (AE#684).
     var upstreamSegmentDurationSeconds: Double? { get }
+
+    /// Summed EXTINF of the segments this reader joined with, nil until it has joined. What the
+    /// first-serve gate measures the cut content against to know the join is spent (AE#684).
+    var joinBacklogSeconds: Double? { get }
 
     /// OBSERVED upstream segment-arrival cadence in seconds (recent max inter-arrival interval, widened by
     /// the currently-open gap), nil until the first arrival. Unlike `upstreamTargetDuration` this reflects

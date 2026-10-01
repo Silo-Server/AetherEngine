@@ -36,7 +36,7 @@ struct HLSPlaylistTracker {
 
     /// AE#678: the join has to carry the cushion the loopback's first serve will ask for, or every zap
     /// ends at the bounded start's grace. The served TARGETDURATION is floored by the longest upstream
-    /// segment, the whole of it (AE#684; `ceil(longest / 1.5)` when this was written), so the gate
+    /// segment, the whole of it up to a ceiling (AE#684; `ceil(longest / 1.5)` when this was written), so the gate
     /// wants `3 x` that. The last joined segment's final GOP also stays open downstream until the next
     /// upstream segment arrives, so one GOP of margin on top, bounded by the segment and by
     /// `openGOPMarginSeconds`. A whole segment of margin would be the strict bound, and it is one
@@ -48,7 +48,7 @@ struct HLSPlaylistTracker {
     /// of one upstream segment, which every ordinary delivery overran.
     static func loopbackCushionCoverageSeconds(segments: [HLSMediaSegment]) -> Double {
         guard let longest = segments.map(\.duration).max(), longest > 0 else { return 0 }
-        let targetDuration = LiveEdgePolicy.targetDurationForUpstreamSegment(longest)
+        let targetDuration = LiveEdgePolicy.targetDurationForIngestedSegment(longest)
         return LiveEdgePolicy.holdBackSeconds(targetDuration: targetDuration)
             + min(longest, openGOPMarginSeconds)
     }

@@ -129,8 +129,114 @@ final class Issue684IngestSealCoversUpstreamSegmentTests: XCTestCase {
         XCTAssertEqual(LiveEdgePolicy.targetDurationForUpstreamSegment(6.0000000000000009), 6)
         XCTAssertEqual(LiveEdgePolicy.targetDurationForUpstreamSegment(6.006), 7)
         XCTAssertEqual(LiveEdgePolicy.targetDurationForUpstreamSegment(.infinity),
-                       LiveEdgePolicy.maxCoveredWholeSeconds)
+                       Int(LiveEdgePolicy.upstreamSegmentSealCeilingSeconds))
         XCTAssertEqual(LiveEdgePolicy.targetDurationForUpstreamSegment(.nan), 0)
+    }
+
+    // MARK: - `.standard`, which the term reaches above 6 s
+
+    /// `.standard` re-cuts too (4 s cut target), so a provider above its `1.5 x cut target` floor is
+    /// delivered in units longer than anything the floor covers. Measured on a 10 s origin with
+    /// jittered deliveries, three 60 s runs per arm and per window depth: at TD 7 one -12888 and one
+    /// item rebuild in every run, at TD 10 (or 9 where the join pays for no more) neither.
+    func testStandardProfileSealsLongUpstreamSegmentsWhole() {
+        func seal(_ upstream: Double) -> Int {
+            LiveEdgePolicy.targetDurationSeconds(maxSegmentDuration: 4.0,
+                                                 cutTargetSeconds: standardCut,
+                                                 cadenceFloorSeconds: upstream,
+                                                 upstreamSegmentSeconds: upstream)
+        }
+        XCTAssertEqual(seal(4.0), 6, "under the floor: unchanged")
+        XCTAssertEqual(seal(6.0), 6, "at the floor: unchanged")
+        XCTAssertEqual(seal(8.0), 8, "was 6")
+        XCTAssertEqual(seal(10.0), 10, "was 7")
+        XCTAssertEqual(LiveEdgePolicy.holdBackSeconds(targetDuration: seal(10.0)), 30.0, accuracy: 1e-9)
+    }
+
+    // MARK: - The ceiling
+
+    /// A degenerate upstream: a 20 s segment taken whole would be a 60 s holdback, the whole
+    /// live-only window. Above the ceiling the term stops growing and the seal is what it was.
+    func testVeryLongUpstreamSegmentsAreNotTakenWhole() {
+        let ceiling = Int(LiveEdgePolicy.upstreamSegmentSealCeilingSeconds)
+        for upstream in [12.0, 15.0, 20.0, 28.0] {
+            let td = LiveEdgePolicy.targetDurationSeconds(maxSegmentDuration: 2.0,
+                                                          cutTargetSeconds: fastZapCut,
+                                                          cadenceFloorSeconds: upstream,
+                                                          upstreamSegmentSeconds: upstream)
+            XCTAssertEqual(td, max(ceiling, LiveEdgePolicy.targetDurationForCadence(upstream)),
+                           "upstream \(upstream)s")
+            XCTAssertLessThan(LiveEdgePolicy.holdBackSeconds(targetDuration: td),
+                              LiveWindowSizing.liveOnlyFloorSeconds, "upstream \(upstream)s")
+        }
+        XCTAssertEqual(LiveEdgePolicy.targetDurationSeconds(maxSegmentDuration: 2.0,
+                                                            cutTargetSeconds: fastZapCut,
+                                                            cadenceFloorSeconds: 20.0,
+                                                            upstreamSegmentSeconds: 20.0), 14,
+                       "a 20 s segment seals what it sealed before the term existed")
+    }
+
+    /// The term on its own never asks for more than half the live-only window of holdback.
+    func testTheTermAloneStaysWellInsideTheLiveWindow() {
+        let most = LiveEdgePolicy.targetDurationForUpstreamSegment(.greatestFiniteMagnitude)
+        XCTAssertLessThanOrEqual(LiveEdgePolicy.holdBackSeconds(targetDuration: most),
+                                 LiveWindowSizing.liveOnlyFloorSeconds / 2)
+    }
+
+    /// The owner's switch: where the ceiling sits is the whole difference between this fix on 10 s
+    /// providers and 7.24.0's answer (AE#678). Pinned so moving it is a decision and not a side effect.
+    func testCeilingIsTheOneSwitchForLongSegmentProviders() {
+        XCTAssertEqual(LiveEdgePolicy.upstreamSegmentSealCeilingSeconds, 10)
+        XCTAssertEqual(LiveEdgePolicy.targetDurationForIngestedSegment(10.0), 10)
+        XCTAssertEqual(LiveEdgePolicy.targetDurationForCadence(10.0), 7, "what 7.24.0 sealed")
+    }
+
+    /// A fractional segment costs a whole second, like every other term (AE#447 round 2).
+    func testFractionalSegmentCost() {
+        let td = LiveEdgePolicy.targetDurationSeconds(maxSegmentDuration: 2.0,
+                                                      cutTargetSeconds: fastZapCut,
+                                                      cadenceFloorSeconds: 6.006,
+                                                      upstreamSegmentSeconds: 6.006)
+        XCTAssertEqual(td, 7)
+        XCTAssertEqual(LiveEdgePolicy.holdBackSeconds(targetDuration: td), 21.0, accuracy: 1e-9)
+        let coverage = HLSPlaylistTracker.loopbackCushionCoverageSeconds(segments: (0..<8).map { _ in
+            HLSMediaSegment(uri: "s", duration: 6.006, discontinuityBefore: false)
+        })
+        XCTAssertEqual(coverage, 25.0, accuracy: 1e-9, "21 s of holdback and 4 s of open GOP: five segments")
+    }
+
+    // MARK: - As far as the join can pay
+
+    func testAnExhaustedJoinSealsWhatItsWindowCovers() {
+        // Three 6 s segments: 18 s joined, 16 s cut, one 2 s GOP open.
+        XCTAssertEqual(LiveEdgePolicy.targetDurationTheJoinCanPay(
+            full: 6, withoutUpstreamSegment: 4, finalizedSeconds: 16.0), 5)
+        // Three 10 s segments: 28 s cut.
+        XCTAssertEqual(LiveEdgePolicy.targetDurationTheJoinCanPay(
+            full: 10, withoutUpstreamSegment: 7, finalizedSeconds: 28.0), 9)
+        // A join deep enough pays in full.
+        XCTAssertEqual(LiveEdgePolicy.targetDurationTheJoinCanPay(
+            full: 6, withoutUpstreamSegment: 4, finalizedSeconds: 22.0), 6)
+        // Never under what the seal was without the term, however little was joined.
+        XCTAssertEqual(LiveEdgePolicy.targetDurationTheJoinCanPay(
+            full: 6, withoutUpstreamSegment: 4, finalizedSeconds: 10.0), 4)
+        // Total.
+        XCTAssertEqual(LiveEdgePolicy.targetDurationTheJoinCanPay(
+            full: 6, withoutUpstreamSegment: 4, finalizedSeconds: .nan), 4)
+        XCTAssertEqual(LiveEdgePolicy.targetDurationTheJoinCanPay(
+            full: 6, withoutUpstreamSegment: 4, finalizedSeconds: .infinity), 4)
+    }
+
+    func testJoinExhaustionIsTheOpenSegmentAndNothingElse() {
+        XCTAssertTrue(LiveEdgePolicy.joinIsExhausted(
+            finalizedSeconds: 16, longestCutSegmentSeconds: 2, joinBacklogSeconds: 18))
+        XCTAssertFalse(LiveEdgePolicy.joinIsExhausted(
+            finalizedSeconds: 12, longestCutSegmentSeconds: 2, joinBacklogSeconds: 18),
+            "two more GOPs of the join are still to be cut")
+        XCTAssertFalse(LiveEdgePolicy.joinIsExhausted(
+            finalizedSeconds: 0, longestCutSegmentSeconds: 0, joinBacklogSeconds: 18))
+        XCTAssertFalse(LiveEdgePolicy.joinIsExhausted(
+            finalizedSeconds: 16, longestCutSegmentSeconds: 2, joinBacklogSeconds: 0))
     }
 
     // MARK: - Where the term comes from
@@ -160,6 +266,7 @@ final class Issue684IngestSealCoversUpstreamSegmentTests: XCTestCase {
         XCTAssertEqual(coverage([6, 6, 6]), 22)     // TD 6, 18 s holdback, 4 s of open GOP
         XCTAssertEqual(coverage([6, 4, 6, 4]), 22)  // the field shape, sealed from the longest
         XCTAssertEqual(coverage([2, 2, 2]), 8)      // AE#447's shape, unchanged
+        XCTAssertEqual(coverage([20, 20, 20]), 46)  // above the ceiling: TD 14, as before the term
     }
 
     // MARK: - The seal says why
