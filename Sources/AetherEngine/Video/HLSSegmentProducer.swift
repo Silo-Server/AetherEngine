@@ -2527,6 +2527,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     private func reportLiveSegmentFinalized(index: Int, nextIndex: Int?) {
         guard let startSeconds = liveSegmentStartByIndex[index] else {
+            liveSegmentSoundByIndex.removeValue(forKey: index)
             EngineLog.emit(
                 "[HLSSegmentProducer] live finalize: no recorded start for seg-\(index); skipping append",
                 category: .session
