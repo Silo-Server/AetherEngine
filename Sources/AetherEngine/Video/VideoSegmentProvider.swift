@@ -2447,13 +2447,19 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// full one unless an ingest's join is exhausted short of it
     /// (`LiveEdgePolicy.targetDurationTheJoinCanPay`). Only the gate asks this: once it has sealed,
     /// the value is frozen, and a later build's fuller candidate is the drift line's to report.
+    ///
+    /// `joinIsSpent` has to have been read BEFORE `snap` was taken. The fact is monotone, so a
+    /// snapshot taken after it was true holds everything the join will ever cut; asked the other way
+    /// round, the cutter can append its last segment and park between the two reads, and the seal is
+    /// paid from the sum without it (4 where the window holds 5).
     func firstServeTargetDuration(
-        _ snap: (count: Int, summed: Double, maxDuration: Double)
+        _ snap: (count: Int, summed: Double, maxDuration: Double),
+        joinIsSpent: Bool?
     ) -> LiveTargetDurationDerivation {
         var derivation = currentLiveTargetDuration(maxSegmentDuration: snap.maxDuration)
         guard derivation.upstreamSegment != nil,
               snap.count >= LiveEdgePolicy.minStartupSegments,
-              liveCadencePolicy?.joinIsSpent == true
+              joinIsSpent == true
         else { return derivation }
         let backlog = liveCadencePolicy?.joinBacklogSeconds ?? 0
         let base = LiveEdgePolicy.targetDurationSeconds(
@@ -2560,8 +2566,10 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             // second request's wait is part of where the session ends up behind the producing edge,
             // which is AE#594's question and not this one's.
             if firstManifestServed, liveCadencePolicy != nil { return true }
+            // Spent first, snapshot second (see `firstServeTargetDuration`).
+            let spent = liveCadencePolicy?.joinIsSpent
             let snap = liveCushionSnapshot()
-            let target = firstServeTargetDuration(snap)
+            let target = firstServeTargetDuration(snap, joinIsSpent: spent)
             if LiveEdgePolicy.startupCushionSatisfied(segmentCount: snap.count,
                                                        summedDurationSeconds: snap.summed,
                                                        targetDuration: target.value,
@@ -2583,14 +2591,15 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             var effectiveDeadline = degradedDeadline.map { min(deadline, $0) } ?? deadline
             // AE#684: a join becomes spent when the cutter parks on an empty reader, which is no
             // event this condition hears. While that is still to come, look again shortly.
-            if liveCadencePolicy?.joinIsSpent == false {
+            if spent == false {
                 effectiveDeadline = min(effectiveDeadline, Date().addingTimeInterval(Self.joinSpentPollSeconds))
             }
             if !firstSegmentCondition.wait(until: effectiveDeadline) {
                 // Re-read after the timed-out wait: an append racing the deadline would otherwise be judged
                 // on the stale snapshot (waitForLiveSegment below already does this).
+                let afterSpent = liveCadencePolicy?.joinIsSpent
                 let after = liveCushionSnapshot()
-                let afterTarget = firstServeTargetDuration(after)
+                let afterTarget = firstServeTargetDuration(after, joinIsSpent: afterSpent)
                 if LiveEdgePolicy.startupCushionSatisfied(segmentCount: after.count,
                                                           summedDurationSeconds: after.summed,
                                                           targetDuration: afterTarget.value,

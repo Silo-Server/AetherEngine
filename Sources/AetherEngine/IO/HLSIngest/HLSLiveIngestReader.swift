@@ -106,11 +106,40 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     }
 
     var joinIsSpent: Bool {
-        let (spent, committed) = startLock.withLock { (_joinSpent, _joinBatchCommitted) }
+        let (spent, committed, companion) = startLock.withLock {
+            (_joinSpent, _joinBatchCommitted, _companionAudioReader)
+        }
         if spent { return true }
-        guard committed, fifo.isEmptyWithReaderParked else { return false }
+        guard Self.pumpJoinIsSpent(
+            main: (committed, fifo.isEmptyWithReaderParked),
+            companion: companion?.pumpJoinState
+        ) else { return false }
         startLock.withLock { _joinSpent = true }
         return true
+    }
+
+    /// One reader's half of `joinIsSpent`: whether its ingest ever started, whether its join batch
+    /// is committed, and whether it is empty with its consumer parked on it.
+    var pumpJoinState: (started: Bool, committed: Bool, parked: Bool) {
+        let (isStarted, committed) = startLock.withLock { (started, _joinBatchCommitted) }
+        return (isStarted, committed, fifo.isEmptyWithReaderParked)
+    }
+
+    /// AE#684: the fact is the PUMP's, not one reader's. With a demuxed audio rendition the cutter
+    /// merges two readers on one thread and parks on whichever runs dry first, and a rendition whose
+    /// segments end a little before the video's runs dry first every time: the video reader is then
+    /// never parked, and a fact read off it alone never becomes true (measured: the full seal over a
+    /// window that cannot hold it, 2.2 s to first picture under `.fastZap` and 10.4 s under
+    /// `.standard`, where 7.25.1 took 0.18 s). So both join batches have to be committed, and the
+    /// cutter has to be parked on EITHER empty reader: it holds a packet of the other one it cannot
+    /// place until the dry one delivers, so nothing more is cut either way. A companion that was
+    /// never started is not being read at all and does not count.
+    static func pumpJoinIsSpent(main: (committed: Bool, parked: Bool),
+                                companion: (started: Bool, committed: Bool, parked: Bool)?) -> Bool {
+        guard main.committed else { return false }
+        guard let companion, companion.started else { return main.parked }
+        guard companion.committed else { return false }
+        return main.parked || companion.parked
     }
 
     public var closedLiveCadenceSeconds: Double? {

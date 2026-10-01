@@ -39,8 +39,9 @@ protocol LiveIngestSourceInfo: AnyObject, Sendable {
     var joinBacklogSeconds: Double? { get }
 
     /// Whether the join has been handed over in full AND consumed: every byte of the join batch has
-    /// been committed to the reader, the reader is empty, and its consumer is parked waiting for the
-    /// next upstream delivery. From then on nothing more can be cut until that delivery, which is
+    /// been committed to the reader (and to its companion audio reader, where there is one), and the
+    /// consumer is parked on an empty reader, either of the two, waiting for the next upstream
+    /// delivery. From then on nothing more can be cut until that delivery, which is
     /// what the first-serve gate needs to know before it waits for a deeper cushion (AE#684).
     var joinIsSpent: Bool { get }
 

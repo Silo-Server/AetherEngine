@@ -110,7 +110,7 @@ final class Issue684JoinBoundSealTests: XCTestCase {
         let (provider, cache) = makeProvider(upstream, cutTarget: 0.5, boundedStart: false)
         defer { cache.close() }
         append(provider, count: 5, each: 2.0)
-        let derivation = provider.firstServeTargetDuration((count: 5, summed: 10.0, maxDuration: 2.0))
+        let derivation = provider.firstServeTargetDuration((count: 5, summed: 10.0, maxDuration: 2.0), joinIsSpent: upstream.joinSpent)
         XCTAssertEqual(derivation.value, 6)
         XCTAssertNil(derivation.joinBound)
     }
@@ -143,7 +143,7 @@ final class Issue684JoinBoundSealTests: XCTestCase {
         let (provider, cache) = makeProvider(upstream, cutTarget: 4.0, boundedStart: false)
         defer { cache.close() }
         append(provider, count: 4, each: 4.0)
-        let derivation = provider.firstServeTargetDuration((count: 4, summed: 16.0, maxDuration: 4.0))
+        let derivation = provider.firstServeTargetDuration((count: 4, summed: 16.0, maxDuration: 4.0), joinIsSpent: upstream.joinSpent)
         XCTAssertEqual(derivation.value, 6)
         XCTAssertNil(derivation.joinBound)
     }
@@ -181,7 +181,7 @@ final class Issue684JoinBoundSealTests: XCTestCase {
         let (provider, cache) = makeProvider(upstream, cutTarget: 0.5, boundedStart: false)
         defer { cache.close() }
         append(provider, count: 8, each: 2.0)
-        let arriving = provider.firstServeTargetDuration((count: 8, summed: 16.0, maxDuration: 2.0))
+        let arriving = provider.firstServeTargetDuration((count: 8, summed: 16.0, maxDuration: 2.0), joinIsSpent: upstream.joinSpent)
         XCTAssertEqual(arriving.value, 6)
         XCTAssertNil(arriving.joinBound)
 
