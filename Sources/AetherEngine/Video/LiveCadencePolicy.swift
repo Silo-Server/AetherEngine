@@ -53,6 +53,8 @@ final class LiveCadencePolicy: @unchecked Sendable {
     /// AE#447: the running floor, the monotonic max of the CLOSED evidence. Not "the observed cadence":
     /// the open gap the gate holds open is deliberately not in here.
     private var measuredFloorSeconds: Double
+    /// AE#684: the served-segment term of that floor, kept apart. Monotonic like the floor.
+    private var longestUpstreamSegmentSeconds: Double = 0
 
     /// - Parameters:
     ///   - observe: reader's current `observedLiveCadenceSeconds`; nil until the first upstream arrival.
@@ -96,6 +98,7 @@ final class LiveCadencePolicy: @unchecked Sendable {
         if let evidence = observeSealEvidence?() {
             if let served = evidence.servedSegmentDurationSeconds, served > 0 {
                 measuredFloorSeconds = max(measuredFloorSeconds, served)
+                longestUpstreamSegmentSeconds = max(longestUpstreamSegmentSeconds, served)
             }
             if let closed = evidence.closedCadenceSeconds, closed > 0 {
                 measuredFloorSeconds = max(measuredFloorSeconds, closed)
@@ -117,6 +120,16 @@ final class LiveCadencePolicy: @unchecked Sendable {
         case .disciplined:
             if cadence > burstThresholdSeconds { state = .bursty }
         }
+    }
+
+    /// AE#684: the longest segment the upstream has served, on its own. Inside the floor above it is
+    /// one more term of a max that is divided by the client's patience; a segment duration is the
+    /// period the upstream delivers at, not a worst case, so the seal takes it whole
+    /// (`LiveEdgePolicy.targetDurationForUpstreamSegment`). nil until the first arrival.
+    var upstreamSegmentDurationSeconds: Double? {
+        lock.lock(); defer { lock.unlock() }
+        advanceLocked()
+        return longestUpstreamSegmentSeconds > 0 ? longestUpstreamSegmentSeconds : nil
     }
 
     var blockingReloadEnabled: Bool {

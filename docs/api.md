@@ -707,8 +707,12 @@ cadence and the holdback follows it down, so the win belongs to the source GOP r
 its runway under either profile. Where the engine cuts the segments itself, each one is a whole GOP and
 the value is sealed from the first few, so it carries `ceil(1.5 x max EXTINF)` of headroom: a broadcast
 whose GOPs run 1.0 to 2.4 s sealed TARGETDURATION 1 on its first three and then broke `EXTINF <= TD`
-on every longer one (AE#670). 1 s GOPs therefore serve TARGETDURATION 2 and a 6 s holdback. Ingested
-segments are bounded by the upstream's own target duration and keep `ceil(max EXTINF)`.
+on every longer one (AE#670). 1 s GOPs therefore serve TARGETDURATION 2 and a 6 s holdback. An
+ingested HLS upstream is re-cut at its GOPs too, but it still arrives one upstream segment at a
+time, so its floor is the longest segment the upstream has served, whole (AE#684): 2 and a 6 s
+holdback on 2 s segments as before, 6 and 18 s on 6 s ones, where `ceil(6 / 1.5)` used to seal 4 and
+left the client a patience of exactly one delivery. The upstream's advertised target duration is
+still not read.
 
 **An HLS source with a window of its own now fills that cushion at the join rather than in wall clock**
 (6.77.0). The ingest used to enter a live playlist three segments behind the edge, and three joined

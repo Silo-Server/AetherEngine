@@ -275,6 +275,26 @@ enum LiveEdgePolicy {
         wholeSecondsCovering(cadenceSeconds / unchangedPlaylistPatienceMultiplier)
     }
 
+    /// AE#684: the TARGETDURATION an ingested upstream's segment duration requires, which is the whole
+    /// of it and not `targetDurationForCadence`'s two thirds.
+    ///
+    /// The division by 1.5 is right for a measured gap because the meter hands over a robust maximum.
+    /// A segment duration is the other end of the distribution: the period the upstream delivers at
+    /// when nothing at all is late, since it cannot publish a segment before it has finished one. Every
+    /// real delivery is that period plus the upstream's jitter plus this reader's own reload interval
+    /// (half a segment, the RFC's), so a patience of exactly one period is under all of them. It only
+    /// looked covered while the served segments were the upstream's own, where `ceil(max EXTINF)` puts
+    /// the whole segment into the value anyway. `.fastZap` re-cuts each upstream segment at its GOPs,
+    /// that term then reads the GOP, and a 6 s upstream sealed at `ceil(6 / 1.5)` = 4: a 6.0 s patience
+    /// for deliveries measured in the field at 6.17 to 6.83 s, -12888 on the first one that also missed
+    /// a poll, a skipped reload after it and a stall with the content already listed.
+    ///
+    /// Re-cutting changes how finely the window is listed, not how often it changes, so the playlist
+    /// promises what a playlist of the upstream's segments would: at least their longest duration.
+    static func targetDurationForUpstreamSegment(_ segmentSeconds: Double) -> Int {
+        wholeSecondsCovering(segmentSeconds)
+    }
+
     /// A duration as the playlist actually serves it: `#EXTINF` is written with `%.3f`, so a millisecond
     /// is the finest distinction any client can ever read, and nothing below it may decide anything.
     ///
@@ -338,24 +358,28 @@ enum LiveEdgePolicy {
     }
 
     /// Served `#EXT-X-TARGETDURATION`, in whole seconds: `>= ceil(max EXTINF)` (HLS requirement), floored
-    /// by `ceil(1.5 x cut target)` (widens AVPlayer's unchanged-playlist patience, anti -12888) and by
-    /// what the observed cadence needs to stay inside that patience. `cutTargetSeconds` /
-    /// `cadenceFloorSeconds` are nil for VOD/EVENT. Every term is taken at the resolution the playlist
-    /// serves (`servedSeconds`), so the value covers the EXTINFs the client is actually handed and no
-    /// sub-millisecond noise can buy a whole second of holdback.
+    /// by `ceil(1.5 x cut target)` (widens AVPlayer's unchanged-playlist patience, anti -12888), by
+    /// what the observed cadence needs to stay inside that patience, and by the longest segment an
+    /// ingested upstream delivers in (`targetDurationForUpstreamSegment`, AE#684). `cutTargetSeconds` /
+    /// `cadenceFloorSeconds` are nil for VOD/EVENT, `upstreamSegmentSeconds` for everything but an
+    /// ingest. Every term is taken at the resolution the playlist serves (`servedSeconds`), so the
+    /// value covers the EXTINFs the client is actually handed and no sub-millisecond noise can buy a
+    /// whole second of holdback.
     ///
     /// AE#670: `segmentsAreCutHere` adds `ceil(1.5 x max EXTINF)` where that headroom has no other source
     /// (`gopHeadroomApplies`).
     static func targetDurationSeconds(maxSegmentDuration: Double,
                                       cutTargetSeconds: Double?,
                                       cadenceFloorSeconds: Double?,
-                                      segmentsAreCutHere: Bool = false) -> Int {
+                                      segmentsAreCutHere: Bool = false,
+                                      upstreamSegmentSeconds: Double? = nil) -> Int {
         var td = wholeSecondsCovering(max(1.0, maxSegmentDuration))
         if let cut = cutTargetSeconds { td = max(td, wholeSecondsCovering(cut * 1.5)) }
         if gopHeadroomApplies(cutTargetSeconds: cutTargetSeconds, segmentsAreCutHere: segmentsAreCutHere) {
             td = max(td, wholeSecondsCovering(maxSegmentDuration * 1.5))
         }
         if let floor = cadenceFloorSeconds { td = max(td, targetDurationForCadence(floor)) }
+        if let upstream = upstreamSegmentSeconds { td = max(td, targetDurationForUpstreamSegment(upstream)) }
         return td
     }
 
@@ -365,9 +389,10 @@ enum LiveEdgePolicy {
     /// every segment it cuts is one whole source GOP, and the value is sealed from the first few of them.
     /// A broadcast's GOPs are not regular (reported: 1.0 to 2.4 s, sealed on three 1.000 s ones), and a
     /// later longer one then breaks `EXTINF <= TD` and holds the playlist unchanged past AVPlayer's
-    /// patience. `.standard` has that headroom already in its `1.5 x cut target` floor, and ingested
-    /// segments are bounded by the upstream's own target duration (AE#447 keeps TD 2 on those), so only
-    /// the engine's own sub-second cut needs it from the segments.
+    /// patience. `.standard` has that headroom already in its `1.5 x cut target` floor, and an ingest
+    /// is bounded by the upstream segment its GOPs were cut from (`targetDurationForUpstreamSegment`;
+    /// AE#447 keeps TD 2 on 2.000 s ones), so only the engine's own sub-second cut needs it from the
+    /// segments.
     static func gopHeadroomApplies(cutTargetSeconds: Double?, segmentsAreCutHere: Bool) -> Bool {
         guard segmentsAreCutHere, let cut = cutTargetSeconds else { return false }
         return cut < 1.0
@@ -546,6 +571,8 @@ struct LiveTargetDurationDerivation {
     let cutTargetFloor: Double?
     var gopHeadroomApplies = false
     let cadenceFloor: CadenceFloorTerm
+    /// AE#684: the longest segment an ingested upstream has served, nil off the ingest path.
+    var upstreamSegment: Double? = nil
     let selfReported: Double?
 
     /// One line, in the order the terms are maxed. Reads as an argument for the number it reports.
@@ -559,6 +586,10 @@ struct LiveTargetDurationDerivation {
                 + "(each segment is one whole GOP)")
         }
         terms.append(cadenceFloor.account)
+        if let upstreamSegment {
+            terms.append("upstream segment \(LiveEdgePolicy.seconds(upstreamSegment))s "
+                + "(one delivery, however finely it is cut here)")
+        }
         let claim = selfReported.map {
             "; upstream advertises \(LiveEdgePolicy.seconds($0))s (reported, not used)"
         } ?? ""
@@ -2311,18 +2342,21 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             policy.targetDurationFloorSeconds.map { CadenceFloorTerm.measured($0) } ?? .pending
         } ?? .unmeasurable
         let cutHere = liveCadencePolicy == nil
+        let upstreamSegment = liveCadencePolicy?.upstreamSegmentDurationSeconds
         return LiveTargetDurationDerivation(
             value: LiveEdgePolicy.targetDurationSeconds(
                 maxSegmentDuration: maxSegmentDuration,
                 cutTargetSeconds: cutTarget,
                 cadenceFloorSeconds: floor.seconds,
-                segmentsAreCutHere: cutHere
+                segmentsAreCutHere: cutHere,
+                upstreamSegmentSeconds: upstreamSegment
             ),
             maxSegmentDuration: maxSegmentDuration,
             cutTargetFloor: cutTarget,
             gopHeadroomApplies: LiveEdgePolicy.gopHeadroomApplies(cutTargetSeconds: cutTarget,
                                                                   segmentsAreCutHere: cutHere),
             cadenceFloor: floor,
+            upstreamSegment: upstreamSegment,
             selfReported: liveCadencePolicy?.selfReportedTargetDurationSeconds
         )
     }
