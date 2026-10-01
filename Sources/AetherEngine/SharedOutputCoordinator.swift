@@ -11,10 +11,13 @@ import Foundation
 final class SharedOutputCoordinator {
     static let shared = SharedOutputCoordinator()
 
-    struct Member: Equatable {
+    struct Member {
         var role: SharedOutputRole
         var tag: String?
         var sourceChannels: Int?
+        /// Weak, so an engine released without a final `stop()` does not stay a member forever.
+        weak var owner: AnyObject?
+        let tracksOwner: Bool
     }
 
     enum LeaveOutcome: Equatable, Sendable {
@@ -34,13 +37,30 @@ final class SharedOutputCoordinator {
 
     init() {}
 
-    var isEmpty: Bool { members.isEmpty }
+    var isEmpty: Bool {
+        pruneReleasedOwners()
+        return members.isEmpty
+    }
 
-    var preferredSourceChannels: Int? { members.values.compactMap(\.sourceChannels).max() }
+    var preferredSourceChannels: Int? {
+        pruneReleasedOwners()
+        return members.values.compactMap(\.sourceChannels).max()
+    }
 
-    func join(_ id: ObjectIdentifier, role: SharedOutputRole, tag: String?) {
+    /// Drops members whose engine was deallocated without a `stop()`. Leaves the deferred resets and
+    /// the owed release alone: the next `leave` or read decides.
+    private func pruneReleasedOwners() {
+        let gone = members.filter { $0.value.tracksOwner && $0.value.owner == nil }
+        for (id, member) in gone {
+            members[id] = nil
+            deferredCriteriaResets[id] = nil
+            EngineLog.emit("[SharedOutput] \(member.tag ?? "engine-\(UInt(bitPattern: id.hashValue) % 10_000)") was released without stop(), dropped", category: .engine)
+        }
+    }
+
+    func join(_ id: ObjectIdentifier, role: SharedOutputRole, tag: String?, owner: AnyObject? = nil) {
         let channels = members[id]?.sourceChannels
-        members[id] = Member(role: role, tag: tag, sourceChannels: channels)
+        members[id] = Member(role: role, tag: tag, sourceChannels: channels, owner: owner, tracksOwner: owner != nil)
         deferredCriteriaResets[id] = nil
     }
 
@@ -50,6 +70,7 @@ final class SharedOutputCoordinator {
     }
 
     func leave(_ id: ObjectIdentifier, releasesSession: Bool) -> LeaveOutcome {
+        pruneReleasedOwners()
         guard members.removeValue(forKey: id) != nil else { return .notMember }
         if releasesSession { releaseOwed = true }
         guard members.isEmpty else { return .othersRemain(members.count) }
@@ -62,7 +83,8 @@ final class SharedOutputCoordinator {
     }
 
     func othersActive(besides id: ObjectIdentifier) -> Bool {
-        members.keys.contains { $0 != id }
+        pruneReleasedOwners()
+        return members.keys.contains { $0 != id }
     }
 
     /// Defers a criteria reset to run when the last engine leaves, unless nobody else is playing now.

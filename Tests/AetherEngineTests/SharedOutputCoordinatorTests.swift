@@ -164,4 +164,24 @@ struct SharedOutputCoordinatorTests {
     nonisolated static func isRelease(_ o: SharedOutputCoordinator.LeaveOutcome) -> Bool {
         o == .lastOut(releaseSession: true)
     }
+
+    @Test("an engine released without stop() no longer holds the session for everyone else")
+    func releasedOwnerIsPruned() {
+        let c = SharedOutputCoordinator()
+        var dropped: Token? = Token()
+        let droppedID = ObjectIdentifier(dropped!)
+        c.join(droppedID, role: .secondary, tag: "tile2", owner: dropped)
+        c.join(a, role: .primary, tag: nil, owner: tokenA)
+        dropped = nil
+        #expect(!c.othersActive(besides: a))
+        #expect(c.leave(a, releasesSession: true) == .lastOut(releaseSession: true))
+    }
+
+    @Test("a member joined without an owner is never pruned")
+    func ownerlessMemberStays() {
+        let c = SharedOutputCoordinator()
+        c.join(a, role: .primary, tag: nil)
+        c.join(b, role: .secondary, tag: "tile2")
+        #expect(c.leave(a, releasesSession: true) == .othersRemain(1))
+    }
 }

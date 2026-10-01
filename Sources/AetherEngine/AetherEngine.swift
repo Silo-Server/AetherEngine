@@ -3806,7 +3806,7 @@ public final class AetherEngine: ObservableObject {
         var source = source
         var options = options
         options = Self.applyingSharedOutputRole(options)
-        SharedOutputCoordinator.shared.join(ObjectIdentifier(self), role: options.sharedOutputRole, tag: logTag)
+        SharedOutputCoordinator.shared.join(ObjectIdentifier(self), role: options.sharedOutputRole, tag: logTag, owner: self)
         // #436: a speed the host set belongs to the item it was set on. The rebuilds a session makes
         // on its own (reload at position, audio-track switch, AirPlay LAN swap, background return)
         // reopen the same source and keep it; a different item starts at 1.0, so a host whose speed
@@ -7155,8 +7155,9 @@ public final class AetherEngine: ObservableObject {
         // #215: release the shared AVAudioSession once every render path above is quiesced. Scheduled
         // last so the item is unloaded, the AVPlayer released and the software/audio outputs stopped
         // before the session goes away, and scheduled rather than called because the release itself can
-        // block for ~0.5 s on a MAT passthrough route. Opt-in twice over: the caller must declare an
-        // actual final teardown, AND the host must have set deactivatesAudioSessionOnStop.
+        // block for ~0.5 s on a MAT passthrough route. The caller must declare an actual final teardown;
+        // the host opt-in (deactivatesAudioSessionOnStop) goes to SharedOutputCoordinator.leave, and the
+        // release belongs to the last engine out.
         if finalTeardown && !keepNativeHost {
             let coordinator = SharedOutputCoordinator.shared
             let label = coordinator.label(for: ObjectIdentifier(self))

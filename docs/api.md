@@ -885,7 +885,7 @@ say so on the tracker rather than working around it.
 | `audioNowPlayingSession`, `setAudioNowPlayingInfo(_:)` | The same pair for the audio-only path, which owns its session unconditionally (there is no AVKit fork there). Pass an empty dictionary to clear. |
 | `setExternalMetadata(_:)` | AVKit's on-screen info pane on the video path. Safe before `load()`; replayed at host creation. |
 | `deactivatesAudioSessionOnStop` | Off by default. The engine declares the audio-session category at init and never activates it on the native path, because AVKit activates per playback and that is what lets tvOS negotiate the HDMI route (#24), so it never deactivates it either. Set true only when the app owns the session outright; the engine then releases it on a genuine final teardown, meaning `stop()` and never a reload, handoff or live retune. With several engines in one process the release belongs to the last one out: a stop while another engine is still active keeps the session and logs `[SharedOutput] ... still active, session kept`. |
-| `logTag` | A short name for this instance (`tile2`), carried by the `[SharedOutput]` lines and a `[AetherEngine:<tag>] state=` line per transition. Set it on every engine of a host that runs several at once. |
+| `logTag` | A short name for this instance (`tile2`), carried by the `[SharedOutput]` lines and a `[AetherEngine:<tag>] state=` line per transition. Set it before `load()` (the tag is captured when the engine joins), on every engine of a host that runs several at once. |
 
 ## Stills and thumbnails
 
