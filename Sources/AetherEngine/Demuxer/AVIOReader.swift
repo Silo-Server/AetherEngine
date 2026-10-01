@@ -4138,7 +4138,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
         let size = state.resolvedSize
         state.cond.unlock()
-        if size <= 0 {
+        if size <= 0, !isClosed {
             EngineLog.emit("[AVIOReader] no probe resolved a size, streaming mode (forward-only)", category: .demux)
         }
         return size > 0 ? size : -1

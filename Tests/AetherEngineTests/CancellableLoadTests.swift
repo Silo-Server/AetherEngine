@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import Testing
 @testable import AetherEngine
@@ -236,5 +237,148 @@ struct CancellableLoadTests {
         #expect(!reader.entered)
         #expect(engine.loadGeneration == generation)
         #expect(engine.loadedURL != nil)
+    }
+    @Test("A plain cancel publishes no error on its way to idle")
+    func cancelPublishesNoError() async throws {
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        var states: [PlaybackState] = []
+        let sub = engine.$state.sink { states.append($0) }
+        defer { sub.cancel() }
+        let reader = ParkedReader()
+        let (task, box) = Self.start(engine, .custom(reader, formatHint: "mpegts"))
+        try await waitFor { reader.entered }
+        task.cancel()
+        await task.value
+
+        #expect(box.outcome == .cancelled)
+        #expect(!states.contains { if case .error = $0 { return true } else { return false } }, "\(states)")
+        #expect(states.last == .idle)
+        #expect(engine.errorInfo == nil)
+    }
+
+    @Test("Cancel-then-load keeps the native player the way a newer load would (#15)")
+    func cancelKeepsTheNativePlayer() async throws {
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        _ = try await engine.load(source: .custom(DataIOReader(data: try Self.fixture()), formatHint: "mp4"))
+        let host = try #require(engine.nativeHost)
+        let player = try #require(engine.currentAVPlayer)
+
+        let reader = ParkedReader()
+        let (task, box) = Self.start(engine, .custom(reader, formatHint: "mpegts"))
+        try await waitFor { reader.entered }
+        task.cancel()
+        await task.value
+        #expect(box.outcome == .cancelled)
+        #expect(engine.nativeHost === host)
+        #expect(engine.currentAVPlayer === player)
+
+        _ = try await engine.load(source: .custom(DataIOReader(data: try Self.fixture()), formatHint: "mp4"))
+        #expect(engine.nativeHost === host)
+        #expect(engine.currentAVPlayer === player)
+    }
+
+    @Test("Cancelling a load that follows an engine rebuild ends the rebuild's load and throws (AE#629)")
+    func cancelledFollowerEndsTheRebuild() async throws {
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        let hostReader = ParkedReader()
+        let (hostLoad, hostBox) = Self.start(engine, .custom(hostReader, formatHint: "mpegts"))
+        try await waitFor { hostReader.entered }
+        let generation = engine.loadGeneration
+
+        // The escalation's rebuild: armed for the live generation, claimed by its own load's teardown.
+        let rebuildReader = ParkedReader()
+        let rebuild = Task { @MainActor in
+            _ = try await engine.load(source: .custom(rebuildReader, formatHint: "mpegts"))
+        }
+        engine.softwarePathRebuild = rebuild
+        engine.softwarePathTakeoverArm = generation
+        try await waitFor { rebuildReader.entered }
+        #expect(engine.softwarePathTakeover?.supersededGeneration == generation)
+        #expect(hostBox.outcome == nil)
+
+        let elapsed = try await Self.cancelAndTime(hostLoad, hostBox)
+        #expect(hostBox.outcome == .cancelled, "ended \(String(describing: hostBox.outcome)) after \(elapsed)")
+        #expect(rebuildReader.wasReleasedByEngine)
+        await #expect(throws: CancellationError.self) { try await rebuild.value }
+        #expect(engine.state == .idle)
+        #expect(engine.errorInfo == nil)
+    }
+    @Test("A reroute's startup continuation does not outlive a load that was cancelled before it began (#361)")
+    func cancelledRerouteWithdrawsItsContinuation() async throws {
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        let before = engine.startupGeneration
+        let task = Task { @MainActor in
+            withUnsafeCurrentTask { $0?.cancel() }
+            engine.continueStartupAcrossReroute()
+            _ = try await engine.load(source: .custom(ParkedReader(fallback: 2), formatHint: "mpegts"))
+        }
+        await #expect(throws: CancellationError.self) { try await task.value }
+
+        _ = try await engine.load(source: .custom(DataIOReader(data: try Self.fixture()), formatHint: "mp4"))
+        #expect(engine.startupGeneration == before &+ 1)
+    }
+    /// A reader whose `cancel()` only unblocks the read in flight (the IOReader contract) and whose
+    /// `close()` ends it, so a rebuild can park on it again after the probe that preceded it was aborted.
+    final class RetainedReader: IOReader, @unchecked Sendable {
+        private let condition = NSCondition()
+        private var cancels = 0
+        private var arrivals = 0
+        private var closed = false
+
+        var arrivalCount: Int { condition.withLock { arrivals } }
+        var isClosed: Bool { condition.withLock { closed } }
+
+        func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32 {
+            condition.lock()
+            defer { condition.unlock() }
+            let epoch = cancels
+            arrivals += 1
+            let deadline = Date().addingTimeInterval(10)
+            while !closed, cancels == epoch, condition.wait(until: deadline) {}
+            return -1
+        }
+        func seek(offset: Int64, whence: Int32) -> Int64 { -1 }
+        func close() { condition.withLock { closed = true; condition.broadcast() } }
+        func cancel() { condition.withLock { cancels += 1; condition.broadcast() } }
+        func makeIndependentReader() -> IOReader? { nil }
+        var discImageProbeEnabled: Bool { false }
+    }
+
+    /// The custom-source rebuild runs `reloadWithAudioOverride` on the retained reader with its probe
+    /// detached, which cancelling the rebuild's Task does not reach. Modelled here by that shape.
+    @Test("Cancelling a follower ends a retained-reader rebuild that Task cancellation cannot reach (AE#629)")
+    func cancelledFollowerEndsARetainedReaderRebuild() async throws {
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        let reader = RetainedReader()
+        let (hostLoad, hostBox) = Self.start(engine, .custom(reader, formatHint: "mpegts"))
+        try await waitFor { reader.arrivalCount > 0 }
+        let generation = engine.loadGeneration
+
+        let rebuild = Task { @MainActor in
+            engine.claimSoftwarePathTakeover()
+            engine.stopInternal(resetDisplayCriteria: false, keepCustomReader: true)
+            let gen = engine.loadGeneration
+            await Task.detached {
+                var byte: UInt8 = 0
+                _ = reader.read(&byte, size: 1)
+            }.value
+            try engine.checkLoadCurrent(gen)
+        }
+        engine.softwarePathRebuild = rebuild
+        engine.softwarePathTakeoverArm = generation
+        try await waitFor { engine.softwarePathTakeover != nil && reader.arrivalCount > 1 }
+
+        let elapsed = try await Self.cancelAndTime(hostLoad, hostBox)
+        #expect(hostBox.outcome == .cancelled, "ended \(String(describing: hostBox.outcome)) after \(elapsed)")
+        #expect(elapsed < .milliseconds(1500))
+        #expect(reader.isClosed)
+        await #expect(throws: CancellationError.self) { try await rebuild.value }
+        await hostLoad.value
+        #expect(engine.state == .idle)
     }
 }

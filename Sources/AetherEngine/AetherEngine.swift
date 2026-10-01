@@ -3767,7 +3767,11 @@ public final class AetherEngine: ObservableObject {
         discTitleID: Int? = nil
     ) async throws -> SourceProbe? {
         // Sodalite#173: a task cancelled before the load began has nothing to end; the running session stays.
-        try Task.checkCancellation()
+        // A reroute's #361 continuation armed for this load is withdrawn with it.
+        if Task.isCancelled {
+            abandonStartupContinuation()
+            throw CancellationError()
+        }
         let attempt = LoadAttempt()
         defer { if let gen = attempt.generation { waitingLoadGenerations.remove(gen) } }
         do {
@@ -3794,11 +3798,21 @@ public final class AetherEngine: ObservableObject {
             EngineLog.emit(
                 "[AetherEngine] #629 load (gen \(generation)) follows the engine's own rebuild "
                 + "instead of unwinding", category: .engine)
-            // Sodalite#173: cancelling the follower cancels the rebuild it follows, whose own load then ends.
-            try await withTaskCancellationHandler {
-                try await takeover.rebuild.value
-            } onCancel: {
-                takeover.rebuild.cancel()
+            // Sodalite#173: a cancelled follower ends the rebuild's generation, not the rebuild's Task, so
+            // the rebuild unwinds at its own checkpoints on either branch (load() or the retained reader).
+            do {
+                try await withTaskCancellationHandler {
+                    try await takeover.rebuild.value
+                } onCancel: {
+                    Task { @MainActor [weak self] in self?.abandonFollowedRebuild(takeover, follower: attempt) }
+                }
+            } catch {
+                if Task.isCancelled { throw CancellationError() }
+                throw error
+            }
+            if Task.isCancelled {
+                abandonFollowedRebuild(takeover, follower: attempt)
+                throw CancellationError()
             }
             return attempt.probe
         } catch {
@@ -3816,19 +3830,45 @@ public final class AetherEngine: ObservableObject {
         var probe: SourceProbe?
     }
 
-    /// Sodalite#173: the caller cancelled the task awaiting this load. Ends it the way a `stop()` would, so
-    /// every blocking open is aborted and the load's next checkpoint throws, but only while this load is
-    /// still the one in flight: a newer load, or a session this one already returned, is not its to end.
-    /// The panel mode is left for the next load, as a load that fails leaves it.
+    /// Sodalite#173: the caller cancelled the task awaiting this load. Ends it only while it is still the
+    /// load in flight: a newer load, or a session this one already returned, is not its to end.
     @discardableResult
     func abandonCancelledLoad(_ attempt: LoadAttempt) -> Bool {
         guard let gen = attempt.generation, loadGeneration == gen,
               waitingLoadGenerations.contains(gen) else { return false }
-        EngineLog.emit(
-            "[AetherEngine] Sodalite#173: load (gen \(gen)) cancelled by its caller; tearing it down",
-            category: .engine)
-        stop(resetDisplayCriteria: false, finalTeardown: false)
+        endCancelledGeneration(gen)
         return true
+    }
+
+    /// Sodalite#173: the same for a load following an AE#629 rebuild, whose generation is the one the
+    /// rebuild's teardown opened. Only while the follower still waits and nothing newer took over.
+    func abandonFollowedRebuild(_ takeover: SoftwarePathEscalation.Takeover, follower: LoadAttempt) {
+        guard let followed = follower.generation, waitingLoadGenerations.contains(followed),
+              loadGeneration == takeover.rebuildGeneration else { return }
+        endCancelledGeneration(takeover.rebuildGeneration)
+    }
+
+    /// Leaves the engine the way the next `load()`'s teardown would: the generation moves on, every
+    /// blocking open is aborted and the custom reader closed, while the native host (#15) and an AE#158
+    /// handover item are kept for that load and the panel keeps its mode. `state` reads `.idle`; a host
+    /// that is leaving playback calls `stop()` to release the rest.
+    private func endCancelledGeneration(_ gen: UInt64) {
+        EngineLog.emit(
+            "[AetherEngine] Sodalite#173: load (gen \(gen)) cancelled by its caller; ending it",
+            category: .engine)
+        let keepNativeHost = Self.shouldPreserveNativeHostAcrossLoad(
+            backend: playbackBackend, nativeHostSurvives: nativeHost != nil,
+            mediaServicesWereReset: mediaServicesResetPending)
+        stopInternal(resetDisplayCriteria: false, keepNativeHost: keepNativeHost,
+                     keepCurrentItem: keepNativeHost && pendingInPlaceItemHandover)
+        pendingInPlaceItemHandover = false
+        state = .idle
+        startupProgress = nil
+        clock.currentTime = 0
+        clock.bufferedPosition = 0
+        clock.progress = 0
+        loadedURL = nil
+        isCustomSource = false
     }
 
     private func loadSession(
