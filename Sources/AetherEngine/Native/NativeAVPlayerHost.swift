@@ -2706,7 +2706,10 @@ final class NativeAVPlayerHost {
         }.joined(separator: ", ")
         EngineLog.emit(
             "[NativeAVPlayerHost] #\(sid) audioRoute output=\(out) preferred=\(pref) max=\(maxCh) "
-            + "ports=[\(outputDescs)] (\(phase))",
+            + "ports=[\(outputDescs)] "
+            // AE#684: what the route says it delays sound by, per item, beside the item's start.
+            + "latency=\(String(format: "%.0f", session.outputLatency * 1000))ms "
+            + "io=\(String(format: "%.1f", session.ioBufferDuration * 1000))ms (\(phase))",
             category: .engine
         )
         #endif

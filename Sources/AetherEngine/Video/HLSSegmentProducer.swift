@@ -208,6 +208,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     /// Fires synchronously on the pump thread per finalized live segment (index, duration, startSeconds, discontinuous).
     var onLiveSegmentFinalized: (@Sendable (Int, Double, Double, Bool) -> Void)?
+    /// AE#684: the sound a finalized live segment carries (index, first and last audio packet on the
+    /// output axis, seconds). Fired just before `onLiveSegmentFinalized` for the same index.
+    var onLiveSegmentSound: (@Sendable (Int, Double, Double) -> Void)?
+    /// Keyed by segment index; a nil value is a segment cut with no audio packet in it.
+    private var liveSegmentSoundByIndex: [Int: (first: Double, last: Double)?] = [:]
 
     /// AE#443: the resident segment count the live runaway park may use, from the session that owns the
     /// window (`VideoSegmentProvider.liveResidentParkCap`). Unset leaves the static floor, which is the
@@ -2369,6 +2374,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
             // credit this pump with the previous epoch's production.
             pumpEpochHighestStored = max(pumpEpochHighestStored, currentMuxerSegmentIndex)
             if isLive {
+                let tb = muxer.muxerAudioTimeBase
+                let tick = tb.den > 0 ? Double(tb.num) / Double(tb.den) : 0
+                liveSegmentSoundByIndex.updateValue(
+                    muxer.takeSegmentSoundSpan().map { (Double($0.first) * tick, Double($0.last) * tick) },
+                    forKey: currentMuxerSegmentIndex)
                 reportLiveSegmentFinalized(index: currentMuxerSegmentIndex,
                                            nextIndex: newIdx)
             } else if onSequentialSegmentFinalized != nil {
@@ -2531,15 +2541,18 @@ final class HLSSegmentProducer: @unchecked Sendable {
             duration = targetSegmentDurationSeconds
         }
         let discontinuous = liveSegmentDiscontinuousByIndex[index] ?? false
+        let sound = liveSegmentSoundByIndex.removeValue(forKey: index)
         liveSegmentStartByIndex.removeValue(forKey: index)
         liveSegmentDiscontinuousByIndex.removeValue(forKey: index)
         stampLiveSegmentFinalize()
         EngineLog.emit(
             "[HLSSegmentProducer] live seg-\(index) finalized: start=\(String(format: "%.3f", startSeconds))s "
             + "dur=\(String(format: "%.3f", duration))s"
+            + (sound.map { $0.map { String(format: " sound=%.3f..%.3fs", $0.first, $0.last) } ?? " sound=none" } ?? "")
             + (discontinuous ? " [DISCONTINUITY]" : ""),
             category: .session
         )
+        if let span = sound ?? nil { onLiveSegmentSound?(index, span.first, span.last) }
         onLiveSegmentFinalized?(index, duration, startSeconds, discontinuous)
     }
 

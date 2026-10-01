@@ -2713,6 +2713,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
                                         durationSeconds: durationSeconds,
                                         discontinuous: discontinuous)
             }
+            prod.onLiveSegmentSound = { [weak prov] index, first, last in
+                prov?.noteLiveSegmentSound(index: index, firstSeconds: first, lastSeconds: last)
+            }
             // AE#443: the runaway park has to sit above the window this session actually serves, or it
             // bounds the window instead of backstopping it, and its enforcement (a sleeping read
             // thread) stops the origin from being drained.
@@ -3837,6 +3840,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     /// AE#454: the placement is spent once the item that asked for it is running.
     func clearLiveRejoinStart() { provider?.clearLiveRejoinStart() }
+
+    /// See `VideoSegmentProvider.liveSegmentHeads(atOutputSeconds:)`.
+    func liveSegmentHeads(atOutputSeconds seconds: Double)
+        -> (index: Int, secondsIntoSegment: Double, pictureStart: Double, sound: (first: Double, last: Double)?)? {
+        provider?.liveSegmentHeads(atOutputSeconds: seconds)
+    }
 
     /// See `VideoSegmentProvider.servedLiveRejoinPlacement`.
     var servedLiveRejoinPlacement: (timeOffset: Double, playlistStartOutputSeconds: Double)? {

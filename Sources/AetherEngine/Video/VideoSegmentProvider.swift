@@ -920,6 +920,29 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         self.segmentServedHandler = segmentServedHandler
     }
 
+    /// AE#684: where a live segment's sound begins and ends on the output axis, by segment index.
+    /// Diagnostic only: it lets an item start say what it started its audio from. Bounded, oldest out.
+    private var _liveSegmentSound: [Int: (first: Double, last: Double)] = [:]
+    static let liveSegmentSoundRetained = 1024
+
+    func noteLiveSegmentSound(index: Int, firstSeconds: Double, lastSeconds: Double) {
+        stateLock.lock()
+        _liveSegmentSound[index] = (firstSeconds, lastSeconds)
+        _liveSegmentSound.removeValue(forKey: index - Self.liveSegmentSoundRetained)
+        stateLock.unlock()
+    }
+
+    /// AE#684: the segment an output-axis position falls in, with its picture's start and its
+    /// sound's span. nil for a position no listed segment covers.
+    func liveSegmentHeads(atOutputSeconds seconds: Double)
+        -> (index: Int, secondsIntoSegment: Double, pictureStart: Double, sound: (first: Double, last: Double)?)? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard let idx = Self.thumbnailSegmentIndex(atSeconds: seconds, segments: segments) else { return nil }
+        return (idx, Swift.max(0, seconds - segments[idx].startSeconds), segments[idx].startSeconds,
+                _liveSegmentSound[idx])
+    }
+
     /// Append a finalized live segment. Index must equal segments.count; out-of-order ignored.
     func appendLiveSegment(index: Int, startSeconds: Double, durationSeconds: Double,
                            discontinuous: Bool = false) {

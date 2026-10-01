@@ -220,6 +220,7 @@ extension AetherEngine {
                 // it can play, nothing it reports is a reading of where the session is; see
                 // `liveItemPlacementPending`.
                 if ready {
+                    self.noteLiveItemStart()
                     // The placement is spent here, on every path rather than only on the one that
                     // replays the stashed seek: a pre-ready seek can be superseded by a host scrub
                     // (latest-wins), and an arm left standing would be inherited by whatever item the

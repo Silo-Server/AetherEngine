@@ -243,6 +243,20 @@ final class MP4SegmentMuxer {
     /// Output-TB DTS of the first video packet since the last flush; Int64.min = no window open yet.
     private var fragmentWindowFirstVideoDts: Int64 = Int64.min
 
+    /// AE#684: the sound handed to the segment being cut, first and last packet, in
+    /// `muxerAudioTimeBase`. A segment opens on a video keyframe and carries whatever audio the
+    /// source interleaved up to there, so where its sound begins against its picture is a property
+    /// of the source's mux, and it is what an item placed in that segment starts its audio from.
+    private var segmentSoundFirstPts: Int64 = Int64.min
+    private var segmentSoundLastPts: Int64 = Int64.min
+
+    /// The span since the last call, nil when the segment carried no audio packet. Consumes it.
+    func takeSegmentSoundSpan() -> (first: Int64, last: Int64)? {
+        defer { segmentSoundFirstPts = Int64.min; segmentSoundLastPts = Int64.min }
+        guard segmentSoundFirstPts != Int64.min else { return nil }
+        return (segmentSoundFirstPts, segmentSoundLastPts)
+    }
+
     let videoOutputStreamIndex: Int32 = 0
     let audioOutputStreamIndex: Int32 = 1
 
@@ -694,6 +708,10 @@ final class MP4SegmentMuxer {
         // must keep the exact stock code path, no extra early fragment flush, so nothing perturbs its audio.
         if streamIndex == audioOutputStreamIndex {
             audioPacketWritten = true
+            if rc >= 0, clean.pts != Int64.min {
+                if segmentSoundFirstPts == Int64.min { segmentSoundFirstPts = clean.pts }
+                segmentSoundLastPts = clean.pts
+            }
             if audioNeedsParsedPacketForMoov, !moovFlushed, fragmentWindowFirstVideoDts != Int64.min {
                 flushPendingFragment()
             }
