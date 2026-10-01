@@ -400,6 +400,17 @@ $ otool -L PlayerEngineKit.framework/PlayerEngineKit | grep -i libavcodec
 
 And the engine says it itself: the `[FFmpeg] libavcodec …` line at `init` reports the versions that actually answered, not the ones it was built against, so a wrong binding shows up in the log before it shows up as a defect.
 
+### Running several engines at once
+
+Each `AetherEngine` has its own loopback server, caches and lifecycle, so two or more can play side by side (a multiview grid). What they share is the process: the audio session, its channel preference and the panel's display criteria. The engine keeps one book of who is still playing (`SharedOutputCoordinator`, internal) and acts on it:
+
+- The audio session is released only by the last engine to stop, and only if some engine in that round had `deactivatesAudioSessionOnStop`.
+- The preferred output channel count is the widest source among the playing engines, so a muted stereo tile cannot downmix a 5.1 one.
+- A display-criteria reset waits until the last engine stops; an engine that loads again in the meantime cancels its own pending reset.
+- Stop every engine before you let go of it. An engine released without `stop()` is noticed and dropped the next time another engine asks, but until then it counts as playing.
+
+Load one engine as `.primary` and the others with `LoadOptions(sharedOutputRole: .secondary)`, set `logTag` (set before `load()`) on each, and control what is audible with `volume`. Every engine keeps decoding its audio, so switching the audible one is a volume change and not a reload.
+
 
 ## Constructing and binding
 
