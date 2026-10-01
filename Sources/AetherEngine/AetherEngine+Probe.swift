@@ -566,17 +566,34 @@ extension AetherEngine {
     ///
     /// `formatKnown` is false when the open-time probe failed: the real range is then unknown and a DV write
     /// may still be inbound, so a suppressed host keeps the full budget.
+    ///
+    /// `noWriterExpected` is a `.secondary` load (Sodalite#175): nobody writes criteria for it, so there is
+    /// no inbound switch to wait for.
     nonisolated static func playGateGrace(
         criteriaUnchanged: Bool,
         engineIsCriteriaWriter: Bool,
         formatKnown: Bool,
-        effectiveFormat: VideoFormat
+        effectiveFormat: VideoFormat,
+        noWriterExpected: Bool = false
     ) -> DisplayCriteriaController.StartGrace {
         // #133: the criteria were already active, nothing was written, nothing can settle.
-        if criteriaUnchanged { return .skip }
+        if criteriaUnchanged || noWriterExpected { return .skip }
         if engineIsCriteriaWriter { return .brief }
         guard formatKnown else { return .full }
         return effectiveFormat == .sdr ? .brief : .full
+    }
+
+    /// Sodalite#175: a secondary never writes criteria, whatever the host passed.
+    nonisolated static func applyingSharedOutputRole(_ options: LoadOptions) -> LoadOptions {
+        guard options.sharedOutputRole == .secondary else { return options }
+        var adjusted = options
+        adjusted.suppressDisplayCriteria = true
+        return adjusted
+    }
+
+    /// Sodalite#175: Now Playing belongs to the primary; a secondary never takes it.
+    nonisolated static func ownsNowPlaying(hostOptIn: Bool, role: SharedOutputRole) -> Bool {
+        hostOptIn && role == .primary
     }
 
     /// Whitelist (not blacklist) of AVPlayer-native audio codecs: AAC, MP3, MP2, ALAC, AC-3/E-AC-3, LPCM, FLAC (native since iOS/tvOS 11). Anything else falls back to `AudioPlaybackHost` (FFmpeg).

@@ -275,6 +275,7 @@ enum SessionOptionCorrection {
         "nativeRemoteHLS",
         "sequentialOrigin",
         "heldSourceConnection",
+        "sharedOutputRole",
     ]
 
     /// The fields a running SESSION owns, which a correction may name and the rebuild then decides
@@ -400,6 +401,6 @@ enum SessionOptionCorrection {
         "declaredDurationSeconds", "probesize", "maxAnalyzeDuration", "preferredAudioLanguages",
         "preferredSubtitleLanguages", "externalSubtitles", "forwardBufferSegments", "autoplay",
         "audioDelaySeconds", "teletextPage", "deinterlaceMode", "deinterlaceFieldRate", "preferredDecodePath",
-        "escalatesToSoftwarePath", "isLiveRejoin", "subtitleSessionCarryover",
+        "escalatesToSoftwarePath", "sharedOutputRole", "isLiveRejoin", "subtitleSessionCarryover",
     ]
 }

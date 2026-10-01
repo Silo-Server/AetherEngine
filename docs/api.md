@@ -329,6 +329,7 @@ arrive together.
 | `LoadOptions.prepareNativeSubtitles`, `externalSubtitles` | the native renditions are declared in the init segment |
 | `LoadOptions.panelIsInHDRMode`, `panelPresentsDolbyVision`, `matchContentEnabled` | the display-criteria handshake and the format clamp both run synchronously inside `load` |
 | `pictureInPictureActive` | governs the background teardown decision at the moment it happens |
+| `logTag` | entered into the shared-output book when the load joins it, so a tag set later is missing from those log lines until the next `load()` |
 
 ### Isolation, and what runs off the main actor
 
@@ -399,6 +400,17 @@ $ otool -L PlayerEngineKit.framework/PlayerEngineKit | grep -i libavcodec
 ```
 
 And the engine says it itself: the `[FFmpeg] libavcodec …` line at `init` reports the versions that actually answered, not the ones it was built against, so a wrong binding shows up in the log before it shows up as a defect.
+
+### Running several engines at once
+
+Each `AetherEngine` has its own loopback server, caches and lifecycle, so two or more can play side by side (a multiview grid). What they share is the process: the audio session, its channel preference and the panel's display criteria. The engine keeps one book of who is still playing (`SharedOutputCoordinator`, internal) and acts on it:
+
+- The audio session is released only by the last engine to stop, and only if some engine in that round had `deactivatesAudioSessionOnStop`.
+- The preferred output channel count is the widest source among the playing engines, so a muted stereo tile cannot downmix a 5.1 one.
+- A display-criteria reset waits until the last engine stops, the ones a load runs to clear stale criteria included; an engine that loads again as `.primary` in the meantime cancels its own pending reset, one that loads again as `.secondary` keeps it.
+- Stop every engine before you let go of it. An engine counts as playing from `load()` until `stop()`, whatever its state, `.error` and `.ended` included, so an engine kept for reuse must be stopped when its tile ends or fails, or the last real stop will not release the session. An engine released without `stop()` is noticed and dropped the next time another engine asks, but until then it counts as playing.
+
+Load one engine as `.primary` and the others with `LoadOptions(sharedOutputRole: .secondary)`, set `logTag` (set before `load()`) on each, and control what is audible with `volume`. Every engine keeps decoding its audio, so switching the audible one is a volume change and not a reload.
 
 
 ## Constructing and binding
@@ -884,7 +896,8 @@ say so on the tracker rather than working around it.
 | `videoNowPlayingSession`, `setVideoNowPlayingInfo(_:)` | The session and its staged identity dictionary. Elapsed / rate / duration are merged from the player; do not stage them. |
 | `audioNowPlayingSession`, `setAudioNowPlayingInfo(_:)` | The same pair for the audio-only path, which owns its session unconditionally (there is no AVKit fork there). Pass an empty dictionary to clear. |
 | `setExternalMetadata(_:)` | AVKit's on-screen info pane on the video path. Safe before `load()`; replayed at host creation. |
-| `deactivatesAudioSessionOnStop` | Off by default. The engine declares the audio-session category at init and never activates it on the native path, because AVKit activates per playback and that is what lets tvOS negotiate the HDMI route (#24), so it never deactivates it either. Set true only when the app owns the session outright; the engine then releases it on a genuine final teardown, meaning `stop()` and never a reload, handoff or live retune. |
+| `deactivatesAudioSessionOnStop` | Off by default. The engine declares the audio-session category at init and never activates it on the native path, because AVKit activates per playback and that is what lets tvOS negotiate the HDMI route (#24), so it never deactivates it either. Set true only when the app owns the session outright; the engine then releases it on a genuine final teardown, meaning `stop()` and never a reload, handoff or live retune. With several engines in one process the release belongs to the last one out: a stop while another engine is still active keeps the session and logs `[SharedOutput] ... still active, session kept`. |
+| `logTag` | A short name for this instance (`tile2`), carried by the `[SharedOutput]` lines and a `[AetherEngine:<tag>] state=` line per transition. Set it before `load()` (the tag is captured when the engine joins), on every engine of a host that runs several at once. |
 
 ## Stills and thumbnails
 
@@ -982,6 +995,7 @@ All flags default to safe values; the table is the full set. Depth for the media
 | `dolbyVisionHandling` | `.automatic` | A `DolbyVisionHandling`. `.baseLayerOnly` presents the HDR10 / HLG base layer of a Dolby Vision source and leaves the Dolby Vision out of the container on every display: plain `hvc1` / `av01` sample entry, `dvcC` stripped, no `SUPPLEMENTAL-CODECS`, HDR10 / HLG display criteria, `videoFormat` reads the base layer's format while `sourceVideoFormat` and `sourceDVProfile` keep saying what the file carries. The route a host offers as "Dolby Vision: off (HDR10)", for a source whose Dolby Vision is wrong and whose base layer is right: the reported shape is a remux carrying a Profile 7 RPU under a container record claiming Profile 5, where a player that believes the record decodes YCbCr as IPT and the picture comes out green / violet. Applies to HEVC Profile 7 / 8.1 / 8.4, AV1 Profile 10.1 / 10.4, and a Profile 5 (or AV1 10.0) record whose VUI declares a BT.2020 YCbCr PQ or HLG base; a Profile 5 whose VUI is unspecified carries IPT-PQ-c2, has no base layer to present, keeps its route, and the engine says so in the log. Takes precedence over `forceDolbyVisionOnNonDVDisplay`. A tuning field, correctable through `reloadAtCurrentPosition(applying:)`; a Profile 5 record the VUI contradicts also stops refusing the software path under it. See [formats.md](formats.md#dolby-vision-signaling). |
 | `preferredDecodePath` | `.automatic` | A `DecodePath`. `.software` serves this source through `SoftwarePlaybackHost` whatever the routing concluded, scoped to this session and costing the source nothing (seeks, the audio switch and the title switch all keep working). The escape for the formats `VTCapabilityProbe` deliberately cannot classify, and for live H.264 / HEVC, which never reaches that gate at all. One-way: there is no `.native`. See [Overriding the decode path](#overriding-the-decode-path). |
 | `escalatesToSoftwarePath` | `true` | Whether a native session AVPlayer refuses on its merits (`CoreMediaErrorDomain`), or a live join without an entry point the native route can open (`AetherEngine.LiveJoin`, AE#627), may be rebuilt once on the software path (AE#561). `false` surfaces the failure as `.error` instead, for a host with its own fallback ladder (AE#629). Correctable. |
+| `sharedOutputRole` | `.primary` (default) or `.secondary` | A `SharedOutputRole`. A secondary engine never writes display criteria and never owns Now Playing, whatever `suppressDisplayCriteria` and `ownsVideoNowPlayingSession` say, on the audio-only path too. It also skips the play gate's wait for a criteria write and the panel readout (`criteriaPanelReadout` is nil, as for any suppressed load), so its HDR labelling relies on `panelIsInHDRMode`. The role is fixed for a session, but a later `load()` may change it: as an identity field it only blocks corrections (Sodalite#175). A host that opted into `ownsVideoNowPlayingSession` and changes the role without a `stop()` keeps the native host's original Now Playing ownership until the next stop. |
 | `deinterlaceMode` | `.auto` | A `DeinterlaceMode` for the software path: the Metal / VideoToolbox graph with a CPU bwdif fallback, or `.software` to force the CPU path. |
 | `deinterlaceFieldRate` | `.field` | A `DeinterlaceFieldRate`: the hardware deinterlacer emits one frame per field (25i to 50p) or per frame. The software fallback is always frame rate, because doubling a CPU bwdif is the wrong trade and a fallback should not change cost class. |
 | `probesize`, `maxAnalyzeDuration` | nil | Caller-bounded open-time probe budget (defaults 50 MB / 60 s). They fail **open**: an over-tight budget loads with late-resolving tracks silently missing rather than throwing, so validate track presence if you tighten them. Do not pass `0` for `maxAnalyzeDuration`; FFmpeg maps it to a shorter heuristic. |

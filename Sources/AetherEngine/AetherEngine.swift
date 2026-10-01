@@ -62,6 +62,7 @@ public final class AetherEngine: ObservableObject {
             recomputePlaybackPhase()
             resolveLoadingStashedSeek(from: oldValue)
             settleOwedBackgroundAction()
+            if let logTag { EngineLog.emit("[AetherEngine:\(logTag)] state=\(state)", category: .engine) }
         }
     }
 
@@ -497,6 +498,10 @@ public final class AetherEngine: ObservableObject {
     /// that has not run yet, so a stop/load pair never loses its session, and a stop that lands while a
     /// software or audio-only load is still activating releases the session after that activation (AE#538).
     public var deactivatesAudioSessionOnStop: Bool = false
+
+    /// Sodalite#175: a short name for this instance ("tile2") carried by the shared-output lines and the
+    /// state transitions, so a log with several engines in it can be read. nil for a lone engine.
+    public var logTag: String?
 
     @Published public internal(set) var duration: Double = 0
 
@@ -3564,9 +3569,6 @@ public final class AetherEngine: ObservableObject {
     private var audioSessionDeactivationTask: Task<Void, Never>?
     #endif
 
-    /// The most recent off-main activation or release of the shared session. See `enqueueAudioSessionTransition`.
-    private var audioSessionTransition: Task<Void, Never>?
-
     /// Run a session activation or release off the main actor, after every one asked for before it.
     ///
     /// Since AE#538 both halves are detached tasks, and two detached tasks carry no order between them.
@@ -3575,14 +3577,9 @@ public final class AetherEngine: ObservableObject {
     /// audio-only load's activation can send `setActive(false)` first and leave the session active after a
     /// final teardown. Each transition awaits its predecessor, including a cancelled one, which then drops
     /// on its own guard. Not platform-gated, so the order is testable where the session does not exist.
+    /// Since Sodalite#175 the queue is the process-wide one in `SharedOutputCoordinator`.
     func enqueueAudioSessionTransition(_ body: @escaping @Sendable () async -> Void) -> Task<Void, Never> {
-        let previous = audioSessionTransition
-        let transition = Task.detached(priority: .userInitiated) {
-            await previous?.value
-            await body()
-        }
-        audioSessionTransition = transition
-        return transition
+        SharedOutputCoordinator.shared.enqueueTransition(body)
     }
 
     #if os(iOS) || os(tvOS)
@@ -3808,6 +3805,8 @@ public final class AetherEngine: ObservableObject {
     ) async throws -> SourceProbe? {
         var source = source
         var options = options
+        options = Self.applyingSharedOutputRole(options)
+        SharedOutputCoordinator.shared.join(ObjectIdentifier(self), role: options.sharedOutputRole, tag: logTag, owner: self)
         // #436: a speed the host set belongs to the item it was set on. The rebuilds a session makes
         // on its own (reload at position, audio-track switch, AirPlay LAN swap, background return)
         // reopen the same source and keep it; a different item starts at 1.0, so a host whose speed
@@ -4429,7 +4428,7 @@ public final class AetherEngine: ObservableObject {
             // apply(), so clear a criteria the previous video session left applied. The engine is a
             // process-wide singleton; without this, music playback keeps the panel in DV/HDR.
             if Self.loadDisplayCriteriaAction(suppressDisplayCriteria: options.suppressDisplayCriteria, audioOnlyPath: true) == .clearStale {
-                displayCriteria.reset()
+                resetDisplayCriteriaRespectingOthers()
             }
             // Read codec before closing the probe; custom sources always use FFmpeg (AVPlayer can't consume a custom demuxer).
             let audioCodecID: AVCodecID = (probeOpened && resolvedInitialAudio >= 0)
@@ -4546,7 +4545,7 @@ public final class AetherEngine: ObservableObject {
             // Suppressed host: the load seam preserved the criteria (#128 follow-up), and AVKit writes its
             // own from the AVPlayerItem formatDescription later. Clear a leftover engine criteria now
             // (didApply-gated no-op for hosts that always suppress) so the two writers can't fight.
-            displayCriteria.reset()
+            resetDisplayCriteriaRespectingOthers()
             // #339: AVKit's write lands inside loadNative, so the observation has to be armed before the
             // load rather than when the play gate opens. After reset(), so a switch back to the default
             // mode is not recorded as this session's. Audio-only loads reach clearStale too and have no
@@ -5028,7 +5027,8 @@ public final class AetherEngine: ObservableObject {
                         criteriaUnchanged: criteriaUnchanged,
                         engineIsCriteriaWriter: !options.suppressDisplayCriteria,
                         formatKnown: probeOpened,
-                        effectiveFormat: effectiveFormat
+                        effectiveFormat: effectiveFormat,
+                        noWriterExpected: options.sharedOutputRole == .secondary
                     ),
                     // Sodalite#49: this gate runs after the item is ready, so waiting out an observed switch
                     // blocks nothing else, and the panel is dark until it ends either way. Live keeps the
@@ -6918,10 +6918,21 @@ public final class AetherEngine: ObservableObject {
     /// - `!keepNativeHost`: belt and braces. A preserved host means audio keeps flowing into the next load.
     /// - `hostOptedIn`: `deactivatesAudioSessionOnStop`. The session is process-global state the engine
     ///   mostly does not own, so releasing it is the host app's call.
+    /// Since Sodalite#175 the host opt-in is folded into `SharedOutputCoordinator.leave`, which owes it to the last engine out.
     nonisolated static func shouldDeactivateAudioSessionOnTeardown(finalTeardown: Bool,
                                                                    keepNativeHost: Bool,
                                                                    hostOptedIn: Bool) -> Bool {
         finalTeardown && !keepNativeHost && hostOptedIn
+    }
+
+    /// Sodalite#175: the session goes only with the last engine out, and only when a release is owed.
+    nonisolated static func shouldDeactivateAudioSession(after outcome: SharedOutputCoordinator.LeaveOutcome) -> Bool {
+        outcome == .lastOut(releaseSession: true)
+    }
+
+    /// Sodalite#175: a scheduled release is stale once another engine has joined in the meantime.
+    nonisolated static func releaseStillWanted(coordinatorIsEmpty: Bool) -> Bool {
+        coordinatorIsEmpty
     }
 
     #if os(iOS) || os(tvOS)
@@ -6983,10 +6994,25 @@ public final class AetherEngine: ObservableObject {
         audioSessionDeactivationTask = enqueueAudioSessionTransition { [weak self] in
             guard let self else { return }
             guard !Task.isCancelled, await self.loadGeneration == generation else { return }
+            guard await Self.releaseStillWanted(coordinatorIsEmpty: SharedOutputCoordinator.shared.isEmpty) else {
+                EngineLog.emit("[SharedOutput] release dropped: another engine joined before it ran", category: .engine)
+                return
+            }
             AetherEngine.deactivateSharedAudioSession()
         }
     }
     #endif
+
+    /// Sodalite#175: the panel mode belongs to every engine still playing, so a reset waits for the last one out.
+    private func resetDisplayCriteriaRespectingOthers() {
+        let id = ObjectIdentifier(self)
+        if SharedOutputCoordinator.shared.othersActive(besides: id) {
+            let controller = displayCriteria
+            SharedOutputCoordinator.shared.deferCriteriaReset(for: id) { controller.reset() }
+        } else {
+            displayCriteria.reset()
+        }
+    }
 
     /// - Parameter resetDisplayCriteria: When `true` (default), release
     ///   the `AVDisplayManager.preferredDisplayCriteria` so the panel
@@ -7141,15 +7167,27 @@ public final class AetherEngine: ObservableObject {
         // #215: release the shared AVAudioSession once every render path above is quiesced. Scheduled
         // last so the item is unloaded, the AVPlayer released and the software/audio outputs stopped
         // before the session goes away, and scheduled rather than called because the release itself can
-        // block for ~0.5 s on a MAT passthrough route. Opt-in twice over: the caller must declare an
-        // actual final teardown, AND the host must have set deactivatesAudioSessionOnStop.
-        #if os(iOS) || os(tvOS)
-        if Self.shouldDeactivateAudioSessionOnTeardown(finalTeardown: finalTeardown,
-                                                       keepNativeHost: keepNativeHost,
-                                                       hostOptedIn: deactivatesAudioSessionOnStop) {
-            scheduleAudioSessionDeactivation()
+        // block for ~0.5 s on a MAT passthrough route. The caller must declare an actual final teardown;
+        // the host opt-in (deactivatesAudioSessionOnStop) goes to SharedOutputCoordinator.leave, and the
+        // release belongs to the last engine out.
+        if finalTeardown && !keepNativeHost {
+            let coordinator = SharedOutputCoordinator.shared
+            let label = coordinator.label(for: ObjectIdentifier(self))
+            let outcome = coordinator.leave(ObjectIdentifier(self), releasesSession: deactivatesAudioSessionOnStop)
+            switch outcome {
+            case .othersRemain(let count):
+                EngineLog.emit("[SharedOutput] \(label) left, \(count) still active, session kept", category: .engine)
+            case .lastOut(let release):
+                EngineLog.emit("[SharedOutput] \(label) left last, release=\(release)", category: .engine)
+            case .notMember:
+                break
+            }
+            #if os(iOS) || os(tvOS)
+            if Self.shouldDeactivateAudioSession(after: outcome) {
+                scheduleAudioSessionDeactivation()
+            }
+            #endif
         }
-        #endif
 
         // Close custom reader on final teardown. Internal reloads pass keepCustomReader=true to survive for reuse.
         if !keepCustomReader {
@@ -7160,7 +7198,7 @@ public final class AetherEngine: ObservableObject {
         }
 
         if resetDisplayCriteria {
-            displayCriteria.reset()
+            resetDisplayCriteriaRespectingOthers()
         }
         playbackBackend = .none
         activeVideoDecoder = nil
