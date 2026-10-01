@@ -639,6 +639,13 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// AE#374: whether the first-serve gate has already reported the interval it held. Read and written
     /// only under `firstSegmentCondition`, inside `waitForFirstLiveSegment` and its two account helpers.
     private var didAccountForFirstServe = false
+    /// AE#684: the gate is a FIRST-serve gate. Every `/media.m3u8` request without an `_HLS_msn`
+    /// re-enters it, and AVPlayer opens a session with two of them back to back, so a bounded start
+    /// (served under the holdback, after its grace) held the second request for a whole second grace:
+    /// measured 2.012 s to the first manifest and 2.02 s more before `init.mp4` was asked for, on
+    /// every shallow start. Once a manifest has gone out, the cushion is the client's to manage.
+    /// Same lock as the flag above.
+    private var firstManifestServed = false
     /// Host override for blocking-reload (`LoadOptions.liveBlockingReload`): nil = auto (observed policy for
     /// ingest, on by default for signal-less live), true/false = force. Wins over the policy (#167).
     private let blockingReloadOverride: Bool?
@@ -2469,6 +2476,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         defer { parkedWaiters -= 1 }
         while true {
             if waitersCancelled { return false }
+            if firstManifestServed { return true }
             let snap = liveCushionSnapshot()
             let target = currentLiveTargetDuration(maxSegmentDuration: snap.maxDuration)
             if LiveEdgePolicy.startupCushionSatisfied(segmentCount: snap.count,
@@ -2551,6 +2559,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         warning: Bool = false,
         note: String? = nil
     ) {
+        firstManifestServed = true
         guard !didAccountForFirstServe else { return }
         didAccountForFirstServe = true
         let account = LiveEdgePolicy.firstServeAccount(
