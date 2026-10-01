@@ -155,13 +155,13 @@ final class HLSPlaylistTrackerTests: XCTestCase {
     }
 
     func testDefaultJoinCoversTheLoopbackCushionForLongSegments() {
-        // AE#678, at AE#684's seal: a 6s provider seals TD 6 downstream, so the first serve wants 18s,
-        // and three joined segments finalize only 18s minus the open GOP. The cushion term takes a fourth.
+        // AE#678: a 6s provider seals TD 4 downstream, so the first serve wants 12s, and two joined
+        // segments finalize only 12s minus the open GOP. The cushion term takes a third.
         var tracker = HLSPlaylistTracker()
         let new = tracker.newSegments(
             in: playlist(sequence: 3, uris: ["a", "b", "c", "d", "e", "f"], duration: 6)
         )
-        XCTAssertEqual(new.map(\.uri), ["c", "d", "e", "f"])
+        XCTAssertEqual(new.map(\.uri), ["d", "e", "f"])
     }
 
     func testLoopbackCushionCoverageIsTheSealedHoldbackPlusAGOP() {
@@ -170,8 +170,8 @@ final class HLSPlaylistTrackerTests: XCTestCase {
                 HLSMediaSegment(uri: "s\($0.offset)", duration: $0.element, discontinuityBefore: false)
             })
         }
-        XCTAssertEqual(coverage([10, 10, 10]), 34)       // TD 10 (AE#684), 30s holdback, 4s margin
-        XCTAssertEqual(coverage([12, 13.5, 12]), 34)     // above the 10s ceiling: TD 10, 30s + 4s
+        XCTAssertEqual(coverage([10, 10, 10]), 25)       // TD 7, 21s holdback, 4s margin
+        XCTAssertEqual(coverage([12, 13.5, 12]), 31)     // TD 9 from the longest, 27s + 4s
         XCTAssertEqual(coverage([2, 2, 2]), 8)           // TD 2, 6s + a 2s GOP bounded by the segment
         XCTAssertEqual(coverage([1, 1, 1]), 4)           // below the 8s floor, which then decides
         XCTAssertEqual(coverage([]), 0)
