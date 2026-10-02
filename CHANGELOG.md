@@ -12,6 +12,30 @@ the public-API contract.
 
 _Nothing yet._
 
+## [7.25.2] - 2026-10-02
+
+### Fixed
+
+- **A live HLS ingest sealed its TARGETDURATION under the upstream's own segment length (#684).** The engine re-cuts each upstream segment (at its GOPs under `.fastZap`), so the upstream's segment entered the seal only as `ceil(segment / 1.5)`: a 6 s provider sealed 4, a client patience of exactly one delivery and a 12 s holdback against deliveries that arrive 6 to 9 s apart. AVPlayer drew `-12888`, skipped its next playlist reload and stalled with the content already listed. The seal now asks for the longest upstream segment served (up to 10 s) and takes as much of it as the join pays for:
+  - uniform 6 s segments under `.fastZap` seal 5 (holdback 15 s), uniform 10 s segments under either profile seal 9 (27 s), with the join unchanged (three segments);
+  - alternating lengths: the join is equalised over the phases of one upstream, so a tune never loads more than the deepest tune of the same channel already did. The reporting channel alternates 6 s and 4 s; its join used to be three or four segments depending on which was newest, and only the four-segment phase got more than 7.25.1's value. Both phases now join four and seal 6 (18 s). Shapes whose phases already joined alike keep their join and what it pays: 10 s / 8 s seals 8 (7 before), 6 s / 6 s / 4 s keeps 4, and a shape like 6 s / 5 s keeps a seal that follows the phase (5 or 4);
+  - 2 s providers keep 2, 3 s providers with 1 s GOPs keep 2 (their join pays for no more), and `.standard` is unchanged up to 6 s segments.
+
+  Measured on a uniform 6 s origin with jittered deliveries over 180 s: 5 `-12888` and a stall before, 3 and no stall after; over nine 60 s runs 7 stalls before and none after. On the alternating 6 s / 4 s shape: 0 to 1 `-12888` per run before, none after, in both phases. On 10 s segments the window close and item rebuild that 7.25.1 produced in 4 of 9 `.fastZap` runs and 6 of 6 `.standard` runs did not occur. Expect far fewer stalls and fewer `-12888`, not none: the reporting capture had 10 of 110 delivery gaps above 9 s.
+
+  Costs. Standing latency: 3 s more behind the upstream's edge on uniform 6 s segments and on 10 s / 8 s, 6 s on alternating 6 s / 4 s and on 10 s ones. Join: unchanged on uniform upstreams and on every shape whose phases joined alike; on alternating 6 s / 4 s about four tunes in ten load one additional short segment (3.47 s to 4.23 s to first picture behind an 8 Mbit/s link; the other six tunes already took 4.27 s). A host that allows fewer parallel requests than the join has segments (`maxConcurrentSourceRequests` of 3 or less) sees its first picture later, because the gate waits for the join to be handed over where it used to serve at 12 s of cut content: 2.79 to 3.08 s before and 3.27 to 3.49 s after, one request at a time behind 14 Mbit/s on the 6 s / 4 s shape. A join slower than the `.fastZap` grace is still served by the bounded start and then seals the full value over a window under its holdback (a `-16832` warning at the start).
+- **On an ingest the first-serve gate held the second playlist request too (#684).** On a `.fastZap` bounded start AVPlayer's second opening request waited out a second grace: 4.47 s to first picture where one grace is 2.24 s. Sources the engine cuts itself (raw MPEG-TS) are unchanged.
+- **The AE#440 forced start is no longer taken on an item that cannot play yet (#684).** On a rejoin placed by `EXT-X-START`, AVPlayer fetches from about 6 s below the target first, and the guard read that lookback as its cushion (`buffer ahead 4.00s` from a playhead the item never played from) and called `playImmediately` 36 ms before the item was ready. The decision now waits for `readyToPlay` and is asked again there. Whether this is what put sound and picture apart on the reporting device is not confirmed.
+
+### Added
+
+- **Each native live item says what it started on (#684):** `#684 item #N starts at its own Xs: segment K + Ys, whose picture opens at ... and whose sound runs ...`, and every `live seg-N finalized` line carries `sound=first..last`. The audio route line adds the route's output latency.
+- **`aetherctl play --served-url`** prints the loopback URL of each native item, and **`Scripts/hls-burst-origin.py`** is a live HLS origin whose delivery rhythm is scripted (jitter cycle, outage, window depth, mixed and inflated EXTINF, shared link rate).
+
+### Changed
+
+- `HLSVideoEngine`'s public initializer gained two defaulted parameters, `liveJoinBacklogObservation` and `liveJoinSpentObservation`. Source compatible; a host that constructs the session itself passes nothing new.
+
 ## [7.25.1] - 2026-10-01
 
 ### Fixed
