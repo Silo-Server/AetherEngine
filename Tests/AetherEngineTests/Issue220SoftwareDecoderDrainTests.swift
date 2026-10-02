@@ -55,8 +55,12 @@ struct Issue220SoftwareDecoderDrainTests {
         let stream = try #require(demuxer.stream(at: videoIndex))
         let counter = FrameCounter()
         let decoder = SoftwareVideoDecoder()
+        // A 32-core Mac's budget: the cap must reach `open`, and every host then runs the same
+        // 16-deep frame pipeline.
+        decoder.activeProcessorCount = 32
         try decoder.open(stream: stream) { _, _, _ in counter.increment() }
         defer { decoder.close() }
+        #expect(decoder.threadCount == 16)
 
         var packets = 0
         while let pkt = try demuxer.readPacket() {

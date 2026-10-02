@@ -82,6 +82,10 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// still extractor is the only caller, everything on a playback path wants the parallel default.
     var decodesSingleThreaded = false
 
+    /// Cores the playback thread budget is sized from. Set before `open`; tests pin it to check the
+    /// cap a many-core Mac gets.
+    var activeProcessorCount = ProcessInfo.processInfo.activeProcessorCount
+
     /// The `thread_count` libavcodec opened with. Written once in `open`, like the other open-time
     /// fields. Frame threading holds back `threadCount - 1` decoded frames until flush.
     private(set) var threadCount = 0
@@ -176,7 +180,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             ctx.pointee.thread_type = 0
         } else {
             ctx.pointee.thread_count = Int32(Self.playbackThreadCount(
-                activeProcessorCount: ProcessInfo.processInfo.activeProcessorCount))
+                activeProcessorCount: activeProcessorCount))
             ctx.pointee.thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE
         }
 
