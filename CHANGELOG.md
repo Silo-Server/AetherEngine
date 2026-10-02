@@ -16,6 +16,8 @@ the public-API contract.
 
 ### Added
 
+- `LoadOptions.objectAudioRendering` keeps the height channels and object positioning of TrueHD Atmos by rendering its objects into a speaker bed; it is a lossy conversion, not passthrough of the original stream. With `.apac(SpatialSpeakerLayout)` a TrueHD track FFmpeg marks as Atmos is decoded (beds, objects and their metadata), rendered into the chosen 5.1.2 to 9.1.6 speaker bed and delivered as Apple Positional Audio (`CODECS="apac.31.LL"`), which tvOS sends to an Atmos receiver as Dolby MAT. Lossy (320 kbps per bed channel) in place of the lossless 7.1 channel presentation, so it is opt-in; requires OS 26 and falls back to `audioBridgeMode` otherwise. See [formats.md › TrueHD Atmos (object rendering)](docs/formats.md#truehd-atmos-object-rendering).
+- `aetherctl serve --atmos-bed <layout>` and `serve --audio-index <n>` serve a TrueHD Atmos track through that path.
 - `ExternalSubtitleTrack.httpRequestAuthorization` supplies refreshable headers for primary/secondary sidecars and native subtitle stores without changing registered track IDs or rendition mappings. Authorized container decoding retains AVIO streaming and range access.
 - `HTTPRequestAuthorization.data(from:maximumBytes:)` fetches raw auxiliary resources such as font bundles with a caller-supplied byte limit and a whole-transfer deadline, reusing the relay's redirect, authorization, retry, cancellation and TLS policy.
 
@@ -23,7 +25,10 @@ the public-API contract.
 
 ### Fixed
 
-- The software-decoder progress regression now warms the frame-thread pipeline before measuring sustained output, avoiding a false failure on hosts with more decoder threads than its former fixed allowance. Production decoding and thread selection are unchanged.
+- A paused video no longer starts playing by itself. When the player item died while paused (`failedToPlayToEndTime`), the recovery reload bypassed the pause guard and called `play()` on the fresh item. The reload now keeps a pause made before the item died, whether it came through the engine, AVKit, Control Center or PiP, and mounts the item paused at the same position.
+- A dead item's recovery no longer restarts the title from where the session was first opened. When AVPlayer refused the recovery item's master (`-11868`), the media fallback reloaded at the first mount's start position, so a title opened from its beginning restarted at 0:00. The fallback now reloads where the refused item was placed. Upstream #621.
+- The media fallback no longer starts a paused title. When the recovery item was refused, the fallback called `play()` unconditionally, so a title paused behind the tvOS screensaver started itself. It now plays only when the refused item was playing, or was told to play, and the viewer had not paused it. A Play or Pause from AVKit, Control Center or PiP counts as well as one through the engine.
+- TrueHD Atmos rendered to APAC (`LoadOptions.objectAudioRendering`) no longer plays 42.7 ms ahead of the video. The bridge dropped the encoder's 2048 frames of priming and stamped the first content packet on the source position, but AVFoundation presents an APAC packet's audio 2048 frames before its timestamp, so every session ran early, at load and after every seek. The priming packets now stay in the stream and take the source position's timestamp.
 - Authorized native HLS uses the engine relay from the initial load, without forwarding origin credentials to the loopback asset. Optional subtitle playlist preparation shares the authorizer and has a bounded deadline across redirects and refreshes.
 - Static-header HLS redirects apply the shared credential policy, including Emby and MediaBrowser token headers, before contacting another origin.
 - Session option corrections recognize `httpRequestAuthorization` and external subtitle provider replacements by identity.

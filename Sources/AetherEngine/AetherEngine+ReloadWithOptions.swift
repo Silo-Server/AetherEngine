@@ -402,7 +402,7 @@ enum SessionOptionCorrection {
         "omitCriteriaColorExtensions", "suppressDisplayCriteria", "httpHeaders", "httpRequestAuthorization",
         "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling", "matchContentEnabled",
         "panelIsInHDRMode", "attemptsHDRMasterOnUnprovenPanel", "panelPresentsDolbyVision",
-        "audioBridgeMode", "isLive", "audioOnly",
+        "audioBridgeMode", "objectAudioRendering", "isLive", "audioOnly",
         "dvrWindowSeconds",
         "liveBlockingReload", "liveJoinProfile", "liveJoinStartsImmediately",
         "clampsLiveResumeToWindow", "nativeRemoteHLS", "nativeRemoteHLSIngestFallback",

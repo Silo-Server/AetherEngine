@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import AetherEngine
 
@@ -49,5 +50,146 @@ struct MasterFallbackDecisionTests {
         // Already fell back once this session (no loop).
         #expect(!MasterFallbackDecision.shouldFallBackToMediaPlaylist(
             errorCode: -11868, servingMasterPlaylist: true, alreadyFellBack: true))
+    }
+}
+
+/// #98: the media fallback reloads where the REJECTED item was placed. A recovery swaps a fresh item in
+/// under a session that stays whole, so that is not always where the session first started.
+///
+/// Field log, Apple TV 4K 3rd gen, tvOS 27.0, HDR10+ HEVC Matroska opened with a resume at 1844 s:
+/// paused at 2099.69 s, the item died behind the screensaver, the #93 stage-2 recovery swapped a
+/// fresh item in at 2099.69 s, that item was refused at startup with -11868, and the fallback
+/// reloaded at the first mount's 1844 s (landing on the keyframe at 1834.79 s). The viewer pressed
+/// play four minutes behind the pause; a session started from the beginning of a title is put back
+/// to its first frame.
+@Suite("#98: the media fallback comes back where the rejected item was placed")
+@MainActor
+struct MasterFallbackPositionTests {
+
+    private let url = URL(fileURLWithPath: "/nonexistent-master-fallback-position-test.m3u8")
+
+    @Test("An in-place recovery swap moves the placement the fallback reads")
+    func recoverySwapMovesThePlacement() {
+        let host = NativeAVPlayerHost()
+        defer { host.tearDown() }
+
+        host.load(url: url, startPosition: 1844, contract: .init())
+        #expect(host.mountedStartPosition == 1844)
+
+        // The #93/#65 stage-2 recovery: same session, fresh item, placed where playback stood.
+        host.swapItem(url: url, startPosition: 2099.69)
+        #expect(host.mountedStartPosition == 2099.69)
+    }
+
+    @Test("A mount with no start position is placed at the head, as its seek is")
+    func nilStartIsTheHead() {
+        let host = NativeAVPlayerHost()
+        defer { host.tearDown() }
+
+        host.load(url: url, startPosition: nil, contract: .init())
+        #expect(host.mountedStartPosition == 0)
+    }
+
+    @Test("A live rejoin makes no start seek, so it records no placement")
+    func liveRejoinRecordsNoPlacement() {
+        let host = NativeAVPlayerHost()
+        defer { host.tearDown() }
+
+        host.load(url: url, startPosition: 30, contract: .init(isLive: true))
+        host.swapItem(url: url, startPosition: nil, skipInitialSeek: true)
+        #expect(host.mountedStartPosition == nil)
+    }
+
+    /// A host-level test cannot see the call site, so this one reads it, as the #535 latch test does.
+    @Test("The fallback reads the placement of the item it replaces")
+    func fallbackReadsThePlacement() throws {
+        let source = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/AetherEngine/AetherEngine.swift")
+        let text = try #require(try? String(contentsOf: source, encoding: .utf8))
+        let fn = try #require(text.range(of: "func fallBackToMediaPlaylist("))
+        let body = String(text[fn.lowerBound...].prefix(4000))
+        #expect(body.contains("host.mountedStartPosition"))
+    }
+}
+
+/// #93/#98: when a dead item's recovery reload is refused, the media fallback replaces it. Whether
+/// the fallback then PLAYS is the viewer's call. The engine's intent (#122) misses a Play from AVKit,
+/// Control Center or PiP, so AVPlayer's rate is read as well.
+@Suite("#98: the media fallback resumes only a viewer who was playing")
+@MainActor
+struct MasterFallbackTransportTests {
+    private func resumes(
+        command: Bool? = nil, intent: Bool, rolled: Bool, pausedBefore: Bool
+    ) -> Bool {
+        NativeAVPlayerHost.mediaFallbackResumesPlaying(
+            commandSinceRejection: command, intentIsPlaying: intent,
+            rolledSinceEngineStop: rolled, pausedBeforeRejection: pausedBefore)
+    }
+
+    @Test("An item the engine was playing is replaced playing")
+    func enginePlayResumes() {
+        #expect(resumes(intent: true, rolled: false, pausedBefore: false))
+    }
+
+    @Test("A Play from AVKit, Control Center or PiP, which leaves the intent clear, is kept")
+    func externalPlayResumes() {
+        #expect(resumes(intent: false, rolled: true, pausedBefore: false))
+    }
+
+    @Test("A viewer who paused before the refusal stays paused, whichever way the pause came")
+    func pauseBeforeRejectionStaysPaused() {
+        #expect(!resumes(intent: true, rolled: true, pausedBefore: true))
+        #expect(!resumes(intent: false, rolled: true, pausedBefore: true))
+    }
+
+    /// An engine pause inside the one-second margin reads as the refusal's own stop, but it clears the
+    /// intent and the roll, so the viewer's pause still holds.
+    @Test("An engine pause just before the refusal stays paused")
+    func enginePauseInsideTheMarginStaysPaused() {
+        #expect(!resumes(intent: false, rolled: false, pausedBefore: false))
+    }
+
+    @Test("A Play or Pause through the engine after the refusal decides")
+    func commandAfterRejectionDecides() {
+        #expect(resumes(command: true, intent: true, rolled: false, pausedBefore: true))
+        #expect(!resumes(command: false, intent: false, rolled: true, pausedBefore: false))
+    }
+
+    /// Engine commands that drive the host's records, on a real host with a mounted item.
+    @Test("The host's records follow engine and external transport")
+    func hostRecordsFollowTransport() {
+        let host = NativeAVPlayerHost()
+        defer { host.tearDown() }
+        host.load(url: URL(fileURLWithPath: "/nonexistent-master-fallback-transport-test.m3u8"),
+                  startPosition: 0, contract: .init())
+        // A fresh load nobody played: stays paused.
+        #expect(!host.mediaFallbackResumesPlaying())
+        host.play()
+        #expect(host.mediaFallbackResumesPlaying())
+        host.pause()
+        #expect(!host.mediaFallbackResumesPlaying())
+    }
+
+    /// The fallback needs a live loopback session to run, so this reads its call site, as the
+    /// placement test above does.
+    @Test("The media fallback plays only on the host's verdict, read before the swap")
+    func fallbackAsksTheHost() throws {
+        let source = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/AetherEngine/AetherEngine.swift")
+        let text = try #require(try? String(contentsOf: source, encoding: .utf8))
+        let fn = try #require(text.range(of: "func fallBackToMediaPlaylist("))
+        let end = try #require(text[fn.upperBound...].range(of: "\n    }\n"))
+        let body = String(text[fn.lowerBound..<end.upperBound])
+        let verdict = try #require(body.range(of: "let resumesPlaying = host.mediaFallbackResumesPlaying()"))
+        let swap = try #require(body.range(of: "host.swapItem("))
+        #expect(verdict.lowerBound < swap.lowerBound)
+        #expect(body.contains("if resumesPlaying {"))
+        #expect(!body.contains("\n        host.play()\n"))
     }
 }

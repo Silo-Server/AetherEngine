@@ -67,6 +67,13 @@ final class NativeAVPlayerHost {
     /// `SessionLoadContract` and `swapItem`.
     private(set) var sessionContract = SessionLoadContract()
 
+    /// Where the current item was placed when it was mounted: the explicit start seek `load` makes,
+    /// or nil when it joined without one (a live rejoin). Recorded on every mount, the in-place swaps
+    /// included, so a recovery that has to replace this item puts the next one where THIS one was,
+    /// not where the session first started (#98). A startup-failed item has no reliable
+    /// `renderedTime`, which is why the fallback reads the placement rather than the clock.
+    private(set) var mountedStartPosition: Double?
+
     /// Set per load; gates the AE#287 premature-end recovery, which only makes sense for a fixed-length
     /// presentation. A live session has no advertised end to fall short of.
     private var isLiveSession: Bool = false
@@ -114,6 +121,13 @@ final class NativeAVPlayerHost {
     /// duration, and publishing that transient would bounce the engine through `.paused` and back for
     /// what the viewer must not even notice; the real status is republished when the recovery settles.
     private var prematureEndRecoveryInFlight = false
+    /// Uptimes bounding the last premature-end recovery. A rate change AVPlayer reported inside that
+    /// interval belongs to the recovery, even when its main-actor hop runs after the recovery ended.
+    private var prematureEndRecoveryStartedUptime: UInt64 = 0
+    private var prematureEndRecoveryEndedUptime: UInt64 = 0
+    /// Uptime of the newest transport event applied to `pausedSinceUptime`. Rate reports reach the
+    /// main actor after engine commands issued later, so an older report must not overwrite them.
+    private var transportStampEventUptime: UInt64 = 0
     /// Mirrors avPlayer.timeControlStatus so the engine can reconcile when AVKit's transport bar, Control Center, or hardware buttons toggle the player externally (without this, engine state goes stale and play/pause presses are swallowed).
     @Published private(set) var timeControlStatus: AVPlayer.TimeControlStatus = .paused
     /// Monotonic count of AVPlayerItem playbackStalled notifications (#93 residual): the engine
@@ -124,6 +138,30 @@ final class NativeAVPlayerHost {
     /// at .paused, which every pause-guarded recovery layer misreads as user intent; the engine
     /// subscribes and escalates into the stage-2 item reload with the pause guard bypassed.
     @Published private(set) var endFailureCount: Int = 0
+    /// Whether the transport had already stopped before the latest counted end failure: the viewer
+    /// paused (through the engine, AVKit, Control Center or PiP) and the item died under that pause.
+    /// Set before `endFailureCount` publishes, so its subscribers read the value for their failure.
+    private(set) var endFailureFollowedPause = false
+    /// The latest engine-routed transport command since the latest counted end failure: true for
+    /// play, false for pause, nil for none. A viewer can press either while the engine confirms the
+    /// death, and that press outranks the transport state the item died in.
+    private(set) var transportCommandSinceEndFailure: Bool?
+    /// Uptime at which the commanded transport stopped: stamped when AVPlayer's `rate` drops to 0 or an
+    /// engine-routed pause lands, cleared by any non-zero rate. The rate is what play and pause set,
+    /// from any source, even on an item that cannot roll; `timeControlStatus` only reports the outcome.
+    private var pausedSinceUptime: UInt64?
+    /// Whether AVPlayer's rate went non-zero since the engine last stopped the transport (a pause, a
+    /// zero rate or a fresh load), judged by when AVPlayer reported it. A Play from AVKit, Control
+    /// Center or PiP moves the rate but not `playIntent`, so this is the only record of it. An in-place
+    /// swap carries the outgoing item's rate in.
+    private var rolledSinceEngineStop = false
+    /// Uptime of the engine's last transport stop. A rate report older than it is not a roll.
+    private var engineStopUptime: UInt64 = 0
+    /// Uptime of the latest master refusal handed to the engine (#98), and the engine-routed transport
+    /// command since it: true for play, false for pause, nil for none. The media fallback runs a task
+    /// hop after the refusal and reads both then.
+    private var displayRejectionUptime: UInt64 = 0
+    private var transportCommandSinceRejection: Bool?
     /// End of the last seekable time range (seconds); tracks the live edge for EVENT playlists.
     /// KVO mirror of `seekableTimeRanges`, NOT a live read: the getter is a sync XPC round-trip
     /// to mediaserverd, and clock-tick sinks plus the 1 Hz paused-live timer read this at a
@@ -431,6 +469,7 @@ final class NativeAVPlayerHost {
         unloadCurrentItem(inPlaceSwap: inPlaceSwap)
 
         self.sessionContract = contract
+        mountedStartPosition = skipInitialSeek ? nil : (startPosition ?? 0)
         let forwardBufferDuration = contract.forwardBufferDuration
         let httpHeaders = contract.httpHeaders
         let armIngestFallback = contract.armIngestFallback
@@ -636,10 +675,20 @@ final class NativeAVPlayerHost {
 
         rateObservation = avPlayer.observe(\.rate, options: [.new]) { [weak self] player, _ in
             let rate = player.rate
+            let observedAt = DispatchTime.now().uptimeNanoseconds
             EngineLog.emit("[NativeAVPlayerHost] #\(sid) rate=\(rate)", category: .engine)
             Task { @MainActor in
                 guard let self, self.sessionID == sid else { return }
                 self.rate = rate
+                if rate != 0, observedAt >= self.engineStopUptime { self.rolledSinceEngineStop = true }
+                // AE#287: a stop AVPlayer reported during the premature-end re-seek is the recovery's,
+                // not the viewer's. Judged by when AVPlayer reported it: this hop can run after the
+                // recovery has ended.
+                let recoveryOwned = observedAt >= self.prematureEndRecoveryStartedUptime
+                    && (self.prematureEndRecoveryInFlight || observedAt <= self.prematureEndRecoveryEndedUptime)
+                if rate != 0 || !recoveryOwned {
+                    self.stampTransport(rolling: rate != 0, at: observedAt)
+                }
             }
         }
 
@@ -745,6 +794,10 @@ final class NativeAVPlayerHost {
                     surfaceEndFailures: false, hasEverPlayed: self.hasEverPlayed) {
                     // #93 round 3: loopback path. Count the death for the engine's revive
                     // escalation; a startup death (never played) stays with the startup watchdogs.
+                    self.endFailureFollowedPause = Self.transportPausedBeforeFailure(
+                        pausedSinceUptime: self.pausedSinceUptime,
+                        failureUptime: DispatchTime.now().uptimeNanoseconds)
+                    self.transportCommandSinceEndFailure = nil
                     self.endFailureCount += 1
                 }
             }
@@ -896,6 +949,77 @@ final class NativeAVPlayerHost {
         !surfaceEndFailures && hasEverPlayed
     }
 
+    /// Keeps `pausedSinceUptime` on the commanded transport: cleared when it rolls, stamped once when
+    /// it stops and left alone while it stays stopped.
+    private func stampTransport(rolling: Bool, at uptime: UInt64 = DispatchTime.now().uptimeNanoseconds) {
+        guard uptime >= transportStampEventUptime else { return }
+        transportStampEventUptime = uptime
+        if rolling {
+            pausedSinceUptime = nil
+        } else if pausedSinceUptime == nil {
+            pausedSinceUptime = uptime
+        }
+    }
+
+    /// The dead item's own drop to rate 0 and its `failedToPlayToEndTime` land within a runloop turn
+    /// of each other, in either order (the two are unsynchronized, see #50). A stop older than this
+    /// was the viewer's.
+    nonisolated static let pausedBeforeFailureMarginSeconds: Double = 1.0
+
+    /// Pure decision: had the transport already stopped when the item died? Read from AVPlayer's
+    /// own `rate` rather than the #122 intent latch, because AVKit's transport bar, Control Center
+    /// and PiP pause and resume the player without passing through the engine.
+    nonisolated static func transportPausedBeforeFailure(
+        pausedSinceUptime: UInt64?, failureUptime: UInt64
+    ) -> Bool {
+        guard let pausedSinceUptime, failureUptime > pausedSinceUptime else { return false }
+        let pausedSeconds = Double(failureUptime - pausedSinceUptime) / 1_000_000_000
+        return pausedSeconds >= pausedBeforeFailureMarginSeconds
+    }
+
+    /// Pure decision: does the reload of a dead item restart transport? A Play or Pause pressed
+    /// through the engine after the failure decides. Otherwise a transport rolling again (a Play from
+    /// AVKit, Control Center or PiP) resumes, and one that had stopped before the failure stays paused.
+    nonisolated static func itemDeathReloadResumesPlaying(
+        diedUnderPause: Bool, commandSinceFailure: Bool?, transportRolling: Bool
+    ) -> Bool {
+        if let commandSinceFailure { return commandSinceFailure }
+        return transportRolling || !diedUnderPause
+    }
+
+    /// Whether the media fallback replacing the latest refused master (#98) should play. The engine
+    /// asks when the fallback runs, a task hop after the refusal, so a rate report or a transport
+    /// command raced with the refusal has landed, and before it swaps, which resets the records read.
+    func mediaFallbackResumesPlaying() -> Bool {
+        Self.mediaFallbackResumesPlaying(
+            commandSinceRejection: transportCommandSinceRejection,
+            intentIsPlaying: playIntent,
+            rolledSinceEngineStop: rolledSinceEngineStop,
+            pausedBeforeRejection: Self.transportPausedBeforeFailure(
+                pausedSinceUptime: pausedSinceUptime, failureUptime: displayRejectionUptime))
+    }
+
+    /// Pure decision: does the media fallback play the item that replaces a refused master? A Play or
+    /// Pause through the engine after the refusal decides. Otherwise a refused item was told to play,
+    /// since `item.status` does not advance before that, so it plays on unless the viewer paused it
+    /// before the refusal (the same one-second margin as an item death). Who told it to play is read
+    /// from both records: `playIntent` for the engine, and a roll since the engine's last stop for
+    /// AVKit, Control Center or PiP, which never touch the intent. An engine pause inside the margin
+    /// still counts, because it clears both.
+    nonisolated static func mediaFallbackResumesPlaying(
+        commandSinceRejection: Bool?, intentIsPlaying: Bool, rolledSinceEngineStop: Bool,
+        pausedBeforeRejection: Bool
+    ) -> Bool {
+        if let commandSinceRejection { return commandSinceRejection }
+        return !pausedBeforeRejection && (intentIsPlaying || rolledSinceEngineStop)
+    }
+
+    /// The engine stopped the transport: a roll reported before now no longer says anyone wants it.
+    private func noteEngineStop() {
+        engineStopUptime = DispatchTime.now().uptimeNanoseconds
+        rolledSinceEngineStop = false
+    }
+
     /// #50: AVPlayer fires .failed for self-healing transients (loopback 404, AVIOReader reconnect) while playback advances uninterrupted (rrgomes: tcs=playing at .failed).
     /// Discriminates on hasEverPlayed, not instantaneous timeControlStatus: .failed and timeControlStatus KVOs are unsynchronized (426b45c: still published terminal failure at 27.3s while AVPlayer played smoothly).
     /// Before first .playing: surface promptly (genuine startup failure). After: defer 5s and confirm -- clear if .playing or clock advanced, surface if both stopped.
@@ -967,6 +1091,8 @@ final class NativeAVPlayerHost {
                     "[NativeAVPlayerHost] #\(sessionID) startup .failed is a master rejection "
                     + "(code=\(code)); signalling engine for media fallback instead of surfacing",
                     category: .engine)
+                displayRejectionUptime = DispatchTime.now().uptimeNanoseconds
+                transportCommandSinceRejection = nil
                 pendingDisplayRejection = DisplayRejection(code: code,
                                                            message: desc,
                                                            domain: (item.error as NSError?)?.domain)
@@ -1637,12 +1763,21 @@ final class NativeAVPlayerHost {
     func play() {
         // Set intent before play() so readyToPlay observer can re-assert if the replaceCurrentItem swap swallowed it.
         playIntent = true
+        transportCommandSinceEndFailure = true
+        transportCommandSinceRejection = true
+        stampTransport(rolling: true)
         // Call play() immediately (no defer-until-ready): item.status never advances past .unknown until AVPlayer is told to play.
         avPlayer.play()
     }
 
     func pause() {
         playIntent = false
+        transportCommandSinceEndFailure = false
+        transportCommandSinceRejection = false
+        noteEngineStop()
+        // Stamped here as well as from the rate KVO: pausing a player whose rate is already 0 (a dead
+        // or parked item) changes nothing AVPlayer reports, and the viewer's pause must still count.
+        stampTransport(rolling: false)
         avPlayer.pause()
     }
 
@@ -1694,6 +1829,7 @@ final class NativeAVPlayerHost {
         prematureEndRecoveryAttempts += 1
         lastPrematureEndRecoveryPlayhead = playhead
         prematureEndRecoveryInFlight = true
+        prematureEndRecoveryStartedUptime = DispatchTime.now().uptimeNanoseconds
         EngineLog.emit(
             "[NativeAVPlayerHost] #\(sessionID) AE#287 premature end: playhead="
             + "\(String(format: "%.3f", playhead))s duration=\(String(format: "%.3f", duration))s "
@@ -1707,8 +1843,22 @@ final class NativeAVPlayerHost {
         // The session may have been handed over while the seek was in flight; a retired session
         // must not restart the player under its successor.
         guard sessionID == sid else { return true }
+        // A viewer who paused through the engine while the re-seek was in flight keeps the pause.
+        guard playIntent else {
+            prematureEndRecoveryInFlight = false
+            prematureEndRecoveryEndedUptime = DispatchTime.now().uptimeNanoseconds
+            timeControlStatus = avPlayer.timeControlStatus
+            EngineLog.emit(
+                "[NativeAVPlayerHost] #\(sessionID) AE#287 re-seeked; staying paused for the viewer",
+                category: .engine)
+            return true
+        }
         avPlayer.play()
         prematureEndRecoveryInFlight = false
+        prematureEndRecoveryEndedUptime = DispatchTime.now().uptimeNanoseconds
+        // The premature end stopped the rate before the recovery began, and nobody paused: the
+        // recovery has now commanded play, so drop that stamp even if AVPlayer's rate has not moved.
+        stampTransport(rolling: true)
         timeControlStatus = avPlayer.timeControlStatus
         let resumedAt = await prematureEndReading().playhead
         EngineLog.emit(
@@ -1888,6 +2038,10 @@ final class NativeAVPlayerHost {
     func setRate(_ value: Float) {
         // Non-zero rate counts as play intent (must survive replaceCurrentItem swap like play() does).
         playIntent = (value != 0)
+        transportCommandSinceEndFailure = (value != 0)
+        transportCommandSinceRejection = (value != 0)
+        if value == 0 { noteEngineStop() }
+        stampTransport(rolling: value != 0)
         // #436: `play()` is rate 1.0 by definition, and it is re-issued from paths no client can see:
         // the readyToPlay re-assert after an item swap, interruption and background resume, the #287
         // premature-end recovery, plus AVKit's own transport and the remote command centre calling
@@ -2063,6 +2217,11 @@ final class NativeAVPlayerHost {
         readinessDeadlineSeconds = nil
         // Re-arm #50 hasEverPlayed: reused host must not inherit prior session's established state.
         hasEverPlayed = false
+        if inPlaceSwap {
+            rolledSinceEngineStop = avPlayer.rate != 0
+        } else {
+            noteEngineStop()
+        }
         // #93 recovery reload: same content, same position, playback must continue. Skip the
         // pause + nil-item gap below (PiP content-source invalidation + transport bounce); the
         // old item keeps playing until replaceCurrentItem swaps in the fresh one, and playIntent

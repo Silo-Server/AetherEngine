@@ -67,7 +67,7 @@ func printUsage() {
 
     Usage:
       aetherctl probe [--detect-hdr10plus] [--detect-atmos] <url>
-      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] <url>
+      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--atmos-bed 7.1.4] <url>
       aetherctl validate [--no-dv] [--force-dv] [--dv-base-layer] <url>
       aetherctl swdecode [--frames N] <url>
       aetherctl play [--seconds N] [--live] [--fast-zap] [--live-start-immediately] [--dvr-window N] [--subs <codec-or-lang>]
@@ -976,6 +976,18 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     // be read straight off the segments (ffprobe the audio and video first-packet PTS) instead of
     // being judged by ear.
     let serveAudioDelayMs = takeIntFlag("--audio-delay", from: &rest) ?? 0
+    // TrueHD Atmos rendered into a speaker bed and served as APAC (LoadOptions.objectAudioRendering).
+    let atmosBedFlag = takeStringFlag("--atmos-bed", from: &rest)
+    let serveObjectAudioRendering: ObjectAudioRendering
+    if let atmosBedFlag {
+        guard let layout = SpatialSpeakerLayout(rawValue: atmosBedFlag) else {
+            print("ERROR: --atmos-bed expects one of \(SpatialSpeakerLayout.allCases.map(\.rawValue)), got '\(atmosBedFlag)'")
+            exit(64)
+        }
+        serveObjectAudioRendering = .apac(layout)
+    } else {
+        serveObjectAudioRendering = .off
+    }
     rejectStrayFlags(rest, subcommand: first)
     guard let urlArg = rest.first else {
         print("ERROR: \(first) requires a <url> argument")
@@ -996,7 +1008,9 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
         runServe(url: url, dvModeAvailable: dvModeAvailable, forceDVWithoutDisplay: forceDV,
                  dolbyVisionHandling: dvHandling,
                  nativeSubsIndex: nativeSubsIndex, startPosition: startPosition,
-                 audioDelayMs: serveAudioDelayMs)
+                 audioDelayMs: serveAudioDelayMs, objectAudioRendering: serveObjectAudioRendering,
+                 // `--audio-index` (parsed once above, shared with customio): serve that source stream.
+                 audioStreamIndex: customAudioIndex)
     case "validate":
         exit(runValidate(url: url, dvModeAvailable: dvModeAvailable, forceDVWithoutDisplay: forceDV,
                          dolbyVisionHandling: dvHandling))
