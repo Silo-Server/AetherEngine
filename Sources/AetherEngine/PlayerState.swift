@@ -647,6 +647,9 @@ public struct LoadOptions: Sendable, Equatable {
     /// Start the native WebVTT subtitle readers eagerly at load (instead of lazily on `setNativeSubtitleSelected`), so the `/subs_N_M.vtt` segments are already populated when AVKit fetches them under a host-independent selection (e.g. an `EXT-X-MEDIA ... DEFAULT=YES` rendition that AVKit auto-selects). Equivalent to a fully-populated static VOD subtitle file. Only meaningful with `prepareNativeSubtitles`. Default `false` (Sodalite#32 probe).
     public var eagerNativeSubtitleReaders: Bool = false
 
+    /// Serve an I-frame rendition (`EXT-X-I-FRAME-STREAM-INF`) next to the master, so a stock `AVPlayerViewController` shows its own scrub thumbnails and can scan on I-frames, with no host code (AE#682). One keyframe per served segment, at the source's full resolution. Costs a second reader on the source for the whole session, opened shortly after load because AVKit asks for the first keyframe before anyone scrubs. Silently absent, with one log line naming the reason, when the session cannot answer every listed keyframe: live, a source without a trustworthy keyframe index (MPEG-TS), `sequentialOrigin`, `heldSourceConnection`, an origin limited to one request, a disc source, a custom reader that cannot clone, or media-playlist routing. A host with its own transport bar wants `scrubThumbnail` instead. A tuning field: correctable through `reloadAtCurrentPosition(applying:)`. Default `false`.
+    public var serveIFramePlaylist: Bool = false
+
     /// Confirm E-AC-3 JOC (Dolby Atmos) on this session's audio tracks, so `audioTracks` carries an honest
     /// `TrackInfo.isAtmos` for a badge instead of the pre-decode guess. No container reliably declares JOC, so
     /// this runs the same bounded decode pass as `AetherEngine.probeDetectingAtmos` (see `AtmosDetectionOptions`
@@ -896,6 +899,7 @@ public struct LoadOptions: Sendable, Equatable {
         preserveASSMarkup: Bool = false,
         prepareNativeSubtitles: Bool = false,
         eagerNativeSubtitleReaders: Bool = false,
+        serveIFramePlaylist: Bool = false,
         confirmAtmos: Bool = false,
         nativeSubtitlePreferredLanguages: [String] = [],
         sequentialOrigin: Bool = false,
@@ -940,6 +944,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.preserveASSMarkup = preserveASSMarkup
         self.prepareNativeSubtitles = prepareNativeSubtitles
         self.eagerNativeSubtitleReaders = eagerNativeSubtitleReaders
+        self.serveIFramePlaylist = serveIFramePlaylist
         self.confirmAtmos = confirmAtmos
         self.nativeSubtitlePreferredLanguages = nativeSubtitlePreferredLanguages
         self.sequentialOrigin = sequentialOrigin

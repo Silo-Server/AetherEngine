@@ -117,4 +117,14 @@ struct IFrameSessionTests {
             isDiscSource: false, secondReaderAvailable: true))
         #expect(verdict == .absent(.live))
     }
+
+    @Test("the load option defaults to off and is a tuning field, not a session identity")
+    func loadOptionDefault() {
+        #expect(LoadOptions().serveIFramePlaylist == false)
+        var on = LoadOptions()
+        on.serveIFramePlaylist = true
+        #expect(LoadOptions(serveIFramePlaylist: true) == on)
+        #expect(SessionOptionCorrection.refusedFields(from: LoadOptions(), to: on).isEmpty)
+        #expect(SessionOptionCorrection.knownFields.contains("serveIFramePlaylist"))
+    }
 }
