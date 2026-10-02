@@ -6,70 +6,132 @@ import AetherLibavcodec
 /// are used; the fragment is stamped from the plan, so this demuxer's timestamp ladder (DTS on mp4,
 /// PTS on Matroska, the #409 shift) never has to agree with the session's.
 final class IFrameSideReader: @unchecked Sendable {
-    private let openDemuxer: () throws -> Demuxer
+    private let open: (Demuxer) throws -> Void
+    private let cleanup: () -> Void
     private let convertP7ToProfile81: Bool
     private let nalFraming: VideoNALFraming
     private let readDeadlineSeconds: TimeInterval
+    private let now: () -> Date
 
     private let lock = NSLock()
     private var demuxer: Demuxer?
+    private var isOpen = false
     private var videoIndex: Int32 = -1
-    private var openFailed = false
     private var interrupted = false
+    private var cleanedUp = false
+    private var consecutiveFailures = 0
+    private var blockedUntil = Date.distantPast
 
     /// A keyframe sits at the seek target or right behind it; this bounds a source that claims an
     /// index entry no keyframe backs.
     private static let maxPacketsPerRead = 256
 
-    init(openDemuxer: @escaping () throws -> Demuxer,
+    /// How long the reader refuses to touch the source after a failed open or read. Requests are
+    /// served one at a time and AVKit sends five at once, so without this a stalled connection
+    /// answers them a full read deadline apart; with it they fall through to a cached neighbour.
+    static func coolDownSeconds(afterConsecutiveFailures failures: Int) -> TimeInterval {
+        failures <= 1 ? 5 : 30
+    }
+
+    /// `open` receives a demuxer that `interrupt()` can already reach, so a slow open is abortable.
+    /// `cleanup` runs once, from `close()`, whether or not the demuxer was ever opened.
+    init(open: @escaping (Demuxer) throws -> Void,
+         cleanup: @escaping () -> Void = {},
          convertP7ToProfile81: Bool = false,
          nalFraming: VideoNALFraming = .lengthPrefixed(size: 4),
-         readDeadlineSeconds: TimeInterval = 8) {
-        self.openDemuxer = openDemuxer
+         readDeadlineSeconds: TimeInterval = 8,
+         now: @escaping () -> Date = Date.init) {
+        self.open = open
+        self.cleanup = cleanup
         self.convertP7ToProfile81 = convertP7ToProfile81
         self.nalFraming = nalFraming
         self.readDeadlineSeconds = readDeadlineSeconds
+        self.now = now
+    }
+
+    private var isInterrupted: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return interrupted
+    }
+
+    private func drop(_ dem: Demuxer) {
+        lock.lock()
+        if demuxer === dem {
+            demuxer = nil
+            isOpen = false
+        }
+        lock.unlock()
+        dem.markClosed()
+        dem.close()
+    }
+
+    private func noteFailure(_ what: String) {
+        lock.lock()
+        guard !interrupted else { lock.unlock(); return }
+        consecutiveFailures += 1
+        let coolDown = Self.coolDownSeconds(afterConsecutiveFailures: consecutiveFailures)
+        blockedUntil = now().addingTimeInterval(coolDown)
+        let failures = consecutiveFailures
+        lock.unlock()
+        EngineLog.emit("[IFrameSideReader] \(what); leaving the source alone for "
+                       + "\(Int(coolDown))s (consecutive failures: \(failures))", category: .session)
     }
 
     private func readyDemuxer() -> Demuxer? {
         lock.lock()
-        if interrupted || openFailed { lock.unlock(); return nil }
-        if let demuxer { lock.unlock(); return demuxer }
+        if interrupted { lock.unlock(); return nil }
+        if let demuxer, isOpen { lock.unlock(); return demuxer }
+        let dem = Demuxer()
+        demuxer = dem
         lock.unlock()
 
         let started = DispatchTime.now()
-        let opened: Demuxer
         do {
-            opened = try openDemuxer()
+            try open(dem)
         } catch {
-            lock.lock(); openFailed = true; lock.unlock()
-            EngineLog.emit("[IFrameSideReader] open failed: \(error)", category: .session)
+            drop(dem)
+            noteFailure("open failed: \(error)")
             return nil
         }
-        let index = opened.videoStreamIndex
+        let index = dem.videoStreamIndex
         guard index >= 0 else {
-            opened.close()
-            lock.lock(); openFailed = true; lock.unlock()
-            EngineLog.emit("[IFrameSideReader] open failed: no video stream", category: .session)
+            drop(dem)
+            noteFailure("open failed: no video stream")
             return nil
         }
-        opened.discardAllStreamsExcept([index])
+        dem.discardAllStreamsExcept([index])
         lock.lock()
         if interrupted {
             lock.unlock()
-            opened.close()
+            drop(dem)
             return nil
         }
-        demuxer = opened
+        isOpen = true
         videoIndex = index
         lock.unlock()
         let ms = Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1_000_000
         EngineLog.emit("[IFrameSideReader] opened in \(String(format: "%.0f", ms))ms", category: .session)
-        return opened
+        return dem
     }
 
     func payload(startPts: Int64) -> Data? {
+        lock.lock()
+        let held = interrupted || now() < blockedUntil
+        lock.unlock()
+        if held { return nil }
         guard let dem = readyDemuxer() else { return nil }
+        if let data = read(dem, startPts: startPts) {
+            lock.lock(); consecutiveFailures = 0; lock.unlock()
+            return data
+        }
+        guard !isInterrupted else { return nil }
+        // The session treats a demuxer whose read failed as suspect-dead and reopens; so does this.
+        drop(dem)
+        noteFailure("read failed at pts=\(startPts)")
+        return nil
+    }
+
+    private func read(_ dem: Demuxer, startPts: Int64) -> Data? {
         dem.beginReadDeadline(secondsFromNow: readDeadlineSeconds)
         defer { dem.endReadDeadline() }
         if dem.isDiscSource || !dem.seek(to: startPts, streamIndex: videoIndex) {
@@ -80,8 +142,7 @@ final class IFrameSideReader: @unchecked Sendable {
             }
         }
         for _ in 0..<Self.maxPacketsPerRead {
-            lock.lock(); let stop = interrupted; lock.unlock()
-            if stop { return nil }
+            if isInterrupted { return nil }
             guard let packet = try? dem.readPacket() else { return nil }
             var owned: UnsafeMutablePointer<AVPacket>? = packet
             defer { av_packet_free(&owned) }
@@ -96,6 +157,7 @@ final class IFrameSideReader: @unchecked Sendable {
         return nil
     }
 
+    /// Any thread. Aborts an open or a read in flight and makes every later call answer nil.
     func interrupt() {
         lock.lock()
         interrupted = true
@@ -104,11 +166,16 @@ final class IFrameSideReader: @unchecked Sendable {
         dem?.markClosed()
     }
 
+    /// The reading thread, after `interrupt()`.
     func close() {
         lock.lock()
         let dem = demuxer
         demuxer = nil
+        isOpen = false
+        let runCleanup = !cleanedUp
+        cleanedUp = true
         lock.unlock()
         dem?.close()
+        if runCleanup { cleanup() }
     }
 }

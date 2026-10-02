@@ -203,7 +203,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// in `start()` and read back as `iFrameRenditionVerdict`.
     var iFramePlaylistRequested = false
     /// AE#682: an independent reader for a custom-IO source, which this session cannot reopen by URL.
-    /// Set before `start()`.
+    /// Set before `start()`. The session owns it from then on and closes it: through the side reader
+    /// that took it, at once when the rendition stays absent, or in `stop()`.
     var customIFrameReader: (reader: IOReader, formatHint: String?)?
     private(set) var iFrameRenditionVerdict: IFrameRenditionEligibility.Verdict = .absent(.notRequested)
     private var iFrameRendition: IFrameRendition?
@@ -2106,6 +2107,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             EngineLog.emit("[HLSVideoEngine] i-frame rendition: served segments=\(plan.count)",
                            category: .session)
         } else if iFramePlaylistRequested {
+            closeUnusedCustomIFrameReader()
             if iFrameRenditionVerdict == .served { iFrameRenditionVerdict = .absent(.noSecondReader) }
             if case .absent(let reason) = iFrameRenditionVerdict {
                 EngineLog.emit("[HLSVideoEngine] i-frame rendition: absent reason=\(reason.rawValue)",
@@ -2559,6 +2561,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         provider = nil
         let iFrames = iFrameRendition
         iFrameRendition = nil
+        closeUnusedCustomIFrameReader()
         savedVideoConfig = nil
         savedAudioConfig = nil
         let ownedParams = ownedCodecParams
@@ -2636,17 +2639,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
             extradata: cfg.codecpar.pointee.extradata.map { UnsafePointer($0) },
             size: Int(cfg.codecpar.pointee.extradata_size))
         let url = sourceURL, headers = sourceHTTPHeaders, custom = customIFrameReader
+        // The side reader owns the clone from here; `stop()` must not close it a second time.
+        customIFrameReader = nil
         let reader = IFrameSideReader(
-            openDemuxer: {
-                let dem = Demuxer()
+            open: { dem in
                 if let custom {
                     try dem.open(reader: custom.reader, formatHint: custom.formatHint,
                                  profile: .iFrameSideDemuxer)
                 } else {
                     try dem.open(url: url, extraHeaders: headers, profile: .iFrameSideDemuxer, isLive: false)
                 }
-                return dem
             },
+            cleanup: { custom?.reader.close() },
             convertP7ToProfile81: cfg.convertP7ToProfile81,
             nalFraming: framing)
         let entries = plan.map {
@@ -2661,26 +2665,38 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 builder.build(payload: payload, index: index,
                               startSeconds: entry.startSeconds, durationSeconds: entry.durationSeconds)
             },
-            waitForLink: { [weak self] in
+            waitForLink: { [weak self] shouldStop in
                 // A seek or a producer restart owns the link for a moment; a thumbnail can wait that
                 // out, but not ordinary fetching, or it would stall whenever the pump is busy.
                 let deadline = Date().addingTimeInterval(2)
-                while Date() < deadline, let self,
+                while Date() < deadline, !shouldStop(), let self,
                       self.restartInFlight || (self.sideReaderLinkGate?.state.seeking ?? false) {
                     Thread.sleep(forTimeInterval: 0.05)
                 }
+            },
+            // The budget learns its limits mid-session (a 429 halves them and arms a pacer), so the
+            // check `start()` made is repeated before every read. A custom reader has no origin.
+            sourceReadsAllowed: {
+                custom != nil || !(OriginRequestBudget.shared.requiresSerialRequests(url)
+                                   || OriginRequestBudget.shared.isPaced(url))
             },
             interruptReads: { reader.interrupt() },
             closeReader: { reader.close() })
     }
 
     /// Stop answering I-frame requests. The shutdown waits for a read in flight, so it runs off the
-    /// caller's thread; the provider is cleared first, so no new request reaches the rendition.
+    /// caller's thread; the provider is cleared first, so no new request reaches the rendition. The
+    /// reference stays, because `stop()` has to drain the same shutdown before it frees the codec
+    /// parameters the builder reads.
     private func tearDownIFrameRendition() {
         provider?.setIFrameSource(nil)
         guard let rendition = iFrameRendition else { return }
-        iFrameRendition = nil
         DispatchQueue.global(qos: .utility).async { rendition.shutdown() }
+    }
+
+    private func closeUnusedCustomIFrameReader() {
+        customIFrameReader?.reader.close()
+        customIFrameReader = nil
     }
 
     // MARK: - Producer construction + restart

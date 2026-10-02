@@ -12,6 +12,50 @@ private func fixtureExists(_ name: String) -> Bool {
     FileManager.default.fileExists(atPath: fixtureURL(name).path)
 }
 
+/// A file-backed custom reader that counts its closes: the stand-in for a host's clone.
+private final class CountingFileReader: IOReader, @unchecked Sendable {
+    let discImageProbeEnabled = false
+    private let lock = NSLock()
+    private let handle: FileHandle
+    private let size: Int64
+    private var offset: Int64 = 0
+    private var _closes = 0
+    init(url: URL) throws {
+        handle = try FileHandle(forReadingFrom: url)
+        size = Int64((try FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value ?? 0)
+    }
+    var closes: Int { lock.withLock { _closes } }
+    func read(_ buffer: UnsafeMutablePointer<UInt8>?, size count: Int32) -> Int32 {
+        lock.withLock {
+            guard let buffer, count > 0, offset < size else { return 0 }
+            try? handle.seek(toOffset: UInt64(offset))
+            let data = handle.readData(ofLength: Int(min(Int64(count), size - offset)))
+            data.copyBytes(to: buffer, count: data.count)
+            offset += Int64(data.count)
+            return Int32(data.count)
+        }
+    }
+    func seek(offset requested: Int64, whence: Int32) -> Int64 {
+        lock.withLock {
+            if whence & 0x10000 != 0 { return size }
+            switch whence & ~0x20000 {
+            case SEEK_SET: offset = requested
+            case SEEK_CUR: offset += requested
+            case SEEK_END: offset = size + requested
+            default: return -1
+            }
+            return offset
+        }
+    }
+    func close() { lock.withLock { _closes += 1 } }
+}
+
+private func waitUntil(_ timeout: TimeInterval = 5, _ condition: () -> Bool) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline { if condition() { return true }; Thread.sleep(forTimeInterval: 0.02) }
+    return condition()
+}
+
 @Suite("I-frame rendition on a real session", .serialized)
 struct IFrameSessionTests {
     private static let fixture = "restart-witness-av.mp4"
@@ -126,5 +170,49 @@ struct IFrameSessionTests {
         #expect(LoadOptions(serveIFramePlaylist: true) == on)
         #expect(SessionOptionCorrection.refusedFields(from: LoadOptions(), to: on).isEmpty)
         #expect(SessionOptionCorrection.knownFields.contains("serveIFramePlaylist"))
+    }
+
+    @Test("a custom source's clone feeds the side reader and is closed exactly once at stop",
+          .enabled(if: fixtureExists(fixture)), .timeLimit(.minutes(2)))
+    func customCloneIsClosedAtStop() throws {
+        let clone = try CountingFileReader(url: fixtureURL(Self.fixture))
+        let engine = HLSVideoEngine(url: fixtureURL(Self.fixture), dvModeAvailable: false)
+        engine.requestIFramePlaylist()
+        engine.customIFrameReader = (reader: clone, formatHint: "mp4")
+        _ = try engine.start()
+        let prov = try #require(engine.provider)
+        let fragment = try #require(prov.iFrameSegment(at: 1))
+        #expect(IFrameTestBoxes.sampleCount(fragment: fragment) == 1)
+        #expect(clone.closes == 0)
+        engine.stop()
+        #expect(waitUntil { clone.closes == 1 })
+        Thread.sleep(forTimeInterval: 0.2)
+        #expect(clone.closes == 1)
+    }
+
+    @Test("a clone nobody ever read from is still closed at stop",
+          .enabled(if: fixtureExists(fixture)), .timeLimit(.minutes(2)))
+    func untouchedCloneIsClosedAtStop() throws {
+        let clone = try CountingFileReader(url: fixtureURL(Self.fixture))
+        let engine = HLSVideoEngine(url: fixtureURL(Self.fixture), dvModeAvailable: false)
+        engine.requestIFramePlaylist()
+        engine.customIFrameReader = (reader: clone, formatHint: "mp4")
+        _ = try engine.start()
+        engine.stop()
+        #expect(waitUntil { clone.closes == 1 })
+    }
+
+    @Test("a clone handed to a session that cannot serve the rendition is closed at once",
+          .enabled(if: fixtureExists("sdr-h264.mp4")), .timeLimit(.minutes(2)))
+    func cloneOfAnAbsentRenditionIsClosed() throws {
+        // One IRAP in the whole file: no keyframe-aligned plan, so the rendition stays absent.
+        let clone = try CountingFileReader(url: fixtureURL("sdr-h264.mp4"))
+        let engine = HLSVideoEngine(url: fixtureURL("sdr-h264.mp4"), dvModeAvailable: false)
+        engine.requestIFramePlaylist()
+        engine.customIFrameReader = (reader: clone, formatHint: "mp4")
+        _ = try engine.start()
+        defer { engine.stop() }
+        #expect(engine.iFrameRenditionVerdict == .absent(.planNotKeyframeAligned))
+        #expect(clone.closes == 1)
     }
 }

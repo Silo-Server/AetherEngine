@@ -8,13 +8,18 @@ private final class Recorder: @unchecked Sendable {
     private var _reads: [Int64] = []
     private var _closed = 0, _interrupted = 0, _waits = 0
     var failing: Set<Int64> = []
+    var readsAllowed = true
+    /// Runs inside a read, before it answers. Lets a test park a read or stop the rendition under it.
+    var duringRead: (@Sendable (IFrameRendition.Entry) -> Void)?
     func read(_ e: IFrameRendition.Entry) -> Data? {
-        lock.lock(); defer { lock.unlock() }
-        _reads.append(e.startPts)
+        lock.lock(); _reads.append(e.startPts); lock.unlock()
+        duringRead?(e)
         return failing.contains(e.startPts) ? nil : Data("key\(e.startPts)".utf8)
     }
     func noteClose() { lock.lock(); _closed += 1; lock.unlock() }
-    func noteInterrupt() { lock.lock(); _interrupted += 1; lock.unlock() }
+    /// Signalled when shutdown has set its flag and is asking the reader to abort.
+    let interruptSeen = DispatchSemaphore(value: 0)
+    func noteInterrupt() { lock.lock(); _interrupted += 1; lock.unlock(); interruptSeen.signal() }
     func noteWait() { lock.lock(); _waits += 1; lock.unlock() }
     var reads: [Int64] { lock.lock(); defer { lock.unlock() }; return _reads }
     var closed: Int { lock.lock(); defer { lock.unlock() }; return _closed }
@@ -39,7 +44,8 @@ struct IFrameRenditionTests {
                     initSegment: Data("init".utf8),
                     fragment: payload + Data("@\(index):\(entry.startSeconds)".utf8))
             },
-            waitForLink: rec.noteWait,
+            waitForLink: { _ in rec.noteWait() },
+            sourceReadsAllowed: { rec.readsAllowed },
             interruptReads: rec.noteInterrupt,
             closeReader: rec.noteClose)
         return (rendition, dir)
@@ -128,5 +134,71 @@ struct IFrameRenditionTests {
             for await ok in group { #expect(ok) }
         }
         #expect(Set(rec.reads).count == 40)
+    }
+
+    @Test("a read that teardown interrupted is not answered with a neighbour")
+    func noSubstitutionAfterAnInterruptedRead() {
+        let rec = Recorder()
+        let (r, dir) = make(rec); defer { try? FileManager.default.removeItem(at: dir) }
+        _ = r.fragment(at: 1)
+        rec.failing = [3000]
+        let stopped = DispatchSemaphore(value: 0)
+        rec.duringRead = { entry in
+            guard entry.startPts == 3000 else { return }
+            // Teardown arrives while this read is in flight; the read then fails, as an aborted one does.
+            // Its own thread and a signal instead of a sleep: a loaded runner starves the global pool.
+            Thread.detachNewThread { r.shutdown(); stopped.signal() }
+            rec.interruptSeen.wait()
+        }
+        #expect(r.fragment(at: 3) == nil)
+        stopped.wait()
+    }
+
+    @Test("a second shutdown waits for the request the first one is still draining")
+    func aSecondShutdownWaitsForTheRequestInFlight() {
+        let rec = Recorder()
+        let (r, dir) = make(rec); defer { try? FileManager.default.removeItem(at: dir) }
+        let parked = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        rec.duringRead = { _ in parked.signal(); release.wait() }
+        let requestDone = DispatchSemaphore(value: 0), firstDone = DispatchSemaphore(value: 0)
+        let secondDone = DispatchSemaphore(value: 0)
+        Thread.detachNewThread { _ = r.fragment(at: 0); requestDone.signal() }
+        parked.wait()
+        Thread.detachNewThread { r.shutdown(); firstDone.signal() }
+        Thread.sleep(forTimeInterval: 0.1)
+        Thread.detachNewThread { r.shutdown(); secondDone.signal() }
+        // The session frees the codec parameters right after its own shutdown() returns, so that
+        // call must not come back while a build can still be running.
+        #expect(secondDone.wait(timeout: .now() + 0.4) == .timedOut)
+        release.signal()
+        requestDone.wait(); firstDone.wait()
+        #expect(secondDone.wait(timeout: .now() + 10) == .success)
+    }
+
+    @Test("while source reads are held, a request is answered from the cache or not at all")
+    func servesFromCacheOnlyWhileSourceReadsAreHeld() {
+        let rec = Recorder()
+        let (r, dir) = make(rec); defer { r.shutdown(); try? FileManager.default.removeItem(at: dir) }
+        rec.readsAllowed = false
+        #expect(r.fragment(at: 2) == nil)
+        #expect(rec.reads.isEmpty)
+        rec.readsAllowed = true
+        _ = r.fragment(at: 1)
+        rec.readsAllowed = false
+        #expect(r.fragment(at: 1) == Data("key1000@1:4.0".utf8))
+        #expect(r.fragment(at: 3) == Data("key1000@3:12.0".utf8))
+        #expect(rec.reads == [1000])
+    }
+
+    @Test("the failure line is written once per window and counts what it swallowed")
+    func logThrottle() {
+        var throttle = IFrameLogThrottle()
+        let t0 = Date(timeIntervalSince1970: 1_000)
+        #expect(throttle.shouldEmit(now: t0) == 0)
+        #expect(throttle.shouldEmit(now: t0.addingTimeInterval(1)) == nil)
+        #expect(throttle.shouldEmit(now: t0.addingTimeInterval(4.9)) == nil)
+        #expect(throttle.shouldEmit(now: t0.addingTimeInterval(5)) == 2)
+        #expect(throttle.shouldEmit(now: t0.addingTimeInterval(6)) == nil)
+        #expect(throttle.shouldEmit(now: t0.addingTimeInterval(11)) == 1)
     }
 }

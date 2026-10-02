@@ -20,7 +20,8 @@ final class IFrameRendition: IFrameSegmentSource, @unchecked Sendable {
     private let cache: IFramePayloadCache
     private let readPayload: (Entry) -> Data?
     private let buildFragment: (Data, Int, Entry) -> IFrameFragmentBuilder.Output?
-    private let waitForLink: () -> Void
+    private let waitForLink: (_ shouldStop: () -> Bool) -> Void
+    private let sourceReadsAllowed: () -> Bool
     private let interruptReads: () -> Void
     private let closeReader: () -> Void
 
@@ -28,12 +29,14 @@ final class IFrameRendition: IFrameSegmentSource, @unchecked Sendable {
     private let stateLock = NSLock()
     private var isShutDown = false
     private var capturedInit: Data?
+    private var failureLog = IFrameLogThrottle()
 
     init(entries: [Entry],
          cache: IFramePayloadCache,
          readPayload: @escaping (Entry) -> Data?,
          buildFragment: @escaping (Data, Int, Entry) -> IFrameFragmentBuilder.Output?,
-         waitForLink: @escaping () -> Void = {},
+         waitForLink: @escaping (_ shouldStop: () -> Bool) -> Void = { _ in },
+         sourceReadsAllowed: @escaping () -> Bool = { true },
          interruptReads: @escaping () -> Void = {},
          closeReader: @escaping () -> Void = {}) {
         self.entries = entries
@@ -41,6 +44,7 @@ final class IFrameRendition: IFrameSegmentSource, @unchecked Sendable {
         self.readPayload = readPayload
         self.buildFragment = buildFragment
         self.waitForLink = waitForLink
+        self.sourceReadsAllowed = sourceReadsAllowed
         self.interruptReads = interruptReads
         self.closeReader = closeReader
     }
@@ -70,25 +74,39 @@ final class IFrameRendition: IFrameSegmentSource, @unchecked Sendable {
         let entry = entries[index]
         var payload = cache.payload(for: index)
         if payload == nil {
-            waitForLink()
-            guard !shutDown else { return nil }
-            let started = DispatchTime.now()
-            if let read = readPayload(entry) {
+            // An origin that went serial or started metering mid-session has one slot and a few
+            // tokens, and the pump needs them; AVKit's overview burst would take them all.
+            var read: Data?
+            if sourceReadsAllowed() {
+                waitForLink { self.shutDown }
+                guard !shutDown else { return nil }
+                let started = DispatchTime.now()
+                read = readPayload(entry)
+                // A read that teardown aborted is not a miss to paper over.
+                guard !shutDown else { return nil }
+                if let read {
+                    let ms = Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1_000_000
+                    EngineLog.emit("[IFrameRendition] read idx=\(index) bytes=\(read.count) "
+                                   + "ms=\(String(format: "%.0f", ms))", category: .session, level: .verbose)
+                }
+            }
+            if let read {
                 cache.store(read, for: index)
                 payload = read
-                let ms = Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1_000_000
-                EngineLog.emit("[IFrameRendition] read idx=\(index) bytes=\(read.count) "
-                               + "ms=\(String(format: "%.0f", ms))", category: .session, level: .verbose)
             } else if let neighbour = cache.nearestIndex(to: index),
                       let substitute = cache.payload(for: neighbour) {
                 // AVKit keeps the last good picture for a keyframe it cannot fetch, and rate trick
                 // play wedges on a 404, so a near keyframe at the right time beats no answer.
                 payload = substitute
-                EngineLog.emit("[IFrameRendition] read failed idx=\(index), serving idx=\(neighbour) in its place",
-                               category: .session)
+                if let suppressed = failureLog.shouldEmit(now: Date()) {
+                    EngineLog.emit("[IFrameRendition] no keyframe for idx=\(index), serving idx=\(neighbour) "
+                                   + "in its place (\(suppressed) more since the last line)", category: .session)
+                }
             } else {
-                EngineLog.emit("[IFrameRendition] read failed idx=\(index) with nothing cached to stand in",
-                               category: .session)
+                if let suppressed = failureLog.shouldEmit(now: Date()) {
+                    EngineLog.emit("[IFrameRendition] no keyframe for idx=\(index) and nothing cached to stand in "
+                                   + "(\(suppressed) more since the last line)", category: .session)
+                }
                 return nil
             }
         }
@@ -97,18 +115,37 @@ final class IFrameRendition: IFrameSegmentSource, @unchecked Sendable {
         return output.fragment
     }
 
-    /// Idempotent. Aborts a read in flight, waits for the request that owns it to return, then
-    /// closes the reader and drops the cache.
+    /// Idempotent, and every call drains: the session frees the codec parameters the builder reads
+    /// as soon as its own call returns, so a second caller must not come back while the first is
+    /// still waiting for a request to finish.
     func shutdown() {
         stateLock.lock()
-        let already = isShutDown
+        let first = !isShutDown
         isShutDown = true
         stateLock.unlock()
-        guard !already else { return }
-        interruptReads()
+        if first { interruptReads() }
         queue.sync {
+            guard first else { return }
             closeReader()
             cache.removeAll()
         }
+    }
+}
+
+/// One line per window for a failure that repeats on every request (AVKit retries a missing
+/// keyframe several times a second), with the count of the ones it swallowed.
+struct IFrameLogThrottle {
+    var windowSeconds: TimeInterval = 5
+    private var lastEmit = Date.distantPast
+    private var suppressed = 0
+
+    /// The number of lines swallowed since the last one, when this one should be written.
+    mutating func shouldEmit(now: Date) -> Int? {
+        guard now.timeIntervalSince(lastEmit) >= windowSeconds else {
+            suppressed += 1
+            return nil
+        }
+        defer { suppressed = 0; lastEmit = now }
+        return suppressed
     }
 }
