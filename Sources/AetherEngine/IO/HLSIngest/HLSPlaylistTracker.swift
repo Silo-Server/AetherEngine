@@ -54,6 +54,39 @@ struct HLSPlaylistTracker {
             + min(longest, openGOPMarginSeconds)
     }
 
+    /// AE#684: on an upstream of MIXED segment lengths, the join takes one segment more when what it
+    /// would otherwise list cannot pay the seal its longest segment asks for.
+    ///
+    /// The coverage loop counts seconds from the newest segment back, so on an upstream alternating
+    /// 6 s and 4 s segments (the channel this issue was reported on) the depth depends on which one
+    /// happens to be newest: `4 + 6 + 4` is under the 16 s target and a fourth is taken (20 s listed,
+    /// 18 s cut, seal 6), while `6 + 4 + 6` meets it at three (16 s listed, 14 s cut, seal 4, which
+    /// is 7.25.1's value and its stalls). About four tunes in ten land in the second phase, and the
+    /// same channel then behaves differently from one zap to the next.
+    ///
+    /// The rule, exactly: the joined segments differ in length by more than
+    /// `mixedLengthSpreadSeconds`, AND their summed EXTINF is not above the holdback of the seal the
+    /// longest listed segment asks for (`3 x` it; the last GOP stays open, so a join has to list MORE
+    /// than a holdback to pay for it). Then one more segment, once. It costs that phase one
+    /// additional segment at the join, the short one on the reported shape, which the other phase
+    /// already loads.
+    ///
+    /// Uniform upstreams are deliberately outside it. There the join keeps the depth it had in
+    /// 7.24.0 and the seal is what that depth pays (5 on 6 s segments, 9 on 10 s), because a fourth
+    /// full-length segment on EVERY tune is the cost AE#678 declined.
+    static func mixedLengthJoinTakesOneMore(joinedDurations: [Double], longestListed: Double) -> Bool {
+        guard let longest = joinedDurations.max(), let shortest = joinedDurations.min(),
+              longest - shortest > mixedLengthSpreadSeconds, longestListed > 0 else { return false }
+        let asked = max(LiveEdgePolicy.targetDurationForCadence(longestListed),
+                        LiveEdgePolicy.targetDurationForUpstreamSegment(longestListed))
+        return joinedDurations.reduce(0, +) <= LiveEdgePolicy.holdBackSeconds(targetDuration: asked)
+    }
+
+    /// Lengths closer than this are one length. A packager's EXTINF wanders by frames around its
+    /// nominal value (5.96, 6.04), and that is a uniform upstream; a whole second is the resolution a
+    /// TARGETDURATION is taken at.
+    static let mixedLengthSpreadSeconds: Double = 1.0
+
     /// Longest GOP the join margin plans for. IPTV and broadcast GOPs run 0.5 to 4 s; a longer one
     /// only costs the bounded start's grace, which is what every join paid before AE#678.
     static let openGOPMarginSeconds: Double = 4
@@ -97,6 +130,11 @@ struct HLSPlaylistTracker {
                 if taken > 0, seconds >= coverage { break }
                 taken += 1
                 seconds += segment.duration
+            }
+            if taken < limit, taken < playlist.segments.count,
+               Self.mixedLengthJoinTakesOneMore(joinedDurations: playlist.segments.suffix(taken).map(\.duration),
+                                                longestListed: playlist.segments.map(\.duration).max() ?? 0) {
+                taken += 1
             }
             return windowEnd &- taken
         }
