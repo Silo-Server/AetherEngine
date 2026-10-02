@@ -148,6 +148,24 @@ valid; wait for refresh when a credential has expired or was rejected. Never pla
 URLs. The engine owns Range, routing and HTTP framing headers. Authorization waits are bounded;
 stopping the load cancels pending work and ignores late resolver results.
 
+**Redirect credential scope includes the scheme.** Validate the destination's scheme, host and
+effective port before obtaining credentials, as well as any session/path restrictions the host
+requires. Checking only the hostname allows an HTTPS-to-HTTP downgrade on the same host. An
+explicitly configured HTTP server is a separate host policy decision; it does not authorize an
+HTTPS session to downgrade.
+
+Each redirect asks the resolver for a new set of headers. The engine does not replay the previous
+provider result. Throw to reject an out-of-scope destination before its request is sent; refusal
+does not fall back to static headers. Returning `[:]` instead permits a request without application
+headers, so use it only when anonymous access to that destination is intended.
+
+Once a request chain has reached HTTPS, the engine drops credential headers (`Authorization`,
+`Proxy-Authorization`, `Cookie` and the Emby/Jellyfin token headers) from every later HTTP hop,
+whether they came from static headers or from the resolver. Other headers are still sent, and the
+hop itself still runs, so an anonymous HTTP redirect target keeps working. This is a backstop, not a
+substitute for scope checks: credentials in a custom header are not recognized, and a chain that
+starts on HTTP sends whatever the resolver returns.
+
 `LoadOptions.httpRequestAuthorization` covers native HLS media and its master/variant playlist
 preparation. Direct media AVIO, live ingest and audio taps retain static headers.
 

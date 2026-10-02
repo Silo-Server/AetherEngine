@@ -393,11 +393,20 @@ final class HLSOriginRelay: @unchecked Sendable {
         var retryHeaders: [String: String]?
         var challenged = false
         var redirects = 0
+        // Once a chain has reached TLS, no credential crosses a later cleartext hop, whatever the
+        // provider answers for it. The hop itself still runs, so anonymous redirects keep working.
+        var reachedTLS = Self.isTLS(origin)
+        func downgradeSafe(_ headers: [String: String], to destination: URL) -> [String: String] {
+            reachedTLS && !Self.isTLS(destination) ? RedirectHeaderPolicy.withoutCredentials(headers) : headers
+        }
         while true {
             let resolved: [String: String]
             do {
                 if let retryHeaders { resolved = retryHeaders }
-                else { resolved = try authorize(url, rejectedHeaders: nil, fallback: staticHeaders) }
+                else {
+                    let answer = try authorize(url, rejectedHeaders: nil, fallback: staticHeaders)
+                    resolved = downgradeSafe(answer, to: url)
+                }
             } catch { reportRequestFailure(); return .failed }
             retryHeaders = nil
             var request = URLRequest(url: url)
@@ -434,11 +443,13 @@ final class HLSOriginRelay: @unchecked Sendable {
                 staticHeaders = RedirectHeaderPolicy.headersToReplay(
                     extraHeaders: staticHeaders, originalURL: url, redirectURL: destination)
                 url = destination
+                reachedTLS = reachedTLS || Self.isTLS(destination)
             case .challenge(let response, let sentHeaders):
                 challenged = true
                 let respondingURL = response.url ?? url
-                guard let fresh = try? authorize(respondingURL, rejectedHeaders: sentHeaders, fallback: [:]),
-                      Self.authorizationValue(fresh) != Self.authorizationValue(sentHeaders) else {
+                let fresh = (try? authorize(respondingURL, rejectedHeaders: sentHeaders, fallback: [:]))
+                    .map { downgradeSafe($0, to: respondingURL) }
+                guard let fresh, Self.authorizationValue(fresh) != Self.authorizationValue(sentHeaders) else {
                     reportRequestFailure()
                     return .held(Fetched(url: respondingURL, status: 401, body: Data(), contentType: nil, contentRange: nil))
                 }
@@ -451,6 +462,8 @@ final class HLSOriginRelay: @unchecked Sendable {
     private static let transportHeaders: Set<String> = [
         "range", "host", "content-length", "transfer-encoding", "connection", "trailer", "te", "upgrade"
     ]
+
+    private static func isTLS(_ url: URL) -> Bool { url.scheme?.lowercased() == "https" }
 
     private static func authorizationValue(_ headers: [String: String]) -> String? {
         headers.first { $0.key.caseInsensitiveCompare("Authorization") == .orderedSame }?.value

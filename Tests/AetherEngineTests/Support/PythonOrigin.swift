@@ -32,6 +32,11 @@ enum PythonOrigin {
         let process: Process
         let port: UInt16
         let workDir: URL
+
+        func stop() {
+            process.terminate()
+            try? FileManager.default.removeItem(at: workDir)
+        }
     }
 
     /// Writes `files` and `script` into a scratch directory, runs the script with the system

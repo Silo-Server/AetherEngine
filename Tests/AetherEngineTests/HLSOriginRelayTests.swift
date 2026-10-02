@@ -1,6 +1,7 @@
 // Addressing and rewriting, none of which asks the trust evaluator. The live
 // proof that a client which never sees the certificate still gets the stream
-// lives with the other tests that set an evaluator, in EngineTLSHandshakeTests.
+// lives with the other tests that set an evaluator, in EngineTLSHandshakeTests. Redirect
+// authorization across an HTTPS-to-HTTP downgrade is in RedirectAuthorizationScopeTests.
 import Foundation
 import Testing
 
@@ -384,9 +385,8 @@ struct HLSOriginRelayAddressingTests {
         static let sliceBytes = 64 * 1024
         static func totalBytes(slices: Int) -> Int { sliceBytes * slices }
 
-        let port: UInt16
-        private let process: Process
-        private let workDir: URL
+        var port: UInt16 { launched.port }
+        private let launched: PythonOrigin.Launched
 
         init?(slices: Int = 8, pauseSeconds: Double = 0.05, declaresLength: Bool = true) async {
             guard let launched = await PythonOrigin.launch(
@@ -394,15 +394,10 @@ struct HLSOriginRelayAddressingTests {
                 script: Self.serverPy(slices: slices, pauseSeconds: pauseSeconds,
                                       declaresLength: declaresLength))
             else { return nil }
-            process = launched.process
-            port = launched.port
-            workDir = launched.workDir
+            self.launched = launched
         }
 
-        func stop() {
-            process.terminate()
-            try? FileManager.default.removeItem(at: workDir)
-        }
+        func stop() { launched.stop() }
 
         private static func serverPy(slices: Int, pauseSeconds: Double, declaresLength: Bool)
             -> String
@@ -451,9 +446,9 @@ struct HLSOriginRelayAddressingTests {
     /// Loopback HTTP origin that answers Range requests exactly as asked and records the last
     /// one it saw, which is what makes "forwarded verbatim" observable rather than asserted.
     final class RangeEchoOrigin {
-        let port: UInt16
-        private let process: Process
-        private let workDir: URL
+        var port: UInt16 { launched.port }
+        private var workDir: URL { launched.workDir }
+        private let launched: PythonOrigin.Launched
 
         var lastRange: String? {
             let log = workDir.appendingPathComponent("range.log")
@@ -465,15 +460,10 @@ struct HLSOriginRelayAddressingTests {
             guard let launched = await PythonOrigin.launch(
                 prefix: "aether-range-origin", script: Self.serverPy(status: status))
             else { return nil }
-            process = launched.process
-            port = launched.port
-            workDir = launched.workDir
+            self.launched = launched
         }
 
-        func stop() {
-            process.terminate()
-            try? FileManager.default.removeItem(at: workDir)
-        }
+        func stop() { launched.stop() }
 
         private static func serverPy(status: Int) -> String {
             """
@@ -520,24 +510,18 @@ struct HLSOriginRelayAddressingTests {
 
 
     final class SelfSignedHLSOrigin {
-        let port: UInt16
-        private let process: Process
-        private let workDir: URL
+        var port: UInt16 { launched.port }
+        private let launched: PythonOrigin.Launched
 
         init?() async {
             guard let launched = await PythonOrigin.launch(
                 prefix: "aether-hls-origin", script: Self.serverPy,
                 files: ["cert.pem": SelfSignedTLSOrigin.certPEM, "key.pem": SelfSignedTLSOrigin.keyPEM])
             else { return nil }
-            process = launched.process
-            port = launched.port
-            workDir = launched.workDir
+            self.launched = launched
         }
 
-        func stop() {
-            process.terminate()
-            try? FileManager.default.removeItem(at: workDir)
-        }
+        func stop() { launched.stop() }
 
         private static let serverPy = """
             import http.server, ssl

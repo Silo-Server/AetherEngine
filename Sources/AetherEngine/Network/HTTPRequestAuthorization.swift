@@ -8,6 +8,10 @@ import Foundation
 /// Direct media AVIO and live ingest still use their existing static headers.
 /// The resolver must independently validate every URL, including redirects and playlist-discovered
 /// origins. Discovery grants no credential authority. Credentials must never be placed in URLs.
+/// Include scheme, host and effective port in that scope. Redirects are authorized afresh. Throw to
+/// refuse a destination, or return no credentials to allow an anonymous request. Once a chain has
+/// reached HTTPS, credential headers are dropped from every later HTTP hop, resolver output included;
+/// a chain that starts on HTTP sends what the resolver returns.
 ///
 /// The engine owns Range, Host, and HTTP framing. A nil rejected-header dictionary asks for a new
 /// request. A nonnil dictionary is the actual request headers rejected by one HTTP 401; returning a

@@ -6,8 +6,9 @@ import Testing
 // Self-signed and private-CA media servers fail URLSession's system trust,
 // which the FFmpeg stack never enforced, so hosts need an explicit opt-in.
 // The resolver must stay on default handling for everything except a
-// server-trust challenge the host answered for.
-@Suite("EngineTLS trust resolution", .serialized)
+// server-trust challenge the host answered for. The evaluator is passed in, so this suite never
+// touches the process-global `EngineTLS.serverTrustEvaluator` the live suites set.
+@Suite("EngineTLS trust resolution")
 struct EngineTLSTests {
 
     private final class RecordingSender: NSObject, URLAuthenticationChallengeSender {
@@ -32,12 +33,8 @@ struct EngineTLSTests {
         method: String,
         host: String = "server.example"
     ) -> URLSession.AuthChallengeDisposition {
-        let previous = EngineTLS.serverTrustEvaluator
-        defer { EngineTLS.serverTrustEvaluator = previous }
-        EngineTLS.serverTrustEvaluator = evaluator
-
         var got: URLSession.AuthChallengeDisposition?
-        EngineTLS.resolve(challenge(method: method, host: host)) { disposition, _ in
+        EngineTLS.resolve(challenge(method: method, host: host), evaluator: evaluator) { disposition, _ in
             got = disposition
         }
         return got ?? .performDefaultHandling

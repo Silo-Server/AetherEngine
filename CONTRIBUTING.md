@@ -17,14 +17,18 @@ swift build
 swift test
 ```
 
-CI runs `RefreshableHLSAuthorizationTests` and `RefreshableSubtitleAuthorizationTests`
-in a separate process because their short deadlines require responsive async resolvers.
-Blocking work elsewhere in the suite can delay those resolvers on smaller runners.
+CI runs `RefreshableHLSAuthorizationTests`, `RefreshableSubtitleAuthorizationTests` and
+`LiveTrustEvaluatorTests` in a separate process because their short authorization deadlines require
+responsive async resolvers. Blocking work elsewhere in the suite can delay those resolvers on smaller
+runners. `LiveTrustEvaluatorTests` is the serialized parent of every live suite that sets the
+process-global `EngineTLS.serverTrustEvaluator`. Nest any new suite that sets it there; the
+redirect-scope tests carry the deadlines, and the TLS handshake tests run with them because they share
+that global.
 The two commands below cover the entire test suite, keeping the existing deadlines
 and parallel execution within each group:
 
 ```bash
-AUTHORIZATION_TEST_SUITES='RefreshableHLSAuthorizationTests|RefreshableSubtitleAuthorizationTests'
+AUTHORIZATION_TEST_SUITES='RefreshableHLSAuthorizationTests|RefreshableSubtitleAuthorizationTests|LiveTrustEvaluatorTests'
 swift test --skip "$AUTHORIZATION_TEST_SUITES"
 swift test --skip-build --filter "$AUTHORIZATION_TEST_SUITES"
 ```
