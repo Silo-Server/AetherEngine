@@ -199,6 +199,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Set before `start()`.
     var enableNativeSubtitleTrackForSession: Bool = false
 
+    /// AE#682: the host asked for an I-frame rendition. Whether the session can serve one is decided
+    /// in `start()` and read back as `iFrameRenditionVerdict`.
+    var iFramePlaylistRequested = false
+    /// AE#682: an independent reader for a custom-IO source, which this session cannot reopen by URL.
+    /// Set before `start()`. The session owns it from then on and closes it: through the side reader
+    /// that took it, at once when the rendition stays absent, or in `stop()`.
+    var customIFrameReader: (reader: IOReader, formatHint: String?)?
+    private(set) var iFrameRenditionVerdict: IFrameRenditionEligibility.Verdict = .absent(.notRequested)
+    private var iFrameRendition: IFrameRendition?
+
     /// Native subtitle rendition marked DEFAULT=YES in the master (Sodalite#32). Set before `start()`; the
     /// provider advertises this ordinal as the group default so a host-selected legible track renders.
     var nativeSubtitleDefaultOrdinal: Int = 0
@@ -334,6 +344,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// this; a full session wires it via `LoadOptions.prepareNativeSubtitles`.
     public func requestNativeSubtitleTrack() {
         enableNativeSubtitleTrackForSession = true
+    }
+
+    /// Ask for an I-frame rendition in the master (AE#682), the `LoadOptions.serveIFramePlaylist`
+    /// path a full session uses. Must precede `start()`.
+    public func requestIFramePlaylist() {
+        iFramePlaylistRequested = true
     }
 
     /// Attach `count` fresh cue stores (one per declared text track) to the current producer (#55).
@@ -2044,6 +2060,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // the standard sourceIsHDR && panelReadyForHDR check routes them correctly.
         // #15: a SUBTITLES rendition lives only in a master; the pure decision below forces the
         // master for routing-safe subtitled sources so PiP can show subtitles.
+        // AE#682: decided before the routing below, because an I-frame rendition is one of the
+        // reasons to serve a master at all.
+        let iFrameCandidate = IFrameRenditionEligibility.candidate(.init(
+            requested: iFramePlaylistRequested,
+            isLive: isLiveSession,
+            planBoundariesClaimRandomAccess: planBoundariesClaimRandomAccess,
+            sequentialOrigin: sequentialOrigin,
+            heldSourceConnection: openProfile.avioHeldConnection,
+            originIsSerial: sourceReopenableByURL
+                && OriginRequestBudget.shared.requiresSerialRequests(sourceURL),
+            isDiscSource: dem.isDiscSource,
+            secondReaderAvailable: sourceReopenableByURL || customIFrameReader != nil))
         let hasNativeSubs = enableNativeSubtitleTrackForSession && !nativeSubtitleCueStoresForSession.isEmpty
         // AE#187: tvOS HW HEVC needs the codec advertised in a master's CODECS attribute; a bare media
         // playlist (H.264 is fine media-direct) fails the item with tracks count=0 / -12848. Scope to
@@ -2061,7 +2089,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             builtInPanelEngagesOnDemand: Self.builtInPanelEngagesOnDemand,
             frameRateKnown: frameRate != nil,
             videoCodecNeedsMasterSignaling: videoCodecNeedsMasterSignaling,
-            hasAudioRendition: servedAudioLanguage != nil)
+            hasAudioRendition: servedAudioLanguage != nil,
+            hasIFrameRendition: iFrameCandidate == .served)
         let resolvedURL: URL? = useMasterPlaylist
             ? srv.playlistURL
             : srv.mediaPlaylistURL
@@ -2070,6 +2099,21 @@ public final class HLSVideoEngine: @unchecked Sendable {
             throw HLSVideoEngineError.openFailed(reason: "server URL not ready")
         }
         self.servingMasterPlaylist = useMasterPlaylist
+        iFrameRenditionVerdict = IFrameRenditionEligibility.resolve(
+            candidate: iFrameCandidate, servingMaster: useMasterPlaylist)
+        if iFrameRenditionVerdict == .served, let rendition = makeIFrameRendition(plan: plan, cache: segmentCache) {
+            iFrameRendition = rendition
+            prov.setIFrameSource(rendition)
+            EngineLog.emit("[HLSVideoEngine] i-frame rendition: served segments=\(plan.count)",
+                           category: .session)
+        } else if iFramePlaylistRequested {
+            closeUnusedCustomIFrameReader()
+            if iFrameRenditionVerdict == .served { iFrameRenditionVerdict = .absent(.noSecondReader) }
+            if case .absent(let reason) = iFrameRenditionVerdict {
+                EngineLog.emit("[HLSVideoEngine] i-frame rendition: absent reason=\(reason.rawValue)",
+                               category: .session)
+            }
+        }
         self.servedSourceIsHDR = videoRange != .sdr
         self.servedDolbyVisionConversion = convertP7ToProfile81 ? .profile7ToProfile81 : nil
         EngineLog.emit("[HLSVideoEngine] serving on \(url.absoluteString) (dvModeAvailable=\(dvModeAvailable) effectiveDvMode=\(effectiveDvMode) panelIsHDR=\(panelIsInHDRMode) displaySupportsHDR=\(displaySupportsHDR) matchContent=\(matchContentEnabled) sourceIsHDR=\(videoRange != .sdr || effectiveDvMode) useMaster=\(useMasterPlaylist) videoRange=\(videoRange) dvVariant=\(dvVariant) audioLang=\(servedAudioLanguage ?? "none"))")
@@ -2116,6 +2160,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// symptom (htrung14, tvOS transport bar, Apple TV 4K 3rd gen). Routing-safety still decides: an
     /// unready HDR panel is a -11848 rejection, and a language is not worth one.
     ///
+    /// AE#682: `hasIFrameRendition` is a third reason of the same shape. `EXT-X-I-FRAME-STREAM-INF`
+    /// lives only in a master, and it is likewise not worth a display rejection.
+    ///
     /// #130: `frameRateKnown` gates PQ/HLG masters. AVPlayer filters a VIDEO-RANGE=PQ/HLG
     /// EXT-X-STREAM-INF that has no FRAME-RATE attribute out of the master at parse time and fails
     /// the item with NSURLErrorDomain -1002 without ever fetching media.m3u8 (byte-exact local
@@ -2131,7 +2178,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         builtInPanelEngagesOnDemand: Bool,
         frameRateKnown: Bool,
         videoCodecNeedsMasterSignaling: Bool = false,
-        hasAudioRendition: Bool = false
+        hasAudioRendition: Bool = false,
+        hasIFrameRendition: Bool = false
     ) -> Bool {
         let sourceIsHDR = videoRange != .sdr || effectiveDvMode
         let panelReadyForHDR = panelIsInHDRMode
@@ -2149,7 +2197,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // before any media fetch (macOS / the Simulator build the track from the init hvcC and never
         // reproduce it). Forcing the master where it is routing-safe (SDR on any panel, HDR on a ready
         // one) closes that gap; the caller scopes the flag to tvOS + HEVC.
-        if (hasNativeSubs || videoCodecNeedsMasterSignaling || hasAudioRendition)
+        if (hasNativeSubs || videoCodecNeedsMasterSignaling || hasAudioRendition || hasIFrameRendition)
             && routingSafeForMaster { return true }
         return sourceIsHDR && panelReadyForHDR
     }
@@ -2190,7 +2238,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
     public var hasServedMediaSegment: Bool { server?.hasServedMediaSegment ?? false }
 
     /// Flip the serving flag after the engine has reloaded the media playlist on a display rejection.
-    func markServingMediaAfterFallback() { servingMasterPlaylist = false }
+    func markServingMediaAfterFallback() {
+        servingMasterPlaylist = false
+        // AE#682: the rendition lives only in the master this session just stopped serving.
+        tearDownIFrameRendition()
+    }
 
     // MARK: - Diagnostics
 
@@ -2507,6 +2559,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         preopenedDemuxer = nil
         let prov = provider
         provider = nil
+        let iFrames = iFrameRendition
+        iFrameRendition = nil
+        closeUnusedCustomIFrameReader()
         savedVideoConfig = nil
         savedAudioConfig = nil
         let ownedParams = ownedCodecParams
@@ -2531,6 +2586,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
         // Wake LL-HLS blocking-reload waiters; without this they sleep out their full 18-30 s timeout.
         prov?.cancelWaiters()
+        prov?.setIFrameSource(nil)
 
         // markClosed unblocks a live pump parked in the AVIO reconnect loop (exits on closed flag,
         // not the producer cancel flag). Without this, waitForFinish blocks ~3 s while reconnects
@@ -2542,6 +2598,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // Detached cleanup: producer waitForFinish must precede demuxer/cache/server close
         // (pump accesses them during unwind). ownedParams released last (pump read them).
         Task.detached {
+            iFrames?.shutdown()
             _ = p?.waitForFinish(timeout: 3.0)
             s?.stop()
             c?.close()
@@ -2555,6 +2612,91 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     deinit {
         stop()
+    }
+
+    // MARK: - I-frame rendition (AE#682)
+
+    private func makeIFrameRendition(plan: [Segment], cache segmentCache: SegmentCache) -> IFrameRendition? {
+        guard let cfg = savedVideoConfig, !plan.isEmpty else { return nil }
+        let directory = segmentCache.sessionDir.appendingPathComponent("iframes", isDirectory: true)
+        let staging = directory.appendingPathComponent("staging", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        } catch {
+            EngineLog.emit("[HLSVideoEngine] i-frame rendition: staging dir failed: \(error)",
+                           category: .session)
+            return nil
+        }
+        let builder = IFrameFragmentBuilder(
+            video: MP4SegmentMuxer.VideoConfig(
+                codecpar: cfg.codecpar, timeBase: cfg.timeBase,
+                codecTagOverride: cfg.codecTagOverride, doviConfig: cfg.doviConfig,
+                colorOverride: cfg.colorOverride, extradataOverride: cfg.extradataOverride,
+                nalFramingLatch: cfg.nalFramingLatch),
+            stagingDir: staging)
+        let framing = cfg.nalFramingOverride ?? A53SEIParser.nalFraming(
+            codec: cfg.codecpar.pointee.codec_id == AV_CODEC_ID_HEVC ? .hevc : .h264,
+            extradata: cfg.codecpar.pointee.extradata.map { UnsafePointer($0) },
+            size: Int(cfg.codecpar.pointee.extradata_size))
+        let url = sourceURL, headers = sourceHTTPHeaders, custom = customIFrameReader
+        // The side reader owns the clone from here; `stop()` must not close it a second time.
+        customIFrameReader = nil
+        let reader = IFrameSideReader(
+            open: { dem in
+                if let custom {
+                    try dem.open(reader: custom.reader, formatHint: custom.formatHint,
+                                 profile: .iFrameSideDemuxer)
+                } else {
+                    try dem.open(url: url, extraHeaders: headers, profile: .iFrameSideDemuxer, isLive: false)
+                }
+            },
+            cleanup: { custom?.reader.close() },
+            convertP7ToProfile81: cfg.convertP7ToProfile81,
+            nalFraming: framing)
+        let entries = plan.map {
+            IFrameRendition.Entry(startPts: $0.startPts, startSeconds: $0.startSeconds,
+                                  durationSeconds: $0.durationSeconds)
+        }
+        return IFrameRendition(
+            entries: entries,
+            cache: IFramePayloadCache(directory: directory.appendingPathComponent("payloads", isDirectory: true)),
+            readPayload: { reader.payload(startPts: $0.startPts) },
+            buildFragment: { payload, index, entry in
+                builder.build(payload: payload, index: index,
+                              startSeconds: entry.startSeconds, durationSeconds: entry.durationSeconds)
+            },
+            waitForLink: { [weak self] shouldStop in
+                // A seek or a producer restart owns the link for a moment; a thumbnail can wait that
+                // out, but not ordinary fetching, or it would stall whenever the pump is busy.
+                let deadline = Date().addingTimeInterval(2)
+                while Date() < deadline, !shouldStop(), let self,
+                      self.restartInFlight || (self.sideReaderLinkGate?.state.seeking ?? false) {
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+            },
+            // The budget learns its limits mid-session (a 429 halves them and arms a pacer), so the
+            // check `start()` made is repeated before every read. A custom reader has no origin.
+            sourceReadsAllowed: {
+                custom != nil || !(OriginRequestBudget.shared.requiresSerialRequests(url)
+                                   || OriginRequestBudget.shared.isPaced(url))
+            },
+            interruptReads: { reader.interrupt() },
+            closeReader: { reader.close() })
+    }
+
+    /// Stop answering I-frame requests. The shutdown waits for a read in flight, so it runs off the
+    /// caller's thread; the provider is cleared first, so no new request reaches the rendition. The
+    /// reference stays, because `stop()` has to drain the same shutdown before it frees the codec
+    /// parameters the builder reads.
+    private func tearDownIFrameRendition() {
+        provider?.setIFrameSource(nil)
+        guard let rendition = iFrameRendition else { return }
+        DispatchQueue.global(qos: .utility).async { rendition.shutdown() }
+    }
+
+    private func closeUnusedCustomIFrameReader() {
+        customIFrameReader?.reader.close()
+        customIFrameReader = nil
     }
 
     // MARK: - Producer construction + restart

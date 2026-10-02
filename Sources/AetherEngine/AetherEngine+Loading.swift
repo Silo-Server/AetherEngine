@@ -867,6 +867,15 @@ extension AetherEngine {
         // #240: the pump claims the source link through this gate while it is fetching, so the
         // subtitle side readers can stay out of its way. Set before start().
         session.sideReaderLinkGate = sideReaderLinkGate
+        // AE#682: set before start(), where the session decides whether it can serve the rendition.
+        // A custom-IO source is not reopenable by URL, so the side reader gets a clone of its own;
+        // a reader that cannot clone leaves the rendition absent.
+        if loadedOptions.serveIFramePlaylist {
+            session.requestIFramePlaylist()
+            if isCustomSource, let clone = customReader?.makeIndependentReader() {
+                session.customIFrameReader = (reader: clone, formatHint: customFormatHint)
+            }
+        }
         // #260: an observer installed before load has to reach this session's producers too.
         session.setNativeVideoFrameTimeObserver(nativeVideoFrameTimeObserver)
         // Audit Vcore-101: every hop below is dropped once this session has ended (`hop(for:)`).

@@ -67,7 +67,7 @@ func printUsage() {
 
     Usage:
       aetherctl probe [--detect-hdr10plus] [--detect-atmos] <url>
-      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] <url>
+      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] <url>
       aetherctl validate [--no-dv] [--force-dv] [--dv-base-layer] <url>
       aetherctl swdecode [--frames N] <url>
       aetherctl play [--seconds N] [--live] [--no-sw-escalation] [--fast-zap] [--live-start-immediately] [--dvr-window N] [--subs <codec-or-lang>]
@@ -976,6 +976,8 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     let audioSeconds = secondsFlag ?? 10
     // --native-subs: diagnostics affordance for mov_text subtitle track (#55); serve only.
     let nativeSubsIndex = takeIntFlag("--native-subs", from: &rest)
+    // AE#682: list an I-frame rendition in the master; serve only.
+    let serveIFrames = takeFlag("--iframes", from: &rest)
     // --throttle-kbps: slow-CDN simulation; starves the producer below real-time to provoke rebuffers.
     let throttleKbps = takeIntFlag("--throttle-kbps", from: &rest)
     // --start-position: anchor the first producer at a resume position like load(startPosition:) (#99); serve only.
@@ -1004,7 +1006,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
         runServe(url: url, dvModeAvailable: dvModeAvailable, forceDVWithoutDisplay: forceDV,
                  dolbyVisionHandling: dvHandling,
                  nativeSubsIndex: nativeSubsIndex, startPosition: startPosition,
-                 audioDelayMs: serveAudioDelayMs)
+                 audioDelayMs: serveAudioDelayMs, iFrames: serveIFrames)
     case "validate":
         exit(runValidate(url: url, dvModeAvailable: dvModeAvailable, forceDVWithoutDisplay: forceDV,
                          dolbyVisionHandling: dvHandling))

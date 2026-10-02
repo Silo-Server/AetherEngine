@@ -94,6 +94,12 @@ protocol HLSSegmentProvider: AnyObject {
     /// has the cues for a segment in the store by the time AVPlayer fetches it.
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String?
 
+    /// AE#682: true when this session lists an I-frame rendition in its master. The two calls below
+    /// answer `iframe_init.mp4` and `iframe{N}.mp4`; both may block on a source read.
+    var iFrameRenditionServed: Bool { get }
+    func iFrameInitSegment() -> Data?
+    func iFrameSegment(at index: Int) -> Data?
+
     /// Atomic snapshot at the top of each playlist build. discontinuitySequence = EXT-X-DISCONTINUITY-tagged segments that slid out of the window (RFC 8216 §6.2.2 requires incrementing it; omission slips AVPlayer's discontinuity tracking one window per boundary). firstVisible in the same snapshot: a separate lock acquisition let a concurrent slide produce MEDIA-SEQUENCE newer than the count.
     func notePlaylistBuild() -> (visibleCount: Int, firstVisible: Int, refreshCounter: Int, endlistAdded: Bool, discontinuitySequence: Int)
 
@@ -158,6 +164,9 @@ extension HLSSegmentProvider {
     var nativeSubtitleDefaultOrdinal: Int { 0 }
     var nativeSubtitleWholeProgram: Bool { false }
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String? { nil }
+    var iFrameRenditionServed: Bool { false }
+    func iFrameInitSegment() -> Data? { nil }
+    func iFrameSegment(at index: Int) -> Data? { nil }
     var liveTargetSegmentDuration: Double? { nil }
     var liveRejoinStart: (segmentIndex: Int, secondsIntoSegment: Double)? { nil }
     func noteServedLiveRejoinPlacement(timeOffset: Double, firstVisible: Int) {}
@@ -1119,6 +1128,27 @@ final class HLSLocalServer: @unchecked Sendable {
                            data: Data(vtt.utf8),
                            contentType: "text/vtt")
 
+        case "/iframe.m3u8":
+            guard let prov = provider, prov.iFrameRenditionServed else {
+                return send404(fd: fd, path: normalizedPath, reason: "no I-frame rendition")
+            }
+            let body = Self.buildIFramePlaylistText(provider: prov, subResourceBaseURL: subResourceBaseURL)
+            return send200(fd: fd, path: normalizedPath, data: Data(body.utf8),
+                           contentType: "application/vnd.apple.mpegurl")
+
+        case "/iframe_init.mp4":
+            guard let data = provider?.iFrameInitSegment(), !data.isEmpty else {
+                return send404(fd: fd, path: normalizedPath, reason: "I-frame init unavailable")
+            }
+            return send200(fd: fd, path: normalizedPath, data: data, contentType: "video/mp4")
+
+        case let p where p.hasPrefix("/iframe") && p.hasSuffix(".mp4"):
+            guard let index = Self.parseIFramePath(p),
+                  let data = provider?.iFrameSegment(at: index), !data.isEmpty else {
+                return send404(fd: fd, path: normalizedPath, reason: "no I-frame for \(normalizedPath)")
+            }
+            return send200(fd: fd, path: normalizedPath, data: data, contentType: "video/mp4")
+
         case "/init.mp4":
             stateLock.lock(); servedMediaBytes = true; stateLock.unlock()
             let data = provider?.initSegment() ?? Data()
@@ -1661,6 +1691,69 @@ final class HLSLocalServer: @unchecked Sendable {
         }
         lines.append("#EXT-X-STREAM-INF:\(streamInfAttrs.joined(separator: ","))")
         lines.append("media.m3u8")
+        if provider.iFrameRenditionServed {
+            // AE#682: BANDWIDTH is the variant's, an honest ceiling (one keyframe cannot outweigh the
+            // segment it opens). A value below the real peak logs -12318 on every fetch.
+            var iFrameAttrs = ["BANDWIDTH=\(bandwidth)", "CODECS=\"\(videoCodecs(of: codecs))\""]
+            if variant == .primary, let supplemental = provider.masterSupplementalCodecs {
+                iFrameAttrs.append("SUPPLEMENTAL-CODECS=\"\(supplemental)\"")
+            }
+            if let resolution = provider.masterResolution {
+                iFrameAttrs.append("RESOLUTION=\(resolution.width)x\(resolution.height)")
+            }
+            if let range = provider.masterVideoRange {
+                iFrameAttrs.append("VIDEO-RANGE=\(range.rawValue)")
+            }
+            iFrameAttrs.append("URI=\"iframe.m3u8\"")
+            lines.append("#EXT-X-I-FRAME-STREAM-INF:\(iFrameAttrs.joined(separator: ","))")
+        }
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// The video entry of a master CODECS list. An I-frame variant carries no audio, and a CODECS
+    /// that names one makes AVPlayer look for a track the fragments do not have.
+    static func videoCodecs(of codecs: String) -> String {
+        let videoPrefixes = ["avc1", "avc3", "hvc1", "hev1", "dvh1", "dvhe", "av01", "vp09"]
+        let video = codecs.split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { entry in videoPrefixes.contains { entry.hasPrefix($0) } }
+        return video.isEmpty ? codecs : video.joined(separator: ",")
+    }
+
+    /// "/iframe{N}.mp4" -> N. nil for the init, for a negative or non-numeric index, and for any
+    /// other path.
+    static func parseIFramePath(_ path: String) -> Int? {
+        guard path.hasPrefix("/iframe"), path.hasSuffix(".mp4") else { return nil }
+        let digits = path.dropFirst("/iframe".count).dropLast(".mp4".count)
+        guard !digits.isEmpty, digits.allSatisfy(\.isNumber) else { return nil }
+        return Int(digits)
+    }
+
+    /// AE#682: one entry per plan segment, each a single keyframe in its own resource. Same count,
+    /// EXTINF and TARGETDURATION as the VOD media playlist, so both renditions describe one timeline.
+    /// VOD only; the caller never lists this rendition for a live or event session.
+    static func buildIFramePlaylistText(provider: HLSSegmentProvider,
+                                        subResourceBaseURL: URL? = nil) -> String {
+        let count = provider.segmentCount
+        var maxDuration: Double = 0
+        for i in 0..<count { maxDuration = max(maxDuration, provider.segmentDuration(at: i)) }
+        let targetDuration = LiveEdgePolicy.targetDurationSeconds(
+            maxSegmentDuration: maxDuration, cutTargetSeconds: nil, cadenceFloorSeconds: nil)
+        let prefix: String
+        if let base = subResourceBaseURL {
+            let baseStr = base.absoluteString
+            prefix = baseStr.hasSuffix("/") ? baseStr : baseStr + "/"
+        } else {
+            prefix = ""
+        }
+        var lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-I-FRAMES-ONLY",
+                     "#EXT-X-TARGETDURATION:\(targetDuration)", "#EXT-X-MEDIA-SEQUENCE:0",
+                     "#EXT-X-PLAYLIST-TYPE:VOD", "#EXT-X-MAP:URI=\"\(prefix)iframe_init.mp4\""]
+        for i in 0..<count {
+            lines.append("#EXTINF:\(String(format: "%.3f", provider.segmentDuration(at: i))),")
+            lines.append("\(prefix)iframe\(i).mp4")
+        }
+        lines.append("#EXT-X-ENDLIST")
         return lines.joined(separator: "\n") + "\n"
     }
 
