@@ -10,6 +10,10 @@ the public-API contract.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [7.26.0] - 2026-10-02
+
 ### Added
 
 - **Scrub thumbnails in the stock player (#682).** `LoadOptions.serveIFramePlaylist` makes a native VOD session list an I-frame rendition in its master, which is the one input `AVPlayerViewController` takes thumbnails from: a host that presents the system transport bar gets them, and I-frame fast forward and rewind, without writing any UI. Each entry is the source's own keyframe at full resolution, read by a second reader and stamped on the main rendition's timeline. Off by default. The rendition is left out entirely, never half-served, where the session cannot answer every keyframe (live, MPEG-TS, single-connection origins, discs, media-playlist routing); the log names the reason.
