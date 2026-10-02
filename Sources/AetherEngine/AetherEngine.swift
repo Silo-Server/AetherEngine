@@ -2296,10 +2296,6 @@ public final class AetherEngine: ObservableObject {
     /// session so a media reload that also fails cannot loop. Reset on each load.
     var masterFallbackUsed = false
 
-    /// Start position of the current loopback video load, replayed if the master is rejected and we
-    /// reload the media playlist (a startup-failed item has no reliable renderedTime).
-    var lastNativeVideoStartPosition: Double = 0
-
     /// #93 PiP skips: AVKit-side seeks (PiP +-15s buttons) bypass the engine seek API, so a far
     /// playhead jump is detected on $renderedTime and, once settled, the native subtitle readers
     /// re-anchor and the remembered rendition selection replays (its deselect/reselect busts
@@ -2479,17 +2475,30 @@ public final class AetherEngine: ObservableObject {
         // #130: a live fallback is a REJOIN of the running ingest (the window may have slid since
         // the failed master attempt); a stale explicit position can wedge AVPlayer against the
         // backlog, so skip the initial seek and let it pick edge-minus-holdback (LiveReloadPolicy).
-        // VOD keeps the explicit pre-failure position.
-        let position = lastNativeVideoStartPosition
+        // VOD reloads where the rejected item was placed. That is not always where the session
+        // started: the #93/#65 stage-2 recovery swaps a fresh item in at the position it held, and a
+        // rejection of THAT item has to come back there, not rewind to the first mount.
+        let position = host.mountedStartPosition ?? 0
+        // Read before the swap, which resets what it reads.
+        let resumesPlaying = host.mediaFallbackResumesPlaying()
         EngineLog.emit(
             "[AetherEngine] AVPlayer rejected the master (code=\(rejection.code)); falling back to "
             + "media playlist (no CC/subtitle renditions) at "
-            + (isLive ? "the live edge" : "\(String(format: "%.2f", position))s"),
+            + (isLive ? "the live edge" : "\(String(format: "%.2f", position))s")
+            + (resumesPlaying ? "" : ", staying paused for the viewer"),
             category: .session)
         host.swapItem(url: fallbackURL,
                       startPosition: isLive ? nil : position,
                       skipInitialSeek: LiveReloadPolicy.skipInitialSeek(isLive: isLive, isRejoin: true))
-        host.play()
+        // Resume only a viewer who was playing, read from both the engine's intent and AVPlayer's
+        // rate. A paused title refused behind the tvOS screensaver used to start itself and wake it.
+        if resumesPlaying {
+            host.play()
+        } else {
+            // Clears the intent latch a pause from AVKit, Control Center or PiP left set, so the fresh
+            // item's readyToPlay does not re-assert play() behind the viewer.
+            host.pause()
+        }
     }
 
     /// #35 readiness-gate settle windows. Generous enough that a slow-but-healthy cold start reads as
@@ -2830,7 +2839,12 @@ public final class AetherEngine: ObservableObject {
     ///   `LiveReloadPolicy.recoveryRejoinPosition` cannot. A window closed with ENDLIST is a finite asset
     ///   whose seekable end IS the playhead, so the distance-behind-live that policy reads is zero and it
     ///   would aim at the edge, discarding the rewind the viewer kept through the whole outage.
+    /// - Parameter resumesPlaying: false when the viewer wants the item paused (see
+    ///   `NativeAVPlayerHost.itemDeathReloadResumesPlaying`). The pause guard bypass admits the dead
+    ///   item; it must not also overrule the viewer, so the fresh item mounts paused at the anchor
+    ///   and the next Play resumes there.
     func reloadStalledConsumerItem(position: Double, allowPausedConsumer: Bool = false,
+                                   resumesPlaying: Bool = true,
                                    liveRejoinOverride: Double? = nil) {
         guard let host = nativeHost, let player = currentAVPlayer,
               let url = (player.currentItem?.asset as? AVURLAsset)?.url else { return }
@@ -2873,7 +2887,7 @@ public final class AetherEngine: ObservableObject {
             + Self.recoveryAnchorLogSuffix(
                 anchor: anchor, position: position,
                 pendingSeekTarget: pendingRecoverySeekClockTarget)
-            + " (same URL, same host)",
+            + " (same URL, same host" + (resumesPlaying ? ")" : ", staying paused for the viewer)"),
             category: .engine
         )
         // AE#454: the placement, expressed in the playlist the fresh item is about to load. A rejoin
@@ -2913,7 +2927,13 @@ public final class AetherEngine: ObservableObject {
         // AE#454 round 2: the item that is about to load is the one the placement was armed for, and
         // the only one whose axis the playlist will state.
         if didArmPlacement { liveRejoinPlacementGeneration = host.itemGeneration }
-        host.play()
+        if resumesPlaying {
+            host.play()
+        } else {
+            // Clears the intent latch a pause from AVKit, Control Center or PiP left set, so the fresh
+            // item's readyToPlay does not re-assert play() behind the viewer.
+            host.pause()
+        }
         if let rejoinPosition {
             // Stashed rather than seeked: the pre-readiness seek IS the wedge LiveReloadPolicy exists
             // to avoid, and a live seek does not defer itself (`shouldDeferHostSeek` excludes live), so
