@@ -306,7 +306,9 @@ enum LiveEdgePolicy {
     /// sit a whole window behind an edge that window can barely list. At 10, segments up to 10 s are
     /// asked for whole and a 20 s one seals 14, as it did before the term existed. What is asked for
     /// is then paid only as far as the join reaches (`targetDurationTheJoinCanPay`), and the join is
-    /// not deepened for it, so in practice a 10 s provider lands at 9.
+    /// not deepened for it, so in practice a 10 s provider lands at 9. (The join's one addition,
+    /// `HLSPlaylistTracker.phaseEqualisedJoinDepth`, only lifts a tune to the depth another phase
+    /// of the same listing already takes.)
     static let upstreamSegmentSealCeilingSeconds: Double = 10
 
     /// AE#684: the upstream-segment seal, as far as the join can pay for it.
@@ -314,7 +316,9 @@ enum LiveEdgePolicy {
     /// A seal is a holdback of `3 x` itself, and a holdback the first window cannot hold is not
     /// protection, it is a start the client spends waiting. The join is three upstream segments on
     /// anything longer than about 5 s and stays that deep (one more would be one more download on
-    /// every zap, AE#678), and its last GOP stays open until the next upstream delivery: three 6 s
+    /// every zap, AE#678; the exception is an upstream whose segment lengths alternate, where a tune
+    /// is lifted to the depth its other phase already takes, 6 s / 4 s to four), and its last GOP
+    /// stays open until the next upstream delivery: three 6 s
     /// segments are 18 s joined and 16 s cut, against the 18 s a seal of 6 asks for. So once the
     /// reader has handed the whole join over and the cutter has nothing left to read, the seal is the
     /// largest value that cut content covers, never under what it was without the upstream term and

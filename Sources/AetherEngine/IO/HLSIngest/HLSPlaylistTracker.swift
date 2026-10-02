@@ -47,6 +47,8 @@ struct HLSPlaylistTracker {
     /// does NOT follow it. A join one segment deeper is one more download before the first picture on
     /// every zap (the fourth segment AE#678 declined above), so the join keeps this depth and the seal
     /// rises only as far as what was joined can pay (`LiveEdgePolicy.targetDurationTheJoinCanPay`).
+    /// The one thing added on top is `phaseEqualisedJoinDepth`, which never exceeds the depth this
+    /// same coverage already takes in another phase of the same listing.
     static func loopbackCushionCoverageSeconds(segments: [HLSMediaSegment]) -> Double {
         guard let longest = segments.map(\.duration).max(), longest > 0 else { return 0 }
         let targetDuration = LiveEdgePolicy.targetDurationForCadence(longest)
@@ -54,38 +56,59 @@ struct HLSPlaylistTracker {
             + min(longest, openGOPMarginSeconds)
     }
 
-    /// AE#684: on an upstream of MIXED segment lengths, the join takes one segment more when what it
-    /// would otherwise list cannot pay the seal its longest segment asks for.
-    ///
-    /// The coverage loop counts seconds from the newest segment back, so on an upstream alternating
-    /// 6 s and 4 s segments (the channel this issue was reported on) the depth depends on which one
-    /// happens to be newest: `4 + 6 + 4` is under the 16 s target and a fourth is taken (20 s listed,
-    /// 18 s cut, seal 6), while `6 + 4 + 6` meets it at three (16 s listed, 14 s cut, seal 4, which
-    /// is 7.25.1's value and its stalls). About four tunes in ten land in the second phase, and the
-    /// same channel then behaves differently from one zap to the next.
-    ///
-    /// The rule, exactly: the joined segments differ in length by more than
-    /// `mixedLengthSpreadSeconds`, AND their summed EXTINF is not above the holdback of the seal the
-    /// longest listed segment asks for (`3 x` it; the last GOP stays open, so a join has to list MORE
-    /// than a holdback to pay for it). Then one more segment, once. It costs that phase one
-    /// additional segment at the join, the short one on the reported shape, which the other phase
-    /// already loads.
-    ///
-    /// Uniform upstreams are deliberately outside it. There the join keeps the depth it had in
-    /// 7.24.0 and the seal is what that depth pays (5 on 6 s segments, 9 on 10 s), because a fourth
-    /// full-length segment on EVERY tune is the cost AE#678 declined.
-    static func mixedLengthJoinTakesOneMore(joinedDurations: [Double], longestListed: Double) -> Bool {
-        guard let longest = joinedDurations.max(), let shortest = joinedDurations.min(),
-              longest - shortest > mixedLengthSpreadSeconds, longestListed > 0 else { return false }
-        let asked = max(LiveEdgePolicy.targetDurationForCadence(longestListed),
-                        LiveEdgePolicy.targetDurationForUpstreamSegment(longestListed))
-        return joinedDurations.reduce(0, +) <= LiveEdgePolicy.holdBackSeconds(targetDuration: asked)
+    /// The 7.24.0 coverage rule on its own: how many segments a tune takes when `durations` (oldest
+    /// first) is what the upstream lists. nil when the listing runs out before the coverage is met and
+    /// before the count limit, so the depth of that tune cannot be read off this listing.
+    static func coverageJoinDepth(durations: ArraySlice<Double>, coverage: Double, limit: Int) -> Int? {
+        var taken = 0
+        var seconds = 0.0
+        for duration in durations.reversed() {
+            if taken >= limit { return taken }
+            if taken > 0, seconds >= coverage { return taken }
+            taken += 1
+            seconds += duration
+        }
+        return (taken >= limit || seconds >= coverage) ? taken : nil
     }
 
-    /// Lengths closer than this are one length. A packager's EXTINF wanders by frames around its
-    /// nominal value (5.96, 6.04), and that is a uniform upstream; a whole second is the resolution a
-    /// TARGETDURATION is taken at.
-    static let mixedLengthSpreadSeconds: Double = 1.0
+    /// AE#684: the join, equalised over the phases of one upstream.
+    ///
+    /// The coverage loop counts seconds back from the newest segment, so on an upstream whose segment
+    /// lengths alternate its depth depends on which one happens to be newest. The channel this issue
+    /// was reported on alternates 6 s and 4 s: `4 + 6 + 4` is under the 16 s target and a fourth is
+    /// taken (20 s listed, 18 s cut, seal 6), while `6 + 4 + 6` meets it at three (16 s listed, 14 s
+    /// cut, seal 4, which is 7.25.1's value and its stalls). About four tunes in ten landed in the
+    /// second phase, and the same channel behaved differently from one zap to the next.
+    ///
+    /// The rule: a tune never loads more than the deepest tune of the same channel already did. The
+    /// depth is the deepest the coverage rule takes over the actual tune and the tunes that would
+    /// have happened one, two, ... segments earlier, as far back as the newest segment of such a tune
+    /// is still one this join takes itself (a rhythm shorter than the join shows all its phases in
+    /// that span; looking further back would let one stray segment anywhere in the listing deepen
+    /// every tune). So 6 s / 4 s joins four in both phases, and the three-segment phase pays one
+    /// additional short segment that the other phase always loaded.
+    ///
+    /// It deliberately does nothing where no phase is deeper. 10 s / 8 s segments join three in both
+    /// phases and 6 s / 6 s / 4 s three in all three, exactly as before, and their seal is what that
+    /// join pays, as for a uniform upstream: a deeper join on EVERY tune is the cost AE#678 declined.
+    /// A lone short segment on an otherwise uniform upstream deepens the join only while it sits
+    /// within that span: for the tunes that needed the extra segment anyway, and the two after them.
+    ///
+    /// Bounded at one segment above the actual tune's own depth. Phases of one listing differ by more
+    /// than that only when lengths swing wildly (a run of 2 s segments behind a 10 s one), and there
+    /// the listing is describing a change of source, not a rhythm to equalise.
+    static func phaseEqualisedJoinDepth(durations: [Double], coverage: Double, limit: Int) -> Int {
+        guard let own = coverageJoinDepth(durations: durations[...], coverage: coverage, limit: limit) else {
+            return min(durations.count, limit)
+        }
+        var deepest = own
+        for earlier in 1..<max(1, own) {
+            guard let depth = coverageJoinDepth(durations: durations.dropLast(earlier),
+                                                coverage: coverage, limit: limit) else { break }
+            deepest = max(deepest, depth)
+        }
+        return min(deepest, own + 1, limit, durations.count)
+    }
 
     /// Longest GOP the join margin plans for. IPTV and broadcast GOPs run 0.5 to 4 s; a longer one
     /// only costs the bounded start's grace, which is what every join paid before AE#678.
@@ -123,19 +146,8 @@ struct HLSPlaylistTracker {
                                Self.loopbackCushionCoverageSeconds(segments: playlist.segments))
             let limit = Self.joinSegmentLimit(edgeOffset: edgeOffset,
                                               windowSegmentCount: playlist.segments.count)
-            var taken = 0
-            var seconds = 0.0
-            for segment in playlist.segments.reversed() {
-                if taken >= limit { break }
-                if taken > 0, seconds >= coverage { break }
-                taken += 1
-                seconds += segment.duration
-            }
-            if taken < limit, taken < playlist.segments.count,
-               Self.mixedLengthJoinTakesOneMore(joinedDurations: playlist.segments.suffix(taken).map(\.duration),
-                                                longestListed: playlist.segments.map(\.duration).max() ?? 0) {
-                taken += 1
-            }
+            let taken = Self.phaseEqualisedJoinDepth(durations: playlist.segments.map(\.duration),
+                                                     coverage: coverage, limit: limit)
             return windowEnd &- taken
         }
 
