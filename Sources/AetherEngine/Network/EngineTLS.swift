@@ -40,15 +40,17 @@ public enum EngineTLS {
     /// Single disposition shared by the session-level delegate and the
     /// per-task delegates in AVIOReader. Anything other than a server-trust
     /// challenge the host accepted is left to default handling, so client
-    /// certificates and HTTP auth behave exactly as before.
+    /// certificates and HTTP auth behave exactly as before. `evaluator` defaults to the host's
+    /// answer; unit tests pass their own rather than writing the process global.
     static func resolve(
         _ challenge: URLAuthenticationChallenge,
+        evaluator: (@Sendable (URLProtectionSpace) -> Bool)? = EngineTLS.serverTrustEvaluator,
         completionHandler: (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
         guard
             challenge.protectionSpace.authenticationMethod
                 == NSURLAuthenticationMethodServerTrust,
-            let evaluator = serverTrustEvaluator,
+            let evaluator,
             evaluator(challenge.protectionSpace),
             let trust = challenge.protectionSpace.serverTrust
         else {

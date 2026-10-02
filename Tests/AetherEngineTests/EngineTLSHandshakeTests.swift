@@ -11,380 +11,246 @@
 
     @testable import AetherEngine
 
-    /// Live tests that set `EngineTLS.serverTrustEvaluator` share this serialized suite. The
-    /// evaluator is process global; CI runs this suite separately from `EngineTLSTests`, which
-    /// also sets it. Serialization within each suite alone cannot prevent that cross-suite race.
-    /// Requests through `HLSLocalServer` carry no client deadline of their own worth reading:
-    /// the hang catcher is the `.timeLimit` trait, and 150 s is only there because a URL request
-    /// must name something. The 15 s they used to carry reported the server as dead twice on CI
-    /// (`NSURLErrorTimedOut`) while it was merely waiting for a thread.
-    @Suite("EngineTLS live handshake against a self-signed origin", .serialized, .timeLimit(.minutes(3)))
-    struct EngineTLSHandshakeTests {
-
-        /// Lives here rather than beside the resolver tests because reading the
-        /// evaluator is as much a claim on the process global as writing it,
-        /// and a suite that only reads still races the ones that write.
-        @Test("No evaluator is set by default")
-        func defaultsToNoEvaluator() {
-            #expect(EngineTLS.serverTrustEvaluator == nil)
-        }
-
-        @Test("No evaluator: the handshake is refused and no request reaches the origin")
-        func refusedByDefault() async throws {
-            let server = try #require(await SelfSignedTLSOrigin())
-            defer { server.stop() }
-
+    /// Every live suite that sets the process-global `EngineTLS.serverTrustEvaluator` nests here.
+    /// `.serialized` applies to nested suites too, so no two of their tests overlap on that global.
+    /// `EngineTLSTests` passes its evaluator in and never writes the global.
+    @Suite(.serialized, .timeLimit(.minutes(3)))
+    enum LiveTrustEvaluatorTests {
+        /// Runs `body` with `evaluator` installed, then restores the previous answer.
+        static func withEvaluator<T>(
+            _ evaluator: (@Sendable (URLProtectionSpace) -> Bool)?,
+            _ body: () async throws -> T
+        ) async rethrows -> T {
             let previous = EngineTLS.serverTrustEvaluator
             defer { EngineTLS.serverTrustEvaluator = previous }
-            EngineTLS.serverTrustEvaluator = nil
-
-            let reader = AVIOReader(
-                url: URL(string: "https://127.0.0.1:\(server.port)/movie.bin")!,
-                chunkRequestTimeout: 5, chunkMaxRetries: 1)
-            defer { reader.markClosed(); reader.close() }
-            let refusal = Self.openFailure(of: reader)
-
-            try await Task.sleep(for: .seconds(1))
-            #expect(server.requestsServed == 0,
-                    "a request crossed a handshake that system trust should have refused")
-            #expect(Self.isTrustRefusal(refusal),
-                    "open failed as \(String(describing: refusal)), not a trust refusal")
-        }
-
-        @Test("Accepted for this origin: the same server serves the reader")
-        func acceptedWhenOptedIn() async throws {
-            let server = try #require(await SelfSignedTLSOrigin())
-            defer { server.stop() }
-
-            let previous = EngineTLS.serverTrustEvaluator
-            defer { EngineTLS.serverTrustEvaluator = previous }
-            EngineTLS.serverTrustEvaluator = { _ in true }
-
-            let reader = AVIOReader(
-                url: URL(string: "https://127.0.0.1:\(server.port)/movie.bin")!,
-                chunkRequestTimeout: 10, chunkMaxRetries: 2)
-            defer { reader.markClosed(); reader.close() }
-            try reader.open()
-
-            let sliceCap = 64 * 1024
-            let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: sliceCap)
-            defer { buf.deallocate() }
-            var got = 0
-            let deadline = Date().addingTimeInterval(20)
-            while got < sliceCap && Date() < deadline {
-                let n = reader.read(into: buf, size: Int32(sliceCap - got))
-                if n <= 0 { break }
-                got += Int(n)
-            }
-            #expect(got == sliceCap, "delivered \(got) of \(sliceCap) bytes")
-            #expect(buf[0] == 0xA7)
-            #expect(server.requestsServed > 0)
-        }
-
-
-        @Test("An evaluator that answers for another host leaves this one refused")
-        func refusedForAnOriginTheHostDidNotAccept() async throws {
-            let server = try #require(await SelfSignedTLSOrigin())
-            defer { server.stop() }
-
-            // The case a process-wide flag cannot express: a host holding a LAN
-            // address behind a private certificate and a WAN address with a real
-            // one, accepting the first without quietly relaxing the second.
-            let previous = EngineTLS.serverTrustEvaluator
-            defer { EngineTLS.serverTrustEvaluator = previous }
-            EngineTLS.serverTrustEvaluator = { $0.host == "media.example" }
-
-            let reader = AVIOReader(
-                url: URL(string: "https://127.0.0.1:\(server.port)/movie.bin")!,
-                chunkRequestTimeout: 5, chunkMaxRetries: 1)
-            defer { reader.markClosed(); reader.close() }
-            let refusal = Self.openFailure(of: reader)
-
-            try await Task.sleep(for: .seconds(1))
-            #expect(server.requestsServed == 0,
-                    "a request crossed a handshake the evaluator did not accept")
-            #expect(Self.isTrustRefusal(refusal),
-                    "open failed as \(String(describing: refusal)), not a trust refusal")
-        }
-
-        @Test("Through the relay: a client that never sees the certificate gets the stream")
-        func relayServesThroughUntrustedOrigin() async throws {
-            let origin = try #require(await SelfSignedHLSOrigin())
-            defer { origin.stop() }
-
-            let previous = EngineTLS.serverTrustEvaluator
-            defer { EngineTLS.serverTrustEvaluator = previous }
-            EngineTLS.serverTrustEvaluator = { _ in true }
-
-            let server = try Self.relayServer()
-            defer { server.stop(); server.relay?.stop() }
-
-            let master = URL(string: "https://127.0.0.1:\(origin.port)/master.m3u8")!
-            let entry = try #require(server.relayURL(for: master))
-
-            let playlist = try await Self.text(of: entry)
-            #expect(playlist.contains("#EXT-X-STREAM-INF"))
-            let variant = try #require(
-                playlist.components(separatedBy: "\n").first { $0.hasPrefix("http://127.0.0.1:") })
-
-            let media = try await Self.text(of: try #require(URL(string: variant)))
-            #expect(media.contains("#EXTINF"))
-            let segmentLine = try #require(
-                media.components(separatedBy: "\n").first {
-                    $0.hasPrefix("http://127.0.0.1:") && !$0.contains("m3u8")
-                })
-
-            var segmentRequest = URLRequest(url: try #require(URL(string: segmentLine)))
-            segmentRequest.timeoutInterval = 150
-            let (bytes, response) = try await URLSession.shared.data(for: segmentRequest)
-            #expect((response as? HTTPURLResponse)?.statusCode == 200)
-            #expect(bytes.count == 4096, "served \(bytes.count) segment bytes")
-            #expect(bytes.first == 0x47, "not an MPEG-TS sync byte")
-        }
-
-        @Test("Through the relay: no evaluator refuses to launder an untrusted origin")
-        func relayRefusesWhenNotOptedIn() async throws {
-            let origin = try #require(await SelfSignedHLSOrigin())
-            defer { origin.stop() }
-
-            let previous = EngineTLS.serverTrustEvaluator
-            defer { EngineTLS.serverTrustEvaluator = previous }
-            EngineTLS.serverTrustEvaluator = nil
-
-            let server = try Self.relayServer()
-            defer { server.stop(); server.relay?.stop() }
-
-            let master = URL(string: "https://127.0.0.1:\(origin.port)/master.m3u8")!
-            let entry = try #require(server.relayURL(for: master))
-
-            var request = URLRequest(url: entry)
-            request.timeoutInterval = 150
-            let (_, response) = try await URLSession.shared.data(for: request)
-            #expect((response as? HTTPURLResponse)?.statusCode == 502,
-                    "the upstream handshake should have failed system trust")
-        }
-
-        @Test("Through the relay: an origin the evaluator declines is not laundered either")
-        func relayRefusesAnOriginTheEvaluatorDeclines() async throws {
-            let origin = try #require(await SelfSignedHLSOrigin())
-            defer { origin.stop() }
-
-            // The relay is mounted for every https origin once an evaluator
-            // exists, so the per-origin answer has to hold at the handshake it
-            // makes on the player's behalf.
-            let previous = EngineTLS.serverTrustEvaluator
-            defer { EngineTLS.serverTrustEvaluator = previous }
-            EngineTLS.serverTrustEvaluator = { $0.host == "media.example" }
-
-            let server = try Self.relayServer()
-            defer { server.stop(); server.relay?.stop() }
-
-            let master = URL(string: "https://127.0.0.1:\(origin.port)/master.m3u8")!
-            let entry = try #require(server.relayURL(for: master))
-
-            var request = URLRequest(url: entry)
-            request.timeoutInterval = 150
-            let (_, response) = try await URLSession.shared.data(for: request)
-            #expect((response as? HTTPURLResponse)?.statusCode == 502,
-                    "an origin the evaluator declined was served anyway")
-        }
-
-        @Test("A self-signed origin is what the relay is mounted for")
-        func trustProbeNamesTheSelfSignedOrigin() async throws {
-            let origin = try #require(await SelfSignedHLSOrigin())
-            defer { origin.stop() }
-
-            // The probe asks the system, not the evaluator, so an answer already given here must not
-            // change what it reads: what is being measured is whether AVPlayer could reach the origin
-            // unaided, and AVPlayer never sees the evaluator.
-            let previous = EngineTLS.serverTrustEvaluator
-            defer { EngineTLS.serverTrustEvaluator = previous }
-            EngineTLS.serverTrustEvaluator = { _ in true }
-
-            let refused = await HLSOriginRelay.systemTrustRefuses(
-                URL(string: "https://127.0.0.1:\(origin.port)/master.m3u8")!)
-            #expect(refused, "the origin the relay exists for was read as one AVPlayer could reach")
-        }
-
-        // PR #2 review: static-header stripping is not a substitute for a resolver's URL scope.
-        // These real redirects characterize that boundary with synthetic credentials only.
-        // They belong in this suite because the TLS trust evaluator is process global.
-        @Test("A permissive provider can send credentials after an HTTPS-to-HTTP redirect")
-        func permissiveProviderAuthorizesDowngradedDestination() async throws {
-            let origin = try await TLSDowngradeOrigin()
-            defer { origin.stop() }
-            let previous = EngineTLS.serverTrustEvaluator
-            defer { EngineTLS.serverTrustEvaluator = previous }
-            EngineTLS.serverTrustEvaluator = { $0.host == "127.0.0.1" }
-
-            // Intentionally unsafe host policy: this documents the limitation, not a safe example.
-            let provider = HTTPRequestAuthorization { _, _ in
-                ["Authorization": "Bearer synthetic-test-only"]
-            }
-            let body = try await provider.data(from: origin.url, maximumBytes: 1024)
-            #expect(String(decoding: body, as: UTF8.self) == "redirect-body")
-            let requests = try origin.requests()
-            #expect(requests.map(\.scheme) == ["https", "http"])
-            #expect(requests.map(\.authorization) == [
-                "Bearer synthetic-test-only", "Bearer synthetic-test-only"
-            ])
-        }
-
-        @Test("A scheme-scoped provider refuses before contacting the HTTP destination")
-        func scopedProviderRefusesDowngradedDestination() async throws {
-            let origin = try await TLSDowngradeOrigin()
-            defer { origin.stop() }
-            let previous = EngineTLS.serverTrustEvaluator
-            defer { EngineTLS.serverTrustEvaluator = previous }
-            EngineTLS.serverTrustEvaluator = { $0.host == "127.0.0.1" }
-
-            let provider = HTTPRequestAuthorization { url, _ in
-                guard url.scheme == "https" else { throw URLError(.userAuthenticationRequired) }
-                return ["Authorization": "Bearer synthetic-test-only"]
-            }
-            await #expect(throws: URLError(.badServerResponse)) {
-                _ = try await provider.data(from: origin.url, maximumBytes: 1024)
-            }
-            let requests = try origin.requests()
-            #expect(requests.map(\.scheme) == ["https"])
-            #expect(requests.map(\.authorization) == ["Bearer synthetic-test-only"])
-        }
-
-        @Test("Static credentials are stripped from the HTTP redirect request")
-        func staticCredentialsStrippedOnDowngrade() async throws {
-            let origin = try await TLSDowngradeOrigin()
-            defer { origin.stop() }
-            let previous = EngineTLS.serverTrustEvaluator
-            defer { EngineTLS.serverTrustEvaluator = previous }
-            EngineTLS.serverTrustEvaluator = { $0.host == "127.0.0.1" }
-
-            let relay = HLSOriginRelay()
-            defer { relay.stop() }
-            let (body, finalURL) = try await relay.fetchPlaylist(
-                origin.url, headers: ["Authorization": "Bearer synthetic-test-only"])
-            #expect(body == "redirect-body")
-            #expect(finalURL.scheme == "http")
-            let requests = try origin.requests()
-            #expect(requests.map(\.scheme) == ["https", "http"])
-            #expect(requests.map(\.authorization) == ["Bearer synthetic-test-only", nil])
-        }
-
-        @Test("A provider can explicitly allow an anonymous HTTP redirect destination")
-        func providerAllowsAnonymousDowngradedDestination() async throws {
-            let origin = try await TLSDowngradeOrigin()
-            defer { origin.stop() }
-            let previous = EngineTLS.serverTrustEvaluator
-            defer { EngineTLS.serverTrustEvaluator = previous }
-            EngineTLS.serverTrustEvaluator = { $0.host == "127.0.0.1" }
-
-            let provider = HTTPRequestAuthorization { url, _ in
-                url.scheme == "https" ? ["Authorization": "Bearer synthetic-test-only"] : [:]
-            }
-            let body = try await provider.data(from: origin.url, maximumBytes: 1024)
-            #expect(String(decoding: body, as: UTF8.self) == "redirect-body")
-            let requests = try origin.requests()
-            #expect(requests.map(\.scheme) == ["https", "http"])
-            #expect(requests.map(\.authorization) == ["Bearer synthetic-test-only", nil],
-                    "the redirect must use the new provider result, not replay the old bearer")
-        }
-
-        private static func relayServer() throws -> HLSLocalServer {
-            let server = HLSLocalServer(relay: HLSOriginRelay())
-            try server.start()
-            return server
-        }
-
-        private static func text(of url: URL) async throws -> String {
-            var request = URLRequest(url: url)
-            request.timeoutInterval = 150
-            let (data, response) = try await URLSession.shared.data(for: request)
-            #expect((response as? HTTPURLResponse)?.statusCode == 200)
-            return String(decoding: data, as: UTF8.self)
-        }
-
-        /// A refused handshake reaches the host as a typed failure rather than as unreadable media,
-        /// so the refusal arms assert the classification and not only that no byte was served.
-        private static func openFailure(of reader: AVIOReader) -> Error? {
-            do {
-                try reader.open()
-                return nil
-            } catch {
-                return error
-            }
-        }
-
-        private static func isTrustRefusal(_ error: Error?) -> Bool {
-            guard case .transportSecurityFailed = error as? AVIOReaderError else { return false }
-            return true
+            EngineTLS.serverTrustEvaluator = evaluator
+            return try await body()
         }
     }
 
-    /// Paired loopback origins record headers before responding, so awaiting the transfer also
-    /// makes the request log observable without a sleep. No traffic leaves this machine.
-    private final class TLSDowngradeOrigin {
-        struct Request: Decodable {
-            let scheme: String
-            let authorization: String?
-        }
+    extension LiveTrustEvaluatorTests {
+        /// Requests through `HLSLocalServer` carry no client deadline of their own worth reading:
+        /// the hang catcher is the parent's `.timeLimit` trait, and 150 s is only there because a
+        /// URL request must name something. The 15 s they used to carry reported the server as dead
+        /// twice on CI (`NSURLErrorTimedOut`) while it was merely waiting for a thread.
+        @Suite("EngineTLS live handshake against a self-signed origin")
+        struct EngineTLSHandshakeTests {
 
-        let url: URL
-        private let launched: PythonOrigin.Launched
+            /// Lives here rather than beside the resolver tests because reading the
+            /// evaluator is as much a claim on the process global as writing it,
+            /// and a suite that only reads still races the ones that write.
+            @Test("No evaluator is set by default")
+            func defaultsToNoEvaluator() {
+                #expect(EngineTLS.serverTrustEvaluator == nil)
+            }
 
-        func requests() throws -> [Request] {
-            let data = try Data(contentsOf: launched.workDir.appendingPathComponent("requests.jsonl"))
-            return try String(decoding: data, as: UTF8.self).split(separator: "\n").map {
-                try JSONDecoder().decode(Request.self, from: Data($0.utf8))
+            @Test("No evaluator: the handshake is refused and no request reaches the origin")
+            func refusedByDefault() async throws {
+                let server = try #require(await SelfSignedTLSOrigin())
+                defer { server.stop() }
+
+                let previous = EngineTLS.serverTrustEvaluator
+                defer { EngineTLS.serverTrustEvaluator = previous }
+                EngineTLS.serverTrustEvaluator = nil
+
+                let reader = AVIOReader(
+                    url: URL(string: "https://127.0.0.1:\(server.port)/movie.bin")!,
+                    chunkRequestTimeout: 5, chunkMaxRetries: 1)
+                defer { reader.markClosed(); reader.close() }
+                let refusal = Self.openFailure(of: reader)
+
+                try await Task.sleep(for: .seconds(1))
+                #expect(server.requestsServed == 0,
+                        "a request crossed a handshake that system trust should have refused")
+                #expect(Self.isTrustRefusal(refusal),
+                        "open failed as \(String(describing: refusal)), not a trust refusal")
+            }
+
+            @Test("Accepted for this origin: the same server serves the reader")
+            func acceptedWhenOptedIn() async throws {
+                let server = try #require(await SelfSignedTLSOrigin())
+                defer { server.stop() }
+
+                let previous = EngineTLS.serverTrustEvaluator
+                defer { EngineTLS.serverTrustEvaluator = previous }
+                EngineTLS.serverTrustEvaluator = { _ in true }
+
+                let reader = AVIOReader(
+                    url: URL(string: "https://127.0.0.1:\(server.port)/movie.bin")!,
+                    chunkRequestTimeout: 10, chunkMaxRetries: 2)
+                defer { reader.markClosed(); reader.close() }
+                try reader.open()
+
+                let sliceCap = 64 * 1024
+                let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: sliceCap)
+                defer { buf.deallocate() }
+                var got = 0
+                let deadline = Date().addingTimeInterval(20)
+                while got < sliceCap && Date() < deadline {
+                    let n = reader.read(into: buf, size: Int32(sliceCap - got))
+                    if n <= 0 { break }
+                    got += Int(n)
+                }
+                #expect(got == sliceCap, "delivered \(got) of \(sliceCap) bytes")
+                #expect(buf[0] == 0xA7)
+                #expect(server.requestsServed > 0)
+            }
+
+
+            @Test("An evaluator that answers for another host leaves this one refused")
+            func refusedForAnOriginTheHostDidNotAccept() async throws {
+                let server = try #require(await SelfSignedTLSOrigin())
+                defer { server.stop() }
+
+                // The case a process-wide flag cannot express: a host holding a LAN
+                // address behind a private certificate and a WAN address with a real
+                // one, accepting the first without quietly relaxing the second.
+                let previous = EngineTLS.serverTrustEvaluator
+                defer { EngineTLS.serverTrustEvaluator = previous }
+                EngineTLS.serverTrustEvaluator = { $0.host == "media.example" }
+
+                let reader = AVIOReader(
+                    url: URL(string: "https://127.0.0.1:\(server.port)/movie.bin")!,
+                    chunkRequestTimeout: 5, chunkMaxRetries: 1)
+                defer { reader.markClosed(); reader.close() }
+                let refusal = Self.openFailure(of: reader)
+
+                try await Task.sleep(for: .seconds(1))
+                #expect(server.requestsServed == 0,
+                        "a request crossed a handshake the evaluator did not accept")
+                #expect(Self.isTrustRefusal(refusal),
+                        "open failed as \(String(describing: refusal)), not a trust refusal")
+            }
+
+            @Test("Through the relay: a client that never sees the certificate gets the stream")
+            func relayServesThroughUntrustedOrigin() async throws {
+                let origin = try #require(await SelfSignedHLSOrigin())
+                defer { origin.stop() }
+
+                let previous = EngineTLS.serverTrustEvaluator
+                defer { EngineTLS.serverTrustEvaluator = previous }
+                EngineTLS.serverTrustEvaluator = { _ in true }
+
+                let server = try Self.relayServer()
+                defer { server.stop(); server.relay?.stop() }
+
+                let master = URL(string: "https://127.0.0.1:\(origin.port)/master.m3u8")!
+                let entry = try #require(server.relayURL(for: master))
+
+                let playlist = try await Self.text(of: entry)
+                #expect(playlist.contains("#EXT-X-STREAM-INF"))
+                let variant = try #require(
+                    playlist.components(separatedBy: "\n").first { $0.hasPrefix("http://127.0.0.1:") })
+
+                let media = try await Self.text(of: try #require(URL(string: variant)))
+                #expect(media.contains("#EXTINF"))
+                let segmentLine = try #require(
+                    media.components(separatedBy: "\n").first {
+                        $0.hasPrefix("http://127.0.0.1:") && !$0.contains("m3u8")
+                    })
+
+                var segmentRequest = URLRequest(url: try #require(URL(string: segmentLine)))
+                segmentRequest.timeoutInterval = 150
+                let (bytes, response) = try await URLSession.shared.data(for: segmentRequest)
+                #expect((response as? HTTPURLResponse)?.statusCode == 200)
+                #expect(bytes.count == 4096, "served \(bytes.count) segment bytes")
+                #expect(bytes.first == 0x47, "not an MPEG-TS sync byte")
+            }
+
+            @Test("Through the relay: no evaluator refuses to launder an untrusted origin")
+            func relayRefusesWhenNotOptedIn() async throws {
+                let origin = try #require(await SelfSignedHLSOrigin())
+                defer { origin.stop() }
+
+                let previous = EngineTLS.serverTrustEvaluator
+                defer { EngineTLS.serverTrustEvaluator = previous }
+                EngineTLS.serverTrustEvaluator = nil
+
+                let server = try Self.relayServer()
+                defer { server.stop(); server.relay?.stop() }
+
+                let master = URL(string: "https://127.0.0.1:\(origin.port)/master.m3u8")!
+                let entry = try #require(server.relayURL(for: master))
+
+                var request = URLRequest(url: entry)
+                request.timeoutInterval = 150
+                let (_, response) = try await URLSession.shared.data(for: request)
+                #expect((response as? HTTPURLResponse)?.statusCode == 502,
+                        "the upstream handshake should have failed system trust")
+            }
+
+            @Test("Through the relay: an origin the evaluator declines is not laundered either")
+            func relayRefusesAnOriginTheEvaluatorDeclines() async throws {
+                let origin = try #require(await SelfSignedHLSOrigin())
+                defer { origin.stop() }
+
+                // The relay is mounted for every https origin once an evaluator
+                // exists, so the per-origin answer has to hold at the handshake it
+                // makes on the player's behalf.
+                let previous = EngineTLS.serverTrustEvaluator
+                defer { EngineTLS.serverTrustEvaluator = previous }
+                EngineTLS.serverTrustEvaluator = { $0.host == "media.example" }
+
+                let server = try Self.relayServer()
+                defer { server.stop(); server.relay?.stop() }
+
+                let master = URL(string: "https://127.0.0.1:\(origin.port)/master.m3u8")!
+                let entry = try #require(server.relayURL(for: master))
+
+                var request = URLRequest(url: entry)
+                request.timeoutInterval = 150
+                let (_, response) = try await URLSession.shared.data(for: request)
+                #expect((response as? HTTPURLResponse)?.statusCode == 502,
+                        "an origin the evaluator declined was served anyway")
+            }
+
+            @Test("A self-signed origin is what the relay is mounted for")
+            func trustProbeNamesTheSelfSignedOrigin() async throws {
+                let origin = try #require(await SelfSignedHLSOrigin())
+                defer { origin.stop() }
+
+                // The probe asks the system, not the evaluator, so an answer already given here must not
+                // change what it reads: what is being measured is whether AVPlayer could reach the origin
+                // unaided, and AVPlayer never sees the evaluator.
+                let previous = EngineTLS.serverTrustEvaluator
+                defer { EngineTLS.serverTrustEvaluator = previous }
+                EngineTLS.serverTrustEvaluator = { _ in true }
+
+                let refused = await HLSOriginRelay.systemTrustRefuses(
+                    URL(string: "https://127.0.0.1:\(origin.port)/master.m3u8")!)
+                #expect(refused, "the origin the relay exists for was read as one AVPlayer could reach")
+            }
+
+            private static func relayServer() throws -> HLSLocalServer {
+                let server = HLSLocalServer(relay: HLSOriginRelay())
+                try server.start()
+                return server
+            }
+
+            private static func text(of url: URL) async throws -> String {
+                var request = URLRequest(url: url)
+                request.timeoutInterval = 150
+                let (data, response) = try await URLSession.shared.data(for: request)
+                #expect((response as? HTTPURLResponse)?.statusCode == 200)
+                return String(decoding: data, as: UTF8.self)
+            }
+
+            /// A refused handshake reaches the host as a typed failure rather than as unreadable media,
+            /// so the refusal arms assert the classification and not only that no byte was served.
+            private static func openFailure(of reader: AVIOReader) -> Error? {
+                do {
+                    try reader.open()
+                    return nil
+                } catch {
+                    return error
+                }
+            }
+
+            private static func isTrustRefusal(_ error: Error?) -> Bool {
+                guard case .transportSecurityFailed = error as? AVIOReaderError else { return false }
+                return true
             }
         }
-
-        init() async throws {
-            launched = try #require(await PythonOrigin.launch(
-                prefix: "aether-tls-downgrade", script: Self.serverPy,
-                files: ["cert.pem": SelfSignedTLSOrigin.certPEM,
-                        "key.pem": SelfSignedTLSOrigin.keyPEM]))
-            url = try #require(URL(string: "https://127.0.0.1:\(launched.port)/start"))
-        }
-
-        func stop() {
-            launched.process.terminate()
-            try? FileManager.default.removeItem(at: launched.workDir)
-        }
-
-        private static let serverPy = """
-            import http.server, json, ssl, threading
-
-            lock = threading.Lock()
-
-            class Handler(http.server.BaseHTTPRequestHandler):
-                protocol_version = "HTTP/1.1"
-                def log_message(self, *args): pass
-                def do_GET(self):
-                    secure = isinstance(self.connection, ssl.SSLSocket)
-                    with lock:
-                        with open("requests.jsonl", "a") as f:
-                            f.write(json.dumps({"scheme": "https" if secure else "http",
-                                                "authorization": self.headers.get("Authorization")}) + "\\n")
-                    if secure:
-                        self.send_response(302)
-                        self.send_header("Location", f"http://127.0.0.1:{plain.server_address[1]}/end")
-                        self.send_header("Content-Length", "0")
-                        self.end_headers()
-                    else:
-                        body = b"redirect-body"
-                        self.send_response(200)
-                        self.send_header("Content-Length", str(len(body)))
-                        self.end_headers()
-                        self.wfile.write(body)
-
-            plain = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-            threading.Thread(target=plain.serve_forever, daemon=True).start()
-            secure = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            context.load_cert_chain("cert.pem", "key.pem")
-            secure.socket = context.wrap_socket(secure.socket, server_side=True)
-            print("READY", secure.server_address[1], flush=True)
-            secure.serve_forever()
-            """
     }
 
     /// Loopback HTTPS origin with a self-signed certificate for 127.0.0.1,
@@ -393,9 +259,9 @@
     /// the refusal observable: a client that distrusts the certificate never
     /// gets a request line onto the wire.
     final class SelfSignedTLSOrigin {
-        let port: UInt16
-        private let process: Process
-        private let workDir: URL
+        var port: UInt16 { launched.port }
+        private var workDir: URL { launched.workDir }
+        private let launched: PythonOrigin.Launched
 
         var requestsServed: Int {
             let log = workDir.appendingPathComponent("requests.log")
@@ -408,15 +274,10 @@
                 prefix: "aether-tls-origin", script: Self.serverPy,
                 files: ["cert.pem": Self.certPEM, "key.pem": Self.keyPEM])
             else { return nil }
-            process = launched.process
-            port = launched.port
-            workDir = launched.workDir
+            self.launched = launched
         }
 
-        func stop() {
-            process.terminate()
-            try? FileManager.default.removeItem(at: workDir)
-        }
+        func stop() { launched.stop() }
 
         private static let serverPy = """
             import http.server, os, re, ssl, sys

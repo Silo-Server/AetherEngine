@@ -25,7 +25,11 @@ enum RedirectHeaderPolicy {
         if credentialsAllowed(from: originalURL, to: redirectURL) {
             return extraHeaders
         }
-        return extraHeaders.filter { !credentialHeaders.contains($0.key.lowercased()) }
+        return withoutCredentials(extraHeaders)
+    }
+
+    static func withoutCredentials(_ headers: [String: String]) -> [String: String] {
+        headers.filter { !credentialHeaders.contains($0.key.lowercased()) }
     }
 
     /// Builds the request actually handed back to URLSession on redirect: re-applies the

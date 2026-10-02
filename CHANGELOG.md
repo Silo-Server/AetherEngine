@@ -12,13 +12,14 @@ the public-API contract.
 
 ### Changed
 
-- CI runs the HLS, subtitle/resource authorization and live TLS suites in a separate test process so unrelated blocking tests cannot delay their resolvers. The live TLS suite also runs separately from the TLS policy unit tests that set the same process-global evaluator. All tests and existing deadlines remain enforced.
+- CI runs the HLS, subtitle/resource authorization and live trust-evaluator suites in a separate test process so unrelated blocking tests cannot delay their resolvers. All tests and existing deadlines remain enforced.
+- Once a redirect chain has reached HTTPS, the engine drops credential headers (`Authorization`, `Cookie`, Emby/Jellyfin tokens) from every later HTTP hop, including headers returned by `HTTPRequestAuthorization`. A provider that authorizes every URL can no longer send its credentials in cleartext after a downgrade. The HTTP hop still runs, so anonymous redirects keep working, and an origin the host configured as HTTP still receives provider credentials.
 
 ### Added
 
 - `LoadOptions.objectAudioRendering` keeps the height channels and object positioning of TrueHD Atmos by rendering its objects into a speaker bed; it is a lossy conversion, not passthrough of the original stream. With `.apac(SpatialSpeakerLayout)` a TrueHD track FFmpeg marks as Atmos is decoded (beds, objects and their metadata), rendered into the chosen 5.1.2 to 9.1.6 speaker bed and delivered as Apple Positional Audio (`CODECS="apac.31.LL"`), which tvOS sends to an Atmos receiver as Dolby MAT. Lossy (320 kbps per bed channel) in place of the lossless 7.1 channel presentation, so it is opt-in; requires OS 26 and falls back to `audioBridgeMode` otherwise. See [formats.md › TrueHD Atmos (object rendering)](docs/formats.md#truehd-atmos-object-rendering).
 - `aetherctl serve --atmos-bed <layout>` and `serve --audio-index <n>` serve a TrueHD Atmos track through that path.
-- Live HTTPS-to-HTTP redirect tests and authorization-scope documentation distinguish provider refusal, anonymous redirects, static-header stripping and the cleartext risk of a permissive provider. The documented Silo Apple integration rejects downgraded destinations before obtaining credentials; runtime transport policy is unchanged.
+- Live HTTPS-to-HTTP redirect tests cover provider refusal, anonymous redirects, static-header stripping and the downgrade credential filter.
 - `ExternalSubtitleTrack.httpRequestAuthorization` supplies refreshable headers for primary/secondary sidecars and native subtitle stores without changing registered track IDs or rendition mappings. Authorized container decoding retains AVIO streaming and range access.
 - `HTTPRequestAuthorization.data(from:maximumBytes:)` fetches raw auxiliary resources such as font bundles with a caller-supplied byte limit and a whole-transfer deadline, reusing the relay's redirect, authorization, retry, cancellation and TLS policy.
 
