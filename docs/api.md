@@ -721,16 +721,20 @@ still not read. What it gets is bounded three ways:
   would be one more download before the first picture on every zap, which AE#678 measured and
   declined). Their last GOP stays open until the next delivery, so three 6 s segments are 18 s joined
   and 16 s cut: the seal is 5, the largest value whose holdback that window holds, not 6. Three 10 s
-  segments cut 28 s and seal 9. An upstream of MIXED segment lengths is the one exception, because
-  there the join's depth used to depend on which segment happened to be newest: alternating 6 s and
-  4 s segments joined four (20 s listed, 18 s cut, seal 6) with a 4 s one newest and three (16 s
-  listed, 14 s cut, seal 4, as in 7.25.1) with a 6 s one newest, so the same channel behaved
-  differently from one tune to the next. When the joined segments differ by more than a second and
-  their summed EXTINF is not above the holdback the longest listed segment asks for, the join takes
-  one segment more, once; both phases then join four and seal 6. That costs the three-segment phase
-  (about four tunes in ten on that shape) one additional short segment at the join, which the other
-  six already load: 3.47 s to 4.21 s to first picture behind an 8 Mbit/s link, median of five, against
-  4.27 s in the other phase on either build. The seal line says what was paid
+  segments cut 28 s and seal 9. The one addition is that the join is equalised over the PHASES of an
+  upstream whose segment lengths alternate: a tune never loads more than the deepest tune of the same
+  channel already did. Alternating 6 s and 4 s segments used to join four (20 s listed, 18 s cut,
+  seal 6) with a 4 s one newest and three (16 s listed, 14 s cut, seal 4, as in 7.25.1) with a 6 s
+  one newest, so the same channel behaved differently from one tune to the next. The depth is now the
+  deepest the coverage rule takes over the tune itself and the tunes one, two, ... segments earlier
+  that its own join still reaches, at most one segment above its own: both phases join four and seal
+  6. That costs the three-segment phase (about four tunes in ten on that shape) one additional short
+  segment at the join, which the other six already load: 3.47 s to 4.23 s to first picture behind an
+  8 Mbit/s link, median of five, against 4.27 s in the other phase on either build. Shapes whose
+  phases already joined alike keep their join and what it pays: 10 s / 8 s stays at three segments
+  and seals 8 (7 before), 6 s / 6 s / 4 s stays at three and seals 4, unchanged, and a shape like
+  6 s / 5 s keeps a seal that follows the phase (5 in one, 4 in the other), because equalising is
+  about how much a tune loads, not about what it seals. The seal line says what was paid
   (`of which the join pays 5s of 6s (16.000s cut of the 18.000s it listed)`), and "the join has no
   more to give" is a fact the reader states (its join batch is handed over and its consumer is
   waiting), not arithmetic on EXTINF, which a playlist that rounds its durations up would fail.
@@ -751,8 +755,8 @@ still not read. What it gets is bounded three ways:
   segments keep 2 and a 6 s holdback, and `.standard` keeps its 6 on anything up to 6 s.
 
 So on a provider of uniform 6 s segments under `.fastZap` the seal goes from 4 to 5 (holdback 12 to
-15 s), on a uniform 10 s one under either profile from 7 to 9 (21 to 27 s), and on mixed 6 s / 4 s
-segments from 4 to 6 (12 to 18 s) in both phases. A provider of 3 s segments with 1 s GOPs is
+15 s), on a uniform 10 s one under either profile from 7 to 9 (21 to 27 s), and on alternating
+6 s / 4 s segments from 4 to 6 (12 to 18 s) in both phases. A provider of 3 s segments with 1 s GOPs is
 unchanged at 2: three joined segments cut 8 s, which pays for no more, so the patience of one
 delivery this issue is about stays as it is there. On uniform upstreams the join, and with a host that
 fetches in parallel the time to the first picture, is what it was: behind an 8 Mbit/s link, three runs
@@ -763,7 +767,7 @@ gate now waits for the join to be handed over where it used to serve at 12 s of 
 request at a time behind 14 Mbit/s on the mixed shape, three runs per arm, 2.79 to 3.08 s before and
 3.27 to 3.28 s after in the four-segment phase, 2.80 to 2.83 s and 3.44 to 3.49 s in the phase that
 now also loads the extra segment. The other cost is standing latency: 3 s more behind the upstream's
-edge on uniform 6 s segments, 6 s on mixed 6 s / 4 s and on 10 s ones.
+edge on uniform 6 s segments, 6 s on alternating 6 s / 4 s and on 10 s ones, 3 s on 10 s / 8 s.
 
 Measured on loopback against `Scripts/hls-burst-origin.py` (deliveries 3 to 9.3 s apart on 6 s
 segments), 60 s per run, three runs per arm and row, 7.25.1 against this; first picture is 0.17 to
