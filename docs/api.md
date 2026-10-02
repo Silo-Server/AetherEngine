@@ -707,8 +707,89 @@ cadence and the holdback follows it down, so the win belongs to the source GOP r
 its runway under either profile. Where the engine cuts the segments itself, each one is a whole GOP and
 the value is sealed from the first few, so it carries `ceil(1.5 x max EXTINF)` of headroom: a broadcast
 whose GOPs run 1.0 to 2.4 s sealed TARGETDURATION 1 on its first three and then broke `EXTINF <= TD`
-on every longer one (AE#670). 1 s GOPs therefore serve TARGETDURATION 2 and a 6 s holdback. Ingested
-segments are bounded by the upstream's own target duration and keep `ceil(max EXTINF)`.
+on every longer one (AE#670). 1 s GOPs therefore serve TARGETDURATION 2 and a 6 s holdback.
+
+**An ingested HLS upstream seals over the segment it is delivered in, as far as its join pays for it,
+under either profile (AE#684).** The engine re-cuts an upstream segment (at its GOPs under `.fastZap`,
+at about 4 s under `.standard`), but the window still changes once per UPSTREAM segment, so what the
+seal asks for is the longest segment the upstream has served, whole, where `ceil(segment / 1.5)` used
+to leave the client a patience of exactly one delivery. The upstream's advertised target duration is
+still not read. What it gets is bounded three ways:
+
+- **By the join, which is not deepened for it on an upstream of uniform segment length.** A seal is a
+  holdback of `3 x` itself, and the join there is the three upstream segments it was before (one more
+  would be one more download before the first picture on every zap, which AE#678 measured and
+  declined). Their last GOP stays open until the next delivery, so three 6 s segments are 18 s joined
+  and 16 s cut: the seal is 5, the largest value whose holdback that window holds, not 6. Three 10 s
+  segments cut 28 s and seal 9. The one addition is that the join is equalised over the PHASES of an
+  upstream whose segment lengths alternate: a tune never loads more than the deepest tune of the same
+  channel already did. Alternating 6 s and 4 s segments used to join four (20 s listed, 18 s cut,
+  seal 6) with a 4 s one newest and three (16 s listed, 14 s cut, seal 4, as in 7.25.1) with a 6 s
+  one newest, so the same channel behaved differently from one tune to the next. The depth is now the
+  deepest the coverage rule takes over the tune itself and the tunes one, two, ... segments earlier
+  that its own join still reaches, at most one segment above its own: both phases join four and seal
+  6. That costs the three-segment phase (about four tunes in ten on that shape) one additional short
+  segment at the join, which the other six already load: 3.47 s to 4.23 s to first picture behind an
+  8 Mbit/s link, median of five, against 4.27 s in the other phase on either build. Shapes whose
+  phases already joined alike keep their join and what it pays: 10 s / 8 s stays at three segments
+  and seals 8 (7 before), 6 s / 6 s / 4 s stays at three and seals 4, unchanged, and a shape like
+  6 s / 5 s keeps a seal that follows the phase (5 in one, 4 in the other), because equalising is
+  about how much a tune loads, not about what it seals. The seal line says what was paid
+  (`of which the join pays 5s of 6s (16.000s cut of the 18.000s it listed)`), and "the join has no
+  more to give" is a fact the reader states (its join batch is handed over and its consumer is
+  waiting), not arithmetic on EXTINF, which a playlist that rounds its durations up would fail.
+  With a demuxed audio rendition the fact is the cutter's rather than one reader's: both join
+  batches handed over and the cutter waiting on either of them, because an audio rendition whose
+  segments end a little before the video's runs dry first and the video reader is then never the
+  one being waited on (three runs per arm on three listed segments, audio aligned and audio 0.2 s
+  short: first picture 0.18 to 0.21 s against 0.17 to 0.36 s on 7.25.1, TD 5 on 6 s and 9 on 10 s
+  under both profiles). A join that is SLOWER than the `.fastZap` grace, a single-connection
+  provider or a slow link, takes the bounded start before it is spent and then seals the full
+  value (6 or 10, not 5 or 9) over a window shorter than its holdback, which AVPlayer notes with a
+  `-16832` warning at the start; measured one request at a time behind a 4 to 5 Mbit/s link that
+  start is not worse than 7.25.1's (first picture 5.05 to 6.08 s against 7.05 to 8.26 s, no
+  `-12888` where 7.25.1 drew 1 to 3).
+- **By a ceiling.** Segments longer than 10 s (`LiveEdgePolicy.upstreamSegmentSealCeilingSeconds`) are
+  not asked for whole: a 20 s one seals 14, as it did before, because the live-only window is 60 s.
+- **Never under what it was.** Where the old value already covered the segment nothing moves: 2 s
+  segments keep 2 and a 6 s holdback, and `.standard` keeps its 6 on anything up to 6 s.
+
+So on a provider of uniform 6 s segments under `.fastZap` the seal goes from 4 to 5 (holdback 12 to
+15 s), on a uniform 10 s one under either profile from 7 to 9 (21 to 27 s), and on alternating
+6 s / 4 s segments from 4 to 6 (12 to 18 s) in both phases. A provider of 3 s segments with 1 s GOPs is
+unchanged at 2: three joined segments cut 8 s, which pays for no more, so the patience of one
+delivery this issue is about stays as it is there. On uniform upstreams the join, and with a host that
+fetches in parallel the time to the first picture, is what it was: behind an 8 Mbit/s link, three runs
+per arm, 3.81 to 4.04 s before and 3.80 to 3.85 s after on 6 s segments, 6.15 to 6.36 s and 6.18 to
+6.28 s on 10 s ones. A host that allows fewer parallel requests than the join has segments
+(`maxConcurrentSourceRequests` of 3 or less) sees its first picture later than before, because the
+gate now waits for the join to be handed over where it used to serve at 12 s of cut content: one
+request at a time behind 14 Mbit/s on the mixed shape, three runs per arm, 2.79 to 3.08 s before and
+3.27 to 3.28 s after in the four-segment phase, 2.80 to 2.83 s and 3.44 to 3.49 s in the phase that
+now also loads the extra segment. The other cost is standing latency: 3 s more behind the upstream's
+edge on uniform 6 s segments, 6 s on alternating 6 s / 4 s and on 10 s ones, 3 s on 10 s / 8 s.
+
+Measured on loopback against `Scripts/hls-burst-origin.py` (deliveries 3 to 9.3 s apart on 6 s
+segments), 60 s per run, three runs per arm and row, 7.25.1 against this; first picture is 0.17 to
+0.51 s in both arms wherever a row does not say otherwise:
+
+| upstream, profile, segments listed | 7.25.1 | now |
+|---|---|---|
+| 6 s, `.fastZap`, 3 | TD 4, 1 x `-12888` per run, 2 stalls in 3 runs | TD 5, none |
+| 6 s, `.fastZap`, 4 | TD 4, 2 x `-12888` per run, 2 stalls in 3 runs | TD 5, 1 to 2 x `-12888`, no stall |
+| 6 s, `.fastZap`, 8 | TD 4, 1 to 3 x `-12888`, 3 stalls in 3 runs | TD 5, 0 to 2 x `-12888`, no stall |
+| 10 s, `.fastZap`, 3 / 4 / 8 | TD 7, 1 x `-12888` in 7 of 9 runs, window closed and item rebuilt in 4 of 9 | TD 9, none in 9 of 9 |
+| 10 s, `.standard`, 3 / 8 | TD 7, item rebuilt in 6 of 6 runs | TD 9, none in 6 of 6 |
+| 6 s, `.standard`, 3 / 8 | TD 6, first picture 6.18 to 6.53 s | unchanged: TD 6, 6.28 to 6.46 s |
+
+Two things this does not do, said plainly. On a 6 s provider `-12888` still comes: over one 180 s run
+5 of them and a stall before, 3 and no stall after, because 7.5 s of patience still loses to a 9 s gap
+and what changed is the holdback under it. (A join one segment deeper seals 6 and drew none in three
+such runs; it was measured and not shipped, for the download it costs.) And `.standard` on 6 s segments
+still takes about 6.3 s to its first picture, waiting for the next upstream segment, exactly as it did:
+its seal there is its own `1.5 x cut target` floor, which three joined segments never covered. A real
+outage longer than the holdback's low point stalls under any of these; the capture that started this
+had 10 of its 110 delivery gaps above 9 s.
 
 **An HLS source with a window of its own now fills that cushion at the join rather than in wall clock**
 (6.77.0). The ingest used to enter a live playlist three segments behind the edge, and three joined
@@ -773,6 +854,17 @@ join holds a fraction of a second, and starting there would trade a still pictur
 The depth is the contiguous span ahead of the playhead, so an island past a gap does not count. When the
 floor is not met the engine says so once per load (`leaving the stall-avoidance wait alone (buffer ahead
 ...s, ...)`), which is what separates the two mechanisms in a report after the fact.
+
+**And the item has to be able to play (AE#684).** The depth is measured from the item's own
+`currentTime()`, and before `readyToPlay` that is where the loader began fetching, not where playback
+will begin. Under an `EXT-X-START` placement, which is how a rejoin lands a fresh item at the place the
+session held, AVPlayer fetches from about 6 s below the target first, so the reading is the lookback
+itself: one device capture shows `buffer ahead 4.00s` from a playhead of 48.00 s on an item placed at
+53.908 s, every second of it behind the start, and `playImmediately` 36 ms before the item was ready. It
+was the one item of five in that capture to be forced and the one its viewer reported out of sync, which
+is a correlation and not yet a mechanism. A hold on an item that cannot play yet is now left alone
+(`leaving the stall-avoidance wait alone on an item that cannot play yet ...; asked again at readiness`)
+and decided again when the item becomes ready, from the playhead it really starts on.
 
 ### The rewind depth a live session really has
 
@@ -971,7 +1063,7 @@ All flags default to safe values; the table is the full set. Depth for the media
 | `dvrWindowSeconds` | nil | Timeshift window. nil means live-only and `seek` is a no-op. The window is a ceiling: the disk budget (a quarter of the free space, at most 2 GiB) bounds what is actually kept, so a long window on a high-bitrate channel or a small volume holds less than it asks for. |
 | `liveJoinProfile` | `.standard` | A `LiveJoinProfile`. `.fastZap` collapses TARGETDURATION to 1.5 x the source GOP (AE#670) so an IPTV join costs seconds instead of a full holdback. |
 | `clampsLiveResumeToWindow` | true | Whether `play()` may move a behind-live playhead by itself (edge snap on a live-only source more than 45 s behind, or a landing above the retained floor when a DVR window has slid past it). `false` hands the whole decision to the host, which then also owns the eviction case. |
-| `liveJoinStartsImmediately` | true | Cuts AVPlayer's stall-avoidance wait short once at the live join, over a buffer that is non-empty and at least 1.5 s deep. The join tail no host can otherwise reach; default since 6.55.0 on a device A/B, see the live-join section. |
+| `liveJoinStartsImmediately` | true | Cuts AVPlayer's stall-avoidance wait short once at the live join, over a buffer that is non-empty and at least 1.5 s deep, on an item that has reached `readyToPlay` (AE#684). The join tail no host can otherwise reach; default since 6.55.0 on a device A/B, see the live-join section. |
 | `liveBlockingReload` | nil (auto) | LL-HLS blocking-reload override for loopback live sessions. Auto derives eligibility from observed upstream cadence, which is what keeps a bursty relay off a `-15410` loop. |
 | `nativeRemoteHLS` | false | Hand a remote `master.m3u8` straight to AVPlayer: no demuxer probe, no loopback. Built for `isLive: true`; a remote HLS VOD URL reaches this route regardless (AE#154). The clock here is item time, see `clock.$sourceTime` (AE#616). |
 | `nativeRemoteHLSIngestFallback` | true | The #168 / #293 carriage recovery and the #363 401/403 bypass refusal recovery. Setting it false turns both off. |

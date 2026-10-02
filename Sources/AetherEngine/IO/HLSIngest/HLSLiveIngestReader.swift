@@ -41,6 +41,11 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     /// AE#447: longest EXTINF the upstream has actually served, the measured counterpart to
     /// `_upstreamTargetDuration`. Monotonic; read via `upstreamSegmentDurationSeconds`.
     private var _upstreamSegmentDurationSeconds: Double?
+    /// AE#684: summed EXTINF of the join batch. Written with the join line, before its bytes flow.
+    private var _joinBacklogSeconds: Double?
+    /// AE#684: the join batch has been committed to the FIFO in full / has been seen consumed.
+    private var _joinBatchCommitted = false
+    private var _joinSpent = false
     /// Installed by the resolver before the first FIFO byte; nil = muxed audio.
     private var _companionAudioReader: HLSLiveIngestReader?
     /// AE#359: SUBTITLES renditions of the picked variant, resolved to absolute URLs. Metadata only.
@@ -94,6 +99,47 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
 
     public var upstreamSegmentDurationSeconds: Double? {
         startLock.withLock { _upstreamSegmentDurationSeconds }
+    }
+
+    var joinBacklogSeconds: Double? {
+        startLock.withLock { _joinBacklogSeconds }
+    }
+
+    var joinIsSpent: Bool {
+        let (spent, committed, companion) = startLock.withLock {
+            (_joinSpent, _joinBatchCommitted, _companionAudioReader)
+        }
+        if spent { return true }
+        guard Self.pumpJoinIsSpent(
+            main: (committed, fifo.isEmptyWithReaderParked),
+            companion: companion?.pumpJoinState
+        ) else { return false }
+        startLock.withLock { _joinSpent = true }
+        return true
+    }
+
+    /// One reader's half of `joinIsSpent`: whether its ingest ever started, whether its join batch
+    /// is committed, and whether it is empty with its consumer parked on it.
+    var pumpJoinState: (started: Bool, committed: Bool, parked: Bool) {
+        let (isStarted, committed) = startLock.withLock { (started, _joinBatchCommitted) }
+        return (isStarted, committed, fifo.isEmptyWithReaderParked)
+    }
+
+    /// AE#684: the fact is the PUMP's, not one reader's. With a demuxed audio rendition the cutter
+    /// merges two readers on one thread and parks on whichever runs dry first, and a rendition whose
+    /// segments end a little before the video's runs dry first every time: the video reader is then
+    /// never parked, and a fact read off it alone never becomes true (measured: the full seal over a
+    /// window that cannot hold it, 2.2 s to first picture under `.fastZap` and 10.4 s under
+    /// `.standard`, where 7.25.1 took 0.18 s). So both join batches have to be committed, and the
+    /// cutter has to be parked on EITHER empty reader: it holds a packet of the other one it cannot
+    /// place until the dry one delivers, so nothing more is cut either way. A companion that was
+    /// never started is not being read at all and does not count.
+    static func pumpJoinIsSpent(main: (committed: Bool, parked: Bool),
+                                companion: (started: Bool, committed: Bool, parked: Bool)?) -> Bool {
+        guard main.committed else { return false }
+        guard let companion, companion.started else { return main.parked }
+        guard companion.committed else { return false }
+        return main.parked || companion.parked
     }
 
     public var closedLiveCadenceSeconds: Double? {
@@ -301,6 +347,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                         startLock.withLock { _joinWallClock = joinDate }
                     }
                     let backlog = fresh.reduce(0.0) { $0 + $1.duration }
+                    startLock.withLock { _joinBacklogSeconds = backlog }
                     EngineLog.emit(
                         "[HLSIngest] joined \(fresh.count) segment(s), ~\(String(format: "%.0f", backlog))s behind the live edge"
                         + " pdt=\(fresh.first?.programDateTime.map { "\($0)" } ?? "nil")",
@@ -312,6 +359,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                     guard try await ingestSegmentBatch(fresh, mediaURL: mediaURL) else {
                         return // FIFO closed underneath us
                     }
+                    if isJoin { startLock.withLock { _joinBatchCommitted = true } }
                 }
 
                 if media.hasEndList {

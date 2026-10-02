@@ -220,6 +220,7 @@ extension AetherEngine {
                 // it can play, nothing it reports is a reading of where the session is; see
                 // `liveItemPlacementPending`.
                 if ready {
+                    self.noteLiveItemStart()
                     // The placement is spent here, on every path rather than only on the one that
                     // replays the stashed seek: a pre-ready seek can be superseded by a host scrub
                     // (latest-wins), and an arm left standing would be inherited by whatever item the
@@ -787,7 +788,11 @@ extension AetherEngine {
         // served), the advert rides along for the seal log only. Both weak, same reason as above.
         let liveClosedCadenceObservation: (@Sendable () -> Double?)?
         let liveUpstreamSegmentDurationObservation: (@Sendable () -> Double?)?
+        let liveJoinBacklogObservation: (@Sendable () -> Double?)?
+        let liveJoinSpentObservation: (@Sendable () -> Bool?)?
         if let liveIngest {
+            liveJoinBacklogObservation = { [weak liveIngest] in liveIngest?.joinBacklogSeconds }
+            liveJoinSpentObservation = { [weak liveIngest] in liveIngest?.joinIsSpent }
             liveClosedCadenceObservation = { [weak liveIngest] in liveIngest?.closedLiveCadenceSeconds }
             liveUpstreamSegmentDurationObservation = { [weak liveIngest] in
                 liveIngest?.upstreamSegmentDurationSeconds
@@ -795,6 +800,8 @@ extension AetherEngine {
         } else {
             liveClosedCadenceObservation = nil
             liveUpstreamSegmentDurationObservation = nil
+            liveJoinBacklogObservation = nil
+            liveJoinSpentObservation = nil
         }
         let upstreamSelfReportedTargetDuration = liveIngest?.upstreamTargetDuration
         // #199: in-engine reopen transport for live ingest sessions. Only HLSLiveIngestReader main
@@ -838,6 +845,8 @@ extension AetherEngine {
             liveCadenceObservation: liveCadenceObservation,
             liveClosedCadenceObservation: liveClosedCadenceObservation,
             liveUpstreamSegmentDurationObservation: liveUpstreamSegmentDurationObservation,
+            liveJoinBacklogObservation: liveJoinBacklogObservation,
+            liveJoinSpentObservation: liveJoinSpentObservation,
             upstreamSelfReportedTargetDuration: upstreamSelfReportedTargetDuration,
             preopenedDemuxer: preopenedDemuxer,
             sourceReopenableByURL: !isCustomSource,

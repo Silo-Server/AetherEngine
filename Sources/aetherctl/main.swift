@@ -696,6 +696,8 @@ if first == "play" {
     // per-frame boundaries and the clock a host would pace an overlay against are both observable.
     let frameTimes = takeFlag("--frame-times", from: &rest)
     let presentTimes = takeFlag("--present-times", from: &rest)
+    // AE#684: print the loopback URL of every native item, so its init and segments can be fetched.
+    let servedURL = takeFlag("--served-url", from: &rest)
     let pictureProbe = takeFlag("--picture-probe", from: &rest)
     // AE#534: the source axis's origin, for a container whose timeline does not start at zero.
     // The picture states a frame index, which an -output_ts_offset remux does not move.
@@ -878,7 +880,7 @@ if first == "play" {
         done.wait()
     }
     exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: playFastZap, liveStartImmediately: liveStartImmediately, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: playStartPosition, mallocCensus: mallocCensus, forceSoftware: playForceSW, softwareEscalation: playSoftwareEscalation,
-                 censusThresholdMB: censusThresholdMB, censusHz: censusHz, frameTimes: frameTimes, presentTimes: presentTimes, pictureProbe: pictureProbe, pictureOrigin: pictureOrigin, sidecars: sidecars,
+                 censusThresholdMB: censusThresholdMB, censusHz: censusHz, frameTimes: frameTimes, presentTimes: presentTimes, servedURL: servedURL, pictureProbe: pictureProbe, pictureOrigin: pictureOrigin, sidecars: sidecars,
                  audioSwitch: audioSwitch,
                  teletextPage: teletextPage, teletextSwitch: teletextSwitch,
                  audioDelayMs: audioDelayMs, audioDelaySwitches: audioDelaySwitches,

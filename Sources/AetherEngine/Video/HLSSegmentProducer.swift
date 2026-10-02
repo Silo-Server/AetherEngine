@@ -208,6 +208,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     /// Fires synchronously on the pump thread per finalized live segment (index, duration, startSeconds, discontinuous).
     var onLiveSegmentFinalized: (@Sendable (Int, Double, Double, Bool) -> Void)?
+    /// AE#684: the sound a finalized live segment carries (index, first and last audio packet on the
+    /// output axis, seconds). Fired just before `onLiveSegmentFinalized` for the same index.
+    var onLiveSegmentSound: (@Sendable (Int, Double, Double) -> Void)?
+    /// Keyed by segment index; a nil value is a segment cut with no audio packet in it.
+    private var liveSegmentSoundByIndex: [Int: (first: Double, last: Double)?] = [:]
+    /// AE#684: set for the length of one merged read, so a second reader thread trips the assertion there.
+    private var mergedReadInFlight = false
 
     /// AE#443: the resident segment count the live runaway park may use, from the session that owns the
     /// window (`VideoSegmentProvider.liveResidentParkCap`). Unset leaves the static floor, which is the
@@ -2369,6 +2376,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
             // credit this pump with the previous epoch's production.
             pumpEpochHighestStored = max(pumpEpochHighestStored, currentMuxerSegmentIndex)
             if isLive {
+                let tb = muxer.muxerAudioTimeBase
+                let tick = tb.den > 0 ? Double(tb.num) / Double(tb.den) : 0
+                liveSegmentSoundByIndex.updateValue(
+                    muxer.takeSegmentSoundSpan().map { (Double($0.first) * tick, Double($0.last) * tick) },
+                    forKey: currentMuxerSegmentIndex)
                 reportLiveSegmentFinalized(index: currentMuxerSegmentIndex,
                                            nextIndex: newIdx)
             } else if onSequentialSegmentFinalized != nil {
@@ -2517,6 +2529,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     private func reportLiveSegmentFinalized(index: Int, nextIndex: Int?) {
         guard let startSeconds = liveSegmentStartByIndex[index] else {
+            liveSegmentSoundByIndex.removeValue(forKey: index)
             EngineLog.emit(
                 "[HLSSegmentProducer] live finalize: no recorded start for seg-\(index); skipping append",
                 category: .session
@@ -2531,15 +2544,18 @@ final class HLSSegmentProducer: @unchecked Sendable {
             duration = targetSegmentDurationSeconds
         }
         let discontinuous = liveSegmentDiscontinuousByIndex[index] ?? false
+        let sound = liveSegmentSoundByIndex.removeValue(forKey: index)
         liveSegmentStartByIndex.removeValue(forKey: index)
         liveSegmentDiscontinuousByIndex.removeValue(forKey: index)
         stampLiveSegmentFinalize()
         EngineLog.emit(
             "[HLSSegmentProducer] live seg-\(index) finalized: start=\(String(format: "%.3f", startSeconds))s "
             + "dur=\(String(format: "%.3f", duration))s"
+            + (sound.map { $0.map { String(format: " sound=%.3f..%.3fs", $0.first, $0.last) } ?? " sound=none" } ?? "")
             + (discontinuous ? " [DISCONTINUITY]" : ""),
             category: .session
         )
+        if let span = sound ?? nil { onLiveSegmentSound?(index, span.first, span.last) }
         onLiveSegmentFinalized?(index, duration, startSeconds, discontinuous)
     }
 
@@ -2775,6 +2791,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
     }
 
     private func readNextSourcePacketMerged() throws -> (packet: UnsafeMutablePointer<AVPacket>, origin: PacketOrigin)? {
+        // AE#684: `HLSLiveIngestReader.pumpJoinIsSpent` reads "parked on EITHER reader" as "nothing
+        // more is cut", which holds only while one thread reads both of them in turn.
+        assert(!mergedReadInFlight, "the main and side readers are read by one thread, one at a time")
+        mergedReadInFlight = true
+        defer { mergedReadInFlight = false }
         guard let side = sideAudioDemuxer else {
             guard let packet = try demuxer.readPacket() else { return nil }
             boundSourceTimestamps(packet)
