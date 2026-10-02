@@ -82,6 +82,18 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// still extractor is the only caller, everything on a playback path wants the parallel default.
     var decodesSingleThreaded = false
 
+    /// The `thread_count` libavcodec opened with. Written once in `open`, like the other open-time
+    /// fields. Frame threading holds back `threadCount - 1` decoded frames until flush.
+    private(set) var threadCount = 0
+
+    /// Frame threads for a playback decode. Each frame thread delays output by one frame, so one
+    /// per core on a 32-core Mac held 31 frames back after every load and seek. 16 is FFmpeg's own
+    /// auto-thread ceiling (`MAX_AUTO_THREADS`); above it libavcodec warns the count is not
+    /// recommended. Apple TV, iPhone and iPad have fewer cores and are unaffected.
+    static func playbackThreadCount(activeProcessorCount: Int) -> Int {
+        return max(1, min(16, activeProcessorCount))
+    }
+
     /// AE#499: what the container declared about colour, captured at `open` before a single frame
     /// exists. A decoded frame carries the VUI alone, and a remux whose VUI is empty would otherwise
     /// reach `attachColorSpace` as an untagged picture, so an HDR10 file decoded in software lost its
@@ -163,7 +175,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             ctx.pointee.thread_count = 1
             ctx.pointee.thread_type = 0
         } else {
-            ctx.pointee.thread_count = Int32(ProcessInfo.processInfo.activeProcessorCount)
+            ctx.pointee.thread_count = Int32(Self.playbackThreadCount(
+                activeProcessorCount: ProcessInfo.processInfo.activeProcessorCount))
             ctx.pointee.thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE
         }
 
@@ -176,6 +189,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             throw VideoDecoderError.sessionCreationFailed(status: -2)
         }
         av_dict_free(&opts)
+        threadCount = Int(ctx.pointee.thread_count)
 
         containerColor = ColorDescription(codecpar: codecpar)
         let bitsPerSample = codecpar.pointee.bits_per_raw_sample

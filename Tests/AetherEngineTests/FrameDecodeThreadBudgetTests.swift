@@ -20,4 +20,14 @@ struct FrameDecodeThreadBudgetTests {
         #expect(FrameDecodeContext.stillExtractionThreadCount(activeProcessorCount: 1) >= 1)
         #expect(FrameDecodeContext.stillExtractionThreadCount(activeProcessorCount: 0) >= 1)
     }
+
+    /// Each frame thread delays software playback output by one frame, so one thread per core
+    /// held 31 frames back after every load and seek on a 32-core Mac.
+    @Test("software playback thread count stops at FFmpeg's 16-thread ceiling")
+    func playbackCapsAtSixteen() {
+        #expect(SoftwareVideoDecoder.playbackThreadCount(activeProcessorCount: 32) == 16)
+        #expect(SoftwareVideoDecoder.playbackThreadCount(activeProcessorCount: 16) == 16)
+        #expect(SoftwareVideoDecoder.playbackThreadCount(activeProcessorCount: 6) == 6)
+        #expect(SoftwareVideoDecoder.playbackThreadCount(activeProcessorCount: 0) == 1)
+    }
 }
