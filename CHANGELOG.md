@@ -10,7 +10,9 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **Engines running side by side each claimed a quarter of the same free space (#687).** A session sizes its disk allowance once, at its start, as `min(2 GiB, a quarter of the tmp volume's free space)`. An allowance another session had claimed but not yet written was still free at that moment, so four engines started together (a multiview host) could claim four quarters: on 4 GiB free, the whole volume. A session is now sized from the free space minus what the other running sessions may still write. One session alone gets exactly what it got; four on 4 GiB free take 2.7 GiB instead of 4, and n sessions always leave at least `(3/4)^n` of the volume. The live window already follows its allowance (#443), so a smaller share means a shorter timeshift depth on the later tiles, and the session log says how much was held back. Covers the native session, the software live ring and the software VOD read-ahead; no API change.
 
 ## [7.25.2] - 2026-10-02
 

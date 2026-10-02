@@ -125,6 +125,8 @@ final class SoftwarePlaybackHost {
     private var audioOutput: AudioOutput?
     private var demuxer: Demuxer?
     private var vodPacketReadAhead: SoftwarePacketReadAhead?
+    /// #687: this host's entries in the process-wide retention ledger, released on `stop()`.
+    private var retentionClaims: [RetentionClaims.Claim] = []
 
     /// The same public buffered-position axis as the live and native hosts, but backed by
     /// actual compressed A/V packet coverage. nil when no continuous cache span contains the clock.
@@ -793,8 +795,14 @@ final class SoftwarePlaybackHost {
                 // window on a small volume shrinks instead of filling the disk.
                 let available = (try? baseDir.resourceValues(forKeys: [.volumeAvailableCapacityKey]))?
                     .volumeAvailableCapacity.map(Int64.init)
-                let budget = PacketRingBuffer.liveByteBudget(volumeAvailableBytes: available)
-                self.dvrRing = try PacketRingBuffer(windowSeconds: window, scratch: scratch, byteBudget: budget)
+                let claim = RetentionClaims.shared.claim(volumeAvailableBytes: available) {
+                    PacketRingBuffer.liveByteBudget(volumeAvailableBytes: $0)
+                }
+                let budget = claim.bytes
+                let ring = try PacketRingBuffer(windowSeconds: window, scratch: scratch, byteBudget: budget)
+                claim.track { [weak ring] in ring?.diskBytes ?? 0 }
+                self.retentionClaims.append(claim)
+                self.dvrRing = ring
                 EngineLog.emit("[SWHost] DVR ring armed window=\(String(format: "%.0f", window))s budget=\(budget >> 20)MiB scratch=\(scratch.lastPathComponent)", category: .swPlayback)
             } catch {
                 EngineLog.emit("[SWHost] DVR ring create failed (\(error)); live-only fallback", category: .swPlayback)
@@ -1010,18 +1018,20 @@ final class SoftwarePlaybackHost {
                 } : nil
             let initialSourceClock = initialClockTime.seconds
             let videoReorderDepth = Self.presentationReorderDepth(codecID: vCodecID)
-            let cacheResult = await Task.detached(priority: .utility) { () throws -> SoftwarePacketReadAhead? in
+            let cacheResult = await Task.detached(priority: .utility) { () throws -> (SoftwarePacketReadAhead, RetentionClaims.Claim)? in
                 let temp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
                 let available = (try? temp.resourceValues(forKeys: [.volumeAvailableCapacityKey]))?
                     .volumeAvailableCapacity.map(Int64.init)
                 let segments = HLSVideoEngine.clampedForwardWindow(forwardBufferSegments)
-                let bytes = HLSVideoEngine.sessionRetentionBudgetBytes(
-                    volumeAvailableBytes: available,
-                    capRelaxed: HLSVideoEngine.retentionCapRelaxed(forwardWindowSegments: segments))
-                guard bytes > 0 else { return Optional<SoftwarePacketReadAhead>.none }
+                let capRelaxed = HLSVideoEngine.retentionCapRelaxed(forwardWindowSegments: segments)
+                let claim = RetentionClaims.shared.claim(volumeAvailableBytes: available) {
+                    HLSVideoEngine.sessionRetentionBudgetBytes(volumeAvailableBytes: $0, capRelaxed: capRelaxed)
+                }
+                let bytes = claim.bytes
+                guard bytes > 0 else { return nil }
                 let fifo = try SoftwarePacketDiskFIFO(
                     chunkTargetBytes: min(4 << 20, max(8, bytes)), retainConsumed: true)
-                return SoftwarePacketReadAhead(
+                let readAhead = SoftwarePacketReadAhead(
                     video: video, audio: audio, byteBudget: bytes,
                     forwardSeconds: Double(segments) * 4,
                     initialSourceClock: initialSourceClock, fifo: fifo,
@@ -1031,10 +1041,14 @@ final class SoftwarePlaybackHost {
                     defer { av_packet_unref(packet); av_packet_free_safe(packet) }
                     return try SoftwareStoredPacket(copying: packet)
                 }
+                claim.track { [weak readAhead] in readAhead?.snapshot.residentBytes ?? 0 }
+                return (readAhead, claim)
             }.result
             let readAhead: SoftwarePacketReadAhead?
             switch cacheResult {
-            case .success(let cache): readAhead = cache
+            case .success(let cache):
+                readAhead = cache?.0
+                if !stopRequested, let claim = cache?.1 { retentionClaims.append(claim) }
             case .failure:
                 // A cache-directory failure must not stop a source that the old direct loop can
                 // still play. Runtime spool corruption is explicit, never silently skipped.
@@ -1641,6 +1655,8 @@ final class SoftwarePlaybackHost {
         }
         dvrRing?.close()
         dvrRing = nil
+        retentionClaims.forEach { $0.release() }
+        retentionClaims.removeAll()
         liveEdgeLock.lock()
         sessionStartPts = .nan
         newestSourcePts = .nan
