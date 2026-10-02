@@ -11,14 +11,16 @@ import Testing
 struct CancellableLoadTests {
 
     /// Parks its first read until the engine closes or cancels it, or until `fallback` runs out,
-    /// which only an engine that never reaches it lets happen.
+    /// which only an engine that never reaches it lets happen. The fallback is far above the wait:
+    /// on a loaded CI runner the main actor took over 10 s to get from "entered" to the cancel, and
+    /// the read gave up first, so the load failed before it was cancelled.
     final class ParkedReader: IOReader, @unchecked Sendable {
         private let condition = NSCondition()
         private let fallback: TimeInterval
         private var arrivals = 0
         private var releasedByEngine = false
 
-        init(fallback: TimeInterval = 10) { self.fallback = fallback }
+        init(fallback: TimeInterval = 60) { self.fallback = fallback }
 
         var entered: Bool { condition.withLock { arrivals > 0 } }
         var wasReleasedByEngine: Bool { condition.withLock { releasedByEngine } }
