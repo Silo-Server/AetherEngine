@@ -683,6 +683,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     private let cache: SegmentCache
     /// Immutable for VOD; grows under stateLock for live (producer appends via appendLiveSegment).
     private var segments: [HLSVideoEngine.Segment]
+    private let iFrameSourceLock = NSLock()
+    private var _iFrameSource: IFrameSegmentSource?
     private let isLive: Bool
     /// Sequential-origin session: playlist grows with finalized real durations (see _seqDurations).
     private let sequentialAppendPlaylist: Bool
@@ -2743,6 +2745,23 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
     /// AE#446: how often a blocking-reload hold re-asks whether the source is still alive.
     static let liveHoldRecheckSeconds: TimeInterval = 1.0
+    /// AE#682. Set once by the session after the routing decision, before the playback URL leaves
+    /// `start()`; cleared when the session falls back to the media playlist or stops.
+    func setIFrameSource(_ source: IFrameSegmentSource?) {
+        iFrameSourceLock.lock()
+        _iFrameSource = source
+        iFrameSourceLock.unlock()
+    }
+
+    private var iFrameSource: IFrameSegmentSource? {
+        iFrameSourceLock.lock(); defer { iFrameSourceLock.unlock() }
+        return _iFrameSource
+    }
+
+    var iFrameRenditionServed: Bool { iFrameSource != nil }
+    func iFrameInitSegment() -> Data? { iFrameSource?.initSegment() }
+    func iFrameSegment(at index: Int) -> Data? { iFrameSource?.fragment(at: index) }
+
     var masterCodecs: String? { codecsString }
     var masterSupplementalCodecs: String? { supplementalCodecsString }
     var masterResolution: (width: Int, height: Int)? {
