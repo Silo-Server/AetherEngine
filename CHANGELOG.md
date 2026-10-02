@@ -25,6 +25,7 @@ the public-API contract.
 
 ### Fixed
 
+- The software video decoder no longer runs more than 16 frame threads. It used one per core, and each frame thread holds back one decoded frame, so a 32-core Mac waited for 31 frames before showing the first one after a load or seek (about 3 s at 10 fps). FFmpeg also warns above 16 threads. Hosts with 16 or fewer cores keep their current thread count.
 - A paused video no longer starts playing by itself. When the player item died while paused (`failedToPlayToEndTime`), the recovery reload bypassed the pause guard and called `play()` on the fresh item. The reload now keeps a pause made before the item died, whether it came through the engine, AVKit, Control Center or PiP, and mounts the item paused at the same position.
 - A dead item's recovery no longer restarts the title from where the session was first opened. When AVPlayer refused the recovery item's master (`-11868`), the media fallback reloaded at the first mount's start position, so a title opened from its beginning restarted at 0:00. The fallback now reloads where the refused item was placed. Upstream #621.
 - The media fallback no longer starts a paused title. When the recovery item was refused, the fallback called `play()` unconditionally, so a title paused behind the tvOS screensaver started itself. It now plays only when the refused item was playing, or was told to play, and the viewer had not paused it. A Play or Pause from AVKit, Control Center or PiP counts as well as one through the engine.

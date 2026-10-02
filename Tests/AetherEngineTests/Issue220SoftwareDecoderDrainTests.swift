@@ -39,8 +39,11 @@ struct Issue220SoftwareDecoderDrainTests {
     // MARK: - Real decode
 
     /// Regression guard for the send/drain split: 40 IDR+P packets, no B-frames, so the decoder
-    /// owes a frame per packet minus whatever its own thread pipeline still holds at the end.
-    @Test("every packet of a progressive fixture still reaches the frame handler")
+    /// owes a frame per packet minus the `threadCount - 1` that frame threading holds until flush.
+    /// A drain that stops early or falls further behind leaves the count short. This synchronous
+    /// feed never makes `avcodec_send_packet` return EAGAIN, so the retry itself is pinned only by
+    /// the disposition checks above.
+    @Test("a progressive fixture reaches the frame handler, short only the thread pipeline")
     func decodesFixtureFrames() throws {
         let data = try #require(Data(base64Encoded: Self.fixtureBase64,
                                      options: .ignoreUnknownCharacters))
@@ -52,24 +55,26 @@ struct Issue220SoftwareDecoderDrainTests {
         let stream = try #require(demuxer.stream(at: videoIndex))
         let counter = FrameCounter()
         let decoder = SoftwareVideoDecoder()
+        // A 32-core Mac's budget: the cap must reach `open`, and every host then runs the same
+        // 16-deep frame pipeline.
+        decoder.activeProcessorCount = 32
         try decoder.open(stream: stream) { _, _, _ in counter.increment() }
         defer { decoder.close() }
+        #expect(decoder.threadCount == 16)
 
         var packets = 0
-        while let pkt = try? demuxer.readPacket() {
+        while let pkt = try demuxer.readPacket() {
+            var ownedPacket: UnsafeMutablePointer<AVPacket>? = pkt
+            defer { trackedPacketFree(&ownedPacket) }
             if pkt.pointee.stream_index == videoIndex {
                 packets += 1
                 decoder.decode(packet: pkt)
             }
-            var p: UnsafeMutablePointer<AVPacket>? = pkt
-            trackedPacketFree(&p)
         }
 
-        #expect(packets == 40)
-        // Frame threading holds a bounded number of frames back until flush; the guard is that
-        // the drain runs at all and keeps up, not the exact pipeline depth.
-        #expect(counter.value > 0)
-        #expect(counter.value >= packets - 16)
+        try #require(packets == 40)
+        #expect(counter.value >= packets - (decoder.threadCount - 1),
+                "the drain must keep up with every packet the thread pipeline has released")
     }
 
     private final class FrameCounter: @unchecked Sendable {
