@@ -117,6 +117,17 @@ struct DemuxerOpenProfile: Sendable {
         auditsRecordlessDolbyVision: false
     )
 
+    /// AE#682: the I-frame rendition's side reader. Reads one keyframe per request, so it takes the
+    /// still extractor's tuning under a name of its own (#240: a connection line without a name
+    /// cannot say which reader opened it).
+    static let iFrameSideDemuxer = stillExtraction.withReaderLabel("iframe")
+
+    /// Readers that fetch single keyframes and publish no timestamp axis, so the #409 repair's
+    /// sample window would be packets read for nothing.
+    static let labelsWithoutCompositionRepair: Set<String> = [
+        stillExtraction.readerLabel, iFrameSideDemuxer.readerLabel,
+    ]
+
     /// A copy of `self` with only the open-time probe budget overridden (#68).
     /// A non-nil `probesize` / `maxAnalyzeDuration` replaces the matching field;
     /// nil keeps the receiver's value. The AVIO tuning (prefetch, chunk size,
@@ -1908,7 +1919,7 @@ public final class Demuxer: @unchecked Sendable {
         // reader, #104) has no pictures to sample at all, and a non-seekable source is a live feed,
         // where holding a dozen packets for a defect that lives in a VOD sample table is latency
         // spent for nothing.
-        guard openProfile.readerLabel != DemuxerOpenProfile.stillExtraction.readerLabel,
+        guard !DemuxerOpenProfile.labelsWithoutCompositionRepair.contains(openProfile.readerLabel),
               isSourceSeekable else { return nil }
         let index = max(-1, av_find_best_stream(ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0))
         guard index >= 0, index < Int32(ctx.pointee.nb_streams),
