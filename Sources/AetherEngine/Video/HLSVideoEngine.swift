@@ -1001,6 +1001,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// playlist advertises stays resident; the producer-side prefetch park it also feeds is
     /// VOD-only (`advanceMuxer`), so live cannot park on it.
     private var retentionBudgetBytes: Int = 0
+    /// #687: this session's entry in the process-wide ledger, released on `stop()`.
+    private var retentionClaim: RetentionClaims.Claim?
 
     /// Clamp for `forwardWindowSegments`: below 4 the window would undercut AVPlayer's own ~5-7-segment
     /// prefetch and starve it (see `LiveWindowSizing.minSafeSegments`). The 2700 ceiling (~3 h at 4 s
@@ -1478,20 +1480,27 @@ public final class HLSVideoEngine: @unchecked Sendable {
             .volumeAvailableCapacityForImportantUsage
         #endif
         let capRelaxed = Self.retentionCapRelaxed(forwardWindowSegments: forwardWindowSegments)
-        let retentionBudget = Self.sessionRetentionBudgetBytes(volumeAvailableBytes: availableBytes,
-                                                               capRelaxed: capRelaxed)
+        // #687: sized from what the other running sessions leave, not from the raw free space.
+        let claim = RetentionClaims.shared.claim(volumeAvailableBytes: availableBytes) {
+            Self.sessionRetentionBudgetBytes(volumeAvailableBytes: $0, capRelaxed: capRelaxed)
+        }
+        let retentionBudget = claim.bytes
         self.retentionBudgetBytes = retentionBudget
         let segmentCache = SegmentCache(
             forwardWindow: forwardWindowSegments,
             retentionBudgetBytes: retentionBudget,
             onResidentSetChanged: { [weak self] in self?.noteResidentSetChanged() }
         )
+        claim.track { [weak segmentCache] in segmentCache?.totalBytes ?? 0 }
+        self.retentionClaim = claim
         self.cache = segmentCache
         EngineLog.emit(
             "[HLSVideoEngine] segment retention budget: \(retentionBudget / (1 << 20)) MiB "
             + "(volumeAvailable=\(availableBytes.map { "\($0 / (1 << 20)) MiB" } ?? "unknown"), "
             + "forwardWindow=\(forwardWindowSegments) seg"
-            + (capRelaxed ? ", opt-in prefetch: default cap relaxed" : "") + ")",
+            + (capRelaxed ? ", opt-in prefetch: default cap relaxed" : "")
+            + (claim.heldBackBytes > 0
+                ? ", \(claim.heldBackBytes / (1 << 20)) MiB held back for other sessions" : "") + ")",
             category: .session
         )
 
@@ -2479,6 +2488,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // while the pump exits a parked HTTP byte-range read).
         restartLock.lock()
         sessionEpoch &+= 1
+        retentionClaim?.release()
+        retentionClaim = nil
         let p = producer
         producer = nil
         let s = server
