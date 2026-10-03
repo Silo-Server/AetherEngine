@@ -112,6 +112,12 @@ enum LiveEdgePolicy {
     static let boundedStartFloorArmed =
         ProcessInfo.processInfo.environment["AETHER_BOUNDED_START_FLOOR"] == "1"
 
+    /// AE#686, env-gated (`AETHER_FIRST_SERVE_LATCH_ALL=1`) for the same reason: it extends #684's
+    /// first-serve latch from ingest sessions to sources the engine cuts itself, so the second plain
+    /// manifest request no longer waits out a second grace. Read once.
+    static let firstServeLatchAllArmed =
+        ProcessInfo.processInfo.environment["AETHER_FIRST_SERVE_LATCH_ALL"] == "1"
+
     /// AVPlayer's unchanged-playlist patience: it tolerates a playlist that has not changed for this
     /// multiple of the served TARGETDURATION before drawing `-12888`. The one number the cadence floor
     /// is answerable to.
@@ -725,9 +731,14 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// AE#594 arm B: skip the bounded branch, so the wait ends at the full holdback cushion or at the
     /// outer wall-clock deadline. Measurement arm, off unless the environment asks for it.
     private let boundedStartFloorsAtHoldback: Bool
+    /// AE#686 arm: the first-serve latch also covers a source the engine cuts itself. Measurement arm,
+    /// off unless the environment asks for it.
+    private let firstServeLatchCoversEngineCut: Bool
     /// AE#374: whether the first-serve gate has already reported the interval it held. Read and written
     /// only under `firstSegmentCondition`, inside `waitForFirstLiveSegment` and its two account helpers.
     private var didAccountForFirstServe = false
+    /// AE#686: whether the first repeat pass through the gate has been reported. Same lock.
+    private var didAccountForRepeatServe = false
     /// AE#684: on an ingest the gate is a FIRST-serve gate. Every `/media.m3u8` request without an
     /// `_HLS_msn` re-enters it, and AVPlayer opens a session with two of them back to back, so a
     /// bounded start (served under the holdback, after its grace) held the second request for a
@@ -953,6 +964,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         liveWindowSizing: LiveWindowSizing = LiveWindowSizing(targetSegmentDurationSeconds: 4.0, dvrWindowSeconds: nil),
         allowsBoundedDegradedStart: Bool = false,
         boundedStartFloorsAtHoldback: Bool = false,
+        firstServeLatchCoversEngineCut: Bool = false,
         blockingReloadOverride: Bool? = nil,
         liveCadencePolicy: LiveCadencePolicy? = nil,
         restartHandler: ((Int) -> Void)? = nil,
@@ -983,6 +995,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         self.liveWindowSizing = liveWindowSizing
         self.allowsBoundedDegradedStart = allowsBoundedDegradedStart
         self.boundedStartFloorsAtHoldback = boundedStartFloorsAtHoldback
+        self.firstServeLatchCoversEngineCut = firstServeLatchCoversEngineCut
         self.blockingReloadOverride = blockingReloadOverride
         self.liveCadencePolicy = liveCadencePolicy
         self.codecsString = codecsString
@@ -2600,8 +2613,11 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             if waitersCancelled { return false }
             // Ingest sessions only. A source the engine cuts itself keeps the gate it had: there the
             // second request's wait is part of where the session ends up behind the producing edge,
-            // which is AE#594's question and not this one's.
-            if firstManifestServed, liveCadencePolicy != nil { return true }
+            // which is AE#594's question and not this one's. AE#686 measures it behind an arm.
+            if firstManifestServed, liveCadencePolicy != nil || firstServeLatchCoversEngineCut {
+                accountForRepeatServe(since: enteredAt, note: "first-serve latch")
+                return true
+            }
             // Spent first, snapshot second (see `firstServeTargetDuration`).
             let spent = liveCadencePolicy?.joinIsSpent
             let snap = liveCushionSnapshot()
@@ -2696,7 +2712,10 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         note: String? = nil
     ) {
         firstManifestServed = true
-        guard !didAccountForFirstServe else { return }
+        guard !didAccountForFirstServe else {
+            accountForRepeatServe(since: entered, note: note)
+            return
+        }
         didAccountForFirstServe = true
         let account = LiveEdgePolicy.firstServeAccount(
             waitedSeconds: Self.secondsSince(entered),
@@ -2706,6 +2725,19 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         )
         EngineLog.emit(
             "[HLSVideoEngine] \(warning ? "WARNING: " : "")\(account)"
+            + (note.map { ", \($0)" } ?? ""),
+            category: .session
+        )
+    }
+
+    /// AE#686: AVPlayer opens with two plain manifest requests, and how long the second one waited is
+    /// the measurement the latch arm is about. Reported once, from whichever exit let it through.
+    private func accountForRepeatServe(since entered: DispatchTime, note: String?) {
+        guard !didAccountForRepeatServe else { return }
+        didAccountForRepeatServe = true
+        EngineLog.emit(
+            "[HLSVideoEngine] repeat live manifest request held "
+            + "\(LiveEdgePolicy.seconds(Self.secondsSince(entered)))s"
             + (note.map { ", \($0)" } ?? ""),
             category: .session
         )
