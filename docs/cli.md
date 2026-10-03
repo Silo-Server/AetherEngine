@@ -769,6 +769,24 @@ No run stalled in either arm. The extra segment on 6,4 is the short one, and the
 
 **The gate held the second playlist request too.** AVPlayer opens with two `/media.m3u8` requests, each re-enters `waitForFirstLiveSegment`, and on a bounded start each waited its own grace (`GET /media.m3u8` at 2.81 s, `GET /init.mp4` at 4.83 s). On an ingest the gate now opens for good once a manifest has gone out. On a source the engine cuts itself it does not: that second grace is the "+2.07 s at the picture" of the AE#594 table above, and removing it there also leaves the session up to 2 s closer to the producing edge, which is that issue's open question. The raw-TS control (`live --fast-zap --realtime --preroll 0`, two seeds, two runs per arm) reads the same in both arms: first manifest at 3.84 to 3.96 s, `init.mp4` at 6.11 to 6.33 s, first picture at 6.20 to 6.58 s, playhead 6.3 to 6.8 s behind the wall clock. The AE#594 table stands as printed.
 
+**AE#686 measures that second grace behind an arm.** `AETHER_FIRST_SERVE_LATCH_ALL=1` applies the same latch to a source the engine cuts itself. It is a measurement arm like `AETHER_BOUNDED_START_FLOOR`, read once per process and off by default, because what it may cost (a session closer to the producing edge for its whole life) needs a device that seeks to edge-minus-holdback, which this harness does not. Both arms now print how long AVPlayer's second plain request waited, once per session:
+
+```
+[HLSVideoEngine] repeat live manifest request held 2.003s, fastZap bounded start after 2.000s grace
+[HLSVideoEngine] repeat live manifest request held 0.000s, first-serve latch
+```
+
+`live --fast-zap --realtime --preroll 0 --seconds 40`, two runs per arm, interleaved:
+
+| seed | arm | first manifest | second request held | `GET /init.mp4` | sustained advance | `item=` at the end | stalls |
+|---|---|---|---|---|---|---|---|
+| `h264-ts-sample.ts` (2 s cuts) | off | 3.76 to 3.94 s, 2 segments | 2.003 s | 6.10 to 6.14 s | 7.4 to 7.7 s | 34.78 to 34.95 s | 0 |
+| `h264-ts-sample.ts` | on | 3.94 s, 2 segments | 0.000 s | 4.08 s | 5.2 to 5.3 s | 36.57 to 37.20 s | 0 |
+| 1080p59.94, 1 s GOP | off | 1.22 to 1.23 s, 3 segments | 1.011 s | 2.43 s | 3.2 s | 38.30 to 38.40 s | 0 |
+| 1080p59.94, 1 s GOP | on | 1.24 s, 3 segments | 0.000 s | 1.41 to 1.44 s | 1.1 s | 39.19 to 39.30 s | 0 |
+
+The arm removes exactly the grace, and the session ends that much closer to the edge. Whether that costs a stall is the device half.
+
 The full matrix (6 s and 10 s segments, 3, 4 and 8 listed, both profiles, three runs per arm) is in `api.md` under the live join; `.standard` drops `--fast-zap` from the `play` line.
 
 **The same fixture measures sound against picture, in the bytes.** `play --served-url` hands over the init segment, the cache holds the rest, and decoding their concatenation gives the presentation time of every flash and every beep onset: 147 of 148 seconds of a served session read **-0.3 ms** (the very first beep reads +19.7 ms, the decoder starting), across a 12 s outage, with no audio frame of any duration but 1024 samples and no gap at any segment seam. A fresh item re-fetches the same cached segments, so a rebuild cannot change that. What a rebuild does change is which segment the item starts on and where in it, and a segment's sound does not begin where its picture does: the cut is taken on the video keyframe and a transport stream interleaves audio behind video, so on this fixture the sound opens between 11 ms after and 208 ms before the picture, segment by segment. Each item now says what it started on,

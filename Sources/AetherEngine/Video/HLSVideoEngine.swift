@@ -1968,6 +1968,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             ),
             allowsBoundedDegradedStart: liveJoinProfile == .fastZap,
             boundedStartFloorsAtHoldback: LiveEdgePolicy.boundedStartFloorArmed,
+            firstServeLatchCoversEngineCut: LiveEdgePolicy.firstServeLatchAllArmed,
             blockingReloadOverride: blockingReloadOverride,
             liveCadencePolicy: liveCadencePolicy,
             restartHandler: isLiveSession ? nil : { [weak self] idx in
