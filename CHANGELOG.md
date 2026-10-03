@@ -10,6 +10,10 @@ the public-API contract.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [7.26.1] - 2026-10-03
+
 ### Fixed
 
 - **A software-path rescue replayed the gap a host `load()` had skipped (#629).** A native VOD item mounted past the head reads, until its mount seek lands, the start of the segment AVPlayer decodes up from (12.00 s under 15.90 s on the reporter's Apple TV), and the session published that reading. Once the host's `load()` had returned nothing else remembered 15.90 s, so an item AVPlayer refused in that window was rebuilt at 12.00 s and the film replayed 3.9 s after the rescue. The clock hold #646 gave the in-place swap now covers that mount as well: the session reads the position it was mounted at until the mount seek lands or the item plays, and the rescue resumes there. No API change.
