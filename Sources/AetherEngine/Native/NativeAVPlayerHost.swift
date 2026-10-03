@@ -228,14 +228,16 @@ final class NativeAVPlayerHost {
     /// uses this as authoritative presented-frame evidence when that publication wins the MainActor
     /// queue race against the resumed deadline continuation.
     private(set) var latestSeekRenderedTimePublished = false
-    /// AE#629: an in-place swap whose fresh item has not landed its mount seek yet. The swap keeps the
-    /// outgoing item's clock and picture, and until the landing AVPlayer reads first the target, then
-    /// the start of the segment it decodes up from (12.00 s under a 15.97 s revive on the harness).
-    /// Published, that second reading rewinds the playhead, and a software-path rebuild raised in the
-    /// window resumed there and replayed the gap. So neither reading is a landing: only the seek's own
-    /// completion is, or the item playing, which it cannot do short of the target. A seek of the host's
-    /// own takes the clock over from here as well.
-    private var inPlaceSwapMountPending = false
+    /// AE#629: a mount whose item has not landed its mount seek yet. Until the landing AVPlayer reads
+    /// first the target, then the start of the segment it decodes up from (12.00 s under a 15.97 s
+    /// revive on the harness). Published, that second reading rewinds the playhead, and a
+    /// software-path rebuild raised in the window resumed there and replayed the gap. So neither
+    /// reading is a landing: only the seek's own completion is, or the item playing, which it cannot
+    /// do short of the target. A seek of the host's own takes the clock over from here as well.
+    /// Round 5: not only an in-place swap. A VOD mount a host `load()` placed past the head has the
+    /// same window, and there the rebuild resumed at 12.00 s once that load had returned. See
+    /// `mountHoldsClock`.
+    private var mountSeekPending = false
 
     // MARK: - Output
 
@@ -462,7 +464,14 @@ final class NativeAVPlayerHost {
 
         self.sessionContract = contract
         mountedStartPosition = skipInitialSeek ? nil : (startPosition ?? 0)
-        inPlaceSwapMountPending = inPlaceSwap && !skipInitialSeek
+        mountSeekPending = Self.mountHoldsClock(inPlaceSwap: inPlaceSwap, skipInitialSeek: skipInitialSeek,
+                                                startPosition: startPosition, isLive: contract.isLive)
+        // A swap keeps the outgoing item's clock, which already reads the place it holds. A fresh
+        // mount has nothing there yet, so it states the place it is mounted at until the landing.
+        if mountSeekPending, !inPlaceSwap, let startPosition {
+            currentTime = startPosition
+            renderedTime = startPosition
+        }
         let forwardBufferDuration = contract.forwardBufferDuration
         let httpHeaders = contract.httpHeaders
         let armIngestFallback = contract.armIngestFallback
@@ -652,7 +661,7 @@ final class NativeAVPlayerHost {
                         // Audit NAT-103: a carried `.playing` that never changes status on its way to
                         // motion is this item's roll from here, as for the AE#440 one-shot.
                         self.hasEverPlayed = true
-                        self.inPlaceSwapMountPending = false
+                        self.mountSeekPending = false
                         self.startLiveJoinImmediatelyIfHolding(waitingReason: "-")
                     } else if self.timeControlStatus == .waitingToPlayAtSpecifiedRate {
                         // AE#684: a hold refused for an item that could not play yet is asked again
@@ -722,7 +731,7 @@ final class NativeAVPlayerHost {
                 if status == .playing,
                    Self.playingIsThisItemsRoll(itemIsReadyToPlay: self.playerItem?.status == .readyToPlay) {
                     self.hasEverPlayed = true
-                    self.inPlaceSwapMountPending = false
+                    self.mountSeekPending = false
                 }
                 if status == .playing, !self.didSampleSettledRoute {
                     self.didSampleSettledRoute = true
@@ -842,7 +851,7 @@ final class NativeAVPlayerHost {
             let value = time.seconds.isFinite ? time.seconds : 0
             Task { @MainActor in
                 guard let self, self.sessionID == sid else { return }
-                if self.inPlaceSwapMountPending { return }
+                if self.mountSeekPending { return }
                 // renderedTime tracks the parked on-screen frame mid-seek (issue #49).
                 self.renderedTime = value
                 // seekInFlight suppresses currentTime: AVPlayer still reports pre-seek clock until physical landing (issue #37).
@@ -906,7 +915,7 @@ final class NativeAVPlayerHost {
                 guard finished else { return }
                 Task { @MainActor in
                     guard let self, self.sessionID == sid else { return }
-                    self.inPlaceSwapMountPending = false
+                    self.mountSeekPending = false
                 }
             }
         }
@@ -1442,6 +1451,18 @@ final class NativeAVPlayerHost {
         itemIsReadyToPlay
     }
 
+    /// AE#629 round 5: whether a mount holds the clock until its mount seek lands. Every in-place swap
+    /// that seeks does (#646). A fresh mount does when it is VOD placed past the head: at the head
+    /// there is no earlier segment start to read, and a live mount's anchor sits on the item axis
+    /// while its clock is folded through the session shift.
+    nonisolated static func mountHoldsClock(
+        inPlaceSwap: Bool, skipInitialSeek: Bool, startPosition: Double?, isLive: Bool
+    ) -> Bool {
+        if skipInitialSeek { return false }
+        if inPlaceSwap { return true }
+        return !isLive && (startPosition ?? 0) > 0
+    }
+
     /// AE#440 round 3: what a refused hold did next, reported and never acted on.
     ///
     /// The guard above answers one instant, and the bound it read is read only at the hold's edges: a
@@ -1883,7 +1904,7 @@ final class NativeAVPlayerHost {
         let gen = seekGeneration
         seekInFlight = true
         // AE#629: this seek's own landing publishes the clock from here on.
-        inPlaceSwapMountPending = false
+        mountSeekPending = false
         latestSeekRenderedTimePublished = false
         let resumeGuard = SeekResumeGuard()
         return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
