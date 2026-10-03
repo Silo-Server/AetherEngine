@@ -12,6 +12,12 @@ the public-API contract.
 
 _Nothing yet._
 
+## [7.26.3] - 2026-10-03
+
+### Added
+
+- **A measurement arm for the first-serve latch on engine-cut sources (#686).** On raw MPEG-TS under `.fastZap` a bounded start held AVPlayer's second plain `/media.m3u8` request for a second grace (1.0 to 1.4 s on the reporter's Apple TV). `AETHER_FIRST_SERVE_LATCH_ALL=1` applies #684's latch to those sources too; read once per process, off by default, so default behaviour is unchanged. Both arms now log how long that second request waited (`repeat live manifest request held Xs`), which was silent before. No API change.
+
 ## [7.26.2] - 2026-10-03
 
 ### Fixed
