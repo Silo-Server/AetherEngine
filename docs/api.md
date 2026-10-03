@@ -706,9 +706,13 @@ measured against, whether it waited or was satisfied immediately.
 cadence and the holdback follows it down, so the win belongs to the source GOP rather than to the flag:
 `TARGETDURATION` can never fall below `ceil(max EXTINF)`, and a long-GOP source therefore keeps most of
 its runway under either profile. Where the engine cuts the segments itself, each one is a whole GOP and
-the value is sealed from the first few, so it carries `ceil(1.5 x max EXTINF)` of headroom: a broadcast
-whose GOPs run 1.0 to 2.4 s sealed TARGETDURATION 1 on its first three and then broke `EXTINF <= TD`
-on every longer one (AE#670). 1 s GOPs therefore serve TARGETDURATION 2 and a 6 s holdback.
+the value is sealed from the first few, so it carries headroom for a GOP 1.5 x the longest seen: a
+broadcast whose GOPs run 1.0 to 2.4 s sealed TARGETDURATION 1 on its first three and then broke
+`EXTINF <= TD` on every longer one (AE#670). The headroom is the smallest value under which that longer
+GOP still lists (RFC 8216 rounds EXTINF to the nearest integer) and finishes inside AVPlayer's
+`1.5 x TARGETDURATION` patience with 0.5 s to spare, so 1 s GOPs serve TARGETDURATION 2 and a 6 s
+holdback, and so does a 59.94 fps stream whose scene-cut keyframes merge GOPs into 80 to 89-frame
+segments (up to 1.666 s seal 2).
 
 **An ingested HLS upstream seals over the segment it is delivered in, as far as its join pays for it,
 under either profile (AE#684).** The engine re-cuts an upstream segment (at its GOPs under `.fastZap`,
@@ -1062,7 +1066,7 @@ All flags default to safe values; the table is the full set. Depth for the media
 | `httpHeaders` | empty | Extra headers on every probe, range and segment fetch. On `nativeRemoteHLS` they ride into the `AVURLAsset`, so header-enforcing IPTV origins work. Forwarded to sidecar subtitle fetches unless overridden. **Scoping differs by route.** On the plain `nativeRemoteHLS` bypass AVFoundation itself sends them to every host the playlists name (cross-host variants, segments and `EXT-X-KEY` URIs) and carries them across 302 redirects, so credential headers there reach every such host and the engine cannot narrow that. The per-origin credential scoping described for `HLSLiveIngestReader` applies only on the routes the engine fetches itself: the ingest, the disc reader, the origin relay, the subtitle proxy, the audio tap and the live subtitle renditions. A credential that must not reach every host a playlist names should not ride in `httpHeaders` on the bypass. |
 | `isLive` | false | Treat the source as live. Set it explicitly; duration-based auto-detection is too noisy. |
 | `dvrWindowSeconds` | nil | Timeshift window. nil means live-only and `seek` is a no-op. The window is a ceiling: the disk budget (a quarter of the free space, at most 2 GiB) bounds what is actually kept, so a long window on a high-bitrate channel or a small volume holds less than it asks for. With several engines running, each one's quarter is taken from the free space the others have not already claimed, so a tile added on a tight volume holds less history than the first one (AE#687). |
-| `liveJoinProfile` | `.standard` | A `LiveJoinProfile`. `.fastZap` collapses TARGETDURATION to 1.5 x the source GOP (AE#670) so an IPTV join costs seconds instead of a full holdback. |
+| `liveJoinProfile` | `.standard` | A `LiveJoinProfile`. `.fastZap` collapses TARGETDURATION to the source GOP plus headroom for one 1.5 x longer (AE#670) so an IPTV join costs seconds instead of a full holdback. |
 | `clampsLiveResumeToWindow` | true | Whether `play()` may move a behind-live playhead by itself (edge snap on a live-only source more than 45 s behind, or a landing above the retained floor when a DVR window has slid past it). `false` hands the whole decision to the host, which then also owns the eviction case. |
 | `liveJoinStartsImmediately` | true | Cuts AVPlayer's stall-avoidance wait short once at the live join, over a buffer that is non-empty and at least 1.5 s deep, on an item that has reached `readyToPlay` (AE#684). The join tail no host can otherwise reach; default since 6.55.0 on a device A/B, see the live-join section. |
 | `liveBlockingReload` | nil (auto) | LL-HLS blocking-reload override for loopback live sessions. Auto derives eligibility from observed upstream cadence, which is what keeps a bursty relay off a `-15410` loop. |

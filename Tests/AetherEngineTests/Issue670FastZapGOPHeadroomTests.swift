@@ -76,6 +76,66 @@ final class Issue670FastZapGOPHeadroomTests: XCTestCase {
                                                             segmentsAreCutHere: true), 6)
     }
 
+    /// Round 2, reported on a 59.94 fps source with 1.001 s GOPs: 79 frames sealed 2 and 80 frames
+    /// sealed 3, one millisecond of `1.5 x` apart (1.977 against 2.002), and the 9 s holdback cost a
+    /// 6.6 s rebuild backlog its immediate start.
+    func testOneMoreFrameDoesNotBuyAWholeSecond() {
+        let frame = 1001.0 / 60000.0
+        for frames in [79, 80, 89] {
+            XCTAssertEqual(fastZapSeal(Double(frames) * frame), 2, "\(frames) frames")
+        }
+    }
+
+    /// The reporter's TD 2 sessions later met segments up to 1.485 s and ran without a stall or -12888.
+    func testFieldMaximumUnderTheSealStaysAtTwo() {
+        XCTAssertEqual(fastZapSeal(1.485), 2)
+    }
+
+    /// The boundary is where a GOP 1.5 x the longest seen would no longer list under TD 2: 2.499 s
+    /// rounds to 2, 2.5 s to 3.
+    func testHeadroomBoundaryFollowsTheListingRule() {
+        XCTAssertEqual(fastZapSeal(1.666), 2)
+        XCTAssertEqual(fastZapSeal(1.667), 3)
+    }
+
+    /// Every value of the round-2 term satisfies what the first version promised for its 2.4 s GOP:
+    /// a GOP 1.5 x the longest seen lists under TD and is finalized inside AVPlayer's patience with the
+    /// delivery margin to spare. And it is never above `ceil(1.5 x max EXTINF)`.
+    func testHeadroomTermKeepsItsPromiseAndNeverRaisesTheSeal() {
+        var gop = 0.3
+        while gop < 12 {
+            let td = LiveEdgePolicy.targetDurationForGOPHeadroom(gop)
+            let longer = LiveEdgePolicy.servedSeconds(gop * 1.5)
+            XCTAssertLessThanOrEqual(Int(longer.rounded(.toNearestOrAwayFromZero)), td, "\(gop)")
+            XCTAssertLessThanOrEqual(longer + LiveEdgePolicy.gopHeadroomDeliveryMarginSeconds,
+                                     Double(td) * LiveEdgePolicy.unchangedPlaylistPatienceMultiplier, "\(gop)")
+            XCTAssertLessThanOrEqual(td, LiveEdgePolicy.wholeSecondsCovering(gop * 1.5), "\(gop)")
+            gop += 0.001
+        }
+    }
+
+    func testHeadroomTermIsTotal() {
+        XCTAssertEqual(LiveEdgePolicy.targetDurationForGOPHeadroom(.nan), 0)
+        XCTAssertEqual(LiveEdgePolicy.targetDurationForGOPHeadroom(-1), 0)
+        XCTAssertEqual(LiveEdgePolicy.targetDurationForGOPHeadroom(.infinity), LiveEdgePolicy.maxCoveredWholeSeconds)
+        XCTAssertEqual(LiveEdgePolicy.targetDurationForGOPHeadroom(.greatestFiniteMagnitude),
+                       LiveEdgePolicy.maxCoveredWholeSeconds)
+    }
+
+    func testSealAccountNamesWhatTheHeadroomTermNeeds() {
+        let derivation = LiveTargetDurationDerivation(
+            value: 2, maxSegmentDuration: 80 * 1001.0 / 60000.0, cutTargetFloor: fastZapCut,
+            gopHeadroomApplies: true, cadenceFloor: .unmeasurable, selfReported: nil)
+        XCTAssertTrue(derivation.account.contains("1.5 x max EXTINF 2.002s needs 2s"), derivation.account)
+    }
+
+    private func fastZapSeal(_ maxSegment: Double) -> Int {
+        LiveEdgePolicy.targetDurationSeconds(maxSegmentDuration: maxSegment,
+                                             cutTargetSeconds: fastZapCut,
+                                             cadenceFloorSeconds: nil,
+                                             segmentsAreCutHere: true)
+    }
+
     func testSealAccountNamesTheHeadroomTerm() {
         let derivation = LiveTargetDurationDerivation(
             value: 2, maxSegmentDuration: 1.0, cutTargetFloor: fastZapCut,

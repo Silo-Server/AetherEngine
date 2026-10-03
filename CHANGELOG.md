@@ -10,7 +10,9 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **One frame more bought a whole second of `.fastZap` TARGETDURATION (#670 round 2).** The GOP headroom term took `ceil(1.5 x max EXTINF)`, so on a 59.94 fps source with 1.001 s GOPs a 79-frame segment (1.318 s) sealed 2 and an 80-frame one (1.335 s) sealed 3: a 9 s holdback, and a 6 s rebuild backlog then started bounded and presented 2.5 s later. The term now asks what it means, whether a GOP 1.5 x the longest seen would list legally (RFC 8216 rounds EXTINF to the nearest integer) and finish inside AVPlayer's `1.5 x TD` patience with 0.5 s to spare, so segments up to 1.666 s seal 2. Never above the old value; 1 s GOPs keep TARGETDURATION 2. The seal line names what the term needs (`1.5 x max EXTINF 2.002s needs 2s`). No API change.
 
 ## [7.26.1] - 2026-10-03
 

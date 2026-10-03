@@ -416,7 +416,7 @@ enum LiveEdgePolicy {
         var td = wholeSecondsCovering(max(1.0, maxSegmentDuration))
         if let cut = cutTargetSeconds { td = max(td, wholeSecondsCovering(cut * 1.5)) }
         if gopHeadroomApplies(cutTargetSeconds: cutTargetSeconds, segmentsAreCutHere: segmentsAreCutHere) {
-            td = max(td, wholeSecondsCovering(maxSegmentDuration * 1.5))
+            td = max(td, targetDurationForGOPHeadroom(maxSegmentDuration))
         }
         if let floor = cadenceFloorSeconds { td = max(td, targetDurationForCadence(floor)) }
         if let upstream = upstreamSegmentSeconds { td = max(td, targetDurationForUpstreamSegment(upstream)) }
@@ -437,6 +437,35 @@ enum LiveEdgePolicy {
         guard segmentsAreCutHere, let cut = cutTargetSeconds else { return false }
         return cut < 1.0
     }
+
+    /// AE#670: the smallest TARGETDURATION under which a GOP 1.5 x the longest seen would still be
+    /// served without fault: listed legally (RFC 8216 4.3.3.1 compares the EXTINF ROUNDED TO THE NEAREST
+    /// integer with TD) and finalized inside AVPlayer's `1.5 x TD` patience with
+    /// `gopHeadroomDeliveryMarginSeconds` to spare.
+    ///
+    /// Round 2: the first version took `ceil(1.5 x max EXTINF)`, which asks the virtual GOP for more than
+    /// any real segment is asked for and puts a cliff a millisecond wide into the seal. Reported on a
+    /// 59.94 fps source with 1.001 s GOPs: a 79-frame segment (1.318 s) sealed 2, an 80-frame one
+    /// (1.335 s, 2.002 x 1.5) sealed 3, a 9 s holdback a 6.6 s rebuild backlog could not hold, and the
+    /// first frame came 2.5 s later. Under TD 2 a GOP of 2.499 s still lists and leaves 0.5 s of patience,
+    /// so segments up to 1.666 s now seal 2, and the reporter's TD 2 sessions that later met 1.485 s ones
+    /// ran without a stall or -12888. Never above the first version: `round <= ceil`, and the patience
+    /// term only binds where the GOP is too short for the rounding to (TD 1 leaves a listed 1.5 x GOP no
+    /// patience at all, so 1.0 s GOPs keep their TD 2).
+    static func targetDurationForGOPHeadroom(_ maxSegmentSeconds: Double) -> Int {
+        guard maxSegmentSeconds.isFinite else { return wholeSecondsCovering(maxSegmentSeconds) }
+        let longerGOP = servedSeconds(maxSegmentSeconds * 1.5)
+        guard longerGOP > 0 else { return 0 }
+        let listed = wholeSecondsCovering(longerGOP.rounded(.toNearestOrAwayFromZero))
+        let patient = wholeSecondsCovering((longerGOP + gopHeadroomDeliveryMarginSeconds)
+                                           / unchangedPlaylistPatienceMultiplier)
+        return max(listed, patient)
+    }
+
+    /// AE#670 round 2: how long before AVPlayer's patience runs out a GOP 1.5 x the longest seen must
+    /// have been finalized. Half a second is what the first version already accepted for the 2.4 s GOP
+    /// it was reported for (TD 2, patience 3.0 s), so the relaxation gives up nothing that one kept.
+    static let gopHeadroomDeliveryMarginSeconds: Double = 0.5
 
     /// AVPlayer's default (and our explicitly advertised) live-edge holdback: `3 x TARGETDURATION`, the
     /// RFC 8216bis floor for `EXT-X-SERVER-CONTROL:HOLD-BACK`.
@@ -643,6 +672,7 @@ struct LiveTargetDurationDerivation {
         }
         if gopHeadroomApplies {
             terms.append("1.5 x max EXTINF \(LiveEdgePolicy.seconds(maxSegmentDuration * 1.5))s "
+                + "needs \(LiveEdgePolicy.targetDurationForGOPHeadroom(maxSegmentDuration))s "
                 + "(each segment is one whole GOP)")
         }
         terms.append(cadenceFloor.account)
