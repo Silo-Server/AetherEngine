@@ -678,6 +678,7 @@ suppressing `AVPlayerItemLegibleOutput` to keep the measurement running.
 | Symbol | Notes |
 | --- | --- |
 | `$isLive` | Mirrors `LoadOptions.isLive` for the session. |
+| `$isSequentialOrigin` | True while a VOD session is served as a sequential origin, declared (`LoadOptions.sequentialOrigin`) or found by the reader (the origin ignores `Range`, or refused the ranged open twice and served a plain GET, AE#693). The session plays from the start, so a `startPosition` given to `load()` was not honoured, and a seek lands only inside what `$residentRanges` already holds. A host that needs the position reopens the source or tells the user. Set during `load()`, cleared on stop. |
 | `seekToLiveEdge()` | `async`. |
 | `liveSourceReset` | The retune contract above. |
 | `liveResumeClamped`, `LiveResumeClamp` | A resume that found the playhead outside the window and moved it; see above. |
