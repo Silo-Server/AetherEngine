@@ -10,7 +10,9 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **An end-of-media park that runs late still stops the clock on the last sample (#694).** The park is deferred by the queued audio tail and ran wherever the clock stood when its task got the main actor, so a busy main actor parked it past the end (measured: 1.149 s on a 1.0 s source). Both the audio-only and the software host now put the clock back on the point the deferral aimed at.
 
 ## [7.27.1] - 2026-10-04
 

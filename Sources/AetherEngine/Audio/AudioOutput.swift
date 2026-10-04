@@ -158,6 +158,17 @@ final class AudioOutput: @unchecked Sendable {
         synchronizer.setRate(0.0, time: at)
     }
 
+    /// Pause the master clock, at `latest` if it has already run past it. A park deferred to the last
+    /// sample runs whenever its task is scheduled, and on a starved main actor that is after the clock
+    /// has walked on (#694: 1.149 s on a 1.0 s source on a CI runner).
+    func pause(notAfter latest: Double) {
+        let now = synchronizer.currentTime()
+        let seconds = SoftwareEndOfMediaClock.parkSeconds(clockSeconds: CMTimeGetSeconds(now), notAfter: latest)
+        let at = seconds.map { CMTime(seconds: $0, preferredTimescale: 90000) } ?? now
+        EngineLog.emit("[AudioOutput] pause at t=\(String(format: "%.3f", at.seconds))", category: .swPlayback)
+        synchronizer.setRate(0.0, time: at)
+    }
+
     /// AE#464: set the audio presentation offset. Positive presents audio later than video, which on
     /// this path means stamping its samples further ahead on the synchronizer's timeline: at clock
     /// time t the renderer then plays what was recorded at t minus the offset, while the video layer

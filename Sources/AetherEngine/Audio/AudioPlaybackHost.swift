@@ -614,7 +614,8 @@ final class AudioPlaybackHost {
     /// #694: stop the master clock on the last sample instead of letting it free-run past the end
     /// (AE#374 on the software host). The playthrough wait in the demux loop releases up to 0.25 s
     /// before the last enqueued sample, so the park is deferred by what is still queued: parking stops
-    /// the renderer too and an immediate park would cut that tail.
+    /// the renderer too and an immediate park would cut that tail. Either way the clock stops on the
+    /// last sample, not where it stands when the park runs.
     private func parkClockAtEndOfMedia(lastEnqueuedEnd: Double) {
         guard !didParkClockAtEnd else { return }
         didParkClockAtEnd = true
@@ -623,18 +624,18 @@ final class AudioPlaybackHost {
             clockSeconds: aOut.currentTimeSeconds,
             lastAudioPts: lastEnqueuedEnd
         )
-        guard tail > 0 else { return parkClockNow() }
+        guard tail > 0 else { return parkClockNow(notAfter: lastEnqueuedEnd) }
         let generation = seekGeneration
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(tail * 1_000_000_000))
             guard let self, self.seekGeneration == generation, self.didParkClockAtEnd else { return }
-            self.parkClockNow()
+            self.parkClockNow(notAfter: lastEnqueuedEnd)
         }
     }
 
-    private func parkClockNow() {
+    private func parkClockNow(notAfter latest: Double) {
         guard !stopRequested, let aOut = audioOutput else { return }
-        aOut.pause()
+        aOut.pause(notAfter: latest)
         rate = 0
         EngineLog.emit(
             "[AudioHost] end of media: clock parked at "

@@ -1231,17 +1231,19 @@ final class SoftwarePlaybackHost {
             lastAudioPts: demuxDiag.snapshot.lastAudioPts
         )
         guard tail > 0 else { return parkClockNow() }
+        // The deferral aims at the end of the queued tail; a task that runs late must not park past it.
+        let target = aOut.currentTimeSeconds + tail
         let generation = seekGeneration
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(tail * 1_000_000_000))
             guard let self, self.admitsRead(generation: generation) else { return }
-            self.parkClockNow()
+            self.parkClockNow(notAfter: target)
         }
     }
 
-    private func parkClockNow() {
+    private func parkClockNow(notAfter latest: Double = .infinity) {
         guard !stopRequested, let aOut = audioOutput else { return }
-        aOut.pause()
+        aOut.pause(notAfter: latest)
         rate = 0
         EngineLog.emit(
             "[SWHost] end of media: clock parked at "
