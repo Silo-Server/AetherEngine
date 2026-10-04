@@ -49,6 +49,7 @@ You provide the transport bar. You provide the dropdowns. You provide the pretty
 - [stashy](https://stashy.shelf.am/): iOS/tvOS native player for stash.
 - [Gflix](https://gflixhub.app/): A flawless media app for your media.
 - [Melon Video](https://apps.apple.com/ca/app/melon-video/id6811750997): Video Player for Vision Pro.
+- [WUW IPTV Player](https://apps.apple.com/tr/app/wuw-iptv-player-smart-m3u-tv/id6759220800): Watch U Want — or simply WUW — your IPTV player for iPhone, iPad, Mac, Apple TV and Apple Vision Pro.
 <!-- used-by:end -->
 
 Shipping something on AetherEngine? [Submit it](https://github.com/superuser404notfound/AetherEngine/issues/new?template=used-by-submission.yml) to get listed here and on [aetherengine.superuser404.de](https://aetherengine.superuser404.de).
