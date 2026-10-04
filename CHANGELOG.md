@@ -10,6 +10,10 @@ the public-API contract.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [7.27.0] - 2026-10-04
+
 ### Fixed
 
 - **One refusal at byte 0 no longer settles a range-capable VOD forward-only for the whole session (#693).** An Xtream origin answered the ranged open of an episode with a 403 and the unranged GET right after it with a 200. Since #378 every 401/403/404/410 at byte 0 was read as the answer to the resource, so the source was served as a sequential origin: `startPosition` dropped and every seek past the downloaded window snapped back. The open now asks the same range once more before it settles: served, the source stays seekable; refused again, the #378 path runs unchanged. A source that refuses everything costs one request more and still fails typed with its status.
