@@ -2742,27 +2742,9 @@ final class NativeAVPlayerHost {
 
     /// Dump audio route channel capability post-load (route renegotiates on asset load; pre-load poll is stale). outputNumberOfChannels is the actual LPCM limit; EAC3/Atmos bypasses it via bitstream tunnel.
     nonisolated private static func dumpAudioRoute(sid: Int, phase: String) {
-        #if os(iOS) || os(tvOS)
-        let session = AVAudioSession.sharedInstance()
-        let out = session.outputNumberOfChannels
-        let pref = session.preferredOutputNumberOfChannels
-        let maxCh = session.maximumOutputNumberOfChannels
-        let route = session.currentRoute
-        let outputDescs = route.outputs.map { port in
-            let portName = port.portName
-            let portType = port.portType.rawValue
-            let nChannels = port.channels?.count ?? -1
-            return "\(portName)[\(portType), ch=\(nChannels)]"
-        }.joined(separator: ", ")
-        EngineLog.emit(
-            "[NativeAVPlayerHost] #\(sid) audioRoute output=\(out) preferred=\(pref) max=\(maxCh) "
-            + "ports=[\(outputDescs)] "
-            // AE#684: what the route says it delays sound by, per item, beside the item's start.
-            + "latency=\(String(format: "%.0f", session.outputLatency * 1000))ms "
-            + "io=\(String(format: "%.1f", session.ioBufferDuration * 1000))ms (\(phase))",
-            category: .engine
-        )
-        #endif
+        // AE#684: the route's own latency rides on the line, per item, beside the item's start.
+        guard let route = AudioRouteDescription.current() else { return }
+        EngineLog.emit("[NativeAVPlayerHost] #\(sid) audioRoute \(route) (\(phase))", category: .engine)
     }
 
     /// Read sr/ch/bits/layoutTag from CMAudioFormatDescription. Layout tag diagnoses where downmix occurs: unknown/stereo tag = AVPlayer parse layer; correct 7.1 tag = route/soundbar layer.
