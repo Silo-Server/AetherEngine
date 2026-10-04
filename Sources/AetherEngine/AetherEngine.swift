@@ -1371,6 +1371,14 @@ public final class AetherEngine: ObservableObject {
     /// True for a live session (`LoadOptions.isLive`). Cleared in stopInternal so it can't bleed into the next VOD load.
     @Published public internal(set) var isLive: Bool = false
 
+    /// True while a VOD session is served as a sequential origin: the source can only be read front to
+    /// back, either because `LoadOptions.sequentialOrigin` declared it or because the origin refused the
+    /// range form at open (twice, AE#693) and served a plain GET. Such a session plays from the start,
+    /// so a `startPosition` passed to `load()` is not honoured, and a seek lands only inside what the
+    /// session has already read. A host that needs the position reopens the source itself, or tells the
+    /// user. Set during `load()`, before `state` leaves `.loading`; cleared on stop.
+    @Published public internal(set) var isSequentialOrigin: Bool = false
+
     /// What the session's live recording is doing (AE#560). `.idle` when nothing is recording.
     /// See `startRecording(to:)`.
     @Published public internal(set) var recordingState: RecordingState = .idle
@@ -3985,6 +3993,7 @@ public final class AetherEngine: ObservableObject {
         // host-initiated reload would resurrect a stale session snapshot.
         loadedOptions.subtitleSessionCarryover = nil
         isLive = options.isLive
+        isSequentialOrigin = !options.isLive && options.sequentialOrigin
         // nativeRemoteHLS: DVR window is unbounded (AVPlayer clamps seeks to its real seekable range);
         // an over-wide published bound only affects range width, not seek landing.
         liveWindow = options.isLive
@@ -4899,6 +4908,7 @@ public final class AetherEngine: ObservableObject {
             options.declaredDurationSeconds = probe.duration
             loadedOptions.sequentialOrigin = true
             loadedOptions.declaredDurationSeconds = probe.duration
+            isSequentialOrigin = true
             EngineLog.emit(
                 "[AetherEngine] forward-only source with a container duration of "
                 + "\(String(format: "%.1f", probe.duration))s: serving it as a sequential origin",
@@ -7360,6 +7370,7 @@ public final class AetherEngine: ObservableObject {
         activeDiscTitleID = nil
         sourceStartSeconds = 0
         isLive = false
+        isSequentialOrigin = false
         liveWindow = nil
         liveBehindWhenLastAdvancing = 0
         lastPublishedLivePlayhead = nil

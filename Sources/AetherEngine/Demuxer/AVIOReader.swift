@@ -1233,7 +1233,26 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 rangeVerdictPending = !isLive
                 winCond.unlock()
                 startPersistentConnection(at: 0, boundedTo: boundedInitialFetch)
-                gotData = awaitFirstPersistentData()
+                var opened = awaitFirstPersistentData()
+                // AE#693: one refusal is the origin's answer to that request, not yet to the
+                // resource. The #378 path below takes a 401/403/404/410 here as final and settles
+                // the session forward-only, which costs it every seek and the resume position. An
+                // IPTV panel answered a ranged open 403 and the unranged GET right after it 200, and
+                // ranged requests worked again later. Asking the same range once more decides it:
+                // served, the source stays seekable; refused again, the #378 path runs as before.
+                if !opened, !isLive, let refusal = refusalOfOpenConnection() {
+                    EngineLog.emit(
+                        "[AVIOReader] \(label) ranged open refused status=\(refusal) at offset 0; "
+                        + "asking once more before settling the source forward-only (AE#693)",
+                        category: .demux)
+                    try probeControl?.check()
+                    winCond.lock()
+                    rangeVerdictPending = true
+                    winCond.unlock()
+                    startPersistentConnection(at: 0, boundedTo: boundedInitialFetch)
+                    opened = awaitFirstPersistentData()
+                }
+                gotData = opened
                 openPrefix = firstWindowPrefix()
             }
             // AE#140: an HLS playlist URL misrouted onto the raw-byte live path. A live origin serves the
@@ -1281,8 +1300,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     try failIfStreamingRefused(fallbackStatus: 0)
                 } else if !haveSize {
                     tookFallback = true
-                    // A 401/403/404/410 at byte 0 is the origin's answer to the RESOURCE, not to
-                    // the range form: a HEAD or a `bytes=0-1` from the same client is answered
+                    // A 401/403/404/410 at byte 0, given twice (AE#693: once can be the moment's),
+                    // is the origin's answer to the RESOURCE, not to the range form: a HEAD or a
+                    // `bytes=0-1` from the same client is answered
                     // alike, and a size learned from either would only re-issue the refused range
                     // on the persistent path (which then dies after one retry with the status
                     // lost). Skip the ladder. The one request still worth making is the unranged
@@ -1408,6 +1428,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let gotData = !window.isEmpty
         winCond.unlock()
         return gotData
+    }
+
+    /// The refusal status the current persistent connection ended on, nil when it did not end on one
+    /// of the `isResolvedExpiryStatus` refusals. Demux thread, open-time only.
+    private func refusalOfOpenConnection() -> Int? {
+        winCond.lock()
+        defer { winCond.unlock() }
+        return (connEnded && Self.isResolvedExpiryStatus(connStatus)) ? connStatus : nil
     }
 
     /// The streaming GET was answered with a status instead of a body, or the ranged open was
