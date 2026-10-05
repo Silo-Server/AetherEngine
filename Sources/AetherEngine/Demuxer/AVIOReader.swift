@@ -1388,6 +1388,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         winCond.unlock()
     }
 
+    /// The status of the latched refusal, nil while none stands.
+    private func latchedAuthorizationRefusal() -> Int? {
+        winCond.lock()
+        defer { winCond.unlock() }
+        if case .refused(let status) = authorizationRecovery { return status }
+        return nil
+    }
+
     /// The provider has answered, so reconnecting cannot help: the read ends with what it has.
     private func failReadForAuthorization(at offset: Int64, status: Int, totalRead: Int) -> Int32 {
         EngineLog.emit("[AVIOReader] \(label) authorization refused at offset \(offset) status=\(status); failing the read", category: .demux)
@@ -1439,10 +1447,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             close()
             throw AVIOReaderError.transportSecurityFailed(code: tlsCode)
         }
-        winCond.lock()
-        let authorization = authorizationRecovery
-        winCond.unlock()
-        if case .refused(let refusedStatus) = authorization, status == 0 {
+        if status == 0, let refusedStatus = latchedAuthorizationRefusal() {
             throw openFailureForAuthorization(status: refusedStatus)
         }
         guard status != 0 else { return }
@@ -2661,6 +2666,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// Single Range fetch for a detour block over the pooled chunkSession. Surfaces rate limiting with
     /// its Retry-After so the caller can back off in place rather than churn the connection (#71).
     private func detourFetchBlock(from offset: Int64, size: Int) -> DetourFetch {
+        // A failed read leaves the cursor where it was, so the retry lands here again. Until a
+        // generation delivers, the latched refusal stands: no provider call, no request.
+        if let status = latchedAuthorizationRefusal() {
+            return .authorizationRefused(status: status)
+        }
         let budget = Self.effectiveDetourBudget(chunkRequestTimeout: chunkRequestTimeout)
         let ticket = OriginRequestBudget.shared.acquire(
             for: requestURL(), label: "\(label) detour", timeout: budget)

@@ -179,7 +179,7 @@ struct RefreshableDirectPlayAuthorizationTests {
     // treated a provider refusal as a transport failure, so the read fell back to a reconnect that
     // asked the provider again, and a 401 there never reached the provider as a rejection.
 
-    @Test("a provider refusal on a backward read fails the read without asking again")
+    @Test("a provider refusal on a backward read latches: a repeat read neither asks nor sends")
     func detourRefusalLatches() async throws {
         let provider = ProviderLog()
         let asksAfterRefusal = Counter()
@@ -198,8 +198,12 @@ struct RefreshableDirectPlayAuthorizationTests {
         let sentBefore = server.requests.count
         provider.rotate()
         let read = try await offThread(reader) { Self.readBehindTheWindow(reader) }
+        // A failed read leaves the cursor where it was, so the demuxer's retry lands on the same
+        // backward offset. Nothing has delivered since, so the refusal must still stand.
+        let repeated = try await offThread(reader) { Self.readBehindTheWindow(reader) }
 
         #expect(read.result < 0)
+        #expect(repeated.result < 0)
         #expect(asksAfterRefusal.value == 1, "the provider was asked \(asksAfterRefusal.value) times")
         #expect(server.requests.count == sentBefore, "a request went out after the refusal")
     }
@@ -227,7 +231,7 @@ struct RefreshableDirectPlayAuthorizationTests {
         #expect(provider.rejections == ["Bearer stale"])
     }
 
-    @Test("an unchanged credential after a 401 on a backward read fails the read")
+    @Test("an unchanged credential after a 401 on a backward read fails it, and a repeat read too")
     func detourUnchangedCredentialFailsTheRead() async throws {
         let provider = ProviderLog()
         let server = try Self.origin(total: Self.detourTotal) { $0.range != Self.detourRange }
@@ -240,8 +244,10 @@ struct RefreshableDirectPlayAuthorizationTests {
         try await offThread(reader) { try Self.anchorPastTheHead(reader) }
         let sentBefore = server.requests.count
         let read = try await offThread(reader) { Self.readBehindTheWindow(reader) }
+        let repeated = try await offThread(reader) { Self.readBehindTheWindow(reader) }
 
         #expect(read.result < 0)
+        #expect(repeated.result < 0)
         #expect(server.requests.dropFirst(sentBefore).map(\.range) == [Self.detourRange])
         #expect(provider.rejections == ["Bearer stale"])
     }
