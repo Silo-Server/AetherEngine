@@ -26,7 +26,7 @@ Interlaced sources (DVD-rip MPEG-2, SD / HD broadcast H.264) are deinterlaced th
 
 ### MP4 without composition offsets
 
-Some writers emit a sample table with no `ctts` while the H.264 bitstream still reorders pictures.
+Some writers emit a sample table with no `ctts` while the H.264 or HEVC bitstream still reorders pictures.
 Every sample then reports `PTS == DTS`, and since the native route stream-copies those timestamps
 into fMP4, AVPlayer is handed decode order as presentation order: each future reference picture is
 shown before the B pictures that precede it. Measured through AVFoundation's own decoder on a twin
@@ -34,8 +34,8 @@ pair (one encode muxed twice, composition offsets removed from one), 45 of 66 pi
 time belonging to a different picture, with the content order stepping backwards 30 times (#409).
 
 The container lost the information, but the bitstream did not: every slice header carries a picture
-order count, which is display order, and libavcodec's H.264 parser reads it without decoding a pixel
-and takes MP4's length-prefixed payload directly. `H264CompositionOffsetRepair` samples the head
+order count, which is display order, and libavcodec's H.264 and HEVC parsers read it without decoding
+a pixel and take MP4's length-prefixed payload directly. `H264CompositionOffsetRepair` samples the head
 (twelve pictures at most, held rather than re-read, so no rewind and no second fetch) and repairs a
 confirmed source at the demuxer boundary:
 
@@ -54,10 +54,12 @@ built from index entries and then filled with these packets.
 Detection is fail-closed and costs a healthy file almost nothing: the first real PTS-DTS offset ends
 the sample (usually on the first packet, since a reordered file's head sample sits one delay below
 zero). A source is only repaired when every sampled pair is equal, the decode ladder is uniform, the
-picture order regresses, and the ranks it produces are distinct and fill the sampled window. Anything
+picture order regresses, and the ranks it produces are distinct and fill the sampled window (or a
+decode-order prefix of at least nine pictures fills its own range exactly, which covers a
+hierarchical mini-GOP longer than the reorder delay, #699). Anything
 short of that (variable frame timing, a picture order that does not advance one rank per picture, a
 sample that starts nowhere it can be anchored) is delivered exactly as the container wrote it.
-Reported by @orut34iop.
+Reported by @orut34iop; the HEVC case (#699) by @ijuniorfu.
 
 ### Matroska with presentation slots in coding order
 
