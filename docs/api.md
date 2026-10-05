@@ -169,7 +169,9 @@ starts on HTTP sends whatever the resolver returns.
 `LoadOptions.httpRequestAuthorization` covers native HLS media and its master/variant playlist
 preparation, and direct play through the engine's byte-range reader: the playback source, its
 reopens and reloads, and the side readers that pull embedded subtitles from it. Live ingest, audio
-taps, remote disc images, one-shot probes and scrub thumbnails retain static headers.
+taps, remote disc images, one-shot probes and scrub thumbnails retain static headers. So does an
+audio-only progressive source whose codec AVPlayer decodes (AAC, MP3, MP1/MP2, FLAC, ALAC, AC-3,
+E-AC-3, PCM): the resolver authorizes its probe, then AVPlayer plays it with `httpHeaders`.
 
 On direct play the reader asks the resolver for the source URL the host loaded before every
 request it builds: each range, reconnect, seek, size probe and tail fetch. The answer replaces
