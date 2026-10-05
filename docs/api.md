@@ -146,7 +146,9 @@ ownership, and share refresh work with its API client. Playlist discovery grants
 authority. Return current credentials without waiting for a proactive refresh while they remain
 valid; wait for refresh when a credential has expired or was rejected. Never place credentials in
 URLs. The engine owns Range, routing and HTTP framing headers. Authorization waits are bounded;
-stopping the load cancels pending work and ignores late resolver results.
+stopping the load cancels pending work and ignores late resolver results. The resolver runs on an
+engine-owned serial executor rather than Swift's shared cooperative pool, so engine threads waiting
+for its answer cannot starve it; suspend in it rather than block.
 
 **Redirect credential scope includes the scheme.** Validate the destination's scheme, host and
 effective port before obtaining credentials, as well as any session/path restrictions the host
