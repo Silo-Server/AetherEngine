@@ -56,6 +56,23 @@ final class AudioOutput: @unchecked Sendable {
         synchronizer.rate
     }
 
+    /// AE#395: the renderer's own view of its queue, for the diagnostic line: `status/sufficient/error`.
+    /// A session that is silent on one route while its clock runs at 1.00 has nothing else that could
+    /// say whether the renderer is playing what it was given, and the renderer error was only ever
+    /// logged in DEBUG builds.
+    var diagRendererState: String {
+        let status: String
+        switch renderer.status {
+        case .rendering: status = "rendering"
+        case .failed: status = "failed"
+        case .unknown: status = "unknown"
+        @unknown default: status = "?"
+        }
+        let sufficient = renderer.hasSufficientMediaDataForReliablePlaybackStart ? "y" : "n"
+        let error = (renderer.error as NSError?).map { "\($0.domain)/\($0.code)" } ?? "-"
+        return "\(status)/\(sufficient)/\(error)"
+    }
+
     /// AE#549: how often this renderer has flushed itself, for the diagnostic line.
     var automaticFlushCount: Int {
         lock.lock()
