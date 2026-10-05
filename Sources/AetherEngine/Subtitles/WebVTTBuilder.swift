@@ -52,12 +52,15 @@ enum WebVTTBuilder {
     /// `X-TIMESTAMP-MAP` placing cue time 0 at `anchorSeconds` of the origin's media timestamps. A positive
     /// anchor is the MPEG-2 value itself, wrapped to its 33 bits. A negative one would need a value below
     /// zero, so it moves to the cue side instead (cue time |anchor| at timestamp 0), which says the same
-    /// thing without leaning on the player's rollover handling.
+    /// thing without leaning on the player's rollover handling. The anchor comes from origin data, so the
+    /// tick count is wrapped while still a `Double` (a huge `tfdt` would not fit `Int64`), and a value
+    /// that is not finite gets the identity map, which is what the header-less body means.
     static func timestampMap(anchorSeconds: Double) -> String {
+        guard anchorSeconds.isFinite else { return "X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000" }
         guard anchorSeconds >= 0 else {
             return "X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:\(timestamp(-anchorSeconds))"
         }
-        let ticks = Int64((anchorSeconds * 90_000).rounded()) & ((Int64(1) << 33) - 1)
+        let ticks = Int64((anchorSeconds * 90_000).rounded().truncatingRemainder(dividingBy: 8_589_934_592))
         return "X-TIMESTAMP-MAP=MPEGTS:\(ticks),LOCAL:00:00:00.000"
     }
 

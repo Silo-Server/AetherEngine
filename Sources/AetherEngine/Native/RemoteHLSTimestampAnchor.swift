@@ -223,16 +223,21 @@ enum RemoteHLSTimestampAnchor {
 
     // MARK: - Parsing
 
-    /// First media timestamp of the segment, in seconds, minus the segment's playlist start.
+    /// First media timestamp of the segment, in seconds, minus the segment's playlist start. Nil when
+    /// either side is not a finite number (a playlist whose EXTINFs sum to NaN), so the rendition keeps
+    /// the plain body.
     static func anchorSeconds(segmentHead: Data, initSegment: Data?, segmentStart: Double) -> Double? {
+        let timestamp: Double
         if let pts = firstPESTimestamp90k(in: segmentHead) {
-            return Double(pts) / 90_000 - segmentStart
+            timestamp = Double(pts) / 90_000
+        } else if let initSegment, let decodeTime = fragmentDecodeTimeSeconds(initSegment: initSegment,
+                                                                              fragment: segmentHead) {
+            timestamp = decodeTime
+        } else {
+            return nil
         }
-        if let initSegment, let decodeTime = fragmentDecodeTimeSeconds(initSegment: initSegment,
-                                                                       fragment: segmentHead) {
-            return decodeTime - segmentStart
-        }
-        return nil
+        let anchor = timestamp - segmentStart
+        return anchor.isFinite ? anchor : nil
     }
 
     /// PTS of the first video PES (stream_id 0xE0-0xEF) in an MPEG-TS head, or of the first audio PES
@@ -309,7 +314,9 @@ enum RemoteHLSTimestampAnchor {
         return first
     }
 
-    /// The complete boxes inside `range`; a box running past it (a truncated `mdat`) ends the walk.
+    /// The complete boxes inside `range`; a box running past it (a truncated `mdat`) ends the walk. The
+    /// size is checked against the bytes left rather than added to the offset: an origin's 64-bit size
+    /// can be anything up to `Int.max`, and the sum would trap.
     private static func boxes(_ bytes: [UInt8], in range: Range<Int>) -> [(type: String, payload: Range<Int>)] {
         var found: [(type: String, payload: Range<Int>)] = []
         var offset = range.lowerBound
@@ -325,7 +332,7 @@ enum RemoteHLSTimestampAnchor {
             } else if size == 0 {
                 size = range.upperBound - offset
             }
-            guard size >= header, offset + size <= range.upperBound else { break }
+            guard size >= header, size <= range.upperBound - offset else { break }
             found.append((fourCC(bytes, offset + 4), (offset + header)..<(offset + size)))
             offset += size
         }

@@ -405,6 +405,44 @@ struct RemoteHLSSubtitleProxyTests {
         #expect(WebVTTBuilder.timestampMap(anchorSeconds: -2.5) == "X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:02.500")
     }
 
+    /// An extended-size box whose 64-bit size is `Int.max`, after a complete box, used to trap on
+    /// `offset + size` while walking an origin's init segment or fragment.
+    @Test("An extended box size past the data ends the box walk instead of trapping")
+    func oversizedExtendedBoxEndsTheWalk() {
+        let oversized: [UInt8] = Self.be32(1) + Array("moov".utf8)
+            + Self.be32(UInt32(UInt64(Int.max) >> 32)) + Self.be32(UInt32(UInt64(Int.max) & 0xFFFF_FFFF))
+        let ftyp = Self.box("ftyp", Array("iso6".utf8) + Self.be32(0))
+        let initSegment = Data(ftyp + Self.box("moov", Self.trak(id: 1, timescale: 12_800, handler: "vide")))
+        let fragment = Data(Self.box("moof", Self.box("mfhd", [0, 0, 0, 0] + Self.be32(3))
+            + Self.traf(id: 1, decodeTime: 22 * 12_800)))
+        #expect(RemoteHLSTimestampAnchor.anchorSeconds(segmentHead: fragment, initSegment: Data(ftyp + oversized),
+                                                       segmentStart: 0) == nil)
+        #expect(RemoteHLSTimestampAnchor.anchorSeconds(segmentHead: Data(ftyp + oversized), initSegment: initSegment,
+                                                       segmentStart: 0) == nil)
+        #expect(RemoteHLSTimestampAnchor.anchorSeconds(segmentHead: fragment, initSegment: initSegment,
+                                                       segmentStart: 12) == 10)
+    }
+
+    /// A version-1 `tfdt` of `UInt64.max` over a timescale of 1 is a finite anchor too large for `Int64`
+    /// ticks; it used to trap building the rendition's header.
+    @Test("An origin anchor too large for Int64 ticks wraps to 33 bits, and a non-finite one is dropped")
+    func hugeAnchorWrapsWithoutTrapping() {
+        let initSegment = Data(Self.box("moov", Self.trak(id: 1, timescale: 1, handler: "vide")))
+        let fragment = Data(Self.box("moof", Self.traf(id: 1, decodeTime: .max)))
+        let anchor = RemoteHLSTimestampAnchor.anchorSeconds(segmentHead: fragment, initSegment: initSegment,
+                                                            segmentStart: 0)
+        #expect(anchor == Double(UInt64.max))
+        #expect(WebVTTBuilder.timestampMap(anchorSeconds: Double(UInt64.max))
+            == "X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000") // 2^64 * 90000 is a multiple of 2^33
+        #expect(WebVTTBuilder.timestampMap(anchorSeconds: 1e15) // 9e19 ticks mod 2^33
+            == "X-TIMESTAMP-MAP=MPEGTS:3643277312,LOCAL:00:00:00.000")
+        for value in [Double.infinity, -.infinity, .nan] {
+            #expect(WebVTTBuilder.timestampMap(anchorSeconds: value) == "X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000")
+        }
+        #expect(RemoteHLSTimestampAnchor.anchorSeconds(segmentHead: fragment, initSegment: initSegment,
+                                                       segmentStart: .nan) == nil)
+    }
+
     // MARK: - Rendition metadata
 
     @Test("Renditions are numbered in subs_{ordinal} order and carry the host's own labels")
