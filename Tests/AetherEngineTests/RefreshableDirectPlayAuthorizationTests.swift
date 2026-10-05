@@ -127,6 +127,54 @@ struct RefreshableDirectPlayAuthorizationTests {
         #expect(!server.requests.contains { $0.range == Self.secondRange })
     }
 
+    /// Review of PR #12: the provider is asked only about the source, so the engine cannot know which
+    /// of its headers are credentials. The static policy stripped six named ones, and a custom one
+    /// (`X-Profile-Token`, `X-Api-Key`) reached the redirect target and every request built against
+    /// the target the session pinned from it. The held connection follows its redirects inline and
+    /// replayed every header to the next hop, static credentials included.
+    @Test("no header the provider returns reaches a cross-origin target, followed or pinned",
+          arguments: [false, true])
+    func providerHeadersStayOnTheSourceOrigin(heldConnection: Bool) async throws {
+        let fileSize: Int64 = 64 * 1024 * 1024
+        let firstRange = 256 * 1024
+        let cdn = try #require(ThrottledOriginServer(totalSize: fileSize))
+        defer { cdn.stop() }
+        let cdnPort = cdn.port
+        let redirecting = ThrottledOriginServer(totalSize: fileSize, respond: { _, _, _ in
+            .redirect(to: "http://127.0.0.1:\(cdnPort)/cdn/movie.bin")
+        })
+        let source = try #require(redirecting)
+        defer { source.stop() }
+        let reader = AVIOReader(
+            url: URL(string: "http://127.0.0.1:\(source.port)/movie.bin")!,
+            extraHeaders: ["Referer": "https://app.example", "X-Emby-Token": "STATIC"],
+            requestAuthorization: HTTPRequestAuthorization { _, _ in
+                ["Authorization": "Bearer SOURCE-ONLY", "X-Profile-Token": "SOURCE-ONLY",
+                 "Referer": "https://provider.example"]
+            },
+            boundedInitialFetch: Int64(firstRange), heldConnection: heldConnection)
+        defer { reader.markClosed(); reader.close() }
+
+        // Past the bounded first range, so the pump also builds a request against the pinned target.
+        let want = firstRange + 128 * 1024
+        let read = try await offThread(reader) {
+            try reader.open()
+            return Self.read(reader, count: want)
+        }
+
+        #expect(read.bytes == want)
+        let atTarget = cdn.requestHeaders
+        // The held connection asks for one open-ended range, so it reaches the target only by its
+        // inline hop; the URLSession pump also builds a request against the pinned target.
+        #expect(atTarget.count >= (heldConnection ? 1 : 2), "\(atTarget)")
+        for name in ["authorization", "x-profile-token", "x-emby-token"] {
+            #expect(atTarget.allSatisfy { $0[name] == nil }, "\(name) reached the target: \(atTarget)")
+        }
+        // What a target gets without a provider: the static headers that are not credentials.
+        #expect(atTarget.allSatisfy { $0["referer"] == "https://app.example" }, "\(atTarget)")
+        #expect(source.requestHeaders.allSatisfy { $0["x-profile-token"] == "SOURCE-ONLY" })
+    }
+
     // A read behind the window goes to the detour fetch, not the pump. Review of PR #12: the detour
     // treated a provider refusal as a transport failure, so the read fell back to a reconnect that
     // asked the provider again, and a 401 there never reached the provider as a rejection.

@@ -177,9 +177,11 @@ E-AC-3, PCM): the resolver authorizes its probe, then AVPlayer plays it with `ht
 
 On direct play the reader asks the resolver for the source URL the host loaded before every
 request it builds: each range, reconnect, seek, size probe and tail fetch. The answer replaces
-`httpHeaders` and then follows the static-header redirect policy, so credentials reach only the
-source's origin (or an http-to-https upgrade of it), never a cross-origin redirect target or a
-target pinned from one. The resolver is not asked about those destinations. After a 401 the
+`httpHeaders` on requests to the source's origin (or an http-to-https upgrade of it). The resolver
+is not asked about any other destination, so the engine treats every header it returns as a
+credential, custom ones such as `X-Api-Key` included: a cross-origin redirect target, or a target
+pinned from one, receives none of them. Such a target gets `httpHeaders` without the credential
+headers named above, as it would without a resolver. After a 401 the
 resolver receives the headers that request carried; a changed `Authorization` value retries the
 request once at the same byte offset. Unchanged credentials, a second 401, or a resolver that throws
 or does not answer within its bound end the read instead of running the reconnect ladder, and fail

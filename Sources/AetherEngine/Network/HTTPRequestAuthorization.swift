@@ -8,9 +8,9 @@ import Foundation
 /// transport policy. Live ingest still uses its static headers.
 ///
 /// Direct media (the engine's own byte-range reader) asks for the source URL the host loaded before
-/// every request it builds: each range, reconnect, probe and seek. The answer then follows the
-/// static-header redirect policy, so credentials reach only the source's origin (and an http-to-https
-/// upgrade of it), never a cross-origin redirect target or a target pinned from one.
+/// every request it builds: each range, reconnect, probe and seek. Because it is asked about nothing
+/// else, every header of the answer counts as a credential and reaches only the source's origin (and
+/// an http-to-https upgrade of it), never a cross-origin redirect target or a target pinned from one.
 /// The resolver must independently validate every URL, including redirects and playlist-discovered
 /// origins. Discovery grants no credential authority. Credentials must never be placed in URLs.
 /// Include scheme, host and effective port in that scope. Redirects are authorized afresh. Throw to
