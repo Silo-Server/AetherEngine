@@ -33,13 +33,13 @@ Twenty-one subcommands plus the bare-URL `serve` alias.
 
 Opens the demuxer, prints the codec / resolution / frame rate of the video track, the audio track list (codec, channels, language, Atmos flag), the subtitle track list, the parsed container metadata (`MediaMetadata`: title / artist / album / albumArtist + embedded cover art presence), then exits. No HLS server is started.
 
-`--detect-hdr10plus` and `--detect-atmos` add the opt-in detail passes of `AetherEngine.probe(url:detecting:)`, and both can be given at once (one open, one connection). HDR10+ is the interesting one to watch: the bare `probe` reads only what the container declares, and ST 2094-40 is declared nowhere, so a carrying source prints `format: hdr10` without the flag and `format: hdr10Plus` plus `HDR10+: ST 2094-40 metadata seen` with it. `not seen` means "not inside the scan budget", not "proven absent".
+`--detect-hdr10plus` and `--detect-atmos` add the opt-in detail passes of `AetherEngine.probe(url:detecting:)`, and both can be given at once (one open, one connection). HDR10+ is the interesting one to watch: the bare `probe` reads only what the container declares, and ST 2094-40 is declared nowhere, so a carrying source prints `format: hdr10` without the flag and `format: hdr10Plus` plus `HDR10+: ST 2094-40 metadata seen` with it. `not seen` means "not inside the scan budget", not "proven absent". `--detect-hdr-vivid` adds the HDR Vivid (CUVA) check to the same packet pass and prints `HDR Vivid: CUVA metadata seen`; `format:` stays `hlg` / `hdr10`, since Vivid rides that base (#699).
 
 ```bash
 swift run aetherctl probe --detect-hdr10plus /path/to/hdr10plus.mkv
 ```
 
-`Scripts/make-hdr10plus-fixture.py <dir>` builds a ~1 KB HEVC/PQ fixture that carries a real ST 2094-40 T.35 SEI (and prints it base64, which is how the two fixtures embedded in `HDR10PlusProbeIntegrationTests` were made). It verifies itself: it only emits the file when `ffprobe -show_frames` reports `HDR Dynamic Metadata SMPTE2094-40` on it, so the payload is one FFmpeg's own parser accepts rather than a byte pattern that resembles one.
+`Scripts/make-hdr10plus-fixture.py <dir>` builds a ~1 KB HEVC/PQ fixture that carries a real ST 2094-40 T.35 SEI (and prints it base64, which is how the two fixtures embedded in `HDR10PlusProbeIntegrationTests` were made). It verifies itself: it only emits the file when `ffprobe -show_frames` reports `HDR Dynamic Metadata SMPTE2094-40` on it, so the payload is one FFmpeg's own parser accepts rather than a byte pattern that resembles one. With `--vivid` it builds an HEVC/HLG fixture carrying a CUVA HDR Vivid SEI instead, verified the same way against ffprobe's `CUVA` side data (the fixture in `HDRVividProbeTests`).
 
 ## serve
 

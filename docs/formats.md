@@ -216,6 +216,22 @@ sets `SourceProbe.carriesHDR10PlusMetadata` independently of the primary format,
 See [whole-probe limits and cancellation](api.md#whole-probe-limits-and-cancellation) for bounded source
 reads; absence of confirmation is not proof of absence or a statement about the connected display.
 
+### HDR Vivid (CUVA) dynamic metadata
+
+HDR Vivid (CUVA T/UWA 005.1) is built to be backward compatible: the base layer is plain HLG or PQ in
+BT.2020, and its dynamic metadata is an optional registered T.35 SEI on top (country 0x26, provider
+0x0004, oriented code 0x0005). The engine plays that base exactly like any HLG or HDR10 source and the
+SEI is stream-copied with the rest of the bitstream; no Apple platform applies it, and a display
+without Vivid support shows the static base, which is the format's intended fallback. There is no
+host-side tone mapping: the native route has no pixel stage, tvOS gives an app no EDR or panel-peak
+reading to map against, and the TV maps the HDR signal itself (#699).
+
+`probe(url:detecting: .hdrVivid)` reports carriage as `SourceProbe.carriesHDRVividMetadata`, in the
+same packet pass and budget as `.hdr10Plus`. libavcodec's CUVA parser is internal, so
+`HDRVividMetadataScan` walks the body with the same field widths and only counts a message whose
+`system_start_code` is one of the defined 1 to 7, whose fields are all present, and whose bits after
+the last field are zero. HEVC only, as in libavcodec. `videoFormat` stays `.hlg` / `.hdr10`.
+
 The label can also be taken back from the item itself, where the platform has no capability table to clamp it against (AE#515). A Dolby Vision source on macOS resolves to `.hdr10`, because `supportsDolbyVision` is unclaimable there without a host assertion, while AVFoundation goes on playing the `dvh1` sample entry the engine served. Measured with the assertion off on a 16" XDR, a Profile 5 and a Profile 8.1 grade of Dolby's reference content both strobe, so the RPU reaches the pixels with no claim set anywhere and the clamp was moving nothing but the label. When the item's sample entry reads `dvh1` / `dvhe` and the probe agrees the source is Dolby Vision, the label is upgraded from `.hdr10` to `.dolbyVision` at `readyToPlay`. It is an upgrade and not a mirror of what AVFoundation parsed, for two reasons that both matter: an `.sdr` label is the clamp being right about a display presenting no HDR at all, and on tvOS and iOS the per-mode table answers the capability question, so the label follows it rather than a sample entry that a Profile 5 master carries on every panel. Profile 8.1 keeps `.hdr10` on macOS: it reports `hvc1` with the DV configuration alongside it, it composes on that display all the same, and nothing in the stack reports that.
 
 ## Audio

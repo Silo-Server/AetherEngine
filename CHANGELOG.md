@@ -10,7 +10,9 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **HDR Vivid (CUVA) detection in the opt-in probe (#699).** `ProbeDetail.hdrVivid` scans HEVC packets for the CUVA T/UWA 005.1 T.35 SEI and sets the new `SourceProbe.carriesHDRVividMetadata`. It runs in the same packet pass as `.hdr10Plus` and under the same `HDR10PlusDetectionOptions` budget; asking for both still opens one connection, and a cap that ends the pass after one of the two was confirmed keeps that confirmation. libavcodec's CUVA parser is internal, so `HDRVividMetadataScan` walks the body with the same field widths and only counts a complete message with a defined `system_start_code` and zero bits after its last field. `videoFormat` does not move (Vivid rides an HLG or PQ base, which stays the label), and playback is unchanged: the SEI is stream-copied as before and no Apple platform applies it. `aetherctl probe --detect-hdr-vivid` prints the finding, and `Scripts/make-hdr10plus-fixture.py --vivid` builds a fixture ffprobe parses as Vivid. Requested by ijuniorfu.
 
 ## [7.27.3] - 2026-10-05
 
