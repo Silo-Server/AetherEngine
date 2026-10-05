@@ -23,6 +23,8 @@ the public-API contract.
 - `ExternalSubtitleTrack.httpRequestAuthorization` supplies refreshable headers for primary/secondary sidecars and native subtitle stores without changing registered track IDs or rendition mappings. Authorized container decoding retains AVIO streaming and range access.
 - `HTTPRequestAuthorization.data(from:maximumBytes:)` fetches raw auxiliary resources such as font bundles with a caller-supplied byte limit and a whole-transfer deadline, reusing the relay's redirect, authorization, retry, cancellation and TLS policy.
 
+- `LoadOptions.httpRequestAuthorization` now covers direct play. The byte-range reader asks the resolver for the source URL before every range, reconnect, probe and seek, so a rotated access token reaches the next request instead of the session sending the headers it opened with until the host reloads the player. A 401 retries once at the same byte offset when the resolver returns a changed `Authorization`; unchanged credentials, a second 401, or a resolver that throws or exceeds its 10 s bound fail the read without running the reconnect ladder. Resolved credentials follow the static-header redirect policy, so they never reach a cross-origin redirect target. Live ingest and remote disc images keep static headers.
+
 - `LoadOptions.httpRequestAuthorization` accepts an async `HTTPRequestAuthorization` resolver for native HLS. The engine resolves headers before requests and redirects, and retries a rejected request once when the bearer changes, preserving the active player item across token rotation.
 
 ### Fixed

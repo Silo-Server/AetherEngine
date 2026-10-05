@@ -167,7 +167,19 @@ substitute for scope checks: credentials in a custom header are not recognized, 
 starts on HTTP sends whatever the resolver returns.
 
 `LoadOptions.httpRequestAuthorization` covers native HLS media and its master/variant playlist
-preparation. Direct media AVIO, live ingest and audio taps retain static headers.
+preparation, and direct play through the engine's byte-range reader: the playback source, its
+reopens and reloads, and the side readers that pull embedded subtitles from it. Live ingest, audio
+taps, remote disc images, one-shot probes and scrub thumbnails retain static headers.
+
+On direct play the reader asks the resolver for the source URL the host loaded before every
+request it builds: each range, reconnect, seek, size probe and tail fetch. The answer replaces
+`httpHeaders` and then follows the static-header redirect policy, so credentials reach only the
+source's origin (or an http-to-https upgrade of it), never a cross-origin redirect target or a
+target pinned from one. The resolver is not asked about those destinations. After a 401 the
+resolver receives the headers that request carried; a changed `Authorization` value retries the
+request once at the same byte offset. Unchanged credentials, a second 401, or a resolver that throws
+or does not answer within its bound end the read instead of running the reconnect ladder, and fail
+an open before anything is sent. A rotated token therefore needs no player reload.
 
 For external subtitles, set `ExternalSubtitleTrack.httpRequestAuthorization` on each registered
 track. This is independent of the media provider, so the host can restrict subtitle credentials
@@ -967,7 +979,7 @@ All flags default to safe values; the table is the full set. Depth for the media
 | Option | Default | What it does |
 | --- | --- | --- |
 | `httpHeaders` | empty | Static headers on probes, range and segment fetches. On direct `nativeRemoteHLS` loads they ride into the `AVURLAsset`; when relayed they stay on upstream requests. Forwarded to sidecar subtitle fetches unless overridden. |
-| `httpRequestAuthorization` | nil | An `HTTPRequestAuthorization` resolver for native HLS requests and playlist preparation. Forces the engine relay, replaces static application headers per request, and supports a bounded changed-bearer retry after 401. See [the credential contract](#rotating-native-hls-credentials-without-replacing-the-item). |
+| `httpRequestAuthorization` | nil | An `HTTPRequestAuthorization` resolver for native HLS requests and playlist preparation, and for every range request of a direct-play source. Replaces static application headers per request and supports a bounded changed-bearer retry after 401; native HLS also forces the engine relay. See [the credential contract](#rotating-native-hls-credentials-without-replacing-the-item). |
 | `isLive` | false | Treat the source as live. Set it explicitly; duration-based auto-detection is too noisy. |
 | `dvrWindowSeconds` | nil | Timeshift window. nil means live-only and `seek` is a no-op. |
 | `liveJoinProfile` | `.standard` | A `LiveJoinProfile`. `.fastZap` collapses TARGETDURATION to the source GOP so an IPTV join costs seconds instead of a full holdback. |

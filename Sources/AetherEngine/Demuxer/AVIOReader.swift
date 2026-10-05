@@ -42,6 +42,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     private let url: URL
     private let extraHeaders: [String: String]
+    /// `LoadOptions.httpRequestAuthorization`: when set, its answer replaces `extraHeaders` on every
+    /// request this reader builds. Nil keeps the static headers.
+    private let authorizer: SourceRequestAuthorizer?
+    /// How long one request waits for the provider before it fails, as the HLS relay allows.
+    static let authorizationTimeoutDefault: TimeInterval = 10
     /// #450: connections the BOUNDED pool may hold to one host. A throttle, and it is allowed to be
     /// one: every request on that pool ends (a 4 MB detour block, a size probe, the tail prefetch),
     /// so a request that waits here waits for one that is finishing.
@@ -730,6 +735,18 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var connStatus = 0
     // Retry-After seconds from a rate-limit status, honoured before reconnect.
     private var connRetryAfter: TimeInterval = 0
+    /// Refreshable authorization on the pump: the headers the current generation carried (the
+    /// `rejectedHeaders` of a 401), the fresh set a 401 staged for its one retry, and where that
+    /// retry stands. winCond-guarded; a generation that delivers resets the recovery.
+    private var connSentHeaders: [String: String] = [:]
+    private var stagedAuthorizedHeaders: [String: String]?
+    private var authorizationRecovery = AuthorizationRecovery.ready
+
+    /// `refused` latches until a generation delivers again. Its status is the 401 that stood, or 0
+    /// when the provider itself refused or did not answer.
+    private enum AuthorizationRecovery: Equatable {
+        case ready, retried, refused(status: Int)
+    }
     // Bumped on every (re)connect; stale delegate callbacks are ignored.
     private var connGeneration = 0
     /// #377: what is on the link for this reader. Either shape is ONE request against the
@@ -1022,12 +1039,15 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private let probeDrainLock = NSLock()
     private var drainingProbeRequest = false
 
-    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, windowHighWater: Int? = nil, heldConnection: Bool = false, probeControl: ProbeControl? = nil, probeRequestSession: URLSession? = nil) {
+    init(url: URL, extraHeaders: [String: String] = [:], requestAuthorization: HTTPRequestAuthorization? = nil, authorizationTimeout: TimeInterval = AVIOReader.authorizationTimeoutDefault, label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, windowHighWater: Int? = nil, heldConnection: Bool = false, probeControl: ProbeControl? = nil, probeRequestSession: URLSession? = nil) {
         self.probeControl = probeControl
         self.probeRequestSession = probeControl == nil ? nil : probeRequestSession
         self.url = url
         self.label = label
         self.extraHeaders = extraHeaders
+        self.authorizer = requestAuthorization.map {
+            SourceRequestAuthorizer($0, sourceURL: url, timeout: authorizationTimeout)
+        }
         self.chunkSize = chunkSize
         self.prefetchEnabled = prefetchEnabled
         self.isLive = isLive
@@ -1070,15 +1090,26 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// arrived `auth=none`, and the post-seek request to the same pinned host 13 s later carried
     /// both `Authorization` and `X-Emby-Token`. One policy, applied where the request is built, so
     /// a pin cannot outflank it.
-    private func headers(for target: URL?) -> [String: String] {
-        RedirectHeaderPolicy.headersToReplay(
-            extraHeaders: extraHeaders, originalURL: url, redirectURL: target ?? url)
+    ///
+    /// With a provider, `base` is its answer for the source URL, asked once per request: the same
+    /// policy then decides where that answer may go, exactly as it does for static headers. A throw
+    /// means the provider refused, timed out or the reader closed, and the request must not be sent.
+    private func headers(for target: URL?, base: [String: String]? = nil) throws -> [String: String] {
+        let source = try base ?? authorizer?.headers() ?? extraHeaders
+        return RedirectHeaderPolicy.headersToReplay(
+            extraHeaders: source, originalURL: url, redirectURL: target ?? url)
     }
 
-    private func applyExtraHeaders(_ request: inout URLRequest) {
-        for (name, value) in headers(for: request.url) {
+    /// Sets the request's headers and returns them, so the delegate replays this request's own
+    /// headers on a redirect instead of asking the provider a second time.
+    @discardableResult
+    private func applyExtraHeaders(_ request: inout URLRequest,
+                                   base: [String: String]? = nil) throws -> [String: String] {
+        let headers = try headers(for: request.url, base: base)
+        for (name, value) in headers {
             request.setValue(value, forHTTPHeaderField: name)
         }
+        return headers
     }
 
     func open() throws {
@@ -1118,8 +1149,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             try failIfStreamingRefused(fallbackStatus: 0)
         } else if prefetchEnabled {
             // #281: the parse seeks that follow this open are what the retained head exists for.
+            // One provider answer serves the open's first two requests, so a provider that does not
+            // answer costs the open one bounded wait rather than two.
+            let openHeaders = try authorizeOpen()
             winCond.lock()
             openPhaseActive = true
+            stagedAuthorizedHeaders = openHeaders
             winCond.unlock()
             // #551: bytes a host warmed for this source before anything asked to play it. When
             // they are here, this open owes the origin nothing for the span they cover.
@@ -1129,7 +1164,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // therefore needs nothing this open has learned yet. A warm that already carries the
             // trailing object has no use for it.
             if warm?.tail == nil {
-                startTailPrefetch()
+                startTailPrefetch(headers: openHeaders)
             }
             // Playback path. The persistent connection's `Range: bytes=0-` request is itself
             // the size probe: its 206 Content-Range is folded into fileSize by
@@ -1152,7 +1187,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 openPrefix = Array(warm.head.data.prefix(16))
             } else {
                 startPersistentConnection(at: 0, boundedTo: boundedInitialFetch)
-                gotData = awaitFirstPersistentData()
+                gotData = try awaitFirstAuthorizedData()
                 openPrefix = firstWindowPrefix()
             }
             // AE#140: an HLS playlist URL misrouted onto the raw-byte live path. A live origin serves the
@@ -1296,6 +1331,55 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return gotData
     }
 
+    /// The provider's answer for the open, nil without a provider. A refusal or timeout fails the
+    /// open before anything is sent.
+    private func authorizeOpen() throws -> [String: String]? {
+        guard let authorizer else { return nil }
+        do {
+            return try authorizer.headers()
+        } catch {
+            latchProviderRefusal()
+            throw openFailureForAuthorization(status: 0)
+        }
+    }
+
+    /// `awaitFirstPersistentData` plus the open's share of the 401 recovery: one retry at byte 0
+    /// with refreshed headers, then a typed failure once the provider's answer stands.
+    private func awaitFirstAuthorizedData() throws -> Bool {
+        while !awaitFirstPersistentData() {
+            winCond.lock()
+            let status = connEnded ? connStatus : 0
+            winCond.unlock()
+            switch recoverAuthorization(status: status) {
+            case .notApplicable:
+                return false
+            case .retry:
+                startPersistentConnection(at: 0, boundedTo: boundedInitialFetch)
+            case .refused(let refusedStatus):
+                throw openFailureForAuthorization(status: refusedStatus)
+            }
+        }
+        return true
+    }
+
+    /// Closes the reader and returns the open's typed failure: a 401 the provider could not answer
+    /// as that status, a provider that refused or did not answer as `authorizationUnavailable`.
+    private func openFailureForAuthorization(status: Int) -> AVIOReaderError {
+        EngineLog.emit(
+            "[AVIOReader] \(label) source authorization refused (status=\(status)); failing the open typed",
+            category: .demux)
+        markClosed()
+        close()
+        return status == 0 ? .authorizationUnavailable : .httpStatus(status)
+    }
+
+    /// The provider refused or did not answer. Latches until a generation delivers again.
+    private func latchProviderRefusal() {
+        winCond.lock()
+        authorizationRecovery = .refused(status: 0)
+        winCond.unlock()
+    }
+
     /// The streaming GET was answered with a status instead of a body, or the ranged open was
     /// already refused with one and the unranged GET then delivered nothing either. Either way the
     /// demuxer would be handed an empty stream (or an error page) and report it as invalid data;
@@ -1339,6 +1423,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             markClosed()
             close()
             throw AVIOReaderError.transportSecurityFailed(code: tlsCode)
+        }
+        winCond.lock()
+        let authorization = authorizationRecovery
+        winCond.unlock()
+        if case .refused(let refusedStatus) = authorization, status == 0 {
+            throw openFailureForAuthorization(status: refusedStatus)
         }
         guard status != 0 else { return }
         EngineLog.emit(
@@ -1463,6 +1553,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// Must be called BEFORE acquiring the demuxer's access lock.
     func markClosed() {
         isClosed = true
+        authorizer?.cancel()
         // Wake any semaphore waits so the read callbacks can exit
         prefetchReady.signal()
         streamDataReady.signal()
@@ -1507,6 +1598,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         guard !isFullyClosed else { return }
         isFullyClosed = true
         isClosed = true
+        authorizer?.cancel()
         if let ctx = context {
             // avio_context_free does NOT free ctx->buffer (verified, aviobuf.c).
             // Free ctx.pointee.buffer, not original av_malloc ptr: FFmpeg can
@@ -2103,10 +2195,21 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 winCond.broadcast()
                 winCond.unlock()
                 if let refillFrom {
-                    if !refillFaulted || chargeFaultedRunwayRefill(at: refillFrom, ahead: undrained,
-                                                                   status: refillStatus,
-                                                                   retryAfter: refillRetryAfter) {
+                    let authorization = refillFaulted ? recoverAuthorization(status: refillStatus) : .notApplicable
+                    switch authorization {
+                    case .retry:
                         timedReconnect(seek: false, at: refillFrom)
+                    case .refused:
+                        // Serve what is resident; the empty-window path fails the read.
+                        winCond.lock()
+                        nextFaultedRefillAt = .distantFuture
+                        winCond.unlock()
+                    case .notApplicable:
+                        if !refillFaulted || chargeFaultedRunwayRefill(at: refillFrom, ahead: undrained,
+                                                                       status: refillStatus,
+                                                                       retryAfter: refillRetryAfter) {
+                            timedReconnect(seek: false, at: refillFrom)
+                        }
                     }
                 }
                 continue
@@ -2198,6 +2301,17 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             if endedByRangeEnd {
                 timedReconnect(seek: false, at: frontier)
                 continue
+            }
+            switch recoverAuthorization(status: status) {
+            case .retry:
+                timedReconnect(seek: false, at: frontier)
+                continue
+            case .refused(let refusedStatus):
+                EngineLog.emit("[AVIOReader] \(label) authorization refused at offset \(frontier) status=\(refusedStatus); failing the read", category: .demux)
+                emitNetworkPhase(.exhausted)   // the provider has answered; reconnecting cannot help
+                return totalRead > 0 ? Int32(totalRead) : -1
+            case .notApplicable:
+                break
             }
             // A 429/503/509 is rate limiting, not a dead source: drive give-up + backoff off the
             // rate-limit streak, which (unlike unproductiveReconnects) survives the seekReconnect
@@ -2407,6 +2521,55 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
     }
 
+    // MARK: - Refreshable authorization
+
+    /// The provider refused, did not answer, or the reader closed before this generation's request
+    /// was built, so nothing went on the link. The generation ends at once and the refusal latches:
+    /// the read fails instead of running the reconnect ladder against a provider that has answered.
+    private func failGenerationForAuthorization(_ generation: Int, error: Error) {
+        winCond.lock()
+        if generation == connGeneration {
+            connEnded = true
+            connStatus = 0
+            authorizationRecovery = .refused(status: 0)
+        }
+        winCond.broadcast()
+        winCond.unlock()
+        guard !isClosed else { return }
+        EngineLog.emit(
+            "[AVIOReader] \(label) gen=\(generation) request authorization failed: \(error.localizedDescription)",
+            category: .demux)
+    }
+
+    private enum AuthorizationStep { case notApplicable, retry, refused(status: Int) }
+
+    /// A 401 against a reader with a provider earns one retry at the same offset, and only when the
+    /// provider answers the rejected headers with a different Authorization value. Unchanged
+    /// credentials, a provider failure or a second 401 latch the refusal. Every other status, and a
+    /// reader without a provider, stays with the reconnect ladder. Demux-thread-only; the provider
+    /// wait is bounded by the authorizer's timeout.
+    private func recoverAuthorization(status: Int) -> AuthorizationStep {
+        guard let authorizer else { return .notApplicable }
+        winCond.lock()
+        let state = authorizationRecovery
+        let rejected = connSentHeaders
+        winCond.unlock()
+        if case .refused(let latched) = state { return .refused(status: latched) }
+        guard status == 401 else { return .notApplicable }
+        let fresh = state == .ready ? authorizer.refreshed(rejecting: rejected) : nil
+        winCond.lock()
+        if let fresh {
+            stagedAuthorizedHeaders = fresh
+            authorizationRecovery = .retried
+        } else {
+            authorizationRecovery = .refused(status: 401)
+        }
+        winCond.unlock()
+        guard fresh != nil else { return .refused(status: 401) }
+        EngineLog.emit("[AVIOReader] \(label) 401 with refreshed authorization; retrying once", category: .demux)
+        return .retry
+    }
+
     /// Increments the consecutive rate-limited streak; returns true once the bounded cap is hit.
     /// Demux-thread-only. Deliberately NOT reset by `seekReconnect` (parse seeks must not mask a
     /// throttled origin into an endless reconnect loop, #71); only real read progress clears it.
@@ -2484,9 +2647,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // #93/#96: a starved backward-scrub detour fetch must abort fast (the rescue reconnect serves
         // instantly), so this path uses the tight interactive budget, not the full chunk timeout.
         request.timeoutInterval = budget
-        applyExtraHeaders(&request)
         do {
-            let (data, response) = try syncRequest(request, budget: budget)
+            let sentHeaders = try applyExtraHeaders(&request)
+            let (data, response) = try syncRequest(request, headers: sentHeaders, budget: budget)
             if let http = response as? HTTPURLResponse {
                 let status = http.statusCode
                 if Self.isRateLimitStatus(status) {
@@ -2594,7 +2757,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// body, so it is ALWAYS still in flight at that moment on any origin whose first byte costs
     /// anything. It never once served the read it exists for; it only added a request. Only a
     /// loopback origin, which answers before the race can be lost, made it look like it worked.
-    private func startTailPrefetch() {
+    private func startTailPrefetch(headers base: [String: String]?) {
         guard !isLive, !isClosed else { return }
         let url = requestURL()
         // #377: a speculative second request is the first thing to drop on an origin that allows
@@ -2619,7 +2782,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         var request = URLRequest(url: url)
         request.setValue("bytes=-\(Self.tailPrefetchBytes)", forHTTPHeaderField: "Range")
         request.timeoutInterval = Self.effectiveDetourBudget(chunkRequestTimeout: chunkRequestTimeout)
-        applyExtraHeaders(&request)
+        // Speculative: a provider that cannot answer costs this fetch, never the open.
+        guard let sentHeaders = try? applyExtraHeaders(&request, base: base) else { return }
 
         // A delegate rather than a completion handler, and the distinction is load-bearing: a
         // completion handler only fires once the body is in hand, so an origin that does not
@@ -2641,7 +2805,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
         let delegate = TailPrefetchDelegate(
             expectedLength: Self.tailPrefetchBytes,
-            extraHeaders: headers(for: request.url)
+            extraHeaders: sentHeaders
         )
         // #281 retest: one line per open, and the line the field needs. The advertised way to check
         // this fix was "does a bytes=-65536 request show up", which the engine never printed, so a
@@ -2901,6 +3065,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
         if isClosed { return }
 
+        winCond.lock()
+        let staged = stagedAuthorizedHeaders
+        stagedAuthorizedHeaders = nil
+        winCond.unlock()
+
         var request = URLRequest(url: requestURL())
         // #93 residual: a bounded open connection asks for a finite range so an origin that dribbles
         // the open-ended `bytes=0-` stream serves it as a fast finite GET. The 206 Content-Range still
@@ -2921,7 +3090,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             request.setValue("bytes=\(askAsJoin ? 0 : offset)-", forHTTPHeaderField: "Range")
         }
         request.timeoutInterval = 0  // long-lived; stalls handled by the reader
-        applyExtraHeaders(&request)
+        // Asked before the origin slot is taken, so a slow provider never holds one.
+        let sentHeaders: [String: String]
+        do {
+            sentHeaders = try applyExtraHeaders(&request, base: staged)
+        } catch {
+            failGenerationForAuthorization(generation, error: error)
+            return
+        }
 
         // #377: take the origin slot before the connection goes on the link. The pump is the one
         // path that must never be refused a slot for long: it is the main line, and everything
@@ -2936,7 +3112,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             transfer = HeldSourceConnection(
                 url: request.url ?? requestURLForBudget,
                 offset: offset,
-                extraHeaders: headers(for: request.url ?? requestURLForBudget),
+                extraHeaders: sentHeaders,
                 userAgent: nil,
                 label: label,
                 generation: generation,
@@ -2947,7 +3123,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             let delegate = PersistentReadDelegate(
                 reader: self,
                 generation: generation,
-                extraHeaders: headers(for: request.url),
+                extraHeaders: sentHeaders,
                 ticket: ticket,
                 originURL: requestURLForBudget
             )
@@ -2965,6 +3141,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             return
         }
         activeTransfer = transfer
+        connSentHeaders = sentHeaders
         winCond.unlock()
 
         transfer.startTransfer()
@@ -3132,6 +3309,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // a give-up latch — an origin that recovered after the faulted ladder capped out may
             // fault again later and deserves a fresh ladder, not `.distantFuture` forever).
             nextFaultedRefillAt = .distantPast
+            // The credential this generation carried is accepted, so a later 401 earns a new retry.
+            authorizationRecovery = .ready
         }
         let count = data.count
         // #310: delivery that lands with the backpressure end ALREADY recorded, i.e. after our
@@ -3397,7 +3576,17 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private func streamDownloadSync() {
         var request = URLRequest(url: url)
         request.timeoutInterval = 0  // No timeout for live streams
-        applyExtraHeaders(&request)
+        let sentHeaders: [String: String]
+        do {
+            sentHeaders = try applyExtraHeaders(&request)
+        } catch {
+            latchProviderRefusal()
+            streamLock.lock()
+            streamEnded = true
+            streamLock.unlock()
+            streamDataReady.signal()
+            return
+        }
 
         // #377: this connection is open for the whole session, so it holds its slot for the whole
         // session, which is exactly what it costs the origin. Scoped to this function because the
@@ -3420,7 +3609,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let semaphore = DispatchSemaphore(value: 0)
 
         let delegate = StreamingDelegate(
-            extraHeaders: headers(for: request.url),
+            extraHeaders: sentHeaders,
             onResponse: { [weak self] response in
                 // Advisory length for the sequential-origin EOF/EIO distinction; -1 (chunked /
                 // unknown) leaves the clean-end path as the only EOF source.
@@ -3764,7 +3953,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         var request = URLRequest(url: url)
         request.setValue(range, forHTTPHeaderField: "Range")
         request.timeoutInterval = 20
-        applyExtraHeaders(&request)
+        guard let sentHeaders = try? applyExtraHeaders(&request) else { return nil }
 
         // #377: `probeSession` runs on `URLSessionConfiguration.default`, so its own cap is 6 and
         // it composes with nothing. The staggered fan fires two fallbacks at once by design, which
@@ -3781,7 +3970,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
         defer { OriginRequestBudget.shared.release(ticket) }
 
-        let delegate = ProbeDelegate(extraHeaders: headers(for: request.url))
+        let delegate = ProbeDelegate(extraHeaders: sentHeaders)
         let task = (probeRequestSession ?? Self.probeSession).dataTask(with: request)
         task.delegate = delegate
 
@@ -3817,12 +4006,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         var request = URLRequest(url: url)
         request.httpMethod = "HEAD"
         request.timeoutInterval = 5
-        applyExtraHeaders(&request)
 
         do {
+            let sentHeaders = try applyExtraHeaders(&request)
             // Honour the still budget here too so the open-time HEAD fallback can't
             // ride the default 35s on a stalled origin during a cold/reopen scrub (#27).
-            let (_, response) = try syncRequest(request, budget: chunkRequestTimeout)
+            let (_, response) = try syncRequest(request, headers: sentHeaders, budget: chunkRequestTimeout)
             guard let http = response as? HTTPURLResponse,
                   (200...299).contains(http.statusCode) else {
                 let status = (response as? HTTPURLResponse)?.statusCode ?? -1
@@ -3855,21 +4044,29 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return nil
     }
 
-    private func fetchChunkAttempt(from offset: Int64, size: Int, forceSource: Bool) -> Data? {
+    /// `refreshedHeaders` is the provider's answer to a 401 on this same range: set, this is the one
+    /// retry it permits, so a second 401 is final.
+    private func fetchChunkAttempt(from offset: Int64, size: Int, forceSource: Bool,
+                                   refreshedHeaders: [String: String]? = nil) -> Data? {
         let usingCachedURL = !forceSource && cachedResolvedURL() != nil
         let target = forceSource ? url : requestURL()
         let rangeEnd = offset + Int64(size) - 1
         var request = URLRequest(url: target)
         request.setValue("bytes=\(offset)-\(rangeEnd)", forHTTPHeaderField: "Range")
         request.timeoutInterval = min(15, chunkRequestTimeout)
-        applyExtraHeaders(&request)
+        guard let sentHeaders = try? applyExtraHeaders(&request, base: refreshedHeaders) else { return nil }
 
         var lastError: Error?
         for attempt in 0..<chunkMaxRetries {
             do {
-                let (data, response) = try syncRequest(request, budget: chunkRequestTimeout)
+                let (data, response) = try syncRequest(request, headers: sentHeaders, budget: chunkRequestTimeout)
                 if let http = response as? HTTPURLResponse {
                     let status = http.statusCode
+                    if status == 401, refreshedHeaders == nil,
+                       let fresh = authorizer?.refreshed(rejecting: sentHeaders) {
+                        return fetchChunkAttempt(from: offset, size: size, forceSource: forceSource,
+                                                 refreshedHeaders: fresh)
+                    }
                     if status != 200 && status != 206 {
                         if usingCachedURL && Self.isResolvedExpiryStatus(status) {
                             invalidateResolvedURL()
@@ -4050,7 +4247,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         completion.wait()
     }
 
-    private func syncRequest(_ request: URLRequest, budget: TimeInterval = 35) throws -> (Data, URLResponse) {
+    /// `headers` are the ones `applyExtraHeaders` set on `request`, replayed on a redirect.
+    private func syncRequest(_ request: URLRequest, headers: [String: String],
+                             budget: TimeInterval = 35) throws -> (Data, URLResponse) {
         // #377: every short fetch the reader makes (detour blocks, size probes, HEAD) funnels
         // through here, so this is the one place that has to take an origin slot for all of them.
         // Scoped to the call: unlike the pump's, this request's life IS this function's.
@@ -4059,7 +4258,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             for: slotURL, label: "\(label) fetch", timeout: Self.shortFetchSlotWaitSeconds)
         defer { OriginRequestBudget.shared.release(ticket) }
 
-        let delegate = ChunkFetchDelegate(extraHeaders: headers(for: request.url),
+        let delegate = ChunkFetchDelegate(extraHeaders: headers,
                                           bodyLimit: Self.expectedBodyBytes(for: request))
         let task = (probeRequestSession ?? Self.chunkSession).dataTask(with: request)
         task.delegate = delegate
@@ -4941,6 +5140,9 @@ enum AVIOReaderError: Error, Equatable, CustomStringConvertible, LocalizedError 
     /// the same reason `httpStatus` is: without it the open surfaces FFmpeg's invalid data and a
     /// self-signed origin reads as a corrupt file.
     case transportSecurityFailed(code: Int)
+    /// `LoadOptions.httpRequestAuthorization` refused the source or did not answer in time, so no
+    /// request was sent.
+    case authorizationUnavailable
 
     var description: String {
         switch self {
@@ -4952,6 +5154,8 @@ enum AVIOReaderError: Error, Equatable, CustomStringConvertible, LocalizedError 
         case .httpStatus(let status): return "Origin answered HTTP \(status) for the source"
         case .transportSecurityFailed(let code):
             return TransportSecurityFailure.sentence(for: code)
+        case .authorizationUnavailable:
+            return "The request authorization provider supplied no headers for the source"
         }
     }
 

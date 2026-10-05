@@ -27,6 +27,7 @@ final class ScriptedOriginServer: @unchecked Sendable {
     struct Recorded: Sendable {
         let method: String
         let range: String?
+        var authorization: String? = nil
     }
 
     struct Reply {
@@ -162,7 +163,9 @@ final class ScriptedOriginServer: @unchecked Sendable {
         let method = lines.first?.split(separator: " ").first.map(String.init) ?? "GET"
         let range = lines.first(where: { $0.lowercased().hasPrefix("range:") })
             .map { String($0.dropFirst("range:".count)).trimmingCharacters(in: .whitespaces) }
-        let recorded = Recorded(method: method, range: range)
+        let authorization = lines.first(where: { $0.lowercased().hasPrefix("authorization:") })
+            .map { String($0.dropFirst("authorization:".count)).trimmingCharacters(in: .whitespaces) }
+        let recorded = Recorded(method: method, range: range, authorization: authorization)
         lock.lock()
         _requests.append(recorded)
         lock.unlock()

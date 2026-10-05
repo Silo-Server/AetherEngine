@@ -657,6 +657,7 @@ extension AetherEngine {
         let isCustom = isCustomSource
         if isCustom, customReader == nil { return }
         let headers = loadedOptions.httpHeaders
+        let authorization = loadedOptions.httpRequestAuthorization
         let formatHint = customFormatHint
         let probesize = loadedOptions.probesize
         let maxAnalyzeDuration = loadedOptions.maxAnalyzeDuration
@@ -708,7 +709,7 @@ extension AetherEngine {
                 guard let self else { return }
                 let outcome = await self.runSubtitleForwardPrefetchSession(
                     url: url, reader: attemptReader, formatHint: formatHint, headers: headers,
-                    startAt: resumeAt, callerProbesize: probesize,
+                    authorization: authorization, startAt: resumeAt, callerProbesize: probesize,
                     callerMaxAnalyzeDuration: maxAnalyzeDuration,
                     selectTitleID: titleID, store: store, leadSeconds: lead, link: link)
                 guard outcome.exit.isRestartable, !Task.isCancelled else { return }
@@ -760,6 +761,7 @@ extension AetherEngine {
     /// packets to the SubtitlePacketStore instead of decoded cues to native stores.
     nonisolated private func runSubtitleForwardPrefetchSession(
         url: URL, reader: IOReader?, formatHint: String?, headers: [String: String],
+        authorization: HTTPRequestAuthorization?,
         startAt: Double, callerProbesize: Int64?, callerMaxAnalyzeDuration: Int64?,
         selectTitleID: Int?, store: SubtitlePacketStore, leadSeconds: Double,
         link: SideReaderLinkArbiter?
@@ -813,8 +815,8 @@ extension AetherEngine {
                 try demuxer.open(reader: reader, formatHint: formatHint, profile: openProfile,
                                  selectTitleID: selectTitleID, discCacheKey: url.absoluteString)
             } else {
-                try demuxer.open(url: url, extraHeaders: headers, profile: openProfile,
-                                 selectTitleID: selectTitleID)
+                try demuxer.open(url: url, extraHeaders: headers, requestAuthorization: authorization,
+                                 profile: openProfile, selectTitleID: selectTitleID)
             }
         } catch {
             EngineLog.emit("[AetherEngine] #151 forward prefetch open failed: \(error)", category: .engine)
@@ -1678,6 +1680,7 @@ extension AetherEngine {
             customClone = clone
         }
         let headers = loadedOptions.httpHeaders
+        let authorization = loadedOptions.httpRequestAuthorization
         let formatHint = customFormatHint
         let w = sourceVideoWidth > 0 ? sourceVideoWidth : 1920
         let h = sourceVideoHeight > 0 ? sourceVideoHeight : 1080
@@ -1691,7 +1694,7 @@ extension AetherEngine {
         nativeSubtitleReadersTask = Task.detached(priority: .utility) { [weak self] in
             await self?.runNativeSubtitleReaders(
                 url: url, reader: reader, formatHint: formatHint, headers: headers,
-                pairs: pairs, startAt: startAt, videoWidth: w, videoHeight: h,
+                authorization: authorization, pairs: pairs, startAt: startAt, videoWidth: w, videoHeight: h,
                 callerProbesize: probesize, callerMaxAnalyzeDuration: maxAnalyzeDuration,
                 selectTitleID: titleID, readToEOF: readToEOF, link: link
             )
@@ -1749,6 +1752,7 @@ extension AetherEngine {
     nonisolated private func runNativeSubtitleReaders(
         url: URL, reader: IOReader?, formatHint: String?,
         headers: [String: String],
+        authorization: HTTPRequestAuthorization? = nil,
         pairs: [(streamIndex: Int32, store: NativeSubtitleCueStore)],
         startAt: Double, videoWidth: Int32, videoHeight: Int32,
         callerProbesize: Int64? = nil, callerMaxAnalyzeDuration: Int64? = nil,
@@ -1778,7 +1782,8 @@ extension AetherEngine {
             if let reader = reader {
                 try demuxer.open(reader: reader, formatHint: formatHint, profile: openProfile, selectTitleID: selectTitleID, discCacheKey: url.absoluteString)
             } else {
-                try demuxer.open(url: url, extraHeaders: headers, profile: openProfile, selectTitleID: selectTitleID)
+                try demuxer.open(url: url, extraHeaders: headers, requestAuthorization: authorization,
+                                 profile: openProfile, selectTitleID: selectTitleID)
             }
         } catch {
             EngineLog.emit("[AetherEngine] native subtitle readers open failed: \(error)", category: .engine)

@@ -909,7 +909,8 @@ extension HLSVideoEngine {
             do {
                 switch transport {
                 case .url:
-                    try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, profile: openProfile, isLive: true)
+                    try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders,
+                                 requestAuthorization: sourceHTTPAuthorization, profile: openProfile, isLive: true)
                 case .customFactory:
                     // #199: fresh engine-created ingest reader over the same channel; the dead
                     // reader's construction inputs are immutable, so this rejoins at the live edge.

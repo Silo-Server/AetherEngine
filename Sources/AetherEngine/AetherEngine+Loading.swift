@@ -692,6 +692,7 @@ extension AetherEngine {
     func loadNative(
         url: URL,
         sourceHTTPHeaders: [String: String] = [:],
+        sourceHTTPAuthorization: HTTPRequestAuthorization? = nil,
         startPosition: Double?,
         audioSourceStreamIndex: Int32? = nil,
         keepDvh1TagWithoutDV: Bool = false,
@@ -760,6 +761,7 @@ extension AetherEngine {
         let session = HLSVideoEngine(
             url: url,
             sourceHTTPHeaders: sourceHTTPHeaders,
+            sourceHTTPAuthorization: sourceHTTPAuthorization,
             dvModeAvailable: sessionDisplayCaps.supportsDolbyVision,
             displaySupportsHDR: sessionDisplayCaps.supportsHDR,
             keepDvh1TagWithoutDV: keepDvh1TagWithoutDV,
@@ -1725,6 +1727,7 @@ extension AetherEngine {
     func loadSoftware(
         url: URL,
         sourceHTTPHeaders: [String: String] = [:],
+        sourceHTTPAuthorization: HTTPRequestAuthorization? = nil,
         startPosition: Double?,
         audioSourceStreamIndex: Int32?,
         isLive: Bool = false,
@@ -1876,13 +1879,13 @@ extension AetherEngine {
         if loadGeneration == generation { recordStartupCheckpoint(.sessionConstructed) }   // #361
         let forwardBufferSegments = loadedOptions.forwardBufferSegments
         try await Task.detached(priority: .userInitiated) {
-            [host, preopenedDemuxer, url, sourceHTTPHeaders, isLive, dvrWindowSeconds, probesize, maxAnalyzeDuration, sequentialOrigin, heldSourceConnection, declaredDuration, networkPhaseSink] in
+            [host, preopenedDemuxer, url, sourceHTTPHeaders, sourceHTTPAuthorization, isLive, dvrWindowSeconds, probesize, maxAnalyzeDuration, sequentialOrigin, heldSourceConnection, declaredDuration, networkPhaseSink] in
             let dem: Demuxer
             if let pre = preopenedDemuxer {
                 dem = pre
             } else {
                 dem = Demuxer()
-                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration).withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDuration).withHeldSourceConnection(heldSourceConnection), isLive: isLive)
+                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, requestAuthorization: sourceHTTPAuthorization, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration).withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDuration).withHeldSourceConnection(heldSourceConnection), isLive: isLive)
             }
             dem.onNetworkPhaseChanged = networkPhaseSink
             try await host.load(
@@ -1905,6 +1908,7 @@ extension AetherEngine {
     func loadAudio(
         url: URL,
         sourceHTTPHeaders: [String: String] = [:],
+        sourceHTTPAuthorization: HTTPRequestAuthorization? = nil,
         startPosition: Double?,
         audioSourceStreamIndex: Int32?,
         preopenedDemuxer: Demuxer?,
@@ -1953,13 +1957,13 @@ extension AetherEngine {
         }
         if loadGeneration == generation { recordStartupCheckpoint(.sessionConstructed) }   // #361
         try await Task.detached(priority: .userInitiated) {
-            [host, preopenedDemuxer, url, sourceHTTPHeaders, probesize, maxAnalyzeDuration, sequentialOrigin, heldSourceConnection, declaredDuration, networkPhaseSink] in
+            [host, preopenedDemuxer, url, sourceHTTPHeaders, sourceHTTPAuthorization, probesize, maxAnalyzeDuration, sequentialOrigin, heldSourceConnection, declaredDuration, networkPhaseSink] in
             let dem: Demuxer
             if let pre = preopenedDemuxer {
                 dem = pre
             } else {
                 dem = Demuxer()
-                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration).withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDuration).withHeldSourceConnection(heldSourceConnection))
+                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, requestAuthorization: sourceHTTPAuthorization, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration).withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDuration).withHeldSourceConnection(heldSourceConnection))
             }
             dem.onNetworkPhaseChanged = networkPhaseSink
             try await host.load(
@@ -2233,10 +2237,12 @@ extension AetherEngine {
             // silently revert to the main title. Preopen the disc demuxer with the title so the selection
             // survives the reload (#67). Non-disc URL sources keep customPreopened nil and reopen by URL.
             let headers = loadedOptions.httpHeaders
+            let authorization = loadedOptions.httpRequestAuthorization
             do {
                 customPreopened = try await Task.detached(priority: .userInitiated) {
                     let d = Demuxer()
-                    try d.open(url: url, extraHeaders: headers, profile: reloadProfile, selectTitleID: titleToReopen)
+                    try d.open(url: url, extraHeaders: headers, requestAuthorization: authorization,
+                               profile: reloadProfile, selectTitleID: titleToReopen)
                     return d
                 }.value
             } catch {
@@ -2286,6 +2292,7 @@ extension AetherEngine {
                 try await loadSoftware(
                     url: url,
                     sourceHTTPHeaders: loadedOptions.httpHeaders,
+                    sourceHTTPAuthorization: loadedOptions.httpRequestAuthorization,
                     startPosition: LiveReloadPolicy.resumePosition(
                         isLive: loadedOptions.isLive, currentTime: resumeAt),
                     audioSourceStreamIndex: audioStreamIndex,
@@ -2348,6 +2355,7 @@ extension AetherEngine {
                 try await loadNative(
                     url: url,
                     sourceHTTPHeaders: loadedOptions.httpHeaders,
+                    sourceHTTPAuthorization: loadedOptions.httpRequestAuthorization,
                     // Live rejoins at the live edge (see loadSoftware above).
                     startPosition: LiveReloadPolicy.resumePosition(
                         isLive: loadedOptions.isLive, currentTime: resumeAt),
