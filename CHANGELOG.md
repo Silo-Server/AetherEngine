@@ -25,6 +25,8 @@ the public-API contract.
 
 - `LoadOptions.httpRequestAuthorization` now covers direct play. The byte-range reader asks the resolver for the source URL before every range, reconnect, probe and seek, so a rotated access token reaches the next request instead of the session sending the headers it opened with until the host reloads the player. A 401 retries once at the same byte offset when the resolver returns a changed `Authorization`; unchanged credentials, a second 401, or a resolver that throws or exceeds its 10 s bound fail the read without running the reconnect ladder. Resolved credentials follow the static-header redirect policy, so they never reach a cross-origin redirect target. Live ingest, remote disc images and audio-only sources that AVPlayer decodes natively keep static headers.
 
+- `audioSessionReleaseGate` lets a host veto the scheduled `deactivatesAudioSessionOnStop` release just before `setActive(false)` runs. The release runs after `stop()` returns and `setActive(false)` alone takes about half a second on an Atmos passthrough route, but only a `load()` on the same engine cancelled it, so a host that opened a new player in that window could have the new player's session released. Returning `false` skips the release and logs it; with no gate set the release runs as before.
+
 - `LoadOptions.httpRequestAuthorization` accepts an async `HTTPRequestAuthorization` resolver for native HLS. The engine resolves headers before requests and redirects, and retries a rejected request once when the bearer changes, preserving the active player item across token rotation.
 
 ### Fixed

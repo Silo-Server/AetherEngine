@@ -497,6 +497,16 @@ public final class AetherEngine: ObservableObject {
     /// software or audio-only load is still activating releases the session after that activation (AE#538).
     public var deactivatesAudioSessionOnStop: Bool = false
 
+    /// Last word on a scheduled `deactivatesAudioSessionOnStop` release. Default `nil`, which releases as before.
+    ///
+    /// The release runs off the main actor after `stop()` returns, and `setActive(false)` alone takes about
+    /// half a second on an Atmos passthrough route. The engine's own guard only covers a `load()` on the same
+    /// engine, so a host that runs more than one engine (a new player opened while the old one is still
+    /// releasing) answers here whether this engine still owns the session. Returning `false` skips `setActive(false)` and logs the skip. Read when `stop()`
+    /// schedules the release and called off the main actor right before it, after any renderer activation
+    /// queued ahead of it, so keep it cheap and thread-safe.
+    public var audioSessionReleaseGate: (@Sendable () -> Bool)?
+
     @Published public internal(set) var duration: Double = 0
 
     /// Forwarder; see `clock.progress`.
@@ -6570,6 +6580,12 @@ public final class AetherEngine: ObservableObject {
         finalTeardown && !keepNativeHost && hostOptedIn
     }
 
+    /// Whether a scheduled release may still run once its turn comes: no `audioSessionReleaseGate`, or one
+    /// that answers `true`.
+    nonisolated static func audioSessionReleaseGateAllows(_ gate: (@Sendable () -> Bool)?) -> Bool {
+        gate?() ?? true
+    }
+
     #if os(iOS) || os(tvOS)
     /// Counterpart to the activations the engine takes part in (#215). The native path never activates the
     /// session itself (AVKit does it per playback, #24); the software and audio renderer paths do, in
@@ -6624,11 +6640,20 @@ public final class AetherEngine: ObservableObject {
     /// the meantime bumps it again and the pending deactivation drops rather than releasing the session
     /// out from under the new item. `stopInternal` also cancels a pending task before scheduling a new one.
     /// The release queues behind a renderer activation still in flight (AE#538), see `enqueueAudioSessionTransition`.
+    /// Another engine's `load()` is out of reach of that guard, so the host's `audioSessionReleaseGate` gets the
+    /// last word.
     private func scheduleAudioSessionDeactivation() {
         let generation = loadGeneration
+        let gate = audioSessionReleaseGate
         audioSessionDeactivationTask = enqueueAudioSessionTransition { [weak self] in
             guard let self else { return }
             guard !Task.isCancelled, await self.loadGeneration == generation else { return }
+            guard AetherEngine.audioSessionReleaseGateAllows(gate) else {
+                EngineLog.emit(
+                    "[AetherEngine] AVAudioSession release skipped: audioSessionReleaseGate returned false",
+                    category: .engine)
+                return
+            }
             AetherEngine.deactivateSharedAudioSession()
         }
     }

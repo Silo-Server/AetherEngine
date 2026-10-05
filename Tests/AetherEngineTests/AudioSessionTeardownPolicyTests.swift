@@ -53,5 +53,25 @@ struct AudioSessionTeardownPolicyTests {
     func optInDefaultsOff() throws {
         let engine = try AetherEngine()
         #expect(engine.deactivatesAudioSessionOnStop == false)
+        #expect(engine.audioSessionReleaseGate == nil)
+    }
+
+    /// The scheduled release runs after `stop()` returns (its `setActive(false)` alone takes ~0.5 s on an
+    /// Atmos passthrough route), and its own guard only sees this engine's loads. A host that opens a
+    /// second player in that window answers through `audioSessionReleaseGate`; without one the release
+    /// behaves exactly as before.
+    @Test("without a release gate a scheduled release still deactivates")
+    func noGateDeactivates() {
+        #expect(AetherEngine.audioSessionReleaseGateAllows(nil))
+    }
+
+    @Test("a release gate that answers false skips the deactivation")
+    func refusingGateSkips() {
+        #expect(!AetherEngine.audioSessionReleaseGateAllows { false })
+    }
+
+    @Test("a release gate that answers true deactivates")
+    func allowingGateDeactivates() {
+        #expect(AetherEngine.audioSessionReleaseGateAllows { true })
     }
 }
