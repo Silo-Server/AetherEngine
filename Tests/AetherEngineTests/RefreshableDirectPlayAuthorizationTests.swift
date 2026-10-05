@@ -127,20 +127,163 @@ struct RefreshableDirectPlayAuthorizationTests {
         #expect(!server.requests.contains { $0.range == Self.secondRange })
     }
 
+    /// Review of PR #12: the provider is asked only about the source, so the engine cannot know which
+    /// of its headers are credentials. The static policy stripped six named ones, and a custom one
+    /// (`X-Profile-Token`, `X-Api-Key`) reached the redirect target and every request built against
+    /// the target the session pinned from it. The held connection follows its redirects inline and
+    /// replayed every header to the next hop, static credentials included.
+    @Test("no header the provider returns reaches a cross-origin target, followed or pinned",
+          arguments: [false, true])
+    func providerHeadersStayOnTheSourceOrigin(heldConnection: Bool) async throws {
+        let fileSize: Int64 = 64 * 1024 * 1024
+        let firstRange = 256 * 1024
+        let cdn = try #require(ThrottledOriginServer(totalSize: fileSize))
+        defer { cdn.stop() }
+        let cdnPort = cdn.port
+        let redirecting = ThrottledOriginServer(totalSize: fileSize, respond: { _, _, _ in
+            .redirect(to: "http://127.0.0.1:\(cdnPort)/cdn/movie.bin")
+        })
+        let source = try #require(redirecting)
+        defer { source.stop() }
+        let reader = AVIOReader(
+            url: URL(string: "http://127.0.0.1:\(source.port)/movie.bin")!,
+            extraHeaders: ["Referer": "https://app.example", "X-Emby-Token": "STATIC"],
+            requestAuthorization: HTTPRequestAuthorization { _, _ in
+                ["Authorization": "Bearer SOURCE-ONLY", "X-Profile-Token": "SOURCE-ONLY",
+                 "Referer": "https://provider.example"]
+            },
+            boundedInitialFetch: Int64(firstRange), heldConnection: heldConnection)
+        defer { reader.markClosed(); reader.close() }
+
+        // Past the bounded first range, so the pump also builds a request against the pinned target.
+        let want = firstRange + 128 * 1024
+        let read = try await offThread(reader) {
+            try reader.open()
+            return Self.read(reader, count: want)
+        }
+
+        #expect(read.bytes == want)
+        let atTarget = cdn.requestHeaders
+        // The held connection asks for one open-ended range, so it reaches the target only by its
+        // inline hop; the URLSession pump also builds a request against the pinned target.
+        #expect(atTarget.count >= (heldConnection ? 1 : 2), "\(atTarget)")
+        for name in ["authorization", "x-profile-token", "x-emby-token"] {
+            #expect(atTarget.allSatisfy { $0[name] == nil }, "\(name) reached the target: \(atTarget)")
+        }
+        // What a target gets without a provider: the static headers that are not credentials.
+        #expect(atTarget.allSatisfy { $0["referer"] == "https://app.example" }, "\(atTarget)")
+        #expect(source.requestHeaders.allSatisfy { $0["x-profile-token"] == "SOURCE-ONLY" })
+    }
+
+    // A read behind the window goes to the detour fetch, not the pump. Review of PR #12: the detour
+    // treated a provider refusal as a transport failure, so the read fell back to a reconnect that
+    // asked the provider again, and a 401 there never reached the provider as a rejection.
+
+    @Test("a provider refusal on a backward read fails the read without asking again")
+    func detourRefusalLatches() async throws {
+        let provider = ProviderLog()
+        let asksAfterRefusal = Counter()
+        let server = try Self.origin(total: Self.detourTotal) { _ in true }
+        defer { server.stop() }
+        let reader = Self.detourReader(server, authorization: HTTPRequestAuthorization { _, rejected in
+            if provider.rotated {
+                asksAfterRefusal.increment()
+                throw URLError(.userAuthenticationRequired)
+            }
+            return provider.answer(rejected: rejected) { "Bearer \($0)" }
+        })
+        defer { reader.markClosed(); reader.close() }
+
+        try await offThread(reader) { try Self.anchorPastTheHead(reader) }
+        let sentBefore = server.requests.count
+        provider.rotate()
+        let read = try await offThread(reader) { Self.readBehindTheWindow(reader) }
+
+        #expect(read.result < 0)
+        #expect(asksAfterRefusal.value == 1, "the provider was asked \(asksAfterRefusal.value) times")
+        #expect(server.requests.count == sentBefore, "a request went out after the refusal")
+    }
+
+    @Test("a 401 on a backward read is retried once with the refreshed credential")
+    func detourUnauthorizedRetriedWithFreshCredential() async throws {
+        let provider = ProviderLog()
+        let server = try Self.origin(total: Self.detourTotal) {
+            $0.range != Self.detourRange || $0.authorization == "Bearer fresh"
+        }
+        defer { server.stop() }
+        let reader = Self.detourReader(server, authorization: HTTPRequestAuthorization { _, rejected in
+            provider.answer(rejected: rejected) { _ in rejected == nil ? "Bearer stale" : "Bearer fresh" }
+        })
+        defer { reader.markClosed(); reader.close() }
+
+        try await offThread(reader) { try Self.anchorPastTheHead(reader) }
+        let sentBefore = server.requests.count
+        let read = try await offThread(reader) { Self.readBehindTheWindow(reader) }
+
+        #expect(read.result > 0)
+        let after = server.requests.dropFirst(sentBefore)
+        #expect(after.map(\.range) == [Self.detourRange, Self.detourRange], "\(after.map(\.range))")
+        #expect(after.map(\.authorization) == ["Bearer stale", "Bearer fresh"])
+        #expect(provider.rejections == ["Bearer stale"])
+    }
+
+    @Test("an unchanged credential after a 401 on a backward read fails the read")
+    func detourUnchangedCredentialFailsTheRead() async throws {
+        let provider = ProviderLog()
+        let server = try Self.origin(total: Self.detourTotal) { $0.range != Self.detourRange }
+        defer { server.stop() }
+        let reader = Self.detourReader(server, authorization: HTTPRequestAuthorization { _, rejected in
+            provider.answer(rejected: rejected) { _ in "Bearer stale" }
+        })
+        defer { reader.markClosed(); reader.close() }
+
+        try await offThread(reader) { try Self.anchorPastTheHead(reader) }
+        let sentBefore = server.requests.count
+        let read = try await offThread(reader) { Self.readBehindTheWindow(reader) }
+
+        #expect(read.result < 0)
+        #expect(server.requests.dropFirst(sentBefore).map(\.range) == [Self.detourRange])
+        #expect(provider.rejections == ["Bearer stale"])
+    }
+
+    /// Review of PR #12: every open the engine starts runs `Demuxer.open` inside a `Task.detached`,
+    /// so it parks a cooperative-pool thread while it waits for the resolver. When the resolver
+    /// needed that same pool, opens that occupied every pool thread left it nowhere to run, and each
+    /// one failed at its bound instead of starting. Twice the pool's width of parked callers, and a
+    /// resolver that hops onto an actor, is that state on any machine.
+    @Test("callers parked on every cooperative thread still get the resolver's answer")
+    func resolverRunsWhileThePoolIsParked() async throws {
+        let store = TokenStore()
+        let authorizer = SourceRequestAuthorizer(
+            HTTPRequestAuthorization { _, _ in ["Authorization": await store.current()] },
+            sourceURL: URL(string: "http://127.0.0.1/movie.mkv")!, timeout: 5)
+        let callers = ProcessInfo.processInfo.activeProcessorCount * 2
+
+        let answered = await withTaskGroup(of: Bool.self) { group in
+            for _ in 0..<callers {
+                group.addTask { (try? authorizer.headers())?["Authorization"] == "Bearer pooled" }
+            }
+            return await group.reduce(0) { $0 + ($1 ? 1 : 0) }
+        }
+
+        #expect(answered == callers, "\(callers - answered) of \(callers) parked callers timed out")
+    }
+
     // MARK: - Support
 
     /// A ranged origin over `total` filler bytes. `accepts` decides per request; a refusal is a 401.
-    private static func origin(accepts: @escaping @Sendable (ScriptedOriginServer.Recorded) -> Bool) throws
+    private static func origin(total: Int = total,
+                               accepts: @escaping @Sendable (ScriptedOriginServer.Recorded) -> Bool) throws
         -> ScriptedOriginServer {
         try #require(ScriptedOriginServer { request in
             guard accepts(request) else { return .init(status: 401, declaredLength: 0) }
-            let (start, end) = Self.bounds(request.range)
+            let (start, end) = Self.bounds(request.range, total: total)
             return .init(status: 206, declaredLength: Int64(end - start + 1),
                          contentRange: "bytes \(start)-\(end)/\(total)", bodyBytes: end - start + 1)
         })
     }
 
-    private static func bounds(_ range: String?) -> (Int, Int) {
+    private static func bounds(_ range: String?, total: Int) -> (Int, Int) {
         let spec = range.map { String($0.dropFirst("bytes=".count)) } ?? "0-"
         if spec.hasPrefix("-") { return (total - (Int(spec.dropFirst()) ?? 0), total - 1) }
         let parts = spec.split(separator: "-", omittingEmptySubsequences: false)
@@ -156,6 +299,33 @@ struct RefreshableDirectPlayAuthorizationTests {
                    extraHeaders: headers, requestAuthorization: authorization,
                    authorizationTimeout: authorizationTimeout,
                    boundedInitialFetch: Int64(openBytes))
+    }
+
+    /// The detour tests need a gap behind the window, so their source is large enough to seek more
+    /// than 8 MiB past a window held to 1 MiB.
+    private static let detourTotal = 16 * 1024 * 1024
+    /// The 4 MiB detour block that holds byte 9 MiB.
+    private static let detourRange = "bytes=8388608-12582911"
+
+    private static func detourReader(_ server: ScriptedOriginServer,
+                                     authorization: HTTPRequestAuthorization) -> AVIOReader {
+        AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/movie.mkv")!,
+                   requestAuthorization: authorization, boundedInitialFetch: Int64(openBytes),
+                   windowHighWater: 1024 * 1024)
+    }
+
+    /// Opens, then seeks far enough forward that the pump re-anchors at 12 MiB.
+    private static func anchorPastTheHead(_ reader: AVIOReader) throws {
+        try reader.open()
+        _ = read(reader, count: openBytes)
+        _ = reader.seek(offset: 12 * 1024 * 1024, whence: SEEK_SET)
+        _ = read(reader, count: 16 * 1024)
+    }
+
+    /// A read at 9 MiB, behind the re-anchored window: it goes to the detour fetch.
+    private static func readBehindTheWindow(_ reader: AVIOReader) -> (bytes: Int, result: Int32) {
+        _ = reader.seek(offset: 9 * 1024 * 1024, whence: SEEK_SET)
+        return read(reader, count: 16 * 1024)
     }
 
     /// Reads until `count` bytes or the first result that is not a delivery.
@@ -185,6 +355,18 @@ struct RefreshableDirectPlayAuthorizationTests {
             reader.markClosed()
         }
     }
+}
+
+private final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    var value: Int { lock.withLock { count } }
+    func increment() { lock.withLock { count += 1 } }
+}
+
+/// A host's token store: the resolver awaits it, as a resolver that shares refresh work does.
+private actor TokenStore {
+    func current() -> String { "Bearer pooled" }
 }
 
 /// What the provider was asked. `answer` numbers every call from 1 and records the Authorization of

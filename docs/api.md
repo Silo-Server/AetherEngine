@@ -146,7 +146,9 @@ ownership, and share refresh work with its API client. Playlist discovery grants
 authority. Return current credentials without waiting for a proactive refresh while they remain
 valid; wait for refresh when a credential has expired or was rejected. Never place credentials in
 URLs. The engine owns Range, routing and HTTP framing headers. Authorization waits are bounded;
-stopping the load cancels pending work and ignores late resolver results.
+stopping the load cancels pending work and ignores late resolver results. The resolver runs on an
+engine-owned serial executor rather than Swift's shared cooperative pool, so engine threads waiting
+for its answer cannot starve it; suspend in it rather than block.
 
 **Redirect credential scope includes the scheme.** Validate the destination's scheme, host and
 effective port before obtaining credentials, as well as any session/path restrictions the host
@@ -175,13 +177,21 @@ E-AC-3, PCM): the resolver authorizes its probe, then AVPlayer plays it with `ht
 
 On direct play the reader asks the resolver for the source URL the host loaded before every
 request it builds: each range, reconnect, seek, size probe and tail fetch. The answer replaces
-`httpHeaders` and then follows the static-header redirect policy, so credentials reach only the
-source's origin (or an http-to-https upgrade of it), never a cross-origin redirect target or a
-target pinned from one. The resolver is not asked about those destinations. After a 401 the
+`httpHeaders` on requests to the source's origin (or an http-to-https upgrade of it). The resolver
+is not asked about any other destination, so the engine treats every header it returns as a
+credential, custom ones such as `X-Api-Key` included: a cross-origin redirect target, or a target
+pinned from one, receives none of them. Such a target gets `httpHeaders` without the credential
+headers named above, as it would without a resolver. After a 401 the
 resolver receives the headers that request carried; a changed `Authorization` value retries the
-request once at the same byte offset. Unchanged credentials, a second 401, or a resolver that throws
-or does not answer within its bound end the read instead of running the reconnect ladder, and fail
-an open before anything is sent. A rotated token therefore needs no player reload.
+request once at the same byte offset. A rotated token therefore needs no player reload. Failures
+fall into two groups, and neither runs the reconnect ladder:
+
+- Before a request is sent: the resolver throws or does not answer within its bound. Nothing goes
+  to the origin. An open fails with `AVIOReaderError.authorizationUnavailable`, which a load reports
+  as `.sourceOpenFailed`; a read in progress ends.
+- After a 401: the credential is unchanged, the retry is refused again, or the resolver throws or
+  times out while answering the 401. A read in progress ends; an open fails with the 401, which a
+  load reports as `.sourceRefused` with `underlyingCode` 401.
 
 For external subtitles, set `ExternalSubtitleTrack.httpRequestAuthorization` on each registered
 track. This is independent of the media provider, so the host can restrict subtitle credentials
