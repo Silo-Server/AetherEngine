@@ -425,14 +425,17 @@ public final class Demuxer: @unchecked Sendable {
     /// Open a media URL and probe its streams.
     /// - Parameters:
     ///   - extraHeaders: Attached to every HTTP request (ignored for file:// URLs).
+    ///   - requestAuthorization: `LoadOptions.httpRequestAuthorization`. Replaces `extraHeaders` on
+    ///     the byte-range reader's requests; a remote disc image keeps `extraHeaders`.
     ///   - isLive: Suppresses EOF synthesis and surfaces terminal error on reconnect cap.
-    func open(url: URL, extraHeaders: [String: String] = [:], profile: DemuxerOpenProfile = .playback, isLive: Bool = false, selectTitleID: Int? = nil) throws {
+    func open(url: URL, extraHeaders: [String: String] = [:], requestAuthorization: HTTPRequestAuthorization? = nil, profile: DemuxerOpenProfile = .playback, isLive: Bool = false, selectTitleID: Int? = nil) throws {
         self.openProfile = profile
         self.auditSource = isLive ? nil : (url, extraHeaders)
         let isHTTP = url.scheme == "http" || url.scheme == "https"
 
         if isHTTP {
-            try openHTTP(url: url, extraHeaders: extraHeaders, isLive: isLive, selectTitleID: selectTitleID)
+            try openHTTP(url: url, extraHeaders: extraHeaders, requestAuthorization: requestAuthorization,
+                         isLive: isLive, selectTitleID: selectTitleID)
         } else {
             // Route a local DVD ISO through the disc adapter (FileIOReader keeps it
             // out of RAM). Falls back to the normal local open when not a disc.
@@ -502,7 +505,7 @@ public final class Demuxer: @unchecked Sendable {
         ["iso", "img", "udf"].contains(url.pathExtension.lowercased())
     }
 
-    private func openHTTP(url: URL, extraHeaders: [String: String], isLive: Bool = false, selectTitleID: Int? = nil) throws {
+    private func openHTTP(url: URL, extraHeaders: [String: String], requestAuthorization: HTTPRequestAuthorization?, isLive: Bool = false, selectTitleID: Int? = nil) throws {
         // A remote disc image goes through the same disc adapter as a local ISO (a raw .iso handed
         // straight to libavformat fails to probe; it is a filesystem, not a media container, #64).
         // Gated on the disc-image extension so normal media URLs skip the range-probe entirely; if
@@ -522,6 +525,7 @@ public final class Demuxer: @unchecked Sendable {
         let reader = AVIOReader(
             url: url,
             extraHeaders: extraHeaders,
+            requestAuthorization: requestAuthorization,
             label: openProfile.readerLabel,
             chunkSize: openProfile.avioChunkSize,
             prefetchEnabled: openProfile.avioPrefetch,

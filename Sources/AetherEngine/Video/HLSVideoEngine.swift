@@ -42,6 +42,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     let sourceURL: URL
     let sourceHTTPHeaders: [String: String]
+    /// `LoadOptions.httpRequestAuthorization`, carried to every reopen of the source.
+    let sourceHTTPAuthorization: HTTPRequestAuthorization?
     private let dvModeAvailable: Bool
 
     /// From `LoadOptions.keepDvh1TagWithoutDV`; default OFF, set only for misreporting DV panels.
@@ -849,6 +851,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     public init(
         url: URL,
         sourceHTTPHeaders: [String: String] = [:],
+        sourceHTTPAuthorization: HTTPRequestAuthorization? = nil,
         dvModeAvailable: Bool = true,
         displaySupportsHDR: Bool = true,
         keepDvh1TagWithoutDV: Bool = false,
@@ -882,6 +885,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     ) {
         self.sourceURL = url
         self.sourceHTTPHeaders = sourceHTTPHeaders
+        self.sourceHTTPAuthorization = sourceHTTPAuthorization
         self.sequentialOrigin = sequentialOrigin
         self.heldSourceConnection = heldSourceConnection
         self.declaredDurationSeconds = declaredDurationSeconds
@@ -1091,7 +1095,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         } else {
             dem = Demuxer()
             do {
-                try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, profile: openProfile, isLive: isLiveSession)
+                try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders,
+                             requestAuthorization: sourceHTTPAuthorization, profile: openProfile, isLive: isLiveSession)
             } catch {
                 throw Self.openFailure(from: error)
             }
@@ -3876,6 +3881,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     // reopen would splice fabricated-position bytes into the new pump.
                     try fresh.open(
                         url: sourceURL, extraHeaders: sourceHTTPHeaders,
+                        requestAuthorization: sourceHTTPAuthorization,
                         profile: restartReopenProfile,
                         isLive: false)
                     dem.markClosed() // abort any wedged read now that the replacement is ready

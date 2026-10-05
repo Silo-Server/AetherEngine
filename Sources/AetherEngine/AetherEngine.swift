@@ -3908,7 +3908,8 @@ public final class AetherEngine: ObservableObject {
                 case .url(let u):
                     // isLive configures the AVIOReader for endless-feed mode; must be set at open time because
                     // the probe demuxer is reused as the session demuxer (avformat_open_input runs only once).
-                    try probe.open(url: u, extraHeaders: options.httpHeaders, profile: probeProfile, isLive: options.isLive, selectTitleID: discTitleID)
+                    try probe.open(url: u, extraHeaders: options.httpHeaders,
+                                   requestAuthorization: options.httpRequestAuthorization, profile: probeProfile, isLive: options.isLive, selectTitleID: discTitleID)
                 case .custom(let reader, let formatHint):
                     // isLive suppresses SEEK_END duration estimate on forward-only live readers; same open-time requirement.
                     try probe.open(reader: reader, formatHint: formatHint, profile: probeProfile, isLive: options.isLive, selectTitleID: discTitleID)
@@ -4210,6 +4211,7 @@ public final class AetherEngine: ObservableObject {
                     try await loadAudio(
                         url: url,
                         sourceHTTPHeaders: options.httpHeaders,
+                        sourceHTTPAuthorization: options.httpRequestAuthorization,
                         startPosition: startPosition,
                         audioSourceStreamIndex: resolvedInitialAudio >= 0 ? resolvedInitialAudio : nil,
                         preopenedDemuxer: probeOpened ? probe : nil,
@@ -4626,6 +4628,7 @@ public final class AetherEngine: ObservableObject {
                 try await loadSoftware(
                     url: url,
                     sourceHTTPHeaders: options.httpHeaders,
+                    sourceHTTPAuthorization: options.httpRequestAuthorization,
                     startPosition: startPosition,
                     audioSourceStreamIndex: selectedAudio,
                     isLive: options.isLive,
@@ -4675,6 +4678,7 @@ public final class AetherEngine: ObservableObject {
                 try await loadNative(
                     url: url,
                     sourceHTTPHeaders: options.httpHeaders,
+                    sourceHTTPAuthorization: options.httpRequestAuthorization,
                     startPosition: startPosition,
                     audioSourceStreamIndex: selectedAudio,
                     keepDvh1TagWithoutDV: options.keepDvh1TagWithoutDV,

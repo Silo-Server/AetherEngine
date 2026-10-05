@@ -124,6 +124,44 @@ struct RedirectHeaderPolicyTests {
         #expect(out["X-Custom"] == "1")
     }
 
+    // MARK: Provider answers
+
+    // The provider is asked about the source only, so any header it returns may be a credential.
+
+    private let answer = ["Authorization": "Bearer abc", "X-Profile-Token": "p1", "Referer": "provider"]
+    private let staticHeaders = ["Referer": "app", "X-Emby-Token": "static"]
+
+    @Test("A cross-origin hop gets no provider header, only the non-credential static ones")
+    func providerHeadersStayOffCrossOriginHops() {
+        let headers = RedirectHeaderPolicy.Headers(authorized: answer, static: staticHeaders)
+        let source = url("https://media.example/x")
+        #expect(headers.toReplay(from: source, to: url("https://cdn.example/x")) == ["Referer": "app"])
+        #expect(headers.toReplay(from: source, to: url("https://media.example/y")) == answer)
+    }
+
+    @Test("A target pinned from a cross-origin redirect carries no provider header on its own hops")
+    func pinnedTargetCarriesNoProviderHeaders() {
+        let pinned = url("https://cdn.example/x")
+        let headers = RedirectHeaderPolicy.Headers(authorized: answer, static: staticHeaders)
+            .scoped(source: url("https://media.example/x"), target: pinned)
+        #expect(headers.credentialed == ["Referer": "app"])
+        #expect(headers.toReplay(from: pinned, to: url("https://cdn.example/y")) == ["Referer": "app"])
+    }
+
+    @Test("A custom provider header URLSession carried over is removed cross-host")
+    func carriedOverProviderHeaderRemovedCrossHost() {
+        var carried = URLRequest(url: url("https://cdn.example/o.mp4"))
+        carried.setValue("p1", forHTTPHeaderField: "X-Profile-Token")
+        carried.setValue("provider", forHTTPHeaderField: "Referer")
+        let out = RedirectHeaderPolicy.redirectRequest(
+            carried,
+            originalURL: url("https://media.example/x"),
+            originalRange: nil,
+            headers: .init(authorized: answer, static: staticHeaders))
+        #expect(out.value(forHTTPHeaderField: "X-Profile-Token") == nil)
+        #expect(out.value(forHTTPHeaderField: "Referer") == "app")
+    }
+
     // MARK: Request-level sanitization
 
     @Test("Credential carried over by URLSession is removed cross-host")

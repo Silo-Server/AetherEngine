@@ -83,7 +83,10 @@ final class HeldSourceConnection: @unchecked Sendable {
     }
 
     private weak var delegate: HeldSourceConnectionDelegate?
-    private let extraHeaders: [String: String]
+    /// Split by `RedirectHeaderPolicy`: a hop followed inline gets what the policy allows it from
+    /// `requestedURL`, never the whole set.
+    private let extraHeaders: RedirectHeaderPolicy.Headers
+    private let requestedURL: URL
     private let offset: Int64
     private let userAgent: String?
     private let queue: DispatchQueue
@@ -106,13 +109,14 @@ final class HeldSourceConnection: @unchecked Sendable {
 
     init(url: URL,
          offset: Int64,
-         extraHeaders: [String: String],
+         extraHeaders: RedirectHeaderPolicy.Headers,
          userAgent: String?,
          label: String,
          generation: Int = 0,
          ticket: OriginRequestBudget.Ticket? = nil,
          delegate: HeldSourceConnectionDelegate) {
         self.respondedBy = url
+        self.requestedURL = url
         self.offset = offset
         self.extraHeaders = extraHeaders
         self.userAgent = userAgent
@@ -237,7 +241,8 @@ final class HeldSourceConnection: @unchecked Sendable {
         if secure { task.startSecureConnection() }
 
         try write(Self.requestBytes(target: target, host: host, port: port, secure: secure,
-                                    offset: offset, extraHeaders: extraHeaders,
+                                    offset: offset,
+                                    extraHeaders: extraHeaders.toReplay(from: requestedURL, to: target),
                                     userAgent: userAgent))
         return try readHead()
     }

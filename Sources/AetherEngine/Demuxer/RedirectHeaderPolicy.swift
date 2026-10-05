@@ -7,6 +7,10 @@ import Foundation
 /// the request outright when the target authenticates via the URL itself and rejects
 /// conflicting auth mechanisms with 400. Non-credential headers are replayed
 /// unconditionally so header-dependent proxies keep working (#8).
+///
+/// Headers from `HTTPRequestAuthorization` are different: the engine asks the provider about the
+/// source only, so it cannot tell which of the answer's headers are credentials. Every one of them
+/// is treated as one, and an untrusted destination gets what it would without a provider.
 enum RedirectHeaderPolicy {
     private static let credentialHeaders: Set<String> = [
         "authorization",
@@ -17,15 +21,47 @@ enum RedirectHeaderPolicy {
         "x-mediabrowser-token",
     ]
 
+    /// The headers one request chain may carry, split by where they may go. `credentialed` reaches
+    /// only a hop the chain's origin may share credentials with; every other hop gets `anonymous`.
+    struct Headers: Sendable, Equatable {
+        let credentialed: [String: String]
+        let anonymous: [String: String]
+
+        private init(credentialed: [String: String], anonymous: [String: String]) {
+            self.credentialed = credentialed
+            self.anonymous = anonymous
+        }
+
+        /// Static headers: all of them to a trusted hop, all but the named credentials elsewhere.
+        init(static headers: [String: String]) {
+            self.init(credentialed: headers, anonymous: withoutCredentials(headers))
+        }
+
+        /// A provider's answer for the source. None of it goes to an untrusted hop, which gets the
+        /// static headers that are not credentials instead.
+        init(authorized answer: [String: String], static headers: [String: String]) {
+            self.init(credentialed: answer, anonymous: withoutCredentials(headers))
+        }
+
+        func toReplay(from original: URL?, to destination: URL?) -> [String: String] {
+            credentialsAllowed(from: original, to: destination) ? credentialed : anonymous
+        }
+
+        /// These headers for a request built against `target` on behalf of `source`. A target the
+        /// source's credentials may not reach, such as one pinned from a cross-origin redirect,
+        /// carries `anonymous` on its own redirects too.
+        func scoped(source: URL, target: URL) -> Headers {
+            credentialsAllowed(from: source, to: target)
+                ? self : Headers(credentialed: anonymous, anonymous: anonymous)
+        }
+    }
+
     static func headersToReplay(
         extraHeaders: [String: String],
         originalURL: URL?,
         redirectURL: URL?
     ) -> [String: String] {
-        if credentialsAllowed(from: originalURL, to: redirectURL) {
-            return extraHeaders
-        }
-        return withoutCredentials(extraHeaders)
+        Headers(static: extraHeaders).toReplay(from: originalURL, to: redirectURL)
     }
 
     static func withoutCredentials(_ headers: [String: String]) -> [String: String] {
@@ -43,18 +79,29 @@ enum RedirectHeaderPolicy {
         originalRange: String?,
         extraHeaders: [String: String]
     ) -> URLRequest {
+        redirectRequest(request, originalURL: originalURL, originalRange: originalRange,
+                        headers: Headers(static: extraHeaders))
+    }
+
+    /// The same, for a chain whose headers are already split. An untrusted hop loses every
+    /// `credentialed` header URLSession carried over, not only the named credentials.
+    static func redirectRequest(
+        _ request: URLRequest,
+        originalURL: URL?,
+        originalRange: String?,
+        headers: Headers
+    ) -> URLRequest {
         var updated = request
         if let originalRange {
             updated.setValue(originalRange, forHTTPHeaderField: "Range")
         }
-        if !credentialsAllowed(from: originalURL, to: request.url) {
-            for name in credentialHeaders {
+        let trusted = credentialsAllowed(from: originalURL, to: request.url)
+        if !trusted {
+            for name in credentialHeaders.union(headers.credentialed.keys) {
                 updated.setValue(nil, forHTTPHeaderField: name)
             }
         }
-        let replayable = headersToReplay(
-            extraHeaders: extraHeaders, originalURL: originalURL, redirectURL: request.url)
-        for (name, value) in replayable {
+        for (name, value) in trusted ? headers.credentialed : headers.anonymous {
             updated.setValue(value, forHTTPHeaderField: name)
         }
         return updated

@@ -185,7 +185,7 @@ struct Issue377HeldConnectionTests {
         let url = try #require(URL(string: "http://127.0.0.1:\(origin.port)/media.mkv"))
 
         let delegate = RecordingHeldDelegate(defaultBudget: 128 * 1024)
-        let connection = HeldSourceConnection(url: url, offset: 0, extraHeaders: [:],
+        let connection = HeldSourceConnection(url: url, offset: 0, extraHeaders: .init(static: [:]),
                                               userAgent: "AetherEngine/test", label: "test",
                                               delegate: delegate)
         connection.start()
@@ -208,7 +208,7 @@ struct Issue377HeldConnectionTests {
 
         // Two pulls, then the answer a paused viewer produces.
         let delegate = RecordingHeldDelegate(budgets: [32 * 1024, 32 * 1024, 0])
-        let connection = HeldSourceConnection(url: url, offset: 0, extraHeaders: [:],
+        let connection = HeldSourceConnection(url: url, offset: 0, extraHeaders: .init(static: [:]),
                                               userAgent: nil, label: "test", delegate: delegate)
         connection.start()
         #expect(delegate.waitForEnd())
@@ -233,7 +233,7 @@ struct Issue377HeldConnectionTests {
         let url = try #require(URL(string: "http://127.0.0.1:\(origin.port)/media.mkv"))
 
         let delegate = RecordingHeldDelegate()
-        let connection = HeldSourceConnection(url: url, offset: 0, extraHeaders: [:],
+        let connection = HeldSourceConnection(url: url, offset: 0, extraHeaders: .init(static: [:]),
                                               userAgent: nil, label: "test", delegate: delegate)
         connection.start()
         #expect(delegate.waitForEnd())
@@ -253,7 +253,7 @@ struct Issue377HeldConnectionTests {
         let url = try #require(URL(string: "http://127.0.0.1:\(origin.port)/source.mkv"))
 
         let delegate = RecordingHeldDelegate(defaultBudget: 64 * 1024)
-        let connection = HeldSourceConnection(url: url, offset: 0, extraHeaders: [:],
+        let connection = HeldSourceConnection(url: url, offset: 0, extraHeaders: .init(static: [:]),
                                               userAgent: nil, label: "test", delegate: delegate)
         connection.start()
         #expect(delegate.waitForEnd())
@@ -273,7 +273,7 @@ struct Issue377HeldConnectionTests {
 
         let offset: Int64 = 1_048_576
         let delegate = RecordingHeldDelegate(defaultBudget: 256 * 1024)
-        let connection = HeldSourceConnection(url: url, offset: offset, extraHeaders: [:],
+        let connection = HeldSourceConnection(url: url, offset: offset, extraHeaders: .init(static: [:]),
                                               userAgent: nil, label: "test", delegate: delegate)
         connection.start()
         #expect(delegate.waitForEnd())

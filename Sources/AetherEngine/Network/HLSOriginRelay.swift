@@ -413,7 +413,7 @@ final class HLSOriginRelay: @unchecked Sendable {
             for (key, value) in resolved {
                 // Header ownership is independent of case. The application cannot change byte
                 // selection, routing, or framing by returning a header dictionary.
-                if authorization != nil && Self.transportHeaders.contains(key.lowercased()) { continue }
+                if authorization != nil && HTTPRequestAuthorization.transportHeaders.contains(key.lowercased()) { continue }
                 request.setValue(value, forHTTPHeaderField: key)
             }
             if let range { request.setValue(range, forHTTPHeaderField: "Range") }
@@ -449,7 +449,7 @@ final class HLSOriginRelay: @unchecked Sendable {
                 let respondingURL = response.url ?? url
                 let fresh = (try? authorize(respondingURL, rejectedHeaders: sentHeaders, fallback: [:]))
                     .map { downgradeSafe($0, to: respondingURL) }
-                guard let fresh, Self.authorizationValue(fresh) != Self.authorizationValue(sentHeaders) else {
+                guard let fresh, HTTPRequestAuthorization.authorizationValue(fresh) != HTTPRequestAuthorization.authorizationValue(sentHeaders) else {
                     reportRequestFailure()
                     return .held(Fetched(url: respondingURL, status: 401, body: Data(), contentType: nil, contentRange: nil))
                 }
@@ -459,15 +459,7 @@ final class HLSOriginRelay: @unchecked Sendable {
         }
     }
 
-    private static let transportHeaders: Set<String> = [
-        "range", "host", "content-length", "transfer-encoding", "connection", "trailer", "te", "upgrade"
-    ]
-
     private static func isTLS(_ url: URL) -> Bool { url.scheme?.lowercased() == "https" }
-
-    private static func authorizationValue(_ headers: [String: String]) -> String? {
-        headers.first { $0.key.caseInsensitiveCompare("Authorization") == .orderedSame }?.value
-    }
 
     private func remainingBudget(upTo maximum: TimeInterval) -> TimeInterval {
         guard let deadline else { return maximum }
