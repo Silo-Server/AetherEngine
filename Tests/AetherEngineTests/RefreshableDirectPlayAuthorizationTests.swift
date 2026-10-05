@@ -183,7 +183,7 @@ struct RefreshableDirectPlayAuthorizationTests {
     func detourRefusalLatches() async throws {
         let provider = ProviderLog()
         let asksAfterRefusal = Counter()
-        let server = try Self.origin(total: Self.detourTotal) { _ in true }
+        let server = try Self.origin(total: Self.detourTotal, stallAt: Self.anchor) { _ in true }
         defer { server.stop() }
         let reader = Self.detourReader(server, authorization: HTTPRequestAuthorization { _, rejected in
             if provider.rotated {
@@ -211,7 +211,7 @@ struct RefreshableDirectPlayAuthorizationTests {
     @Test("a 401 on a backward read is retried once with the refreshed credential")
     func detourUnauthorizedRetriedWithFreshCredential() async throws {
         let provider = ProviderLog()
-        let server = try Self.origin(total: Self.detourTotal) {
+        let server = try Self.origin(total: Self.detourTotal, stallAt: Self.anchor) {
             $0.range != Self.detourRange || $0.authorization == "Bearer fresh"
         }
         defer { server.stop() }
@@ -234,7 +234,7 @@ struct RefreshableDirectPlayAuthorizationTests {
     @Test("an unchanged credential after a 401 on a backward read fails it, and a repeat read too")
     func detourUnchangedCredentialFailsTheRead() async throws {
         let provider = ProviderLog()
-        let server = try Self.origin(total: Self.detourTotal) { $0.range != Self.detourRange }
+        let server = try Self.origin(total: Self.detourTotal, stallAt: Self.anchor) { $0.range != Self.detourRange }
         defer { server.stop() }
         let reader = Self.detourReader(server, authorization: HTTPRequestAuthorization { _, rejected in
             provider.answer(rejected: rejected) { _ in "Bearer stale" }
@@ -278,14 +278,18 @@ struct RefreshableDirectPlayAuthorizationTests {
     // MARK: - Support
 
     /// A ranged origin over `total` filler bytes. `accepts` decides per request; a refusal is a 401.
-    private static func origin(total: Int = total,
+    /// `stallAt`: a range starting there sends 64 KiB of what it declares and then nothing, so the
+    /// reader keeps a live connection that delivers no more.
+    private static func origin(total: Int = total, stallAt: Int? = nil,
                                accepts: @escaping @Sendable (ScriptedOriginServer.Recorded) -> Bool) throws
         -> ScriptedOriginServer {
         try #require(ScriptedOriginServer { request in
             guard accepts(request) else { return .init(status: 401, declaredLength: 0) }
             let (start, end) = Self.bounds(request.range, total: total)
-            return .init(status: 206, declaredLength: Int64(end - start + 1),
-                         contentRange: "bytes \(start)-\(end)/\(total)", bodyBytes: end - start + 1)
+            let length = end - start + 1
+            return .init(status: 206, declaredLength: Int64(length),
+                         contentRange: "bytes \(start)-\(end)/\(total)",
+                         bodyBytes: start == stallAt ? 64 * 1024 : length)
         })
     }
 
@@ -308,7 +312,9 @@ struct RefreshableDirectPlayAuthorizationTests {
     }
 
     /// The detour tests need a gap behind the window, so their source is large enough to seek more
-    /// than 8 MiB past a window held to 1 MiB.
+    /// than 8 MiB past a window held to 1 MiB. A backward read takes the detour only while the pump
+    /// is connected, and a pump that delivers lifts a latched refusal by design, so the anchored
+    /// range stalls (`stallAt`): connected, and silent while a test measures.
     private static let detourTotal = 16 * 1024 * 1024
     /// The 4 MiB detour block that holds byte 9 MiB.
     private static let detourRange = "bytes=8388608-12582911"
@@ -320,11 +326,15 @@ struct RefreshableDirectPlayAuthorizationTests {
                    windowHighWater: 1024 * 1024)
     }
 
-    /// Opens, then seeks far enough forward that the pump re-anchors at 12 MiB.
+    /// Where the detour tests re-anchor the pump: more than 8 MiB past the open's window, so the
+    /// seek reconnects there instead of reading forward to it.
+    private static let anchor = 12 * 1024 * 1024
+
+    /// Opens, then seeks so the pump re-anchors at `anchor`.
     private static func anchorPastTheHead(_ reader: AVIOReader) throws {
         try reader.open()
         _ = read(reader, count: openBytes)
-        _ = reader.seek(offset: 12 * 1024 * 1024, whence: SEEK_SET)
+        _ = reader.seek(offset: Int64(anchor), whence: SEEK_SET)
         _ = read(reader, count: 16 * 1024)
     }
 
