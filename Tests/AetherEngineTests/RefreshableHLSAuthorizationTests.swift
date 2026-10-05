@@ -46,7 +46,15 @@ struct RefreshableHLSAuthorizationTests {
             }))
         defer { prepared.tearDown() }
         #expect(prepared.servesSubtitleRenditions)
-        #expect(origin.requests.map { $0["authorization"] } == ["Bearer /master.m3u8", "Bearer /redirect", "Bearer /final/media.m3u8"])
+        #expect(origin.requests.prefix(3).map { $0["authorization"] }
+                == ["Bearer /master.m3u8", "Bearer /redirect", "Bearer /final/media.m3u8"])
+        // The renditions' timestamp probe runs after the build and reads the head of the segment the
+        // load opens on, through the same authorizer.
+        await prepared.provider?.awaitTimestampAnchor()
+        let probe = origin.requests.dropFirst(3)
+        #expect(probe.map { $0["path"] } == ["/final/segment.ts"])
+        #expect(probe.first?["authorization"] == "Bearer /final/segment.ts")
+        #expect(probe.first?["range"] == "bytes=0-\(RemoteHLSTimestampAnchor.segmentHeadBytes - 1)")
         #expect(origin.requests.allSatisfy { $0["x-static-secret"] == nil })
     }
 

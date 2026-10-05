@@ -499,7 +499,8 @@ extension AetherEngine {
         // rewritten master, without them the relay stands alone. A required authorization relay
         // that cannot start throws rather than returning nil.
         let playbackURL = try await prepareRemoteHLSStandIn(
-            originURL: url, options: options, expectedGeneration: bypassGeneration) ?? url
+            originURL: url, options: options, startPosition: startPosition,
+            expectedGeneration: bypassGeneration) ?? url
         // With a relay in front, the item AVPlayer fails is a loopback 502 and the refused handshake
         // happened out of its sight, so the classification has to be able to ask the side that made it.
         if let relay = remoteHLSSubtitleProxy?.server.relay {
@@ -575,6 +576,7 @@ extension AetherEngine {
     @MainActor
     private func prepareRemoteHLSStandIn(originURL: URL,
                                          options: LoadOptions,
+                                         startPosition: Double?,
                                          expectedGeneration: UInt64) async throws -> URL? {
         let requiresAuthorizationRelay = options.httpRequestAuthorization != nil
         let mayNeedRelay = EngineTLS.serverTrustEvaluator != nil
@@ -600,7 +602,9 @@ extension AetherEngine {
         let preparation = Task {
             await RemoteHLSSubtitleProxy.prepare(
                 originURL: originURL, tracks: tracks, httpHeaders: options.httpHeaders,
-                needsRelay: needsRelay, httpRequestAuthorization: options.httpRequestAuthorization)
+                needsRelay: needsRelay, httpRequestAuthorization: options.httpRequestAuthorization,
+                // Picks the segment the subtitle timestamp probe reads: the one this load opens on.
+                startPosition: startPosition)
         }
         remoteHLSPreparationTask = preparation
         let result = await withTaskCancellationHandler {

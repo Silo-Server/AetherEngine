@@ -513,16 +513,28 @@ final class HLSOriginRelay: @unchecked Sendable {
         return body
     }
 
+    /// The first `maximumBytes` of a resource, asked for as a byte range. An origin that ignores the
+    /// range and announces more than the cap fails the read rather than streaming a whole segment; the
+    /// caller treats that as no answer.
+    func fetchHead(_ url: URL, headers: [String: String], maximumBytes: Int) async throws -> Data {
+        guard Self.originKey(for: url) != nil else { throw URLError(.unsupportedURL) }
+        guard maximumBytes > 0 else { throw URLError(.dataLengthExceedsMaximum) }
+        let body = try await fetchWhole(url, headers: headers, maximumBytes: maximumBytes,
+                                        range: "bytes=0-\(maximumBytes - 1)").body
+        try Task.checkCancellation()
+        return body
+    }
+
     /// One successful body, read whole. Dispatching the synchronous pump keeps the caller's actor
     /// and cooperative executor free; cancellation stops the relay, which wakes the pump.
     private func fetchWhole(_ url: URL, headers: [String: String],
-                            maximumBytes: Int? = nil) async throws -> Fetched {
+                            maximumBytes: Int? = nil, range: String? = nil) async throws -> Fetched {
         try await withTaskCancellationHandler {
             try Task.checkCancellation()
             return try await withCheckedThrowingContinuation { continuation in
                 DispatchQueue.global(qos: .userInitiated).async { [self] in
                     let sink = Sink(head: { _, _, _, _ in false }, body: { _ in false })
-                    switch fetch(origin: url, headers: headers, range: nil, sink: sink,
+                    switch fetch(origin: url, headers: headers, range: range, sink: sink,
                                  forceHold: true, maximumBytes: maximumBytes) {
                     case .held(let fetched) where (200..<300).contains(fetched.status):
                         continuation.resume(returning: fetched)
