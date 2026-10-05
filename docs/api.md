@@ -926,6 +926,7 @@ say so on the tracker rather than working around it.
 | `audioNowPlayingSession`, `setAudioNowPlayingInfo(_:)` | The same pair for the audio-only path, which owns its session unconditionally (there is no AVKit fork there). Pass an empty dictionary to clear. |
 | `setExternalMetadata(_:)` | AVKit's on-screen info pane on the video path. Safe before `load()`; replayed at host creation. |
 | `deactivatesAudioSessionOnStop` | Off by default. The engine declares the audio-session category at init and never activates it on the native path, because AVKit activates per playback and that is what lets tvOS negotiate the HDMI route (#24), so it never deactivates it either. Set true only when the app owns the session outright; the engine then releases it on a genuine final teardown, meaning `stop()` and never a reload, handoff or live retune. |
+| `audioSessionReleaseGate` | Optional `@Sendable () -> Bool`, `nil` by default. The release above runs off the main actor after `stop()` returns, `setActive(false)` alone takes about half a second on an Atmos passthrough route, and the engine only cancels the release for a `load()` on the same engine. A host that runs several engines, or opens a new player while the old one is still releasing, sets this to answer whether this engine still owns the session; `false` skips `setActive(false)` and logs the skip. Read when `stop()` schedules the release and called off the main actor just before it, after any renderer activation queued ahead, so keep it cheap and thread-safe. |
 
 ## Stills and thumbnails
 
