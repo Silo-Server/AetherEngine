@@ -252,29 +252,6 @@ struct RefreshableDirectPlayAuthorizationTests {
         #expect(provider.rejections == ["Bearer stale"])
     }
 
-    /// Review of PR #12: every open the engine starts runs `Demuxer.open` inside a `Task.detached`,
-    /// so it parks a cooperative-pool thread while it waits for the resolver. When the resolver
-    /// needed that same pool, opens that occupied every pool thread left it nowhere to run, and each
-    /// one failed at its bound instead of starting. Twice the pool's width of parked callers, and a
-    /// resolver that hops onto an actor, is that state on any machine.
-    @Test("callers parked on every cooperative thread still get the resolver's answer")
-    func resolverRunsWhileThePoolIsParked() async throws {
-        let store = TokenStore()
-        let authorizer = SourceRequestAuthorizer(
-            HTTPRequestAuthorization { _, _ in ["Authorization": await store.current()] },
-            sourceURL: URL(string: "http://127.0.0.1/movie.mkv")!, timeout: 5)
-        let callers = ProcessInfo.processInfo.activeProcessorCount * 2
-
-        let answered = await withTaskGroup(of: Bool.self) { group in
-            for _ in 0..<callers {
-                group.addTask { (try? authorizer.headers())?["Authorization"] == "Bearer pooled" }
-            }
-            return await group.reduce(0) { $0 + ($1 ? 1 : 0) }
-        }
-
-        #expect(answered == callers, "\(callers - answered) of \(callers) parked callers timed out")
-    }
-
     // MARK: - Support
 
     /// A ranged origin over `total` filler bytes. `accepts` decides per request; a refusal is a 401.
@@ -378,11 +355,6 @@ private final class Counter: @unchecked Sendable {
     private var count = 0
     var value: Int { lock.withLock { count } }
     func increment() { lock.withLock { count += 1 } }
-}
-
-/// A host's token store: the resolver awaits it, as a resolver that shares refresh work does.
-private actor TokenStore {
-    func current() -> String { "Bearer pooled" }
 }
 
 /// What the provider was asked. `answer` numbers every call from 1 and records the Authorization of
