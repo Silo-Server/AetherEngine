@@ -1338,7 +1338,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         do {
             return try authorizer.headers()
         } catch {
-            latchProviderRefusal()
+            latchAuthorizationRefusal()
             throw openFailureForAuthorization(status: 0)
         }
     }
@@ -1373,11 +1373,19 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return status == 0 ? .authorizationUnavailable : .httpStatus(status)
     }
 
-    /// The provider refused or did not answer. Latches until a generation delivers again.
-    private func latchProviderRefusal() {
+    /// The provider refused or did not answer (status 0), or a 401 stood. Latches until a generation
+    /// delivers again.
+    private func latchAuthorizationRefusal(status: Int = 0) {
         winCond.lock()
-        authorizationRecovery = .refused(status: 0)
+        authorizationRecovery = .refused(status: status)
         winCond.unlock()
+    }
+
+    /// The provider has answered, so reconnecting cannot help: the read ends with what it has.
+    private func failReadForAuthorization(at offset: Int64, status: Int, totalRead: Int) -> Int32 {
+        EngineLog.emit("[AVIOReader] \(label) authorization refused at offset \(offset) status=\(status); failing the read", category: .demux)
+        emitNetworkPhase(.exhausted)
+        return totalRead > 0 ? Int32(totalRead) : -1
     }
 
     /// The streaming GET was answered with a status instead of a body, or the ranged open was
@@ -2129,6 +2137,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         // Hard transport failure: degrade to the OLD single-reconnect behavior.
                         timedReconnect(seek: true, at: curPosition)
                         continue
+                    case .authorizationRefused(let status):
+                        diag.recordDetourFetchAttempt(ms: msSince(detourStart))
+                        return failReadForAuthorization(at: curPosition, status: status, totalRead: totalRead)
                     }
                 }
                 timedReconnect(seek: true, at: curPosition)
@@ -2240,8 +2251,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         // (#380/#410).
                         detourTrackSequential(at: curPosition, length: n)
                         continue
-                    case .rateLimited, .miss:
-                        break   // allowFetch:false never rate-limits; a miss falls through to reconnect
+                    case .rateLimited, .miss, .authorizationRefused:
+                        break   // allowFetch:false never fetches; a miss falls through to reconnect
                     }
                 }
                 timedReconnect(seek: true, at: curPosition)
@@ -2307,9 +2318,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 timedReconnect(seek: false, at: frontier)
                 continue
             case .refused(let refusedStatus):
-                EngineLog.emit("[AVIOReader] \(label) authorization refused at offset \(frontier) status=\(refusedStatus); failing the read", category: .demux)
-                emitNetworkPhase(.exhausted)   // the provider has answered; reconnecting cannot help
-                return totalRead > 0 ? Int32(totalRead) : -1
+                return failReadForAuthorization(at: frontier, status: refusedStatus, totalRead: totalRead)
             case .notApplicable:
                 break
             }
@@ -2584,8 +2593,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// `fetched` says whether the served bytes crossed the network. The callers charge the
     /// reconnect ladders on it: a resident-block hit is a memcpy out of read-ahead already paid
     /// for, so it is no more "progress" against a refusing origin than a window serve is (#380).
-    private enum DetourServe { case served(Int, fetched: Bool); case rateLimited(TimeInterval); case miss }
-    private enum DetourFetch { case ok(Data); case rateLimited(TimeInterval); case failed }
+    /// `authorizationRefused` is the latched refusal: the read fails rather than reconnecting.
+    private enum DetourServe {
+        case served(Int, fetched: Bool); case rateLimited(TimeInterval); case miss
+        case authorizationRefused(status: Int)
+    }
+    private enum DetourFetch {
+        case ok(Data); case rateLimited(TimeInterval); case failed; case authorizationRefused(status: Int)
+    }
 
     /// Serve `[offset, offset+maxLen)` (clamped to one 4 MB block) from the detour cache,
     /// fetching the block over the pooled keep-alive chunkSession on a miss when `allowFetch`.
@@ -2621,6 +2636,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             return .rateLimited(retryAfter)
         case .failed:
             return .miss
+        case .authorizationRefused(let status):
+            return .authorizationRefused(status: status)
         }
 
         let inBlock = Int(offset - blockStart)
@@ -2642,36 +2659,54 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             for: requestURL(), label: "\(label) detour", timeout: budget)
         defer { OriginRequestBudget.shared.release(ticket) }
         let rangeEnd = offset + Int64(size) - 1
-        var request = URLRequest(url: requestURL())
-        request.setValue("bytes=\(offset)-\(rangeEnd)", forHTTPHeaderField: "Range")
-        // #93/#96: a starved backward-scrub detour fetch must abort fast (the rescue reconnect serves
-        // instantly), so this path uses the tight interactive budget, not the full chunk timeout.
-        request.timeoutInterval = budget
-        do {
-            let sentHeaders = try applyExtraHeaders(&request)
-            let (data, response) = try syncRequest(request, headers: sentHeaders, budget: budget)
-            if let http = response as? HTTPURLResponse {
-                let status = http.statusCode
-                if Self.isRateLimitStatus(status) {
-                    let retryAfter = Self.parseRetryAfter(http)
-                    noteOriginRefusal(status: status, retryAfter: retryAfter > 0 ? retryAfter : nil,
-                                      respondedBy: http.url)
-                    return .rateLimited(retryAfter)
-                }
-                if status != 200 && status != 206 {
-                    if Self.isResolvedExpiryStatus(status) { invalidateResolvedURL() }
-                    return .failed
-                }
-                // VOD: 200 at offset > 0 = server ignored Range; silent corruption. Reject.
-                if status == 200 && offset > 0 && !isLive {
-                    EngineLog.emit("[AVIOReader] detour: server ignored Range (200 for offset \(offset)); rejecting", category: .demux, level: .verbose)
-                    return .failed
-                }
+        // The provider's answer to a 401 on this block: set, the one retry it permits is spent.
+        var refreshedHeaders: [String: String]?
+        while true {
+            var request = URLRequest(url: requestURL())
+            request.setValue("bytes=\(offset)-\(rangeEnd)", forHTTPHeaderField: "Range")
+            // #93/#96: a starved backward-scrub detour fetch must abort fast (the rescue reconnect serves
+            // instantly), so this path uses the tight interactive budget, not the full chunk timeout.
+            request.timeoutInterval = budget
+            guard let sentHeaders = try? applyExtraHeaders(&request, base: refreshedHeaders) else {
+                // Nothing was sent. A reconnect would only ask the provider again.
+                latchAuthorizationRefusal()
+                return .authorizationRefused(status: 0)
             }
-            addBytesFetched(data.count)
-            return .ok(data)
-        } catch {
-            return .failed
+            do {
+                let (data, response) = try syncRequest(request, headers: sentHeaders, budget: budget)
+                if let http = response as? HTTPURLResponse {
+                    let status = http.statusCode
+                    if Self.isRateLimitStatus(status) {
+                        let retryAfter = Self.parseRetryAfter(http)
+                        noteOriginRefusal(status: status, retryAfter: retryAfter > 0 ? retryAfter : nil,
+                                          respondedBy: http.url)
+                        return .rateLimited(retryAfter)
+                    }
+                    if status != 200 && status != 206 {
+                        if Self.isResolvedExpiryStatus(status) { invalidateResolvedURL() }
+                        // The pump's 401 contract: one retry with a changed credential, then it stands.
+                        if status == 401, let authorizer {
+                            if refreshedHeaders == nil,
+                               let fresh = authorizer.refreshed(rejecting: sentHeaders) {
+                                refreshedHeaders = fresh
+                                continue
+                            }
+                            latchAuthorizationRefusal(status: 401)
+                            return .authorizationRefused(status: 401)
+                        }
+                        return .failed
+                    }
+                    // VOD: 200 at offset > 0 = server ignored Range; silent corruption. Reject.
+                    if status == 200 && offset > 0 && !isLive {
+                        EngineLog.emit("[AVIOReader] detour: server ignored Range (200 for offset \(offset)); rejecting", category: .demux, level: .verbose)
+                        return .failed
+                    }
+                }
+                addBytesFetched(data.count)
+                return .ok(data)
+            } catch {
+                return .failed
+            }
         }
     }
 
@@ -3580,7 +3615,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         do {
             sentHeaders = try applyExtraHeaders(&request)
         } catch {
-            latchProviderRefusal()
+            latchAuthorizationRefusal()
             streamLock.lock()
             streamEnded = true
             streamLock.unlock()

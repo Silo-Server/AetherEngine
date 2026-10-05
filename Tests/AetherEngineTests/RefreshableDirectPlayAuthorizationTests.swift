@@ -127,6 +127,77 @@ struct RefreshableDirectPlayAuthorizationTests {
         #expect(!server.requests.contains { $0.range == Self.secondRange })
     }
 
+    // A read behind the window goes to the detour fetch, not the pump. Review of PR #12: the detour
+    // treated a provider refusal as a transport failure, so the read fell back to a reconnect that
+    // asked the provider again, and a 401 there never reached the provider as a rejection.
+
+    @Test("a provider refusal on a backward read fails the read without asking again")
+    func detourRefusalLatches() async throws {
+        let provider = ProviderLog()
+        let asksAfterRefusal = Counter()
+        let server = try Self.origin(total: Self.detourTotal) { _ in true }
+        defer { server.stop() }
+        let reader = Self.detourReader(server, authorization: HTTPRequestAuthorization { _, rejected in
+            if provider.rotated {
+                asksAfterRefusal.increment()
+                throw URLError(.userAuthenticationRequired)
+            }
+            return provider.answer(rejected: rejected) { "Bearer \($0)" }
+        })
+        defer { reader.markClosed(); reader.close() }
+
+        try await offThread(reader) { try Self.anchorPastTheHead(reader) }
+        let sentBefore = server.requests.count
+        provider.rotate()
+        let read = try await offThread(reader) { Self.readBehindTheWindow(reader) }
+
+        #expect(read.result < 0)
+        #expect(asksAfterRefusal.value == 1, "the provider was asked \(asksAfterRefusal.value) times")
+        #expect(server.requests.count == sentBefore, "a request went out after the refusal")
+    }
+
+    @Test("a 401 on a backward read is retried once with the refreshed credential")
+    func detourUnauthorizedRetriedWithFreshCredential() async throws {
+        let provider = ProviderLog()
+        let server = try Self.origin(total: Self.detourTotal) {
+            $0.range != Self.detourRange || $0.authorization == "Bearer fresh"
+        }
+        defer { server.stop() }
+        let reader = Self.detourReader(server, authorization: HTTPRequestAuthorization { _, rejected in
+            provider.answer(rejected: rejected) { _ in rejected == nil ? "Bearer stale" : "Bearer fresh" }
+        })
+        defer { reader.markClosed(); reader.close() }
+
+        try await offThread(reader) { try Self.anchorPastTheHead(reader) }
+        let sentBefore = server.requests.count
+        let read = try await offThread(reader) { Self.readBehindTheWindow(reader) }
+
+        #expect(read.result > 0)
+        let after = server.requests.dropFirst(sentBefore)
+        #expect(after.map(\.range) == [Self.detourRange, Self.detourRange], "\(after.map(\.range))")
+        #expect(after.map(\.authorization) == ["Bearer stale", "Bearer fresh"])
+        #expect(provider.rejections == ["Bearer stale"])
+    }
+
+    @Test("an unchanged credential after a 401 on a backward read fails the read")
+    func detourUnchangedCredentialFailsTheRead() async throws {
+        let provider = ProviderLog()
+        let server = try Self.origin(total: Self.detourTotal) { $0.range != Self.detourRange }
+        defer { server.stop() }
+        let reader = Self.detourReader(server, authorization: HTTPRequestAuthorization { _, rejected in
+            provider.answer(rejected: rejected) { _ in "Bearer stale" }
+        })
+        defer { reader.markClosed(); reader.close() }
+
+        try await offThread(reader) { try Self.anchorPastTheHead(reader) }
+        let sentBefore = server.requests.count
+        let read = try await offThread(reader) { Self.readBehindTheWindow(reader) }
+
+        #expect(read.result < 0)
+        #expect(server.requests.dropFirst(sentBefore).map(\.range) == [Self.detourRange])
+        #expect(provider.rejections == ["Bearer stale"])
+    }
+
     /// Review of PR #12: every open the engine starts runs `Demuxer.open` inside a `Task.detached`,
     /// so it parks a cooperative-pool thread while it waits for the resolver. When the resolver
     /// needed that same pool, opens that occupied every pool thread left it nowhere to run, and each
@@ -153,17 +224,18 @@ struct RefreshableDirectPlayAuthorizationTests {
     // MARK: - Support
 
     /// A ranged origin over `total` filler bytes. `accepts` decides per request; a refusal is a 401.
-    private static func origin(accepts: @escaping @Sendable (ScriptedOriginServer.Recorded) -> Bool) throws
+    private static func origin(total: Int = total,
+                               accepts: @escaping @Sendable (ScriptedOriginServer.Recorded) -> Bool) throws
         -> ScriptedOriginServer {
         try #require(ScriptedOriginServer { request in
             guard accepts(request) else { return .init(status: 401, declaredLength: 0) }
-            let (start, end) = Self.bounds(request.range)
+            let (start, end) = Self.bounds(request.range, total: total)
             return .init(status: 206, declaredLength: Int64(end - start + 1),
                          contentRange: "bytes \(start)-\(end)/\(total)", bodyBytes: end - start + 1)
         })
     }
 
-    private static func bounds(_ range: String?) -> (Int, Int) {
+    private static func bounds(_ range: String?, total: Int) -> (Int, Int) {
         let spec = range.map { String($0.dropFirst("bytes=".count)) } ?? "0-"
         if spec.hasPrefix("-") { return (total - (Int(spec.dropFirst()) ?? 0), total - 1) }
         let parts = spec.split(separator: "-", omittingEmptySubsequences: false)
@@ -179,6 +251,33 @@ struct RefreshableDirectPlayAuthorizationTests {
                    extraHeaders: headers, requestAuthorization: authorization,
                    authorizationTimeout: authorizationTimeout,
                    boundedInitialFetch: Int64(openBytes))
+    }
+
+    /// The detour tests need a gap behind the window, so their source is large enough to seek more
+    /// than 8 MiB past a window held to 1 MiB.
+    private static let detourTotal = 16 * 1024 * 1024
+    /// The 4 MiB detour block that holds byte 9 MiB.
+    private static let detourRange = "bytes=8388608-12582911"
+
+    private static func detourReader(_ server: ScriptedOriginServer,
+                                     authorization: HTTPRequestAuthorization) -> AVIOReader {
+        AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/movie.mkv")!,
+                   requestAuthorization: authorization, boundedInitialFetch: Int64(openBytes),
+                   windowHighWater: 1024 * 1024)
+    }
+
+    /// Opens, then seeks far enough forward that the pump re-anchors at 12 MiB.
+    private static func anchorPastTheHead(_ reader: AVIOReader) throws {
+        try reader.open()
+        _ = read(reader, count: openBytes)
+        _ = reader.seek(offset: 12 * 1024 * 1024, whence: SEEK_SET)
+        _ = read(reader, count: 16 * 1024)
+    }
+
+    /// A read at 9 MiB, behind the re-anchored window: it goes to the detour fetch.
+    private static func readBehindTheWindow(_ reader: AVIOReader) -> (bytes: Int, result: Int32) {
+        _ = reader.seek(offset: 9 * 1024 * 1024, whence: SEEK_SET)
+        return read(reader, count: 16 * 1024)
     }
 
     /// Reads until `count` bytes or the first result that is not a delivery.
@@ -208,6 +307,13 @@ struct RefreshableDirectPlayAuthorizationTests {
             reader.markClosed()
         }
     }
+}
+
+private final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    var value: Int { lock.withLock { count } }
+    func increment() { lock.withLock { count += 1 } }
 }
 
 /// A host's token store: the resolver awaits it, as a resolver that shares refresh work does.
