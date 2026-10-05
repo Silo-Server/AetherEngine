@@ -10,6 +10,14 @@ the public-API contract.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [7.27.2] - 2026-10-05
+
+### Added
+
+- **The software path names its audio route, its audio lead on live, and its renderer state (#395).** A live software session that was silent on an AirPlay 2 receiver and audible over HDMI logged the same on both. The software host now writes `[SoftwarePlaybackHost] audioRoute ...` at session start with the route's output latency (same fields as the native host's line), the engine writes `[AetherEngine] audioRoute changed reason=N ...` on every route change once per process, `[SWDiag]` reports `aLead` on live sessions too (diagnostic marker only, pacing unchanged), and it carries `aRend=status/sufficient/error` for the audio renderer, whose error was only logged in DEBUG builds before. No API change.
+
 ### Fixed
 
 - **An end-of-media park that runs late still stops the clock on the last sample (#694).** The park is deferred by the queued audio tail and ran wherever the clock stood when its task got the main actor, so a busy main actor parked it past the end (measured: 1.149 s on a 1.0 s source). Both the audio-only and the software host now put the clock back on the point the deferral aimed at.
