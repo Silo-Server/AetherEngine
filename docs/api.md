@@ -183,9 +183,15 @@ credential, custom ones such as `X-Api-Key` included: a cross-origin redirect ta
 pinned from one, receives none of them. Such a target gets `httpHeaders` without the credential
 headers named above, as it would without a resolver. After a 401 the
 resolver receives the headers that request carried; a changed `Authorization` value retries the
-request once at the same byte offset. Unchanged credentials, a second 401, or a resolver that throws
-or does not answer within its bound end the read instead of running the reconnect ladder, and fail
-an open before anything is sent. A rotated token therefore needs no player reload.
+request once at the same byte offset. A rotated token therefore needs no player reload. Failures
+fall into two groups, and neither runs the reconnect ladder:
+
+- Before a request is sent: the resolver throws or does not answer within its bound. Nothing goes
+  to the origin. An open fails with `AVIOReaderError.authorizationUnavailable`, which a load reports
+  as `.sourceOpenFailed`; a read in progress ends.
+- After a 401: the credential is unchanged, the retry is refused again, or the resolver throws or
+  times out while answering the 401. A read in progress ends; an open fails with the 401, which a
+  load reports as `.sourceRefused` with `underlyingCode` 401.
 
 For external subtitles, set `ExternalSubtitleTrack.httpRequestAuthorization` on each registered
 track. This is independent of the media provider, so the host can restrict subtitle credentials
