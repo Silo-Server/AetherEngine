@@ -10,6 +10,10 @@ the public-API contract.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [7.28.1] - 2026-10-06
+
 ### Fixed
 
 - **`[SWDiag]` reports `aLead` on live DVR sessions as well (#395).** 7.27.2 added the marker to the combined demux loop only. A live session loaded with `dvrWindowSeconds` feeds its audio from the ring pump, which never wrote it, so its line still read `aLead=-` throughout. The line now reads the pump's own fed PTS there, the value the pump paces on. Measured with `aetherctl dvr --path sw`: `aLead=-` before, `aLead=4.00`, `3.12`, `2.12` after. Diagnostic only, pacing unchanged, no API change.
