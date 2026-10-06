@@ -50,6 +50,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
         /// which is only correct while the two agree; on a source where they do not, every walker
         /// downstream (A53 captions, the DV P7 RPU rewrite) reads the packet at the wrong offsets.
         let nalFramingOverride: VideoNALFraming?
+        /// Forwarded to `MP4SegmentMuxer.VideoConfig.convertsAnnexBSamples`. The packets stay Annex B
+        /// up to the muxer, so `nalFramingOverride` keeps describing them.
+        let convertsAnnexBSamples: Bool
         /// The session's BIT-1 framing verdict, handed to every muxer this producer builds for the
         /// program's own track (audit BIT-104).
         let nalFramingLatch: NALFramingLatch?
@@ -63,6 +66,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             colorOverride: MP4SegmentMuxer.ColorOverride? = nil,
             extradataOverride: [UInt8]? = nil,
             nalFramingOverride: VideoNALFraming? = nil,
+            convertsAnnexBSamples: Bool = false,
             nalFramingLatch: NALFramingLatch? = nil
         ) {
             self.codecpar = codecpar
@@ -73,6 +77,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             self.colorOverride = colorOverride
             self.extradataOverride = extradataOverride
             self.nalFramingOverride = nalFramingOverride
+            self.convertsAnnexBSamples = convertsAnnexBSamples
             self.nalFramingLatch = nalFramingLatch
         }
     }
@@ -2113,6 +2118,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             doviConfig: isAdCreative ? .keep : videoConfig.doviConfig,
             colorOverride: isAdCreative ? nil : videoConfig.colorOverride,
             extradataOverride: isAdCreative ? nil : videoConfig.extradataOverride,
+            convertsAnnexBSamples: isAdCreative ? false : videoConfig.convertsAnnexBSamples,
             nalFramingLatch: isAdCreative ? nil : videoConfig.nalFramingLatch
         )
         let muxerAudio: MP4SegmentMuxer.AudioConfig? = audioConfig.map { a in

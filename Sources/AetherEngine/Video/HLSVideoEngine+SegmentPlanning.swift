@@ -599,6 +599,9 @@ extension HLSVideoEngine {
         /// never going to reformat this track anyway). Callers fall back to deriving it from the
         /// extradata, which is only safe while the two agree.
         let measuredFraming: VideoNALFraming?
+        /// The packets are Annex B and `extradataOverride` is a length-prefixed record: the muxer
+        /// converts every sample itself and keeps its in-band parameter sets (`AnnexBSampleConverter`).
+        var convertsAnnexBSamples = false
     }
 
     /// Measure the video NAL framing on packets, then decide what config record the muxer gets.
@@ -635,8 +638,8 @@ extension HLSVideoEngine {
 
         let framing = probeVideoNALFraming(demuxer: demuxer, videoStreamIndex: videoStreamIndex)
         guard case .lengthPrefixed = framing else {
-            // The record stays Annex B here: movenc reads it to decide whether to convert the samples,
-            // and these samples do need converting. What it must not keep is a prefix SEI, because the
+            // Except for HEVC on Annex-B packets (below) the record stays Annex B: movenc reads it to
+            // decide whether to convert the samples, and these samples do need converting. What it must not keep is a prefix SEI, because the
             // hvcC movenc then builds carries it as a fourth array (`ff_isom_write_hvcc` collects five
             // NAL types) and Apple TV's HEVC track builder rejects such a record (AE#187). That defense
             // sits on the record path and cannot see this one, so the SEI goes before the muxer runs.
@@ -645,6 +648,25 @@ extension HLSVideoEngine {
             } ?? []
             let canonical = codecID == AV_CODEC_ID_HEVC
                 ? VideoConfigRecord.canonicalizeAnnexBHEVCConfigRecord(source) : nil
+            // HEVC on conclusively Annex-B packets: movenc's own conversion drops every in-band
+            // parameter set under `hvc1`, which breaks a stream that sends a new PPS mid-title. Give
+            // it a length-prefixed record so it copies the samples, and convert them in the muxer
+            // instead, parameter sets kept. Built from the canonical record so the hvcC carries no
+            // SEI array (AE#187).
+            if codecID == AV_CODEC_ID_HEVC, case .annexB? = framing,
+               let record = VideoConfigRecord.fromAnnexB(
+                   canonical ?? source, codecID: codecID,
+                   width: codecpar.pointee.width, height: codecpar.pointee.height) {
+                EngineLog.emit(
+                    "[HLSVideoEngine] #365 HEVC on Annex-B packets: the muxer gets a length-prefixed "
+                    + "record (\(source.count) B → \(record.count) B) and converts the samples itself, "
+                    + "keeping their in-band parameter sets",
+                    category: .session
+                )
+                var result = VideoFramingNormalization(extradataOverride: record, measuredFraming: framing)
+                result.convertsAnnexBSamples = true
+                return result
+            }
             EngineLog.emit(
                 "[HLSVideoEngine] #365 the muxer will reformat this track's samples and the packets "
                 + "are \(framing == nil ? "not conclusively framed" : "Annex B"); the muxer builds the "

@@ -1594,6 +1594,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             colorOverride: p5ColorOverride,
             extradataOverride: hevcExtradataOverride,
             nalFramingOverride: measuredVideoNALFraming,
+            convertsAnnexBSamples: framingNormalization.convertsAnnexBSamples,
             nalFramingLatch: NALFramingLatch(confirmed: framingMeasuredLengthPrefixed)
         )
         self.videoStreamIndex = videoIndex
@@ -2633,6 +2634,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 codecpar: cfg.codecpar, timeBase: cfg.timeBase,
                 codecTagOverride: cfg.codecTagOverride, doviConfig: cfg.doviConfig,
                 colorOverride: cfg.colorOverride, extradataOverride: cfg.extradataOverride,
+                convertsAnnexBSamples: cfg.convertsAnnexBSamples,
                 nalFramingLatch: cfg.nalFramingLatch),
             stagingDir: staging)
         let framing = cfg.nalFramingOverride ?? A53SEIParser.nalFraming(
