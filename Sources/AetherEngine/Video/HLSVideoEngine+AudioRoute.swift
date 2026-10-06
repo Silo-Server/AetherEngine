@@ -219,7 +219,8 @@ extension HLSVideoEngine {
                 codecTagOverride: vcfg.codecTagOverride,
                 doviConfig: vcfg.doviConfig,
                 colorOverride: vcfg.colorOverride,
-                extradataOverride: vcfg.extradataOverride
+                extradataOverride: vcfg.extradataOverride,
+                convertsAnnexBSamples: vcfg.convertsAnnexBSamples
             )
             let probeAudio = MP4SegmentMuxer.AudioConfig(
                 codecpar: cfg.codecpar,

@@ -72,6 +72,10 @@ final class MP4SegmentMuxer {
         /// has numOfArrays=0 (in-band parameter sets) and the engine rebuilt a proper hvcC with
         /// VPS/SPS/PPS arrays; the mp4 muxer writes extradata directly into the hvcC/avcC box.
         let extradataOverride: [UInt8]?
+        /// The video samples are Annex B while `extradataOverride` is a length-prefixed record: the
+        /// muxer converts each sample itself and keeps its in-band parameter sets, which movenc's own
+        /// `hvc1` conversion would drop. See `AnnexBSampleConverter`.
+        let convertsAnnexBSamples: Bool
         /// The session's framing verdict for this track (audit BIT-104); nil gives the muxer its own.
         let nalFramingLatch: NALFramingLatch?
 
@@ -82,6 +86,7 @@ final class MP4SegmentMuxer {
             doviConfig: DoviConfigPolicy = .keep,
             colorOverride: ColorOverride? = nil,
             extradataOverride: [UInt8]? = nil,
+            convertsAnnexBSamples: Bool = false,
             nalFramingLatch: NALFramingLatch? = nil
         ) {
             self.codecpar = codecpar
@@ -90,6 +95,7 @@ final class MP4SegmentMuxer {
             self.doviConfig = doviConfig
             self.colorOverride = colorOverride
             self.extradataOverride = extradataOverride
+            self.convertsAnnexBSamples = convertsAnnexBSamples
             self.nalFramingLatch = nalFramingLatch
         }
     }
@@ -171,6 +177,8 @@ final class MP4SegmentMuxer {
     /// length-prefixed at all. Latched at init: it is a property of the configuration record that
     /// lands in the sample entry, and the AE#561 sanitizer walks every video sample with it.
     private let videoNALLengthPrefixSize: Int?
+    /// Latched from `VideoConfig.convertsAnnexBSamples`.
+    private let convertsAnnexBVideoSamples: Bool
     /// AE#561 harness switch: the sanitizer removes the only shape that reproduces a segment Apple's
     /// parser refuses, so the rung underneath it (the software-path escalation) would have nothing to
     /// be measured against. Read once from the environment, never set in a shipped configuration.
@@ -284,6 +292,7 @@ final class MP4SegmentMuxer {
         self.audioNeedsParsedPacketForMoov =
             audio.map { Self.audioNeedsParsedPacketForMoov($0.codecpar.pointee.codec_id) } ?? false
         self.videoNALFraming = video.nalFramingLatch ?? NALFramingLatch()
+        self.convertsAnnexBVideoSamples = video.convertsAnnexBSamples
         // AE#561: the override, when there is one, is the record that reaches the sample entry. Both
         // carry the same width (the #19 rebuild keeps the source header's first 22 bytes), so this
         // only matters for a source whose own extradata is missing or Annex B.
@@ -632,6 +641,12 @@ final class MP4SegmentMuxer {
         packet.pointee.dts = clean.dts
 
         let streamIndex = packet.pointee.stream_index
+
+        // Before the AE#561 sanitizer, which walks the sample as the length-prefixed chain the
+        // record declares. A packet with no start code is written as it came.
+        if convertsAnnexBVideoSamples, streamIndex == videoOutputStreamIndex {
+            _ = AnnexBSampleConverter.convertToLengthPrefixed(packet)
+        }
 
         // #64 mid-segment flush bound: cap libavformat's interleaver RAM on a very long segment
         // (degenerate sparse-keyframe plan, or an audio stream that decodes to nothing) by emitting a

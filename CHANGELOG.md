@@ -10,7 +10,10 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **HEVC with a parameter-set change mid-title keeps its picture.** On an Annex-B HEVC source (Blu-ray M2TS, broadcast TS) movenc converted the samples itself and, under the `hvc1` sample entry, dropped every in-band VPS/SPS/PPS, so a stream that sends a new PPS mid-title had every later slice decoded against the stale one: sound continued over a frozen or black picture. The session muxer now gets a length-prefixed record and converts the samples itself with their parameter sets kept, the shape a Matroska remux of the same stream already had; `init.mp4` and `CODECS` are unchanged. The I-frame rendition muxer takes the same path. Measured on a fixture whose PPS changes at 20 s: 463 presented frames in 42 s before (none after the change), 936 after. Diagnosed by yipengfei329 (#703).
+- **A keyframe index that stops minutes before the end is no longer trusted.** A partial scan (an MKV whose Cues are missing or point past EOF) passed both the gap and the coverage check, and the keyframe planner then cut a final segment from the last scanned keyframe to the end of the title, which the producer can never finish. The index now also has to reach within 60 s of the source duration, otherwise the session takes the uniform plan. Diagnosed by yipengfei329 (#703).
 
 ## [7.28.0] - 2026-10-06
 
