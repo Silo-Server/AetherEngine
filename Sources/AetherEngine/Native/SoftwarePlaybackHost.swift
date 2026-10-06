@@ -3132,6 +3132,15 @@ final class SoftwarePlaybackHost {
     /// the line stops rather than repeating itself at 1 Hz for as long as the host holds the engine.
     private var didEmitParkedDiag = false
 
+    /// AE#395: a DVR session feeds audio from the ring pump, which never writes `demuxDiag`, so its
+    /// line read `aLead=-` throughout. The pump's own fed PTS is the marker it paces on, and a DVR
+    /// seek clears it, so it carries no pre-seek value.
+    nonisolated static func diagAudioMarker(
+        demuxLoopPts: Double, dvrPumpPts: Double, isDVRSession: Bool
+    ) -> Double {
+        isDVRSession ? dvrPumpPts : demuxLoopPts
+    }
+
     /// 1 Hz [SWDiag] line: clock + clock delta, decoded-audio and video lead over the clock, parked
     /// video PACKET FIFO depth, rebuffer state, frames produced vs frames handed to the layer with
     /// the spacing of the timestamps they carried, and the display layer's OWN drop counter with its
@@ -3161,7 +3170,11 @@ final class SoftwarePlaybackHost {
             if prevClock.isFinite, clock == prevClock { didEmitParkedDiag = true }
         }
         diagPrevClock = clock
-        let lead = d.lastAudioPts.isFinite && clock.isFinite ? d.lastAudioPts - clock : Double.nan
+        let audioMarker = Self.diagAudioMarker(
+            demuxLoopPts: d.lastAudioPts,
+            dvrPumpPts: audioLookahead.lastFedAudioPTS,
+            isDVRSession: isLive && dvrRing != nil)
+        let lead = audioMarker.isFinite && clock.isFinite ? audioMarker - clock : Double.nan
         let enqueued = framesEnqueued
         let dEnq = enqueued - diagPrevEnqueued
         diagPrevEnqueued = enqueued
