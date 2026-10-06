@@ -2,7 +2,8 @@
 // AVPlayer's second plain `/media.m3u8` request for a second grace, measured on an Apple TV as
 // 1.015 to 1.384 s on every bounded start. #684 latched the gate for ingest sessions only, because
 // whether the engine-cut path pays for skipping that wait (a session closer to the producing edge)
-// was never measured. `AETHER_FIRST_SERVE_LATCH_ALL=1` is the arm that measures it; off by default.
+// was never measured. The Apple TV A/B showed it does not, so the latch is now on by default and
+// `AETHER_FIRST_SERVE_LATCH_ALL=0` is the opt-out.
 import XCTest
 @testable import AetherEngine
 
@@ -34,9 +35,9 @@ final class Issue686FirstServeLatchArmTests: XCTestCase {
         return Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000
     }
 
-    func testTheArmIsOffWithoutTheEnvironment() {
+    func testTheLatchIsOnUnlessTheEnvironmentOptsOut() {
         XCTAssertEqual(LiveEdgePolicy.firstServeLatchAllArmed,
-                       ProcessInfo.processInfo.environment["AETHER_FIRST_SERVE_LATCH_ALL"] == "1")
+                       ProcessInfo.processInfo.environment["AETHER_FIRST_SERVE_LATCH_ALL"] != "0")
     }
 
     /// Two 0.2 s segments against a 3 s holdback: the bounded start, grace 0.5 s.

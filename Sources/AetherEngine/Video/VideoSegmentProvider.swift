@@ -112,11 +112,12 @@ enum LiveEdgePolicy {
     static let boundedStartFloorArmed =
         ProcessInfo.processInfo.environment["AETHER_BOUNDED_START_FLOOR"] == "1"
 
-    /// AE#686, env-gated (`AETHER_FIRST_SERVE_LATCH_ALL=1`) for the same reason: it extends #684's
-    /// first-serve latch from ingest sessions to sources the engine cuts itself, so the second plain
-    /// manifest request no longer waits out a second grace. Read once.
+    /// AE#686: #684's first-serve latch covers sources the engine cuts itself too, so AVPlayer's second
+    /// plain manifest request no longer waits out a second grace. On by default since the Apple TV A/B
+    /// (first picture 1.003 to 1.039 s sooner on every bounded start, no stall in 18 launches);
+    /// `AETHER_FIRST_SERVE_LATCH_ALL=0` restores the old gate for a comparison run. Read once.
     static let firstServeLatchAllArmed =
-        ProcessInfo.processInfo.environment["AETHER_FIRST_SERVE_LATCH_ALL"] == "1"
+        ProcessInfo.processInfo.environment["AETHER_FIRST_SERVE_LATCH_ALL"] != "0"
 
     /// AVPlayer's unchanged-playlist patience: it tolerates a playlist that has not changed for this
     /// multiple of the served TARGETDURATION before drawing `-12888`. The one number the cadence floor
@@ -731,8 +732,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// AE#594 arm B: skip the bounded branch, so the wait ends at the full holdback cushion or at the
     /// outer wall-clock deadline. Measurement arm, off unless the environment asks for it.
     private let boundedStartFloorsAtHoldback: Bool
-    /// AE#686 arm: the first-serve latch also covers a source the engine cuts itself. Measurement arm,
-    /// off unless the environment asks for it.
+    /// AE#686: the first-serve latch also covers a source the engine cuts itself. The engine passes
+    /// `LiveEdgePolicy.firstServeLatchAllArmed`, on unless the environment opts out.
     private let firstServeLatchCoversEngineCut: Bool
     /// AE#374: whether the first-serve gate has already reported the interval it held. Read and written
     /// only under `firstSegmentCondition`, inside `waitForFirstLiveSegment` and its two account helpers.
@@ -2611,9 +2612,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         defer { parkedWaiters -= 1 }
         while true {
             if waitersCancelled { return false }
-            // Ingest sessions only. A source the engine cuts itself keeps the gate it had: there the
-            // second request's wait is part of where the session ends up behind the producing edge,
-            // which is AE#594's question and not this one's. AE#686 measures it behind an arm.
+            // AE#684 latched ingest sessions; AE#686 extends it to a source the engine cuts itself,
+            // where the second grace bought nothing on device but a session 1 s further from the edge.
             if firstManifestServed, liveCadencePolicy != nil || firstServeLatchCoversEngineCut {
                 accountForRepeatServe(since: enteredAt, note: "first-serve latch")
                 return true
