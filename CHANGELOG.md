@@ -10,7 +10,9 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **A keyframe index that stops minutes before the end is no longer trusted.** A partial scan (an MKV whose Cues are missing or point past EOF) passed both the gap and the coverage check, and the keyframe planner then cut a final segment from the last scanned keyframe to the end of the title, which the producer can never finish. The index now also has to reach within 60 s of the source duration, otherwise the session takes the uniform plan. Diagnosed by yipengfei329 (#703).
 
 ## [7.28.0] - 2026-10-06
 
