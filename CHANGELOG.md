@@ -12,6 +12,12 @@ the public-API contract.
 
 _Nothing yet._
 
+## [7.28.2] - 2026-10-06
+
+### Changed
+
+- **A bounded live start on a source the engine cuts itself no longer waits a second grace (#686).** AVPlayer opens with two plain `/media.m3u8` requests, and on raw MPEG-TS under `.fastZap` each one waited out the bounded-start grace; #684's first-serve latch spared only ingest sessions. It now covers engine-cut sources too, the behaviour 7.26.3 put behind `AETHER_FIRST_SERVE_LATCH_ALL=1`. Measured by cmcpherson274 on an Apple TV 4K (1080p59.94 H.264 + AAC, 1.001 s segments, three runs per cell): every bounded start reached its picture 1.003 to 1.039 s sooner, the session sat 0.5 to 1.5 s nearer the edge after 60 s, and 18 latched launches logged no stall, `-16832` or `-12888`. Rebuilds from a backlog served a full cushion either way. `AETHER_FIRST_SERVE_LATCH_ALL=0` restores the old gate. No API change.
+
 ## [7.28.1] - 2026-10-06
 
 ### Fixed
