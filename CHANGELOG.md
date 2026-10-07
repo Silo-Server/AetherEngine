@@ -10,7 +10,9 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- Rapid audio-track selections coalesce into serialized rebuilds. Stop/load invalidate queued work, and play/pause commands received during a rebuild supply its final transport intent. Native handover retains the old item until replacement unless media services were reset.
 
 ## [7.28.3] - 2026-10-07
 

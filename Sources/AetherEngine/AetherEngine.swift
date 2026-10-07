@@ -3443,6 +3443,19 @@ public final class AetherEngine: ObservableObject {
     /// window as `positionUnderReconstruction` and for the same reason. Read only through
     /// `sessionRebuildResumesPlaying`. See `rebuildResumesPlaying`.
     var transportIntentUnderReconstruction: Bool?
+    private(set) var audioSelectionTask: Task<Void, Never>?
+    private var pendingAudioSelection: Int?
+    private var audioSelectionEpoch = UUID()
+    // Non-nil only during an audio rebuild. Transport received across awaits wins.
+    var audioSelectionTransportIntent: Bool?
+
+    private func cancelPendingAudioSelection() {
+        audioSelectionEpoch = UUID()
+        audioSelectionTask?.cancel()
+        audioSelectionTask = nil
+        pendingAudioSelection = nil
+        audioSelectionTransportIntent = nil
+    }
 
     /// AE#464 round 3: true while a re-anchor raised by `setAudioDelay` is running, so the presses
     /// that arrive during it are folded into it instead of stacking re-anchors of their own. The
@@ -3933,6 +3946,7 @@ public final class AetherEngine: ObservableObject {
         // RUNNING session is the right question here, unlike the host above: a background teardown
         // has already unloaded the item, so there is nothing left to hand over in place.
         let handOverInPlace = consumeInPlaceItemHandoverRequest(priorBackendWasNative: priorBackendWasNative)
+        cancelPendingAudioSelection()
         pendingInPlaceItemHandover = handOverInPlace
         // #128 follow-up: preserve the previous session's display criteria across the load seam. Nil-ing it
         // here bounces the panel through SDR before apply() re-negotiates the same mode on video->video
@@ -5220,6 +5234,7 @@ public final class AetherEngine: ObservableObject {
     }
 
     public func play() {
+        if audioSelectionTransportIntent != nil { audioSelectionTransportIntent = true }
         // AetherEngine#164: a VOD parked at its final frame (scrubbed to the end, or paused there)
         // cannot advance; AVPlayer.play() would no-op and leave the button frozen. Rewind to the start
         // first, then resume. `.ended` is excluded (see shouldRewindBeforePlay): it stays terminal so a
@@ -5241,6 +5256,7 @@ public final class AetherEngine: ObservableObject {
     }
 
     public func pause() {
+        if audioSelectionTransportIntent != nil { audioSelectionTransportIntent = false }
         resumeAfterInterruption = false
         activeTransportHost?.pause()
         isBuffering = false
@@ -6171,6 +6187,7 @@ public final class AetherEngine: ObservableObject {
     }
 
     public func stop(resetDisplayCriteria: Bool = true, finalTeardown: Bool? = nil) {
+        cancelPendingAudioSelection()
         nextLoadRequestsInPlaceItemHandover = false
         stopInternal(resetDisplayCriteria: resetDisplayCriteria,
                      finalTeardown: finalTeardown ?? resetDisplayCriteria)
@@ -6852,8 +6869,9 @@ public final class AetherEngine: ObservableObject {
 
     // MARK: - Audio / subtitle track selection
 
-    /// Switch the active audio track mid-playback. Restarts the HLS pipeline with the new audio stream;
-    /// expects ~0.5-1 s black frame (AVPlayer.replaceCurrentItem tears the surface). Display-criteria handshake
+    /// Switch the active audio track mid-playback. Rebuilds the pipeline at the current position;
+    /// native audio handover retains the old item until replacement, but decoder readiness can still
+    /// interrupt presentation. Software/forward-only sources cannot promise a seamless switch. Display-criteria handshake
     /// is suppressed (video unchanged). `index` is the container stream index (TrackInfo.id). No-op if
     /// out-of-range, pointing at a non-audio stream, or already active.
     ///
@@ -6889,21 +6907,37 @@ public final class AetherEngine: ObservableObject {
             )
             return
         }
-        if activeAudioTrackIndex == index { return }
+        if activeAudioTrackIndex == index && audioSelectionTask == nil { return }
 
         EngineLog.emit(
             "[AetherEngine] selectAudioTrack: scheduling switch to stream \(index)",
             category: .engine
         )
 
-        let gen = loadGeneration
-        Task { @MainActor [weak self] in
-            guard let self = self else { return }
-            await self.reloadWithAudioOverride(
-                url: url,
-                audioStreamIndex: Int32(index),
-                expectedGeneration: gen
-            )
+        pendingAudioSelection = index
+        guard audioSelectionTask == nil else { return }
+        let epoch = audioSelectionEpoch
+        audioSelectionTask = Task { @MainActor [weak self] in
+            guard let self, self.audioSelectionEpoch == epoch else { return }
+            defer {
+                if self.audioSelectionEpoch == epoch {
+                    self.audioSelectionTask = nil
+                    self.audioSelectionTransportIntent = nil
+                }
+            }
+            while let selected = self.pendingAudioSelection {
+                self.pendingAudioSelection = nil
+                guard !Task.isCancelled, self.audioSelectionEpoch == epoch else { return }
+                if self.activeAudioTrackIndex == selected { continue }
+                self.audioSelectionTransportIntent = self.sessionRebuildResumesPlaying
+                let beforeReload = self.loadGeneration
+                let failure = await self.reloadWithAudioOverride(
+                    url: url, audioStreamIndex: Int32(selected), expectedGeneration: beforeReload)
+                // This rebuild owns one stopInternal generation. Background teardown or
+                // another SDK recovery cannot lend its successor to queued audio work.
+                guard !Task.isCancelled, self.audioSelectionEpoch == epoch, failure == nil,
+                      self.loadGeneration == beforeReload &+ 1 else { return }
+            }
         }
     }
 
