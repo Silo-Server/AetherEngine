@@ -5060,7 +5060,14 @@ public final class AetherEngine: ObservableObject {
             isLive: isLive, sourceCanReposition: softwareHost?.sourceCanReposition ?? true
         ) {
             EngineLog.emit("[AetherEngine] seek(to:\(seconds)) ignored: the source is forward-only", category: .engine)
-            emitSeekRejected(.sourceNotSeekable, target: seconds)
+            // A seek stashed during load is replayed here, and its ticket is still open. Close
+            // that ticket with the rejection, or `isSeeking` stays latched over a session that
+            // plays on. A seek with no stash gets the standalone event instead, never both.
+            if deferredSeekInFlight || deferredSeekTicket != nil {
+                endDeferredSeek(.rejected(.sourceNotSeekable))
+            } else {
+                emitSeekRejected(.sourceNotSeekable, target: seconds)
+            }
             return
         }
         // #127: pre-ready native item (background-teardown reload, cold start): forwarding the seek now
