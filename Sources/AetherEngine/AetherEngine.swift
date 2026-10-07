@@ -2356,6 +2356,8 @@ public final class AetherEngine: ObservableObject {
     /// The suppressing legible output behind which an overlay-drawn ASS track keeps its injected
     /// rendition selected, so AE#616 goes on measuring. Nil whenever AVPlayer may draw legible media.
     var injectedRenditionSuppression: InjectedRenditionSuppression?
+    /// What `deselectInjectedRenditionNow` takes down. Nil once anything else owns the selection.
+    var injectedRenditionSelection: InjectedRenditionSelection?
 
     /// Deferred lazy-reader start while a producer restart is in flight (#93 residual): the
     /// readers' side demuxer competed with the restart for the starved link. Cancelled by
@@ -4098,6 +4100,7 @@ public final class AetherEngine: ObservableObject {
         injectedSubtitleSelectionTask?.cancel()
         injectedSubtitleSelectionTask = nil
         releaseInjectedRenditionSuppression()
+        injectedRenditionSelection = nil
         detachRemoteHLSCueClock()   // AE#616
         stallRecoveryWindowUntil = .distantPast
         stallRecoveryReasserts = 0
@@ -6278,6 +6281,7 @@ public final class AetherEngine: ObservableObject {
         injectedSubtitleSelectionTask?.cancel()
         injectedSubtitleSelectionTask = nil
         releaseInjectedRenditionSuppression()
+        injectedRenditionSelection = nil
         detachRemoteHLSCueClock()   // AE#616
         // Font attachments are session-scoped but must survive stopInternal (audio-track-switch skips the probe;
         // clearing in stopInternal would leave the session with an empty font list after any audio switch).

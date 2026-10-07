@@ -17,11 +17,20 @@ import AVFoundation
 struct InjectedASSRenditionSuppressionTests {
 
     private static let script = #"""
-    import http.server
+    import http.server, time
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         def log_message(self, *args): pass
         def do_GET(self):
+            if self.path == "/slow.ass":
+                time.sleep(2)
+                body = open("sub.ass", "rb").read()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/x-ssa")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if self.path == "/master.m3u8":
                 body = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nmedia.m3u8\n"
             elif self.path == "/media.m3u8":
@@ -101,15 +110,49 @@ struct InjectedASSRenditionSuppressionTests {
         engine.setNativeSubtitleRendering(false)
         try await waitFor { Self.selectedName(item, in: group) == name && Self.suppressed(item) }
 
-        // Off takes the rendition down and leaves the output: nothing selected draws nothing, and
-        // the next styled pick must not uncover a line while it resolves.
+        // Off takes the rendition down at once and leaves the output: nothing selected draws
+        // nothing, and the next styled pick must not uncover a line while it resolves.
         engine.clearSubtitle()
-        try await waitFor { Self.selectedName(item, in: group) == nil }
+        #expect(Self.selectedName(item, in: group) == nil)
         #expect(Self.suppressed(item))
 
         engine.selectSubtitleTrack(index: id)
         try await waitFor { Self.selectedName(item, in: group) == name }
         #expect(Self.suppressed(item))
+    }
+
+    /// AVPlayer fetches and buffers a selected rendition, and the whole-program .vtt is served only
+    /// once extraction finishes. A hidden rendition selected before that holds playback up for a
+    /// subtitle nobody sees, and one still selected when the host turns subtitles off and plays is
+    /// fetched on into playback. Seen as a stalled start in Silo's authorization playback tests.
+    @Test("The hidden rendition waits for its extraction, and Off takes it down at once")
+    func hiddenRenditionWaitsForExtraction() async throws {
+        let origin = try #require(await PythonOrigin.launch(
+            prefix: "aether-ass-slow", script: Self.script, files: ["sub.ass": Self.assScript]))
+        defer { origin.stop() }
+        let engine = try AetherEngine()
+        defer { engine.stop(finalTeardown: true) }
+        let master = try #require(URL(string: "http://127.0.0.1:\(origin.port)/master.m3u8"))
+        let sidecar = try #require(URL(string: "http://127.0.0.1:\(origin.port)/slow.ass"))
+        _ = try await engine.load(url: master, options: LoadOptions(
+            nativeRemoteHLS: true, preserveASSMarkup: true,
+            externalSubtitles: [ExternalSubtitleTrack(url: sidecar, name: "Styled ASS")], autoplay: false))
+        let id = AetherEngine.externalSubtitleTrackIDBase
+        let name = try #require(engine.injectedSubtitleRenditionNames[id])
+        let item = try #require(engine.currentAVPlayer?.currentItem)
+        let group = try #require(try await item.asset.loadMediaSelectionGroup(for: .legible))
+        let provider = try #require(engine.remoteHLSSubtitleProxy?.provider)
+
+        engine.selectSubtitleTrack(index: id)
+        try await Task.sleep(for: .milliseconds(800))
+        #expect(!provider.isFillFinished, "the origin holds the sidecar for two seconds")
+        #expect(Self.selectedName(item, in: group) == nil)
+
+        try await waitFor { provider.isFillFinished }
+        try await waitFor { Self.selectedName(item, in: group) == name && Self.suppressed(item) }
+
+        engine.clearSubtitle()
+        #expect(Self.selectedName(item, in: group) == nil)
     }
 }
 

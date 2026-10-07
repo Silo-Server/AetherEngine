@@ -1674,6 +1674,7 @@ extension AetherEngine {
         // it off until the host selects again; the pin is a no-op while a reapply ordinal stands.
         if let active = activeSubtitleTrackIndex, injectedSubtitleRenditionNames[active] != nil,
            nativeSubtitleReapplyOrdinal == nil {
+            deselectInjectedRenditionNow()
             forceNativeLegibleDeselectedUntilHostSelects()
         } else if let active = activeSubtitleTrackIndex,
            nativeSubtitleRenderingRequested
@@ -2724,6 +2725,7 @@ extension AetherEngine {
         guard let id = activeSubtitleTrackIndex, injectedSubtitleRenditionNames[id] != nil else { return }
         injectedSubtitleSelectionTask?.cancel()
         injectedSubtitleSelectionTask = nil
+        deselectInjectedRenditionNow()
         forceNativeLegibleDeselectedUntilHostSelects()
     }
 
@@ -2786,11 +2788,19 @@ extension AetherEngine {
                 // The reporter's order: take the rendition down, let a frame or two pass, then hide
                 // it and select it again.
                 item.select(nil, in: group)
+                // AVPlayer fetches and buffers a selected rendition, and the whole-program .vtt is only
+                // served once extraction finishes, so a hidden one selected early can hold playback up.
+                // It is there only for AE#616, which reads nothing before the fill is done either.
+                while let provider = self.remoteHLSSubtitleProxy?.provider, !provider.isFillFinished {
+                    try? await Task.sleep(nanoseconds: 200_000_000)
+                    guard stillWanted() else { return }
+                }
                 try? await Task.sleep(nanoseconds: 100_000_000)
                 guard stillWanted() else { return }
                 self.suppressInjectedRenditionDrawing(on: item)
             }
             item.select(group.options[index], in: group)
+            self.injectedRenditionSelection = InjectedRenditionSelection(item: item, group: group)
             EngineLog.emit("[AetherEngine] #316: selected injected rendition \"\(name)\" for external id=\(id)"
                            + (nativeRendering ? "" : ", drawn by the host overlay (rendition suppressed)"),
                            category: .engine)
@@ -2804,6 +2814,16 @@ extension AetherEngine {
         output.suppressesPlayerRendering = true
         item.add(output)
         injectedRenditionSuppression = InjectedRenditionSuppression(output: output, item: item)
+    }
+
+    /// Takes the injected rendition the engine selected down on the spot. The pinned deselect that
+    /// follows has to load the legible group first, and a rendition still selected when playback
+    /// starts is one AVPlayer goes on fetching.
+    private func deselectInjectedRenditionNow() {
+        guard let selection = injectedRenditionSelection else { return }
+        injectedRenditionSelection = nil
+        guard let item = selection.item, item === currentAVPlayer?.currentItem else { return }
+        item.select(nil, in: selection.group)
     }
 
     /// Lets AVPlayer draw legible media again. Called right before a selection AVPlayer is meant to
@@ -2835,6 +2855,7 @@ extension AetherEngine {
                   ordinal < group.options.count else { return }
             // The origin's own rendition is AVPlayer's to draw.
             self.releaseInjectedRenditionSuppression()
+            self.injectedRenditionSelection = nil
             item.select(group.options[ordinal], in: group)
             EngineLog.emit(
                 "[AetherEngine] AE#154: remote-HLS legible select ordinal=\(ordinal) (\(group.options[ordinal].displayName))",
@@ -2847,6 +2868,12 @@ extension AetherEngine {
 struct InjectedRenditionSuppression {
     let output: AVPlayerItemLegibleOutput
     weak var item: AVPlayerItem?
+}
+
+/// The injected rendition the engine selected and the group it belongs to.
+struct InjectedRenditionSelection {
+    weak var item: AVPlayerItem?
+    let group: AVMediaSelectionGroup
 }
 
 /// AE#628: one channel's share of a drain tick, everything the decode needs and everything the
