@@ -2346,9 +2346,15 @@ extension AetherEngine {
         // or the first rebuild after a reset mounts its item on the invalidated AVPlayer.
         let mediaServicesWereReset = consumeMediaServicesReset()
         claimSoftwarePathTakeover()   // AE#629
+        // Keep the current native item through an ordinary audio switch, but never reuse a host
+        // invalidated by a media-services reset (audit LIF-104).
+        let keepAudioSwitchItem = audioStreamIndex != nil && discTitleIDOverride == nil
+            && !targetSoftwarePath && !mediaServicesWereReset && nativeHost?.avPlayer.currentItem != nil
+        if keepAudioSwitchItem { nativeHost?.pause() }
         stopInternal(resetDisplayCriteria: false,
                      keepNativeHost: !targetSoftwarePath && !mediaServicesWereReset,
-                     keepCustomReader: true)
+                     keepCustomReader: true, keepCurrentItem: keepAudioSwitchItem)
+        pendingInPlaceItemHandover = keepAudioSwitchItem
         if mediaServicesWereReset { dropAudioPlayerHostAfterMediaServicesReset() }
         EngineLog.emit("[AetherEngine] reload: stopInternal done (\(elapsedMs(since: reloadStart))ms)", category: .engine)
         let gen = loadGeneration
@@ -2378,8 +2384,8 @@ extension AetherEngine {
                     return d
                 }.value
             } catch {
-                // Sodalite#173: a reopen a stop() or a cancelled load aborted is not a failed reload.
-                if loadGeneration != gen {
+                // A superseded or caller-cancelled reopen is not a reload failure.
+                if loadGeneration != gen || Task.isCancelled {
                     EngineLog.emit("[AetherEngine] reload superseded during custom reader reopen; unwinding", category: .engine)
                     return nil
                 }
@@ -2408,8 +2414,8 @@ extension AetherEngine {
                     return d
                 }.value
             } catch {
-                // Sodalite#173: a reopen a stop() or a cancelled load aborted is not a failed reload.
-                if loadGeneration != gen {
+                // A superseded or caller-cancelled reopen is not a reload failure.
+                if loadGeneration != gen || Task.isCancelled {
                     EngineLog.emit("[AetherEngine] reload superseded during disc URL reopen; unwinding", category: .engine)
                     return nil
                 }
@@ -2478,8 +2484,9 @@ extension AetherEngine {
                     audioTracks: audioTracks, activeIndex: softwareHost?.audioStreamIndex ?? -1
                 )
                 presentCurrentLayer()
-                // #124: not resuming leaves the host paused; its readiness settles `.loading -> .paused`.
-                if resumesPlaying { softwareHost?.play() }
+                // Keep the latest transport intent if play/pause changed while the rebuild awaited I/O.
+                if audioSelectionTransportIntent ?? resumesPlaying { softwareHost?.play() }
+                else { softwareHost?.pause() }
             } else {
                 EngineLog.emit("[AetherEngine] reload: loadNative enter audio=\(audioStreamIndex.map(String.init) ?? "nil") resumeAt=\(String(format: "%.2f", resumeAt))s", category: .engine)
                 // #339: the only write this reload can still produce is a sole-writer host's re-write on the
@@ -2569,10 +2576,11 @@ extension AetherEngine {
                     settleCap: loadedOptions.isLive ? .standard : .awaitObservedEnd,
                     isCurrent: { self.loadGeneration == gen })
                 try checkLoadCurrent(gen)
-                if resumesPlaying { nativeHost?.play() }
+                if audioSelectionTransportIntent ?? resumesPlaying { nativeHost?.play() }
+                else { nativeHost?.pause() }
             }
             try checkLoadCurrent(gen)
-            if resumesPlaying { state = .playing }
+            state = (audioSelectionTransportIntent ?? resumesPlaying) ? .playing : .paused
             // Re-arm samplers: stopInternal nilled them, and the reload path bypasses public load() that normally restarts them. Without this, liveTelemetry stays nil and the stats overlay shows "-" after every audio switch.
             startMemoryProbe()
             startLiveTelemetrySampler()
@@ -2584,11 +2592,12 @@ extension AetherEngine {
             if loadedOptions.isLive, !targetSoftwarePath {
                 armLiveReloadWatchdog(generation: gen)
             }
-            EngineLog.emit("[AetherEngine] reload: state=\(resumesPlaying ? ".playing" : "paused on readiness") total=\(elapsedMs(since: reloadStart))ms", category: .engine)
+            EngineLog.emit("[AetherEngine] reload: state=\(state == .playing ? ".playing" : ".paused") total=\(elapsedMs(since: reloadStart))ms", category: .engine)
         } catch is CancellationError {
             // Superseded by a newer load/stop: it owns the engine state.
             return nil
         } catch {
+            guard loadGeneration == gen, !Task.isCancelled else { return nil }
             EngineLog.emit(
                 "[AetherEngine] selectAudioTrack reload failed: \(error), playback stopped",
                 category: .engine

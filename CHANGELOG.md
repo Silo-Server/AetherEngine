@@ -18,6 +18,7 @@ the public-API contract.
 ### Fixed
 
 - Video routing consults the AV1 hardware decoder only for AV1 sources, avoiding supplemental decoder registration on unrelated playback starts.
+- Rapid audio-track selections coalesce into serialized rebuilds. Stop/load invalidate queued work, and play/pause commands received during a rebuild supply its final transport intent. Native handover retains the old item until replacement unless media services were reset.
 
 ## [7.28.3] - 2026-10-07
 

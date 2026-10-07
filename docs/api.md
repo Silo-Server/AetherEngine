@@ -1146,3 +1146,14 @@ Public for the CLI, the test suite, or a diagnostic overlay, and outside the sha
 - **`DiscInspector` / `DiscInspection`**, `DoviRpuConverter` and its probe, `AudioTapProbe`, `SoftwareDecodeProbeResult`, `A53SEIParser`: repro and inspection surfaces behind `aetherctl` subcommands.
 - **`HLSLiveIngestReader`'s internals** (`terminalError`, `upstreamTargetDuration`, `observedLiveCadenceSeconds`, `closedLiveCadenceSeconds`, `upstreamSegmentDurationSeconds`, `companionAudioReader`): fixture and diagnostic reads. The last two are the closed evidence the served TARGETDURATION is sealed from (AE#447); `upstreamTargetDuration` is the upstream's own claim, reported in the seal line and derived from nowhere.
 - **`SubtitleChannel`**: the primary / secondary selector on the engine's internal subtitle routing. No public signature takes one; a host picks the channel by calling the primary or the secondary method.
+
+### Audio selection while rebuilding
+
+`selectAudioTrack(index:)` coalesces rapid choices and runs one rebuild at a time.
+A queued choice for the already-active track requires no source reopen. Stop or a
+new load invalidates pending audio selections; a superseded or cancelled rebuild
+cannot publish a stale error. Play/pause commands received while a rebuild awaits
+I/O determine the final transport state.
+
+An ordinary native audio handover retains the old item until replacement, but does
+not promise a gapless switch. A media-services reset still discards the old host.
