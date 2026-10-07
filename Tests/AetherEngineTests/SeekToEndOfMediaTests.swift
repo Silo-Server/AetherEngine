@@ -81,6 +81,20 @@ struct SeekToEndOfMediaTests {
         #expect(!AetherEngine.shouldRewindBeforePlay(state: .paused, currentTime: 100, duration: 100, isLive: true))
     }
 
+    @Test("A source that cannot be repositioned never rewinds, whatever its duration claims")
+    func forwardOnlySourceNeverRewinds() {
+        // A fragmented MP4 served as one response reports its first fragment as the duration:
+        // 3.6 s for a film with over an hour left. Twenty minutes in, that reads as parked at
+        // the end, and the rewind is a seek this source cannot serve.
+        #expect(!AetherEngine.shouldRewindBeforePlay(
+            state: .paused, currentTime: 1_196.7, duration: 3.6, isLive: false, sourceCanReposition: false))
+        #expect(!AetherEngine.shouldRewindBeforePlay(
+            state: .paused, currentTime: 100, duration: 100, isLive: false, sourceCanReposition: false))
+        // The same playhead on a source that can rewind still does.
+        #expect(AetherEngine.shouldRewindBeforePlay(
+            state: .paused, currentTime: 100, duration: 100, isLive: false, sourceCanReposition: true))
+    }
+
     // MARK: - Integration: real seek() / play() paths (no hosts)
 
     @MainActor

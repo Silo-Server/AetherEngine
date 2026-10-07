@@ -41,6 +41,9 @@ public struct SeekEvent: Sendable, Equatable {
         case noActiveSession
         /// Live source without a DVR window; there is no seekable range to land in.
         case liveWithoutDVR
+        /// The source is forward-only (one response with no ranges, or a one-shot reader): it has
+        /// no other position to offer. Playback continues where it is.
+        case sourceNotSeekable
     }
 
     public enum Outcome: Sendable, Equatable {

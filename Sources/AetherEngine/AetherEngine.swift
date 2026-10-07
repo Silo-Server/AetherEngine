@@ -3210,11 +3210,23 @@ public final class AetherEngine: ObservableObject {
     /// `AVPlayer.play()` at end-of-media is a no-op, freezing the button. `.ended` is deliberately
     /// excluded: it is terminal (#63), the host revives it by reloading, and a play press racing the end
     /// card must not silently restart the finished session.
+    ///
+    /// A source that cannot be repositioned never rewinds. Its container can report a duration far
+    /// short of the stream (a fragmented MP4 served as one response reports its first fragment, a
+    /// few seconds), which reads as "parked at the end" for the rest of the session; the rewind is a
+    /// seek the source cannot serve, and it ended playback on the first play after a pause.
     nonisolated static func shouldRewindBeforePlay(
-        state: PlaybackState, currentTime: Double, duration: Double, isLive: Bool
+        state: PlaybackState, currentTime: Double, duration: Double, isLive: Bool,
+        sourceCanReposition: Bool = true
     ) -> Bool {
-        guard state != .ended else { return false }
+        guard state != .ended, sourceCanReposition else { return false }
         return isAtEndOfMedia(currentTime: currentTime, duration: duration, isLive: isLive)
+    }
+
+    /// Whether a seek is refused because the loaded source cannot be repositioned. Live sources
+    /// keep their own (DVR window) rules.
+    nonisolated static func seekRefusedForForwardOnlySource(isLive: Bool, sourceCanReposition: Bool) -> Bool {
+        !isLive && !sourceCanReposition
     }
 
     #if DEBUG
@@ -4828,7 +4840,8 @@ public final class AetherEngine: ObservableObject {
         // first, then resume. `.ended` is excluded (see shouldRewindBeforePlay): it stays terminal so a
         // play press racing the host end card does not silently revive a finished session (#63).
         if Self.shouldRewindBeforePlay(
-            state: state, currentTime: currentTime, duration: duration, isLive: isLive
+            state: state, currentTime: currentTime, duration: duration, isLive: isLive,
+            sourceCanReposition: softwareHost?.sourceCanReposition ?? true
         ) {
             Task { @MainActor in
                 await self.seek(to: 0)
@@ -5038,6 +5051,24 @@ public final class AetherEngine: ObservableObject {
                 emitSeekRejected(.liveWithoutDVR, target: seconds)
                 return
             }
+        }
+        // A forward-only source on the software path has no other position to offer, and its
+        // container can report a duration far short of the stream. Forwarding the seek would
+        // clamp the target to that duration, publish it as the position and park the state, all
+        // for a reposition the host has to refuse. Reject it here and leave the session playing.
+        if Self.seekRefusedForForwardOnlySource(
+            isLive: isLive, sourceCanReposition: softwareHost?.sourceCanReposition ?? true
+        ) {
+            EngineLog.emit("[AetherEngine] seek(to:\(seconds)) ignored: the source is forward-only", category: .engine)
+            // A seek stashed during load is replayed here, and its ticket is still open. Close
+            // that ticket with the rejection, or `isSeeking` stays latched over a session that
+            // plays on. A seek with no stash gets the standalone event instead, never both.
+            if deferredSeekInFlight || deferredSeekTicket != nil {
+                endDeferredSeek(.rejected(.sourceNotSeekable))
+            } else {
+                emitSeekRejected(.sourceNotSeekable, target: seconds)
+            }
+            return
         }
         // #127: pre-ready native item (background-teardown reload, cold start): forwarding the seek now
         // would clamp to 0 against empty seekable ranges and replace load()'s pending startPosition seek.
