@@ -2788,10 +2788,10 @@ extension AetherEngine {
                 // The reporter's order: take the rendition down, let a frame or two pass, then hide
                 // it and select it again.
                 item.select(nil, in: group)
-                // AVPlayer fetches and buffers a selected rendition, and the whole-program .vtt is only
-                // served once extraction finishes, so a hidden one selected early can hold playback up.
-                // It is there only for AE#616, which reads nothing before the fill is done either.
-                while let provider = self.remoteHLSSubtitleProxy?.provider, !provider.isFillFinished {
+                // AVPlayer fetches and buffers a selected rendition, so a hidden one selected before
+                // playback runs joins the startup buffer for a subtitle nobody sees. It is there only
+                // for AE#616, which measures presented lines and reads nothing before the fill is done.
+                while !self.hiddenRenditionMayJoin() {
                     try? await Task.sleep(nanoseconds: 200_000_000)
                     guard stillWanted() else { return }
                 }
@@ -2814,6 +2814,16 @@ extension AetherEngine {
         output.suppressesPlayerRendering = true
         item.add(output)
         injectedRenditionSuppression = InjectedRenditionSuppression(output: output, item: item)
+    }
+
+    /// When a hidden ASS rendition may be selected: its whole-program .vtt is extracted, and playback
+    /// is running, so AE#616 has presented lines to measure.
+    private func hiddenRenditionMayJoin() -> Bool {
+        if let provider = remoteHLSSubtitleProxy?.provider, !provider.isFillFinished { return false }
+        #if DEBUG
+        if hiddenRenditionIgnoresPlaybackForTesting { return true }
+        #endif
+        return currentAVPlayer?.timeControlStatus == .playing
     }
 
     /// Takes the injected rendition the engine selected down on the spot. The pinned deselect that

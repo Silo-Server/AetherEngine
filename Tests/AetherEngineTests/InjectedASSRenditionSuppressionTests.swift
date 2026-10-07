@@ -83,6 +83,7 @@ struct InjectedASSRenditionSuppressionTests {
 
         let engine = try AetherEngine()
         defer { engine.stop(finalTeardown: true) }
+        engine.hiddenRenditionIgnoresPlaybackForTesting = true
         let master = try #require(URL(string: "http://127.0.0.1:\(origin.port)/master.m3u8"))
         _ = try await engine.load(url: master, options: LoadOptions(
             nativeRemoteHLS: true, preserveASSMarkup: true,
@@ -121,6 +122,36 @@ struct InjectedASSRenditionSuppressionTests {
         #expect(Self.suppressed(item))
     }
 
+    /// AE#616 measures presented lines, so a paused item has nothing to gain from the hidden rendition,
+    /// and selected before playback starts it would join the startup buffer. Silo's authorization
+    /// playback tests start with stall waiting off and stopped at rate 0 when it did.
+    @Test("A paused item gets no hidden rendition, and the overlay still gets its cues")
+    func pausedItemGetsNoHiddenRendition() async throws {
+        let origin = try #require(await PythonOrigin.launch(prefix: "aether-ass-paused", script: Self.script))
+        defer { origin.stop() }
+        let ass = FileManager.default.temporaryDirectory
+            .appendingPathComponent("paused-\(UUID().uuidString).ass")
+        try Self.assScript.write(to: ass, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: ass) }
+        let engine = try AetherEngine()
+        defer { engine.stop(finalTeardown: true) }
+        let master = try #require(URL(string: "http://127.0.0.1:\(origin.port)/master.m3u8"))
+        _ = try await engine.load(url: master, options: LoadOptions(
+            nativeRemoteHLS: true, preserveASSMarkup: true,
+            externalSubtitles: [ExternalSubtitleTrack(url: ass, name: "Styled ASS")], autoplay: false))
+        let id = AetherEngine.externalSubtitleTrackIDBase
+        let item = try #require(engine.currentAVPlayer?.currentItem)
+        let group = try #require(try await item.asset.loadMediaSelectionGroup(for: .legible))
+        let provider = try #require(engine.remoteHLSSubtitleProxy?.provider)
+
+        engine.selectSubtitleTrack(index: id)
+        try await waitFor { provider.isFillFinished && !engine.subtitleCues.isEmpty }
+        try await Task.sleep(for: .milliseconds(500))
+        #expect(engine.currentAVPlayer?.timeControlStatus != .playing)
+        #expect(Self.selectedName(item, in: group) == nil)
+        #expect(!Self.suppressed(item))
+    }
+
     /// AVPlayer fetches and buffers a selected rendition, and the whole-program .vtt is served only
     /// once extraction finishes. A hidden rendition selected before that holds playback up for a
     /// subtitle nobody sees, and one still selected when the host turns subtitles off and plays is
@@ -132,6 +163,7 @@ struct InjectedASSRenditionSuppressionTests {
         defer { origin.stop() }
         let engine = try AetherEngine()
         defer { engine.stop(finalTeardown: true) }
+        engine.hiddenRenditionIgnoresPlaybackForTesting = true
         let master = try #require(URL(string: "http://127.0.0.1:\(origin.port)/master.m3u8"))
         let sidecar = try #require(URL(string: "http://127.0.0.1:\(origin.port)/slow.ass"))
         _ = try await engine.load(url: master, options: LoadOptions(

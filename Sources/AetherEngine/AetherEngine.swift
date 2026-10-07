@@ -1243,6 +1243,8 @@ public final class AetherEngine: ObservableObject {
     #if DEBUG
     /// AE#628: lets a test drive the drain tick with a real decoder but no playback session.
     var subtitleDrainDecoderFactoryForTesting: ((Int32) -> EmbeddedSubtitleDecoder?)?
+    /// Lets a test select the hidden ASS rendition on an item whose fixture media never plays.
+    var hiddenRenditionIgnoresPlaybackForTesting = false
     #endif
     /// SW-host sessions have no HLSVideoEngine; their tap fills this store instead.
     var softwareSubtitlePacketStore: SubtitlePacketStore?
