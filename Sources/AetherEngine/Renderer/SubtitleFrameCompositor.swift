@@ -76,7 +76,7 @@ final class SubtitleFrameCompositor: @unchecked Sendable {
     private var poolFormat: (width: Int, height: Int, pixelFormat: OSType)?
 
     /// Any thread; called by the engine when its published cues or the PiP flag change.
-    func update(cues: [SubtitleCue], enabled: Bool, delaySeconds: Double = 0) {
+    func update(cues: [SubtitleCue], enabled: Bool, delaySeconds: Double) {
         lock.lock()
         self.cues = cues
         self.enabled = enabled

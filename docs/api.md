@@ -671,6 +671,7 @@ suppressing `AVPlayerItemLegibleOutput` to keep the measurement running.
 | `$nativeSubtitleRenditionAvailable` | At least one cue exists for the native track. Gate the AVMediaSelection picker on it. |
 | `$nativeSubtitleRenditionsServed` | Whether the served playlist is the master. A reload signal and a diagnostic, nothing more: whether a legible rendition reaches a wired external display is AVKit's business and is not observable from here. |
 | `setNativeSubtitleRendering(_:)` | Hand subtitle drawing to AVKit while the video leaves the host's view hierarchy (PiP, AirPlay, wired external display) and take it back on return. No-op when the active subtitle has no native text equivalent (bitmap, or a track added after load). |
+| `setSoftwareSubtitleDelay(_:)`, `softwareSubtitleDelaySeconds` | Media-time offset for both channels composited into software PiP frames: positive delays cues, negative advances them. Non-finite values are ignored; the default is 0 and the value survives later loads on the same engine. Takes effect on the next composited frame, without a seek, reopen or A/V clock change. A host overlay applies the same value as `clock.sourceTime - delay`. AVPlayer-owned native renditions, native PiP and AirPlay are not shifted; a host offering a timing control should say so. |
 | `teletextPage`, `setTeletextPage(_:)` | The DVB teletext caption page, at load and while the channel plays. |
 
 ## Live and DVR
@@ -1144,15 +1145,3 @@ Public for the CLI, the test suite, or a diagnostic overlay, and outside the sha
 - **`DiscInspector` / `DiscInspection`**, `DoviRpuConverter` and its probe, `AudioTapProbe`, `SoftwareDecodeProbeResult`, `A53SEIParser`: repro and inspection surfaces behind `aetherctl` subcommands.
 - **`HLSLiveIngestReader`'s internals** (`terminalError`, `upstreamTargetDuration`, `observedLiveCadenceSeconds`, `closedLiveCadenceSeconds`, `upstreamSegmentDurationSeconds`, `companionAudioReader`): fixture and diagnostic reads. The last two are the closed evidence the served TARGETDURATION is sealed from (AE#447); `upstreamTargetDuration` is the upstream's own claim, reported in the seal line and derived from nowhere.
 - **`SubtitleChannel`**: the primary / secondary selector on the engine's internal subtitle routing. No public signature takes one; a host picks the channel by calling the primary or the secondary method.
-
-### Software PiP subtitle timing
-
-`setSoftwareSubtitleDelay(_:)` applies an engine-wide media-time offset to both subtitle
-channels composited into software PiP frames. Positive values delay cues; negative values
-advance them. `softwareSubtitleDelaySeconds` reports the current preference. Non-finite
-values are ignored; the default is zero and the value survives subsequent loads on the same
-engine. It takes effect on the next composited frame without a seek, source reopen or A/V
-clock change. An inline overlay can use the same value with `clock.sourceTime - delay`.
-
-This setting does not shift AVPlayer-owned native subtitle renditions, native PiP or AirPlay.
-Hosts should expose that renderer limit when offering subtitle timing controls.

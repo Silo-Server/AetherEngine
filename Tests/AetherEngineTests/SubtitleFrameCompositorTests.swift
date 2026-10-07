@@ -96,11 +96,11 @@ struct SubtitleFrameCompositorTests {
         CVPixelBufferUnlockBaseAddress(buffer, [])
 
         // Disabled: passthrough must be the same instance.
-        compositor.update(cues: [SubtitleCue(id: 1, startTime: 0, endTime: 10, body: .text("HELLO"))], enabled: false)
+        compositor.update(cues: [SubtitleCue(id: 1, startTime: 0, endTime: 10, body: .text("HELLO"))], enabled: false, delaySeconds: 0)
         #expect(compositor.composite(buffer, ptsSeconds: 5) === buffer)
 
         // Enabled with an active cue: output keeps the format and the bottom region gains bright pixels.
-        compositor.update(cues: [SubtitleCue(id: 1, startTime: 0, endTime: 10, body: .text("HELLO"))], enabled: true)
+        compositor.update(cues: [SubtitleCue(id: 1, startTime: 0, endTime: 10, body: .text("HELLO"))], enabled: true, delaySeconds: 0)
         let out = compositor.composite(buffer, ptsSeconds: 5)
         #expect(CVPixelBufferGetPixelFormatType(out) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
         #expect(out !== buffer)
@@ -153,7 +153,7 @@ struct SubtitleFrameCompositorTests {
     @Test("a composited frame keeps the source's pixel aspect ratio and colour tags")
     func compositedFrameKeepsSourceAttachments() throws {
         let compositor = SubtitleFrameCompositor()
-        compositor.update(cues: [SubtitleCue(id: 1, startTime: 0, endTime: 10, body: .text("HELLO"))], enabled: true)
+        compositor.update(cues: [SubtitleCue(id: 1, startTime: 0, endTime: 10, body: .text("HELLO"))], enabled: true, delaySeconds: 0)
 
         let hdr = try blackFrame(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
         let aspect: NSDictionary = [
@@ -184,7 +184,7 @@ struct SubtitleFrameCompositorTests {
     @Test("a recycled output buffer does not keep an earlier source's pixel aspect ratio")
     func recycledBufferDropsStaleAspect() throws {
         let compositor = SubtitleFrameCompositor()
-        compositor.update(cues: [SubtitleCue(id: 1, startTime: 0, endTime: 10, body: .text("HELLO"))], enabled: true)
+        compositor.update(cues: [SubtitleCue(id: 1, startTime: 0, endTime: 10, body: .text("HELLO"))], enabled: true, delaySeconds: 0)
         let format = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
 
         let anamorphic = try blackFrame(format)
