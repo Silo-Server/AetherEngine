@@ -10,6 +10,10 @@ the public-API contract.
 
 ## [Unreleased]
 
+### Added
+
+- `setSoftwareSubtitleDelay(_:)` applies a persistent, caller-selected subtitle offset to both channels in software PiP without changing the playback clock. Native renditions remain unchanged.
+
 ### Fixed
 
 - Video routing consults the AV1 hardware decoder only for AV1 sources, avoiding supplemental decoder registration on unrelated playback starts.
