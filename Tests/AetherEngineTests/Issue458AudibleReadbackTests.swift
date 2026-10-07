@@ -122,7 +122,7 @@ struct Issue458AudibleReadbackTests {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent("Sources/AetherEngine/AetherEngine+Loading.swift")
-        guard let text = try? String(contentsOf: source, encoding: .utf8) else { return }
+        let text = try String(contentsOf: source, encoding: .utf8)
         #expect(text.contains("logAudibleReadback(host: host)"))
     }
 }

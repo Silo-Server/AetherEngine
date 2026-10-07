@@ -75,6 +75,14 @@ struct SpatialAudioBridgeTests {
         func reset() { skipped = 0; inputFrames = 0; blocks = []; pushes = 0 }
     }
 
+    /// Stand-in decoder that refuses every access unit, as a corrupt or foreign stream would.
+    final class RejectingDecoder: ObjectAudioDecoding {
+        struct Refused: Error {}
+        func push(_ bytes: UnsafeRawBufferPointer) throws { throw Refused() }
+        func nextBlock() throws -> ObjectAudioDecodedBlock? { nil }
+        func reset() {}
+    }
+
     /// Stand-in decoder with something to find: one pushed byte is one 40-frame access unit,
     /// contiguous from the first push, and the left bed channel carries a 3 ms 1 kHz burst
     /// starting at input frame `clickFrame`.
@@ -169,6 +177,46 @@ struct SpatialAudioBridgeTests {
         // last partial packet.
         #expect(packets.count == 2 + Int((Double(96_000 - 200) / 1024).rounded(.up)))
         #expect(bridge.feedStats.packetsEmitted == packets.count)
+    }
+
+    /// The APAC sample entry is written before any audio, so a decoder that never finds a major sync
+    /// plays the picture over silence unless the bridge says so itself (AE#641).
+    @Test("a decoder that returns or accepts nothing is reported once, at the threshold, and a healthy one never")
+    func decodedNothingIsReportedOnce() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        final class Reports: @unchecked Sendable {
+            private let lock = NSLock()
+            private var count = 0
+            func add() { lock.lock(); count += 1; lock.unlock() }
+            var value: Int { lock.lock(); defer { lock.unlock() }; return count }
+        }
+        let silent = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
+            decoder: SyntheticDecoder(skipAfterReset: .max))
+        defer { silent.close() }
+        let reports = Reports()
+        silent.onDecoderProducedNothing = { _ in reports.add() }
+        _ = try feed(silent, startMs: 0, count: AudioBridge.silentFeedPacketThreshold - 1)
+        #expect(reports.value == 0)
+        _ = try feed(silent, startMs: 1260, count: 40)
+        #expect(reports.value == 1)
+
+        let rejecting = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: RejectingDecoder())
+        defer { rejecting.close() }
+        let rejected = Reports()
+        rejecting.onDecoderProducedNothing = { _ in rejected.add() }
+        _ = try feed(rejecting, startMs: 0, count: AudioBridge.silentFeedPacketThreshold + 10)
+        #expect(rejected.value == 1)
+
+        let healthy = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
+            decoder: SyntheticDecoder(skipAfterReset: 5))
+        defer { healthy.close() }
+        let quiet = Reports()
+        healthy.onDecoderProducedNothing = { _ in quiet.add() }
+        _ = try feed(healthy, startMs: 0, count: 100)
+        #expect(quiet.value == 0)
     }
 
     @Test("a producer restart re-anchors on the new position")

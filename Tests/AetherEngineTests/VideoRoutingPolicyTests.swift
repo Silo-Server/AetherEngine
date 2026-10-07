@@ -67,6 +67,21 @@ struct VideoRoutingPolicyTests {
             codecID: AV_CODEC_ID_AV1, fieldOrder: AV_FIELD_PROGRESSIVE, av1Available: true))
     }
 
+    @Test("Only AV1 routing evaluates the hardware capability probe")
+    func hardwareProbeIsLazy() {
+        var calls = 0
+        func probe() -> Bool { calls += 1; return true }
+        for codec in [AV_CODEC_ID_H264, AV_CODEC_ID_HEVC, AV_CODEC_ID_NONE,
+                      AV_CODEC_ID_VP9, AV_CODEC_ID_MPEG2VIDEO] {
+            _ = VideoRoutingPolicy.requiresSoftwarePath(
+                codecID: codec, fieldOrder: AV_FIELD_PROGRESSIVE, av1Available: probe())
+        }
+        #expect(calls == 0)
+        #expect(!VideoRoutingPolicy.requiresSoftwarePath(
+            codecID: AV_CODEC_ID_AV1, fieldOrder: AV_FIELD_PROGRESSIVE, av1Available: probe()))
+        #expect(calls == 1)
+    }
+
     // MARK: - #150 SPS frame_mbs_only fallback for UNKNOWN field order
 
     @Test("UNKNOWN field order + SPS frame_mbs_only=0 routes to software")
@@ -148,14 +163,52 @@ struct VideoRoutingPolicyTests {
             codecID: AV_CODEC_ID_HEVC, dvProfile: nil, canHardwareDecode: { true }))
     }
 
-    @Test("non-H.264/HEVC codecs ignore the undecodable gate (own policy governs them)")
+    @Test("codecs outside the gate ignore it (own policy governs them)")
     func otherCodecsIgnoreUndecodableGate() {
-        // AV1 without HW is already routed software by requiresSoftwarePath; this gate must not double-handle
-        // it, and must never reclassify VP9 / MPEG-2 / etc. off a codec they don't apply to.
-        for codec in [AV_CODEC_ID_AV1, AV_CODEC_ID_VP9, AV_CODEC_ID_MPEG2VIDEO, AV_CODEC_ID_VC1] {
+        // Must never reclassify VP9 / MPEG-2 / etc. off a codec it doesn't apply to.
+        for codec in [AV_CODEC_ID_VP9, AV_CODEC_ID_MPEG2VIDEO, AV_CODEC_ID_VC1] {
             #expect(!VideoRoutingPolicy.forcesSoftwareForUndecodableFormat(
                 codecID: codec, dvProfile: nil, canHardwareDecode: { false }))
         }
+    }
+
+    // MARK: - Audit HLS-5: HW AV1 is Main profile only
+
+    @Test("AV1 on a HW-AV1 device the decoder cannot take falls back to software")
+    func av1OutsideHardwareProfileSoftware() {
+        #expect(VideoRoutingPolicy.forcesSoftwareForUndecodableFormat(
+            codecID: AV_CODEC_ID_AV1, dvProfile: nil, canHardwareDecode: { false }))
+        #expect(!VideoRoutingPolicy.forcesSoftwareForUndecodableFormat(
+            codecID: AV_CODEC_ID_AV1, dvProfile: nil, canHardwareDecode: { true }))
+    }
+
+    @Test("live consults the format gate for AV1 only; VOD consults it for every codec")
+    func liveConsultsFormatGateForAV1Only() {
+        #expect(VideoRoutingPolicy.consultsUndecodableFormatGate(codecID: AV_CODEC_ID_AV1, isLive: true))
+        #expect(!VideoRoutingPolicy.consultsUndecodableFormatGate(codecID: AV_CODEC_ID_H264, isLive: true))
+        #expect(!VideoRoutingPolicy.consultsUndecodableFormatGate(codecID: AV_CODEC_ID_HEVC, isLive: true))
+        for codec in [AV_CODEC_ID_AV1, AV_CODEC_ID_H264, AV_CODEC_ID_HEVC] {
+            #expect(VideoRoutingPolicy.consultsUndecodableFormatGate(codecID: codec, isLive: false))
+        }
+    }
+
+    @Test("av1C seq_profile decides: Main fits the hardware decoder, High and Professional do not")
+    func av1ProfileFromAV1C() {
+        // marker|version 0x81, then seq_profile (3 bits) | seq_level_idx_0 (5 bits), flags, reserved.
+        let main10 = [UInt8]([0x81, 0x08, 0x4C, 0x00])      // profile 0, high_bitdepth
+        let high444 = [UInt8]([0x81, 0x28, 0x00, 0x00])     // profile 1
+        let pro12bit = [UInt8]([0x81, 0x48, 0x60, 0x00])    // profile 2, high_bitdepth + twelve_bit
+        #expect(VideoRoutingPolicy.av1FitsHardwareDecoder(av1C: main10, codecparProfile: -99))
+        #expect(!VideoRoutingPolicy.av1FitsHardwareDecoder(av1C: high444, codecparProfile: -99))
+        #expect(!VideoRoutingPolicy.av1FitsHardwareDecoder(av1C: pro12bit, codecparProfile: -99))
+    }
+
+    @Test("without an av1C the codecpar profile decides, and unknown keeps the native route")
+    func av1ProfileFallback() {
+        #expect(VideoRoutingPolicy.av1FitsHardwareDecoder(av1C: nil, codecparProfile: 0))
+        #expect(!VideoRoutingPolicy.av1FitsHardwareDecoder(av1C: nil, codecparProfile: 1))
+        #expect(!VideoRoutingPolicy.av1FitsHardwareDecoder(av1C: [], codecparProfile: 2))
+        #expect(VideoRoutingPolicy.av1FitsHardwareDecoder(av1C: nil, codecparProfile: -99))
     }
 
     // MARK: - #176 DV Profile 5 bypasses the VT probe gate

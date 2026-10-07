@@ -5,7 +5,7 @@ import AetherEngine
 
 func runSWDecode(url: URL, maxPackets: Int) -> Int32 {
     EngineLog.handler = { print($0) }
-    print("aetherctl swdecode: \(url.absoluteString) (maxPackets=\(maxPackets))")
+    print(EngineLog.redacted("aetherctl swdecode: \(url.absoluteString) (maxPackets=\(maxPackets))"))
     print("")
 
     let result: SoftwareDecodeProbeResult
@@ -30,6 +30,9 @@ func runSWDecode(url: URL, maxPackets: Int) -> Int32 {
     if let fmt = result.firstFramePixelFormat {
         print("First frame pixfmt:   \(fmt)")
         print("First frame size:     \(result.firstFrameWidth)x\(result.firstFrameHeight)")
+        if let color = result.firstFrameColor {
+            print("First frame color:    \(color)")
+        }
     } else {
         print("First frame:          (none decoded)")
     }

@@ -6,8 +6,7 @@ import Testing
 /// the access token in that same query, and `EngineLog` emits with `.public` privacy into OSLog plus
 /// whatever handler the host installed, so an unredacted line is a live credential in a Console.app
 /// capture, a sysdiagnose, and every in-app log a host builds on the handler.
-/// Serialized: `EngineLog.handler` is process-global, so two of these running at once would
-/// each install over the other and read an empty capture.
+/// Serialized: the secret-registry tests mutate process-global redaction state.
 @Suite("EngineLog credential stripping", .serialized)
 struct LogRedactionTests {
 
@@ -170,14 +169,233 @@ struct LogRedactionTests {
         #expect(LogRedaction.redact(line) == line)
     }
 
+    @Test("an Xtream Codes path loses its password and keeps the account name", arguments: [
+        ("http://h:8080/live/john/S3cretPass/12345.m3u8", "http://h:8080/live/john/<redacted>/12345.m3u8"),
+        ("http://h:8080/movie/john/S3cretPass/678.mkv", "http://h:8080/movie/john/<redacted>/678.mkv"),
+        ("http://h:8080/series/john/S3cretPass/901.mkv", "http://h:8080/series/john/<redacted>/901.mkv"),
+        ("http://h:8080/timeshift/john/S3cretPass/60/2026-09-24:20-00/12345.ts",
+         "http://h:8080/timeshift/john/<redacted>/60/2026-09-24:20-00/12345.ts"),
+        ("http://h:8080/hls/a1b2c3d4e5/12345_3.ts", "http://h:8080/hls/<redacted>/12345_3.ts"),
+        ("http://h:8080/hlsr/a1b2c3d4e5/john/S3cretPass/12345/1/7.ts", "http://h:8080/hlsr/<redacted>/12345/1/7.ts"),
+    ])
+    func xtreamPath(url: String, expected: String) {
+        let line = LogRedaction.redact("[AetherEngine] load url=\(url) source-format=hls")
+        #expect(line == "[AetherEngine] load url=\(expected) source-format=hls")
+    }
+
+    @Test("an ordinary path under the same prefixes is left alone", arguments: [
+        "https://origin.example/live/master.m3u8",
+        "https://origin.example/live/channel1/index.m3u8",
+        "https://origin.example/movie/trailer.mp4",
+        "https://origin.example/live/ch1/index.m3u8?x=1",
+        "https://jellyfin.example/LiveTv/LiveStreamFiles/abc/stream.ts",
+    ])
+    func ordinaryPrefixedPathsSurvive(url: String) {
+        #expect(LogRedaction.redact("[x] url=\(url) ok") == "[x] url=\(url) ok")
+    }
+
+    @Test("a URL logged percent-encoded inside another URL's query loses its token (audit NET-1)")
+    func percentEncodedNestedURL() {
+        // The exact shape the pre-NET-1 origin relay logged on every request.
+        let origin = "https://jf.example.com/Videos/abc/master.m3u8?MediaSourceId=x&api_key=\(token)&Tag=7"
+        let encoded = origin.addingPercentEncoding(withAllowedCharacters: .alphanumerics)!
+        let lines = [
+            "[HLSLocalServer] GET /deadbeef/aether-origin-relay?origin=\(encoded) HTTP/1.1 fd=12",
+            "[NativeAVPlayerHost] #3 load url=http://127.0.0.1:50123/deadbeef/aether-origin-relay?origin=\(encoded)",
+        ]
+        for line in lines {
+            let out = LogRedaction.redact(line)
+            #expect(!out.contains(token), "leaked: \(out)")
+            #expect(out.contains("api%5Fkey%3D<redacted>%26Tag%3D7"), "\(out)")
+            #expect(out.contains("MediaSourceId%3Dx"), "diagnostic context went with it: \(out)")
+        }
+        let tail = LogRedaction.redact("GET /x?origin=\(encoded) HTTP/1.1 fd=12")
+        #expect(tail.hasSuffix(" HTTP/1.1 fd=12"))
+    }
+
+    @Test("a doubly encoded token is stripped too")
+    func doublyEncodedNestedURL() {
+        let once = "https://s/a?b=1&X-Emby-Token=\(token)&keep=1"
+            .addingPercentEncoding(withAllowedCharacters: .alphanumerics)!
+        let twice = once.addingPercentEncoding(withAllowedCharacters: .alphanumerics)!
+        let out = LogRedaction.redact("[x] outer?u=\(twice)&z=2")
+        #expect(!out.contains(token), "leaked: \(out)")
+        #expect(out.contains("<redacted>%2526keep%253D1&z=2"), "\(out)")
+    }
+
+    @Test("an encoded separator inside a plain query value stays part of the value")
+    func encodedAmpersandInPlainValue() {
+        // At depth 0 a `%26` is data in the value, not the `&` that ends it, so the whole value goes.
+        let out = LogRedaction.redact("[x] https://s/a?api_key=abc%26def&keep=1")
+        #expect(out == "[x] https://s/a?api_key=<redacted>&keep=1")
+    }
+
+    @Test("an escape that decodes to a letter is no boundary, and prose with percent signs is left alone")
+    func encodedBoundaryRules() {
+        // `%73` is `s`, so this reads `hasToken=` and must stay, like its plain form.
+        let letter = "[x] ha%73Token=visible"
+        #expect(LogRedaction.redact(letter) == letter)
+        let prose = "[x] buffer 100% full, 5%token budget, 12%3 left"
+        #expect(LogRedaction.redact(prose) == prose)
+        #expect(LogRedaction.redact("[x] a%2Ftoken%3Asecretvalue done") == "[x] a%2Ftoken%3A<redacted> done")
+    }
+
+    @Test("a registered secret goes wherever it sits, raw or percent-encoded, until unregistered")
+    func registeredSecret() {
+        #expect(EngineLog.registerSecret("p@ss w0rd"))
+        let raw = LogRedaction.redact("[x] http://h:8080/john/p%40ss%20w0rd/123 alt=p@ss w0rd.")
+        #expect(raw == "[x] http://h:8080/john/<redacted>/123 alt=<redacted>.")
+        EngineLog.unregisterSecret("p@ss w0rd")
+        #expect(LogRedaction.redact("[x] alt=p@ss w0rd") == "[x] alt=p@ss w0rd")
+    }
+
+    @Test("a value too short to match literally is refused")
+    func shortSecretRefused() {
+        #expect(!EngineLog.registerSecret("abc"))
+        #expect(LogRedaction.redact("[x] abc") == "[x] abc")
+    }
+
+    /// Audit SUB-109: `registerSecret` was a set, so the second owner of a value unregistering it
+    /// (logout of one of two profiles sharing a password) unmasked it for the first.
+    @Test("a secret registered twice stays redacted until both registrations are gone")
+    func registrationsAreCounted() {
+        let secret = "sh4redPassw0rd"
+        #expect(EngineLog.registerSecret(secret))
+        #expect(EngineLog.registerSecret(secret))
+        EngineLog.unregisterSecret(secret)
+        #expect(LogRedaction.redact("[x] pw=\(secret)x") == "[x] pw=<redacted>x")
+        EngineLog.unregisterSecret(secret)
+        #expect(LogRedaction.redact("[x] v=\(secret)x") == "[x] v=\(secret)x")
+    }
+
+    // MARK: - Nameless shapes inside a percent-encoded URL (audit SUB-104)
+
+    /// An IPTV proxy or a debrid wrapper carries the upstream URL percent-encoded in its own query.
+    /// The key forms of that were covered by NET-1; the shapes that need no key only matched raw.
+    @Test("a nameless credential inside a percent-encoded URL goes", arguments: [
+        ("url=http://proxy/x?u=http%3A%2F%2Fiptv.example%2Flive%2Falice%2FSECRETpass%2F1234.ts",
+         "url=http://proxy/x?u=http%3A%2F%2Fiptv.example%2Flive%2Falice%2F<redacted>%2F1234.ts"),
+        ("u=http%3A%2F%2Faddon%2FeyJzdG9yZXMiOlsiYSJdLCJjIjoiU0VDUkVUeHl6IiwidCI6InQifQ%2Fmanifest.json",
+         "u=http%3A%2F%2Faddon%2F<redacted>%2Fmanifest.json"),
+        ("u=smb%3A%2F%2Fbob%3ASECRETpw%40nas%2Fshare", "u=smb%3A%2F%2Fbob%3A<redacted>%40nas%2Fshare"),
+        ("http://addon/v1-eyJzdG9yZXMiOlsiYSJdLCJjIjoiU0VDUkVUeHl6IiwidCI6InQifQ/manifest.json",
+         "http://addon/v1-<redacted>/manifest.json"),
+    ])
+    func namelessShapesThroughEscapes(input: String, expected: String) {
+        #expect(LogRedaction.redact(input) == expected)
+    }
+
+    @Test("the same shapes encoded twice go too", arguments: [
+        "http://iptv.example/live/alice/SECRETpass/1234.ts",
+        "http://addon/eyJzdG9yZXMiOlsiYSJdLCJjIjoiU0VDUkVUeHl6IiwidCI6InQifQ/manifest.json",
+        "smb://bob:SECRETpw@nas/share",
+    ])
+    func namelessShapesEncodedTwice(upstream: String) {
+        let once = upstream.addingPercentEncoding(withAllowedCharacters: .alphanumerics)!
+        let twice = once.addingPercentEncoding(withAllowedCharacters: .alphanumerics)!
+        let out = LogRedaction.redact("[NativeAVPlayerHost] #1 load url=https://mfp.example/p?d=\(twice) startPos=nil")
+        for secret in ["SECRETpass", "SECRETpw", "U0VDUkVUeHl6"] { #expect(!out.contains(secret), "\(out)") }
+        #expect(out.contains("<redacted>"))
+        #expect(out.hasSuffix(" startPos=nil"))
+    }
+
+    /// NET-114: `"\(error)"` of a URLError prints the failing URL twice through its userInfo.
+    @Test("an interpolated URLError loses the encoded upstream credential of its failing URL")
+    func urlErrorDescription() {
+        let upstream = "http://iptv/live/alice/SECRETpass/1.ts"
+            .addingPercentEncoding(withAllowedCharacters: .alphanumerics)!
+        let failing = "http://127.0.0.1:1/live/playlist.m3u8?u=\(upstream)"
+        let error = NSError(domain: NSURLErrorDomain, code: NSURLErrorTimedOut,
+                            userInfo: [NSURLErrorFailingURLStringErrorKey: failing,
+                                       NSURLErrorFailingURLErrorKey: URL(string: failing)!])
+        let out = LogRedaction.redact("[HLSVODIngest] carriage probe inconclusive: \(error)")
+        #expect(!out.contains("SECRETpass"), "\(out)")
+    }
+
+    @Test("an error summary names the URL error code and host, never the failing URL")
+    func errorSummaryDropsTheURL() throws {
+        let failing = try #require(URL(string: "http://iptv.example:8080/get.php?username=u&password=Pa:ss"))
+        let urlError = URLError(.timedOut, userInfo: [NSURLErrorFailingURLErrorKey: failing,
+                                                      NSURLErrorFailingURLStringErrorKey: failing.absoluteString])
+        let summary = EngineLog.summary(of: urlError)
+        #expect(summary == "NSURLError \(NSURLErrorTimedOut) from iptv.example")
+        #expect(EngineLog.summary(of: HLSIngestError.playlistUnreachable(status: 403))
+                == "playlistUnreachable(403)")
+    }
+
+    @Test("an escape-heavy line with nothing secret in it comes back unchanged", arguments: [
+        "[ffmpeg] Opening 'https://s/Videos/My%20Movie%20(2009)/stream.mkv' for reading",
+        "[x] url=https://s/Shows/Show%20Name/Season%2001/Show%20Name%20-%20S01E01.mkv ok",
+        "[x] path=%2Fmedia%2Flive%2Fchannel1%2Findex.m3u8 ok",
+        "[HLSLocalServer] GET /0123/aether-origin-relay?ref=eW91IGNhbm5vdCByZWFkIHRoaXM_3kJ-qZ HTTP/1.1 fd=9",
+    ])
+    func escapesWithoutSecretsSurvive(line: String) {
+        #expect(LogRedaction.redact(line) == line)
+    }
+
+    // MARK: - Query values that hold a terminator (audit SUB-108)
+
+    @Test("a query password holding : ; , ) or > goes whole", arguments: [":", ";", ",", ")", ">"])
+    func queryPasswordWithPunctuation(mark: String) {
+        let out = LogRedaction.redact("https://h/get.php?username=u&password=SECRET\(mark)tail123&type=m3u")
+        #expect(out == "https://h/get.php?username=u&password=<redacted>&type=m3u")
+    }
+
+    @Test("punctuation that prose puts after a value still ends it")
+    func proseAfterAValue() {
+        #expect(LogRedaction.redact("[x] fetch failed (api_key=abc), retrying")
+                == "[x] fetch failed (api_key=<redacted>), retrying")
+        #expect(LogRedaction.redact("[x] seen <token=abc>") == "[x] seen <token=<redacted>>")
+    }
+
+    // MARK: - Credential names outside Jellyfin and Xtream (audit SUB-109)
+
+    @Test("the other backends' credential names are covered", arguments: [
+        ("Authorization: Bearer SECRETopaque12345", "Authorization: Bearer <redacted>"),
+        ("Authorization: Basic dmluY2VudDpzZWNyZXQxMjM0", "Authorization: Basic <redacted>"),
+        ("Cookie: PHPSESSID=SECRETsess123; other=1", "Cookie: <redacted>; other=1"),
+        ("Set-Cookie: session=SECRETsess123; Path=/", "Set-Cookie: <redacted>; Path=/"),
+        ("X-Api-Key: SECRETkey123", "X-Api-Key: <redacted>"),
+        ("https://h/a?api-key=SECRETkey123&x=1", "https://h/a?api-key=<redacted>&x=1"),
+        (#"{"api_key":"SECRETjson123"}"#, #"{"api_key":"<redacted>"}"#),
+        (#"["X-Emby-Token": "SECRETjson123"]"#, #"["X-Emby-Token": "<redacted>"]"#),
+        ("https://h/p.php?user=u&pwd=SECRETkey123", "https://h/p.php?user=u&pwd=<redacted>"),
+        ("https://h/p.php?user=u&passwd=SECRETkey123", "https://h/p.php?user=u&passwd=<redacted>"),
+        ("authToken=SECRETrt123 done", "authToken=<redacted> done"),
+        ("refreshToken=SECRETrt123 done", "refreshToken=<redacted> done"),
+        ("sessionToken=SECRETrt123 done", "sessionToken=<redacted> done"),
+        ("auth_token=SECRETrt123 done", "auth_token=<redacted> done"),
+        ("https://h/a?sessionid=SECRETsid123&session_id=SECRETsid456", "https://h/a?sessionid=<redacted>&session_id=<redacted>"),
+    ])
+    func otherBackendNames(input: String, expected: String) {
+        #expect(LogRedaction.redact(input) == expected)
+    }
+
+    @Test("prose around the new names is left alone", arguments: [
+        "[http] 401 with WWW-Authenticate: Bearer realm=\"fixture\"",
+        "[auth] a bearer token was sent",
+        "[auth] basic auth failed",
+        "[x] X-Playback-Session-Id: 5A0C2D7E-1234",
+        "[x] no cookie was set",
+    ])
+    func proseAroundNewNames(line: String) {
+        #expect(LogRedaction.redact(line) == line)
+    }
+
+    /// Audit OPS-106: aetherctl printed the source URL in its own banner, outside the funnel, so the
+    /// first line of a pasted transcript undid the redaction of every engine line below it.
+    @Test("a line a tool prints itself gets the funnel's redaction")
+    func redactedForATool() {
+        #expect(EngineLog.redacted("aetherctl probe: http://h:8080/live/john/S3cretPass/1.ts?api_key=\(token)")
+                == "aetherctl probe: http://h:8080/live/john/<redacted>/1.ts?api_key=<redacted>")
+    }
+
     /// The point of putting this in EngineLog rather than in each host: the handler a host installs
     /// must never see the raw token, whether or not that host scrubs its own log.
     @Test("the host handler receives the redacted line")
     func handlerSeesRedactedLine() {
-        let box = LineBox()
-        let previous = EngineLog.handler
-        EngineLog.handler = { box.append($0) }
-        defer { EngineLog.handler = previous }
+        let box = EngineLogCapture()
+        defer { box.end() }
 
         EngineLog.emit("[test-496a] load url=https://s/v?api_key=\(token)&Static=true", category: .engine)
 
@@ -194,31 +412,13 @@ struct LogRedactionTests {
     /// shared funnel and not on the `.info` branch alone.
     @Test("a verbose line is withheld from the handler")
     func verboseSkipsTheHandler() {
-        let box = LineBox()
-        let previous = EngineLog.handler
-        EngineLog.handler = { box.append($0) }
-        defer { EngineLog.handler = previous }
+        let box = EngineLogCapture()
+        defer { box.end() }
 
         EngineLog.emit("[test-496b] per-segment trace api_key=\(token)", category: .session, level: .verbose)
 
         // #496: same singleton, same rule. The bare `box.lines.isEmpty` failed a full run once on
         // an unrelated AVIOReader line from a parallel suite, which says nothing about `.verbose`.
         #expect(box.lines.filter { $0.contains("[test-496b]") }.isEmpty)
-    }
-
-    /// The handler is called on whatever thread emitted, so the capture needs its own lock.
-    private final class LineBox: @unchecked Sendable {
-        private let lock = NSLock()
-        private var storage: [String] = []
-
-        func append(_ line: String) {
-            lock.lock(); defer { lock.unlock() }
-            storage.append(line)
-        }
-
-        var lines: [String] {
-            lock.lock(); defer { lock.unlock() }
-            return storage
-        }
     }
 }

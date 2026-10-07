@@ -20,6 +20,7 @@ struct SoftwarePacketCoverage: Sendable {
     }
 
     var rangeCount: Int { ranges.count }
+    var isFull: Bool { ranges.count >= maximumRangeCount }
 
     /// Adds [pts, pts + duration). Invalid or capacity-exceeding input leaves existing coverage
     /// unchanged. Rejecting a sparse extension is conservative: it never claims a missing packet.

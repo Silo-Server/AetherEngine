@@ -300,7 +300,7 @@ struct Issue281ColdStartRoundTripTests {
     /// itself is still a second connection opened at the same instant as the data connection whose
     /// first byte IS the cold start, and paid again on every open, against a server that has already
     /// shown it cannot serve it.
-    @Test("an origin that declined a suffix range is not asked again")
+    @Test("an origin that declined a suffix range is not asked again", .timeLimit(.minutes(1)))
     func declinedSuffixRangesAreNotRetried() async throws {
         let declared: Int64 = 4 * 1024 * 1024 * 1024
         let server = try #require(ScriptedOriginServer { recorded in
@@ -317,9 +317,7 @@ struct Issue281ColdStartRoundTripTests {
 
         let first = AVIOReader(url: url)
         try first.open()
-        for _ in 0..<100 where SuffixRangeSupport.shared.denialReason(for: url) == nil {
-            try? await Task.sleep(nanoseconds: 20_000_000)
-        }
+        try await waitFor { SuffixRangeSupport.shared.denialReason(for: url) != nil }
         first.markClosed(); first.close()
 
         let reason = try #require(SuffixRangeSupport.shared.denialReason(for: url),
@@ -395,6 +393,14 @@ struct Issue281ColdStartRoundTripTests {
         #expect(AVIOReader.suffixRangeStart(response(nil, length: 100), expectedLength: 100) == nil)
         #expect(AVIOReader.suffixRangeStart(response("bytes */1000", length: 100),
                                             expectedLength: 100) == nil)
+        // Audit DMX-8: a suffix ends on the last byte of a numeric total, or it is not a suffix.
+        #expect(AVIOReader.suffixRangeStart(response("bytes 900-999/*", length: 100),
+                                            expectedLength: 100) == nil)
+        #expect(AVIOReader.suffixRangeStart(response("bytes 900-999/2000", length: 100),
+                                            expectedLength: 100) == nil)
+        #expect(AVIOReader.suffixRangeStart(
+            response("bytes 9223372036854775708-9223372036854775807/*", length: 100),
+            expectedLength: 100) == nil)
     }
 
     /// The calibration the in-flight test above no longer carries, checked where it costs no socket

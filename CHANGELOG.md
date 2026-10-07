@@ -22,22 +22,821 @@ the public-API contract.
 - Live HTTPS-to-HTTP redirect tests cover provider refusal, anonymous redirects, static-header stripping and the downgrade credential filter.
 - `ExternalSubtitleTrack.httpRequestAuthorization` supplies refreshable headers for primary/secondary sidecars and native subtitle stores without changing registered track IDs or rendition mappings. Authorized container decoding retains AVIO streaming and range access.
 - `HTTPRequestAuthorization.data(from:maximumBytes:)` fetches raw auxiliary resources such as font bundles with a caller-supplied byte limit and a whole-transfer deadline, reusing the relay's redirect, authorization, retry, cancellation and TLS policy.
-
 - `LoadOptions.httpRequestAuthorization` accepts an async `HTTPRequestAuthorization` resolver for native HLS. The engine resolves headers before requests and redirects, and retries a rejected request once when the bearer changes, preserving the active player item across token rotation.
+- `setSoftwareSubtitleDelay(_:)` applies a persistent, caller-selected subtitle offset to both channels in software PiP without changing the playback clock. Native renditions remain unchanged.
+- `needsForegroundVideoRestore` exposes actual background video teardown so a host can rebuild through the existing reload API before resuming.
 
 ### Fixed
 
 - The software video decoder no longer runs more than 16 frame threads. It used one per core, and each frame thread holds back one decoded frame, so a 32-core Mac waited for 31 frames before showing the first one after a load or seek (about 3 s at 10 fps). FFmpeg also warns above 16 threads. Hosts with 16 or fewer cores keep their current thread count.
-- A paused video no longer starts playing by itself. When the player item died while paused (`failedToPlayToEndTime`), the recovery reload bypassed the pause guard and called `play()` on the fresh item. The reload now keeps a pause made before the item died, whether it came through the engine, AVKit, Control Center or PiP, and mounts the item paused at the same position.
-- A dead item's recovery no longer restarts the title from where the session was first opened. When AVPlayer refused the recovery item's master (`-11868`), the media fallback reloaded at the first mount's start position, so a title opened from its beginning restarted at 0:00. The fallback now reloads where the refused item was placed. Upstream #621.
-- The media fallback no longer starts a paused title. When the recovery item was refused, the fallback called `play()` unconditionally, so a title paused behind the tvOS screensaver started itself. It now plays only when the refused item was playing, or was told to play, and the viewer had not paused it. A Play or Pause from AVKit, Control Center or PiP counts as well as one through the engine.
 - TrueHD Atmos rendered to APAC (`LoadOptions.objectAudioRendering`) no longer plays 42.7 ms ahead of the video. The bridge dropped the encoder's 2048 frames of priming and stamped the first content packet on the source position, but AVFoundation presents an APAC packet's audio 2048 frames before its timestamp, so every session ran early, at load and after every seek. The priming packets now stay in the stream and take the source position's timestamp.
 - Authorized native HLS uses the engine relay from the initial load, without forwarding origin credentials to the loopback asset. Optional subtitle playlist preparation shares the authorizer and has a bounded deadline across redirects and refreshes.
 - Static-header HLS redirects apply the shared credential policy, including Emby and MediaBrowser token headers, before contacting another origin.
 - Session option corrections recognize `httpRequestAuthorization` and external subtitle provider replacements by identity.
 - Sidecar decoding runs on a dispatch worker instead of a cooperative-pool thread, so concurrent authorized decodes cannot starve the async resolvers their requests wait on.
+- A pause made through the engine while the premature-end recovery re-seeks (AE#287) is kept. The recovery called `play()` after its seek whatever the play intent said, so the title started again.
+- An external ASS sidecar the host draws itself (`preserveASSMarkup`) on the `nativeRemoteHLS` bypass keeps its plain rendition selected behind a suppressing legible output instead of deselecting it. AE#616 measures `sourceTime` off the selected injected rendition, so the deselect left the clock a styled-ASS overlay draws from on item time, 1 to 8 s ahead of the picture after a seek on a transcode restarted at an earlier keyframe.
+- TrueHD Atmos rendered to APAC reports a decoder that produces nothing (`.audioBridgeProducedNoOutput` on VOD), as the channel bridges do since AE#641, instead of playing the picture over silence.
+- Playlist preflight through a refreshable `HTTPRequestAuthorization` keeps the 2 MB playlist cap the static-header preflight has (audit NAT-5), and relayed fetches use upstream's per-fetch pending cap (audit NET-107) in place of the fork's high-water wait.
 - Native subtitle renditions wait for complete extraction instead of caching a partial whole-track response. While extraction is pending, the local server returns a retryable HTTP 503.
 - External subtitles can declare `nativeTimelineOffsetSeconds` for media reanchored upstream. Native HLS/PiP/AirPlay renditions use the adjusted timeline while host overlay cues retain source timestamps.
+- Video routing consults the AV1 hardware decoder only for AV1 sources, avoiding supplemental decoder registration on unrelated playback starts.
+- Rapid audio-track selections coalesce into serialized rebuilds. Stop/load invalidate queued work, and play/pause commands received during a rebuild supply its final transport intent. Native handover retains the old item until replacement unless media services were reset.
+- A `play()` or `pause()` that arrives while any session-preserving rebuild runs (an audio or disc-title switch, `reloadAtCurrentPosition()`, an engine-raised rebuild) now decides the transport it comes back in; before, only an audio pick honoured it and the others came back in the state they started from.
+
+## [7.28.3] - 2026-10-07
+
+### Fixed
+
+- **A resume or seek onto an open-GOP keyframe keeps the #409 repair (#699).** Two defects on H.264/HEVC MP4s without composition offsets. The repair verdict was reached at the first read, and the software host seeks to its resume position before reading, so the sample started on a CRA (picture order not 0) and was declined: the whole session played in decode order. A seek before the first read now settles the verdict at the head first. Separately, every post-seek re-anchor treated the landing keyframe as the first picture displayed; a CRA with leading pictures is displayed that many slots later, so the axis sat early and B pictures that fell below their decode time went out untouched. The session now holds from the landing to the first trailing picture and anchors with the leading-picture count. Covered by an x265 open-GOP twin (CRA plus four RASL pictures) for a resume-shaped seek and a seek during playback. Reported by cmcpherson274. No API change.
+
+## [7.28.2] - 2026-10-06
+
+### Changed
+
+- **A bounded live start on a source the engine cuts itself no longer waits a second grace (#686).** AVPlayer opens with two plain `/media.m3u8` requests, and on raw MPEG-TS under `.fastZap` each one waited out the bounded-start grace; #684's first-serve latch spared only ingest sessions. It now covers engine-cut sources too, the behaviour 7.26.3 put behind `AETHER_FIRST_SERVE_LATCH_ALL=1`. Measured by cmcpherson274 on an Apple TV 4K (1080p59.94 H.264 + AAC, 1.001 s segments, three runs per cell): every bounded start reached its picture 1.003 to 1.039 s sooner, the session sat 0.5 to 1.5 s nearer the edge after 60 s, and 18 latched launches logged no stall, `-16832` or `-12888`. Rebuilds from a backlog served a full cushion either way. `AETHER_FIRST_SERVE_LATCH_ALL=0` restores the old gate. No API change.
+
+## [7.28.1] - 2026-10-06
+
+### Fixed
+
+- **`[SWDiag]` reports `aLead` on live DVR sessions as well (#395).** 7.27.2 added the marker to the combined demux loop only. A live session loaded with `dvrWindowSeconds` feeds its audio from the ring pump, which never wrote it, so its line still read `aLead=-` throughout. The line now reads the pump's own fed PTS there, the value the pump paces on. Measured with `aetherctl dvr --path sw`: `aLead=-` before, `aLead=4.00`, `3.12`, `2.12` after. Diagnostic only, pacing unchanged, no API change.
+- **HEVC with a parameter-set change mid-title keeps its picture.** On an Annex-B HEVC source (Blu-ray M2TS, broadcast TS) movenc converted the samples itself and, under the `hvc1` sample entry, dropped every in-band VPS/SPS/PPS, so a stream that sends a new PPS mid-title had every later slice decoded against the stale one: sound continued over a frozen or black picture. The session muxer now gets a length-prefixed record and converts the samples itself with their parameter sets kept, the shape a Matroska remux of the same stream already had; `init.mp4` and `CODECS` are unchanged. The I-frame rendition muxer takes the same path. Measured on a fixture whose PPS changes at 20 s: 463 presented frames in 42 s before (none after the change), 936 after. Diagnosed by yipengfei329 (#703).
+- **A keyframe index that stops minutes before the end is no longer trusted.** A partial scan (an MKV whose Cues are missing or point past EOF) passed both the gap and the coverage check, and the keyframe planner then cut a final segment from the last scanned keyframe to the end of the title, which the producer can never finish. The index now also has to reach within 60 s of the source duration, otherwise the session takes the uniform plan. Diagnosed by yipengfei329 (#703).
+
+## [7.28.0] - 2026-10-06
+
+### Added
+
+- **HDR Vivid (CUVA) detection in the opt-in probe (#699).** `ProbeDetail.hdrVivid` scans HEVC packets for the CUVA T/UWA 005.1 T.35 SEI and sets the new `SourceProbe.carriesHDRVividMetadata`. It runs in the same packet pass as `.hdr10Plus` and under the same `HDR10PlusDetectionOptions` budget; asking for both still opens one connection, and a cap that ends the pass after one of the two was confirmed keeps that confirmation. libavcodec's CUVA parser is internal, so `HDRVividMetadataScan` walks the body with the same field widths and only counts a complete message with a defined `system_start_code` and zero bits after its last field. `videoFormat` does not move (Vivid rides an HLG or PQ base, which stays the label), and playback is unchanged: the SEI is stream-copied as before and no Apple platform applies it. `aetherctl probe --detect-hdr-vivid` prints the finding, and `Scripts/make-hdr10plus-fixture.py --vivid` builds a fixture ffprobe parses as Vivid. Requested by ijuniorfu.
+
+## [7.27.3] - 2026-10-05
+
+### Fixed
+
+- **An HEVC MP4 without composition offsets is presented in display order (#699).** The #409 repair only armed on H.264, so an HEVC file whose writer dropped `ctts` while the bitstream reorders pictures went to AVPlayer and the software decoder in decode order, which shows as flicker and back-and-forth motion. The repair now reads the picture order count with libavcodec's HEVC parser as well, and its window check also accepts a hierarchical mini-GOP longer than the reorder delay (five pictures at delay 2 on the reporting asset). Measured on that asset (4K50 Main 10, 1500 frames): 0 backward steps in the served stream, against 35 of 88 in the first frames before. The partial-region repair stays H.264-only. Reported by ijuniorfu.
+
+## [7.27.2] - 2026-10-05
+
+### Added
+
+- **The software path names its audio route, its audio lead on live, and its renderer state (#395).** A live software session that was silent on an AirPlay 2 receiver and audible over HDMI logged the same on both. The software host now writes `[SoftwarePlaybackHost] audioRoute ...` at session start with the route's output latency (same fields as the native host's line), the engine writes `[AetherEngine] audioRoute changed reason=N ...` on every route change once per process, `[SWDiag]` reports `aLead` on live sessions too (diagnostic marker only, pacing unchanged), and it carries `aRend=status/sufficient/error` for the audio renderer, whose error was only logged in DEBUG builds before. No API change.
+
+### Fixed
+
+- **An end-of-media park that runs late still stops the clock on the last sample (#694).** The park is deferred by the queued audio tail and ran wherever the clock stood when its task got the main actor, so a busy main actor parked it past the end (measured: 1.149 s on a 1.0 s source). Both the audio-only and the software host now put the clock back on the point the deferral aimed at.
+
+## [7.27.1] - 2026-10-04
+
+### Fixed
+
+- **The audio-only path's clock parks at end of media instead of free-running past it (#694).** `AudioPlaybackHost` reported `.ended` while its synchronizer kept rate 1, so `currentTime` grew past `duration` for as long as the session stood. It now gets the AE#374 park the software host has: the queued tail plays out, then the clock stops on the last sample, and `play()` no longer restarts a clock the source stopped. Reported by ijuniorfu.
+
+## [7.27.0] - 2026-10-04
+
+### Fixed
+
+- **One refusal at byte 0 no longer settles a range-capable VOD forward-only for the whole session (#693).** An Xtream origin answered the ranged open of an episode with a 403 and the unranged GET right after it with a 200. Since #378 every 401/403/404/410 at byte 0 was read as the answer to the resource, so the source was served as a sequential origin: `startPosition` dropped and every seek past the downloaded window snapped back. The open now asks the same range once more before it settles: served, the source stays seekable; refused again, the #378 path runs unchanged. A source that refuses everything costs one request more and still fails typed with its status.
+
+### Added
+
+- **`isSequentialOrigin` (#693).** Published, true while a VOD session is served as a sequential origin, declared or found by the reader. Such a session plays from the start (a `startPosition` was not honoured) and a seek lands only inside `$residentRanges`, so a host can reopen the source itself or tell the user instead of reading log lines.
+
+## [7.26.3] - 2026-10-03
+
+### Added
+
+- **A measurement arm for the first-serve latch on engine-cut sources (#686).** On raw MPEG-TS under `.fastZap` a bounded start held AVPlayer's second plain `/media.m3u8` request for a second grace (1.0 to 1.4 s on the reporter's Apple TV). `AETHER_FIRST_SERVE_LATCH_ALL=1` applies #684's latch to those sources too; read once per process, off by default, so default behaviour is unchanged. Both arms now log how long that second request waited (`repeat live manifest request held Xs`), which was silent before. No API change.
+
+## [7.26.2] - 2026-10-03
+
+### Fixed
+
+- **One frame more bought a whole second of `.fastZap` TARGETDURATION (#670 round 2).** The GOP headroom term took `ceil(1.5 x max EXTINF)`, so on a 59.94 fps source with 1.001 s GOPs a 79-frame segment (1.318 s) sealed 2 and an 80-frame one (1.335 s) sealed 3: a 9 s holdback, and a 6 s rebuild backlog then started bounded and presented 2.5 s later. The term now asks what it means, whether a GOP 1.5 x the longest seen would list legally (RFC 8216 rounds EXTINF to the nearest integer) and finish inside AVPlayer's `1.5 x TD` patience with 0.5 s to spare, so segments up to 1.666 s seal 2. Never above the old value; 1 s GOPs keep TARGETDURATION 2. The seal line names what the term needs (`1.5 x max EXTINF 2.002s needs 2s`). No API change.
+
+## [7.26.1] - 2026-10-03
+
+### Fixed
+
+- **A software-path rescue replayed the gap a host `load()` had skipped (#629).** A native VOD item mounted past the head reads, until its mount seek lands, the start of the segment AVPlayer decodes up from (12.00 s under 15.90 s on the reporter's Apple TV), and the session published that reading. Once the host's `load()` had returned nothing else remembered 15.90 s, so an item AVPlayer refused in that window was rebuilt at 12.00 s and the film replayed 3.9 s after the rescue. The clock hold #646 gave the in-place swap now covers that mount as well: the session reads the position it was mounted at until the mount seek lands or the item plays, and the rescue resumes there. No API change.
+
+## [7.26.0] - 2026-10-02
+
+### Added
+
+- **Scrub thumbnails in the stock player (#682).** `LoadOptions.serveIFramePlaylist` makes a native VOD session list an I-frame rendition in its master, which is the one input `AVPlayerViewController` takes thumbnails from: a host that presents the system transport bar gets them, and I-frame fast forward and rewind, without writing any UI. Each entry is the source's own keyframe at full resolution, read by a second reader and stamped on the main rendition's timeline. Off by default. The rendition is left out entirely, never half-served, where the session cannot answer every keyframe (live, MPEG-TS, single-connection origins, discs, media-playlist routing); the log names the reason.
+
+## [7.25.3] - 2026-10-02
+
+### Fixed
+
+- **Engines running side by side each claimed a quarter of the same free space (#687).** A session sizes its disk allowance once, at its start, as `min(2 GiB, a quarter of the tmp volume's free space)`. An allowance another session had claimed but not yet written was still free at that moment, so four engines started together (a multiview host) could claim four quarters: on 4 GiB free, the whole volume. A session is now sized from the free space minus what the other running sessions may still write. One session alone gets exactly what it got; four on 4 GiB free take 2.7 GiB instead of 4, and n sessions always leave at least `(3/4)^n` of the volume. The live window already follows its allowance (#443), so a smaller share means a shorter timeshift depth on the later tiles, and the session log says how much was held back. Covers the native session, the software live ring and the software VOD read-ahead; no API change.
+
+## [7.25.2] - 2026-10-02
+
+### Fixed
+
+- **A live HLS ingest sealed its TARGETDURATION under the upstream's own segment length (#684).** The engine re-cuts each upstream segment (at its GOPs under `.fastZap`), so the upstream's segment entered the seal only as `ceil(segment / 1.5)`: a 6 s provider sealed 4, a client patience of exactly one delivery and a 12 s holdback against deliveries that arrive 6 to 9 s apart. AVPlayer drew `-12888`, skipped its next playlist reload and stalled with the content already listed. The seal now asks for the longest upstream segment served (up to 10 s) and takes as much of it as the join pays for:
+  - uniform 6 s segments under `.fastZap` seal 5 (holdback 15 s), uniform 10 s segments under either profile seal 9 (27 s), with the join unchanged (three segments);
+  - alternating lengths: the join is equalised over the phases of one upstream, so a tune never loads more than the deepest tune of the same channel already did. The reporting channel alternates 6 s and 4 s; its join used to be three or four segments depending on which was newest, and only the four-segment phase got more than 7.25.1's value. Both phases now join four and seal 6 (18 s). Shapes whose phases already joined alike keep their join and what it pays: 10 s / 8 s seals 8 (7 before), 6 s / 6 s / 4 s keeps 4, and a shape like 6 s / 5 s keeps a seal that follows the phase (5 or 4);
+  - 2 s providers keep 2, 3 s providers with 1 s GOPs keep 2 (their join pays for no more), and `.standard` is unchanged up to 6 s segments.
+
+  Measured on a uniform 6 s origin with jittered deliveries over 180 s: 5 `-12888` and a stall before, 3 and no stall after; over nine 60 s runs 7 stalls before and none after. On the alternating 6 s / 4 s shape: 0 to 1 `-12888` per run before, none after, in both phases. On 10 s segments the window close and item rebuild that 7.25.1 produced in 4 of 9 `.fastZap` runs and 6 of 6 `.standard` runs did not occur. Expect far fewer stalls and fewer `-12888`, not none: the reporting capture had 10 of 110 delivery gaps above 9 s.
+
+  Costs. Standing latency: 3 s more behind the upstream's edge on uniform 6 s segments and on 10 s / 8 s, 6 s on alternating 6 s / 4 s and on 10 s ones. Join: unchanged on uniform upstreams and on every shape whose phases joined alike; on alternating 6 s / 4 s about four tunes in ten load one additional short segment (3.47 s to 4.23 s to first picture behind an 8 Mbit/s link; the other six tunes already took 4.27 s). A host that allows fewer parallel requests than the join has segments (`maxConcurrentSourceRequests` of 3 or less) sees its first picture later, because the gate waits for the join to be handed over where it used to serve at 12 s of cut content: 2.79 to 3.08 s before and 3.27 to 3.49 s after, one request at a time behind 14 Mbit/s on the 6 s / 4 s shape. A join slower than the `.fastZap` grace is still served by the bounded start and then seals the full value over a window under its holdback (a `-16832` warning at the start).
+- **On an ingest the first-serve gate held the second playlist request too (#684).** On a `.fastZap` bounded start AVPlayer's second opening request waited out a second grace: 4.47 s to first picture where one grace is 2.24 s. Sources the engine cuts itself (raw MPEG-TS) are unchanged.
+- **The AE#440 forced start is no longer taken on an item that cannot play yet (#684).** On a rejoin placed by `EXT-X-START`, AVPlayer fetches from about 6 s below the target first, and the guard read that lookback as its cushion (`buffer ahead 4.00s` from a playhead the item never played from) and called `playImmediately` 36 ms before the item was ready. The decision now waits for `readyToPlay` and is asked again there. Whether this is what put sound and picture apart on the reporting device is not confirmed.
+
+### Added
+
+- **Each native live item says what it started on (#684):** `#684 item #N starts at its own Xs: segment K + Ys, whose picture opens at ... and whose sound runs ...`, and every `live seg-N finalized` line carries `sound=first..last`. The audio route line adds the route's output latency.
+- **`aetherctl play --served-url`** prints the loopback URL of each native item, and **`Scripts/hls-burst-origin.py`** is a live HLS origin whose delivery rhythm is scripted (jitter cycle, outage, window depth, mixed and inflated EXTINF, shared link rate).
+
+### Changed
+
+- `HLSVideoEngine`'s public initializer gained two defaulted parameters, `liveJoinBacklogObservation` and `liveJoinSpentObservation`. Source compatible; a host that constructs the session itself passes nothing new.
+
+## [7.25.1] - 2026-10-01
+
+### Fixed
+
+- **Cancelling the task that awaits `load()` now ends the load at once (Sodalite#173, #683).** A `.custom(HLSLiveIngestReader)` load against an unreachable provider kept running for 19 s (`open_input 18987ms` while the ingest retried its playlist), and a host that cancelled it to tune the next channel had to wait it out. The load now throws `CancellationError` within tens of milliseconds for URL and `.custom` sources, and leaves the engine the way a newer load would: `.idle`, native host and AVPlayer kept for the next load, display criteria and audio-session membership untouched; a host that leaves on cancel calls `stop()`. Generation-guarded, so a cancel never touches a session a newer `load()` or `stop()` started. A cancelled AE#629 follower also ends the software-path rebuild, nested reroutes included.
+- **A superseded custom-source `reloadAtCurrentPosition()` throws `CancellationError`** like the URL branch already did, instead of returning normally and logging a false "rebuilt on the software path".
+- **A closed `AVIOReader` no longer waits out the 0.75 s probe-fallback delay** (about 0.03 s now), which also shortens `stop()` during a URL open.
+
+## [7.25.0] - 2026-10-01
+
+### Added
+
+- **Several engines in one process share the audio session, its channel preference, the panel and Now Playing correctly (Sodalite#175, #681).** Measured with two live tiles on an Apple TV: every stop that released the session paused the OTHER engine within 10 ms, picture frozen, 4 of 4. An internal coordinator now tracks which engines are active (join on `load()`, leave on `stop()`): the session is released only by the last engine out and only when a release is owed in that round, the preferred output channel count is the widest playing source, display-criteria resets (on stop and the two load-time clears) wait for the last engine, and activation and release run on one process-wide queue (AE#538 ordering across engines). Owners are held weakly, so an engine released without `stop()` cannot pin the session. A host with one engine sees no change. See `docs/api.md`, "Running several engines at once".
+- **`LoadOptions.sharedOutputRole`** (`SharedOutputRole.primary` default, `.secondary`). A secondary never writes display criteria, skips the play-gate wait for a criteria write nobody will make, and never claims Now Playing, on the video and the audio-only path. Identity field.
+- **`AetherEngine.logTag`**: a short instance name carried by the `[SharedOutput]` lines and a `[AetherEngine:<tag>] state=` line per transition. Set it before `load()`.
+- **`aetherctl play` checks the served `.vtt` against the window its playlist declares (#680):** segments are picked at the playhead by walking EXTINF, `MISPLACED=N` names cues outside their segment's window, and an empty served `.vtt` is now a visible log line.
+
+## [7.24.0] - 2026-09-30
+
+### Fixed
+
+- **`.fastZap` on an HLS upstream with long segments always ended at the bounded start (#678).** The served TARGETDURATION on an ingest is floored by the longest upstream segment (`ceil(longest / 1.5)`, AE#447), so a 10 s provider seals 7 and the first serve wants 21 s, but the join covered `1.5 x` the advertised target duration: two 10 s segments, 19 s once the last GOP stays open. Short by construction for every segment above ~5 s, so every zap waited out the grace on content the origin already held. The join now covers that holdback plus one GOP (at most 4 s). Measured on 10 s segments: first picture t+2.2 to 2.5 s -> t+0.22 s on loopback, t+4.1 to 4.4 s -> t+2.9 s behind a 40 Mbit/s link.
+- **The HLS live ingest ignored `maxConcurrentSourceRequests` (#678).** It charged nothing to the origin request budget and fetched four segments in parallel, so a host declaring `1` for a single-connection provider still opened four requests to it. Playlist, segment and key fetches now take a budget ticket, report refusals and redirects, and the prefetch window narrows to the limit; a direct `.custom(HLSLiveIngestReader(...))` load registers the ceiling on its playlist URL.
+- **A same-format load kept the panel in its UI mode after the host cleared the display criteria itself (#678).** The unchanged skip compared against the engine's own record only; it now also reads `preferredDisplayCriteria` back and writes again when it finds nothing set.
+
+### Changed
+
+- **A live URL known to be an HLS playlist skips the raw probe (#678).** A `.m3u8` / `.m3u` path, or a URL that already took the AE#363 reroute in this process, goes straight onto the live ingest instead of spending one discarded request per zap.
+
+### Added
+
+- **`[Demuxer] open timings`** on every playback, probe and restart open: connect, `open_input` and `find_stream_info` separately, the stream count and the probe budget, also when the stream analysis fails (#678).
+
+## [7.23.2] - 2026-09-30
+
+### Fixed
+
+- **A Dolby Vision master was refused when the source stated HEVC level 5.2 (#674).** Encoders stamp level 5.2 (156) on 1080p24 streams, the level went into the master's `CODECS` verbatim, and an Apple TV 4K screens a declared level against the device: the DV master and the reduced HDR master both failed with -11848 / CoreMedia -15517, and the session ended on the media playlist with Dolby Vision dropped. The declared level is now capped at 5.1 (`L153`, which covers 2160p60), for the hvcC-derived string and the fallback alike; the init's hvcC keeps the stated level. The DV routes (P8.1, P8.4, P7) also derive their `CODECS` from the hvcC now, so they carry its constraint bytes like the plain HEVC route has since AE#187. Contributed by @gonkowonko (#677).
+
+## [7.23.1] - 2026-09-30
+
+### Fixed
+
+- **`.fastZap` live froze on sources with irregular GOPs (#670).** The engine's sub-second cut makes every segment one whole GOP, and TARGETDURATION was sealed from the first few with no headroom over them: a broadcast whose GOPs run 1.0 to 2.4 s sealed 1 on three 1.000 s ones, then broke `EXTINF <= TD` on every longer GOP and held the playlist unchanged past AVPlayer's patience (-12888, #524 on 1.5 s of runway, and on macOS the playlist refused outright). Self-cut fastZap segments now seal `ceil(1.5 x max EXTINF)`, the headroom `.standard` always had from its cut-target floor, so 1 s GOPs serve TARGETDURATION 2 and a 6 s holdback. Ingested segments and `.standard` are unchanged.
+
+## [7.23.0] - 2026-09-30
+
+Second full audit of the engine (2026-09-29, against 7.22.2): about 107 verified defects (3 High, 35 Medium), including regressions and incomplete fixes the first audit's patches left behind. All but three performance items are fixed here, each with a regression test that failed before it; the embedded-subtitle double download (PERF-103), the byte-bounded fragment flush (PERF-105) and the audio tap readers' cost (DEC-108) need a device round or a larger redesign and are deferred.
+
+### Added
+
+- **`EngineLog.redacted(_:)`** returns a line exactly as the log handler would receive it, so a host or tool can print a URL through the same redaction funnel (audit OPS-106).
+
+### Changed
+
+- **Durations past a week are refused or clamped.** An HLS `#EXTINF` / `#EXT-X-TARGETDURATION` that is non-finite or over 7 days, or a VOD playlist summing past 7 days, fails the load with `playlistInvalid`; a container duration over 7 days is reported as 7 days (audit NET-101, HLS-102).
+- **A server that ignores HTTP Range plays forward-only.** It is detected at the response head (confirmed once with a one byte range) and played like `sequentialOrigin`: no seeking, `AVSEEK_SIZE` still answers the Content-Length. A remote disc image on such a server fails at load with `originIgnoresRange` (audit DMX-101, NET-102).
+- **Remote HLS bodies are size-capped at the response head.** Segments may weigh 20 MB per second of their `#EXTINF` (between 32 and 256 MiB), keys 64 bytes, live subtitle playlists 8 MiB and their segments 1 MiB; a non-2xx status ends the transfer (audit NET-112, FEA-107).
+- **Credential headers stay on the host's origin.** Cross-origin redirects and playlist-named hosts on the ingest, disc, relay, subtitle proxy, audio tap and live-subtitle routes no longer receive `LoadOptions.httpHeaders`. On the native bypass AVFoundation still sends them everywhere, which `docs/api.md` now states (audit NET-108, NET-109, Vcred-104).
+- **Log lines changed shape.** The local server's session token reads `/<redacted>/`, request lines omit it, tokenless requests collapse into one throttled line, and ingest / carriage-probe URL errors log `NSURLError <code> from <host>` instead of the failing URL (audit SUB-107, NET-111, NET-114).
+- **`load()` returns normally when the app backgrounds mid-load, and an audio-track switch keeps a paused session paused.** Hosts that treated a `CancellationError` from `load()` as a supersede now get a normal return followed by the background teardown (audit LIF-101, LIF-102).
+
+### Security
+
+- **A hostile HLS playlist no longer crashes the app with an infinite or huge duration.** `inf`, `nan` or values past a week in `#EXTINF` / `#EXT-X-TARGETDURATION` are refused at the parser, and a VOD playlist summing past a week is refused. Before, a live join, a live subtitle rendition or a HEVC-in-TS VOD ingest trapped on it (audit NET-101, FEA-102, HLS-102).
+- **A corrupt container duration or keyframe index can no longer crash segment planning or ask for terabytes.** Durations are clamped to a week, implausible index entries are dropped, and the plan builders fail empty instead of trapping or reserving trillions of segments (audit HLS-102).
+- **A crafted DVD subpicture no longer reserves up to 4 GiB.** Units above 1 MiB are dropped, the up-front reservation is at most 64 KiB, and fragments join in place instead of copying the partial unit each time (audit NET-104, DMX-106).
+- **Tiny laced audio packets can no longer pin gigabytes while the video gate waits.** The pre-gate audio buffer is also capped at 65,536 entries (audit SEG-102).
+- **Credential headers no longer follow a redirect to another origin on any engine session** (audit NET-108). URLSession's own redirect copies every custom header except `Authorization`, so `X-Emby-Token` and `Cookie` followed a cross-host or https-to-http 302 on the HLS ingest readers, the carriage probe, the remote disc reader, the origin relay, the subtitle proxy, the audio tap and the live rendition fetch. Every engine session now applies the #126 rule AVIOReader already applied.
+- **Allowing a relay or proxy fetch no longer grants it the host's credentials** (audit NET-109, NAT-105, DEC-103, Vcred-101). After a cross-host redirect on the #316 master, the relay anchored its grant on the edge, so the token went there and the host's own origin lost it. The #316 variant fetch, the remote-HLS audio tap and the live subtitle rendition fetch sent every host header to every host a playlist named. All of them now send credentials only to the URL the host handed over.
+- **The log redactor reads through percent escapes** (audit SUB-104, NET-114). An upstream URL carried percent-encoded inside a proxy or debrid wrapper kept its Xtream password, userinfo password or base64 token in `load url=`, `asset.url=` and URL error dumps. The ingest and carriage-probe errors now log the error code and host instead of the failing URL.
+- **A query password holding `:` `;` `,` `)` or `>` is redacted whole** (audit SUB-108). Previously the text after the first such character stayed in the log.
+- **More credential shapes are redacted** (audit SUB-109). This covers `Bearer` and `Basic` credentials, any cookie, `api-key` / `X-Api-Key`, `pwd`, `passwd`, session ids, auth, refresh and session tokens, and quoted JSON or dictionary keys. `EngineLog.registerSecret` now counts registrations.
+- **The local server's session token no longer appears in the log** (audit SUB-107). Request lines, `load url=` and `asset.url=` used to hand a live LAN capability to anyone reading a shared log.
+- **A LAN peer without the session token can no longer flood or forge the log** (audit NET-111). Its lines are throttled with a tally, and its request text is logged with control characters escaped.
+- **The first-request header dump prints header names, not values** (audit Vcred-102). On the stand-in route AVPlayer sends the host's credentials to the loopback server too.
+- **aetherctl banners print the redacted source URL** (audit OPS-106). New public `EngineLog.redacted(_:)` returns a line exactly as the log handler would receive it.
+- **The local server's exposure is documented accurately.** `SECURITY.md`, `architecture.md` and `cli.md` no longer say it is loopback-only: it binds all interfaces for AirPlay behind a per-session 128-bit path token, a 32-connection cap (24 for non-loopback peers) and a 10 s head deadline. `docs/api.md` also states that on the native bypass AVFoundation sends `LoadOptions.httpHeaders` to every host and redirect target (audit OPS-102, Vcred-104).
+- **The bridge memory telemetry no longer reads freed FFmpeg contexts** (audit DEC-104). `liveBytes` and `fifoSampleCount` read a snapshot published under the bridge lock, instead of calling `swr_get_delay` on a resampler or encoder that feed or restart may have just freed.
+- **A crafted Blu-ray or DVD image can no longer stall or exhaust memory during disc recognition** (audit NET-103). Playlists are capped at 999 PlayItems, at most 4000 `.mpls` entries and 32 MiB of playlist data are read, retained PlayItems are budgeted, and a title is cut at 65 536 extents. Clips and IFOs are found through one name index instead of a scan per item, and a DVD only groups title sets 1 to 99.
+- **The Dolby Vision record audit can no longer read a whole source looking for a frame** (audit BIT-103). The RPU walk now arms the same input byte budget the HDR10+ and Atmos probes use.
+- **HLS segments, AES keys and audio tap downloads are bounded as they arrive, not after they are fully held** (audit NET-112, NET-113, DEC-103). A non-2xx status or a declared length over the cap ends the transfer at the response head; the body accumulates in chunks and is cancelled at the cap (a segment may weigh 20 MB per second of its duration, between 32 and 256 MiB; a key 64 bytes).
+- **The live subtitle rendition loop no longer fetches, parses and merges on the main actor, and is bounded** (audit FEA-104, FEA-107, SUB-106). Ephemeral session with a 30 s resource timeout, status checked, playlists capped at 8 MiB, segments at 1 MiB and 4096 cues, non-finite or negative timestamps dropped, published list capped at 2000 cues.
+- **Hostile subtitle and playlist text no longer costs quadratic time** (audit SUB-101, SUB-110, NET-105, NAT-102). An unclosed-brace ASS cue took 2.6 s for 20k braces on the pump thread, and a 64 KiB HLS tag line with unclosed quotes took 9.6 s. Override blocks strip in one forward pass and a cue is cut at 64 KiB; attributes scan a tag line once and a line over 64 KiB is refused.
+
+### Fixed
+
+- **Seeking, thumbnails and resume positions reject NaN, infinity and huge values instead of crashing.** The Demuxer converts seconds through a checked helper and the seek fails cleanly. `FrameExtractor` returns nil, the SW and audio hosts ignore a non-finite start position, `seek(to:)` ignores a non-finite target, and the byte-estimate seek saturates at an inflated `Content-Range` total (audit DMX-113, BIT-105, DMX-103).
+- **`dvrWindowSeconds: .infinity` no longer crashes the first live manifest request.** The window is clamped to a day inside the live window sizing (audit SEG-107).
+- **A non-finite or absurd audio sample rate on the remote-HLS bypass reads as 0 instead of crashing at readyToPlay** (audit NAT-106).
+- **ASS `\pos(nan,nan)` or `PlayResX: inf` no longer publish a NaN placement.** The cue falls back to its alignment (audit SUB-112).
+- **aetherctl rejects huge or negative numeric flags with exit 64, and `pktdump` survives overflowing dts deltas** (audit OPS-110, SUB-112).
+- **Going to the background during a load no longer makes `load()` throw `CancellationError`** (audit LIF-101, LIF-105). The teardown owed since `didEnterBackground` ran when the native load passed item readiness, seconds before it returned, so the host read a supersede and left its spinner up without a start report. It now runs after `load()` returns. A PiP window closed in the background during a load or seek is torn down once it settles, instead of never.
+- **An audio-track switch on a paused session stays paused** (audit LIF-102). The same goes for every custom-source `reloadAtCurrentPosition` (audio-delay nudge, option correction), including a mount with `autoplay = false`.
+- **An audio or disc-title switch after a media services reset builds a fresh AVPlayer** (audit LIF-104).
+- **A callback from an ended session no longer reaches the next one** (audit LIF-103, Vcore-101, Vcore-102). No `.error` on a stopped engine from a late escalation, no reader stall or scrub state carried into a successor, and no stale master rejection replayed by a reused host.
+- **Cancelled or superseded loads stop waiting on a display mode switch at the next tick, and the #667 wait and the play gate share one 6 s cap** (audit LIF-106, DEC-105).
+- **An in-place item swap releases its clock hold only on the fresh item's own playback** (audit NAT-103).
+- **A load superseded during its Dolby Vision RPU audit no longer writes its geometry over its successor's** (audit LIF-107).
+- **A live channel the engine reconnects keeps playing instead of freezing on its last segment** (audit HLS-101). Only the session's first producer reported its segments to the playlist. A live reopen, a muxer-failure rebuild or the AE#222 rebuild cut new segments that the playlist never listed, so AVPlayer froze after "live reopen succeeded" until the host retuned (Sodalite) or the viewer acted (AetherPlayer). Every producer the session builds now reports into the playlist.
+- **A rate-limited source's delayed revive no longer drags a recovered session back to where it failed** (audit HLS-104). The #377 revive waited 3 to 45 s and then re-anchored whichever producer was running, usually the working one a seek or segment request had already put in. It now runs only while its dead producer is still installed and the session is unchanged.
+- **A seek that re-cuts a keyframe drought keeps the clock and captions on the picture when the re-cut opens late** (audit HLS-105). If the AE#412 re-cut took longer than the seek's 2 s wait, its mark was dropped and its backoff went into the published axis, up to one GOP off until the AE#418 reconcile. The mark now belongs to the restart that performs it.
+- **A seek burst no longer leaves a stale timeline entry or a truncated segment behind** (audit SEG-104). A producer replaced while a read was in flight could still record its gate-open epoch, or adopt its half-written segment when the aborted read came back as end of file, so a later backward seek hit a short segment. Replaced producers are now ignored, and a stopped pump drops the read it had in flight.
+- **A sequential archive with bridged audio plays to its real end** (audit SEG-103). When the last GOP crossed the last plan boundary, the audio tail flushed at end of file opened a segment the video never reached, and ENDLIST landed one segment early. The flush now follows the video cutter like the rest of the audio.
+- **A damaged keyframe at a seek or restart point is repaired like the same frame played through** (audit BIT-104). The framing verdict that lets the AE#561 sanitizer cut an overlong NAL length reset with every muxer, so the sample a restart landed on reached movenc uncut and failed with `-19602` on every retry. The verdict is now kept for the whole session.
+- **Manual DMG runs build the tag they upload to.** `release-dmg.yml` dispatched by hand checked out the dispatching branch and then signed, notarized and `--clobber`-uploaded it under the tag's name; the checkout is now pinned to the tag and the log names the built commit (audit OPS-101).
+- **`aetherctl dovitest` reads Annex-B sources and fails loudly.** The probe resolves the NAL framing once and uses it for the converter and the writer, so a disc remux is no longer reported as converted while writing one bogus NAL per packet. A full disk or a read error now ends the run with an error instead of an abort or a silent EOF, and the output is opened without following symlinks (audit BIT-106).
+- **`aetherctl` no longer leaves a new debug directory per run.** Debug artefacts go to one private per-user directory that the next run overwrites, and `dovitest` takes `--out` (audit OPS-107).
+- **`aetherctl seektest` and `smbtest` can fail.** `seektest` reads its counters under the log lock and exits 1 when a probe prints FAIL or a wedge is left unrecovered. `smbtest`'s random-seek check compares against the bytes the sequential pass saw and no longer passes when reads fail (audit OPS-104, OPS-105).
+- **The demo DMG drops two hardened-runtime exceptions.** `disable-library-validation` and `allow-unsigned-executable-memory` are gone from the notarized demo, effective at the next release build (audit OPS-112).
+- **Audio-only files and radio streams whose timestamps start late play instead of staying silent** (audit DEC-102). The audio-only host anchored its clock at the load position and ignored the first sample, so a source starting an hour in (an Ogg Icecast stream, a mid-broadcast audio TS) stamped every buffer far ahead of a clock at 0. It now anchors at the first sample, publishes position relative to it, and seeks on the source axis.
+- **Dolby Vision Profile 5 scrub thumbnails lose the green and magenta cast again** (audit BIT-102). The cache-backed still path took VideoToolbox for every title, and its P010 output skips the Dolby Vision converter. No-base-layer Dolby Vision (P5, AV1 P10.0) stays on software for stills.
+- **A second undecodable audio track on a live channel no longer re-hangs the session silently** (audit FEA-103). The AE#641 mark held one stream; it is a set now, and a repeat report is logged.
+- **A stop during a failing recording teardown reports the failure, and a start that a stop or zap overtook is cancelled** (audit FEA-105, FEA-106). `stopRecording()` used to publish `.ended` while the file was still draining and lose the `.writeTooSlow` failure. `startRecording(to:)` now throws `CancellationError` when a stop or a new load lands during its wait for the previous file.
+- **Full-range and 10-bit SDR software-decoded video show correctly** (audit DEC-107). The software decoder now reads `color_range` and the frame's bit depth, so full-range AV1 / VP9 / HEVC is no longer crushed and 10-bit SDR AV1 / VP9 is no longer dithered to 8 bit.
+- **A seek, a DVR rewind or a renderer self-flush no longer leaves audio stuck** (audit DEC-106). `AudioOutput.flush()` retires an epoch, and the FFmpeg hosts, including the DVR ring path, enqueue only if it is unchanged. The AE#549 auto-flush runs off the posting thread, so a renderer that posts from inside `enqueue` cannot hang the feed.
+- **An injected subtitle rendition is matched by its playlist identity** (audit NAT-104). An origin rendition whose localized display name equalled the sidecar's NAME could be selected instead.
+- **The Atmos confirmation pass closes the reader fork it only tests for nil** (audit DEC-109).
+- **A server that ignores HTTP Range now plays to the end instead of stopping at 32 MB, including when the first request was refused or slow** (audit DMX-101). The response head is judged on the cold open and again on the connection that follows the size probe, so a 429/503 or slow first answer no longer hides the origin. A range-ignoring 200 is confirmed once with a one byte range, then plays forward-only (no seeking), still reporting its Content-Length so MPEG-TS duration estimation works. Origins that honour Range, and small files answered with a 200, are unchanged. A CDN that only fills its cache while a client downloads it can read as range-ignoring and then plays forward-only.
+- **A remote disc image on a server that ignores Range now fails at once with a named cause** (audit NET-102). The disc reader judged range answers only after downloading the whole body. It now decides at the response head and hangs up, and the load throws `originIgnoresRange`. A 206 wider than asked is cut where the range ends.
+- **A forward-only source whose transport ignores the pause now ends with a named cause** (audit DMX-107). Reaching the 128 MB hard cap reports `AVIOReaderError.originIgnoresFlowControl` through `lastReadFailure` and the log, instead of a bare EIO that looked like a dropped connection.
+- **A detour block fetch no longer takes two origin slots** (audit DMX-105). On an origin limited to two requests with the pump holding one, each detour block waited 4 s for its own second slot.
+- **A malformed chunked response on the held connection ends the connection instead of growing without bound** (audit DMX-111). A size or trailer line over 4 KiB, or 64 KiB of framing with no body byte, now throws. Opt-in `heldSourceConnection` path.
+- **A forward-only source keeps its opening GOP** (audit HLS-103). The NAL framing probe and the in-band hvcC scan used to seek to 0 and consume packets; libavformat flushes its queue before it tries a seek, so a range-less archive lost its first GOP. The demuxer now holds the packets those probes look at and hands them to the producer, and refuses repositions on a source that cannot rewind.
+- **A remote disc image session is released when the demuxer closes** (audit NET-110, DMX-110). The disc reader the demuxer built for a remote ISO stayed open on close, on a failed open and on an unparseable structure.
+- **Closing a demuxer cancels an open that is still connecting, a read on a local path, and a pump waiting for its origin slot** (audit DMX-102, DMX-109, DMX-112). `markClosed()` now reaches those stages instead of waiting out the origin's slot or pacer timeout.
+- **A stop no longer looks like the end of the source** (audit SEG-104). A read aborted by the demuxer close now reports `AVERROR_EXIT` and the hosts treat it as the stop arriving; tail adoption, bridge flush and `onSequentialSourceEnded` no longer fire from a teardown.
+- **Track and stream accessors no longer read libavformat's live streams array** (audit DMX-108). They answer from a snapshot, and `close()` waits for callers inside `withStream(at:)`, closing a use-after-free window during a live reopen.
+- **Unfinished PGS display sets count toward the subtitle store's memory cap** (audit SUB-111). A stream that never sends an END segment can no longer escape the aggregate cap; one set is capped at 4 MiB instead of 16.
+- **A full volume no longer freezes a software live channel** (audit VPERF-101). The ring used to evict only after a successful write; it now frees its oldest chunk on a failed write (full disk or quota) and retries.
+- **The segment cache's stale sweep no longer deletes a live DVR ring an hour into a session** (audit SEG-105). The ring holds the same flock marker as the cache.
+- **One stalled relay consumer no longer blocks every other relayed fetch** (audit NET-107). A fetch that falls more than 32 MiB behind is cancelled and re-requested.
+
+### Performance
+
+- **`playlistShiftSeconds` is published only when it changes**, so the engine's `objectWillChange` no longer fires at 10 Hz (audit PERF-106).
+- **Forward-only playback no longer copies the whole read-ahead buffer on every read** (audit PERF-102, DMX-104). The streaming buffer is chunked, so a read copies only what it returns. 200 reads against a 60 MB buffer went from 329 ms to 5.7 ms on a debug build.
+- **Idle scrub detour blocks are released after 30 s** (audit PERF-108). Previously they stayed resident until close, up to 32 MB per reader.
+- **The subtitle packet store appends in place** (audit SUB-103, PERF-107). 40k appends took 10.9 s because every append copied each retained packet.
+- **HLS program dates parse without building two formatters per line** (audit NET-106).
+- **Playlist bodies accumulate in chunks** (audit NET-113). 32 MiB took 5 s in a debug build and takes 0.14 s now.
+- **The software live DVR ring no longer costs a file and a heap object per packet** (audit PERF-101, SEG-106). It spools into ~4 MB chunk files behind a flat 24-byte index (266 MB of index heap at 100k packets is now 4 MB, appends 314 us to 28-45 us) and is bounded by bytes as well as time (min(2 GiB, a quarter of free space), at least 64 MiB). The software live seekable range follows what the ring still holds.
+- **Software video holds one frame for reordering instead of four** (audit PERF-104). Only the VideoToolbox HEVC decoder emits out of presentation order, so libavcodec and dav1d output skips three dead frames (75 MB of IOSurface at 4K P010). A late frame is dropped, not shown out of order, and raises the depth to 4 for that renderer.
+- **The software demux loop no longer wakes 200 times a second while parked** (audit PERF-110). It waits on its condition for 5 to 20 ms.
+- **The software VOD packet spool writes a record with one `writev` and reads it without intermediate copies** (audit PERF-109). A 208 KB packet round trip went from about 800 us to about 380 us on the dev Mac.
+- **Dolby Vision profile 7 to 8.1 rebuilds a packet with one copy instead of two** (audit PERF-111).
+
+## [7.22.2] - 2026-09-29
+
+### Fixed
+
+- **An unproven HDR master is served after the display mode switch, not during it** (#667). The
+  pre-flight releases the load at its 2 s cap while an HDR switch is still running, which is what keeps
+  the load overlapping the switch (#348). On a panel whose EDR headroom never proves HDR (#459) the
+  engine then offers the master and lets AVPlayer's acceptance answer, and mid-switch AVPlayer answers
+  for the mode the panel is leaving: measured on tvOS 27, `-11868` 80 ms after the serve and 660 ms
+  before the switch ended. The refusal latched (#588), so every HDR title went media-direct and lost its
+  subtitle and audio renditions. That route now waits for a switch it saw start to end, re-reads the
+  panel, and routes then; the play gate held the first frame until that end anyway. A refusal raised
+  while a switch is in progress still earns the item its media fallback but no longer sets the latch.
+
+## [7.22.1] - 2026-09-29
+
+### Fixed
+
+- **`LiveTelemetry`'s two bitrate fields measure the media played, not the bytes transferred** (#514).
+  Both were metered from the reader's transfer counter, which parts from playback on every route that
+  reads ahead: a 20 Mbps VOD stream read about 35 Mbps (prefetch and seek re-fetches counted as they
+  arrived), and a paused live session kept draining its origin into the DVR window while the divisor
+  stood still, so its average climbed for as long as the pause ran. The pumps now record the played
+  video and audio packets by presentation time, and the sampler charges what the playhead crossed:
+  `instantBitrateMbps` over about the last 10 s of playback, `averageBitrateMbps` over the session.
+  Both stand still through a pause on every route, live included, and a seek charges nothing for the
+  span it jumps. The transfer remains `networkThroughputMbps`. The remote-HLS bypass is unchanged (it
+  reports the variant's declared rates).
+
+## [7.22.0] - 2026-09-28
+
+### Changed
+
+- **The remote-HLS bypass publishes what a stats panel reads.** On `nativeRemoteHLS` (route
+  `.remoteBypass`) the engine published no `liveTelemetry`, an empty `audioTracks` and no delivered
+  video format, so a host fell back to its own metadata for the original file: a 1280x720 H.264 Jellyfin
+  transcode showed as "3840x2160, Main 10, 17 Mbps". Everything is now read from AVPlayer's own item, with
+  no second connection to the origin (#664):
+  - `diagnostics.liveTelemetry` runs on the bypass. The two bitrate fields are what the playing variant
+    declares (BANDWIDTH, and AVERAGE-BANDWIDTH or BANDWIDTH where the master omits it), because what
+    AVPlayer transferred is buffer fill at link speed. Network throughput, transferred bytes, dropped
+    frames and forward buffer come from the access log and the loaded ranges. The loopback counters read 0.
+  - `audioTracks` carries one `TrackInfo` per audio track AVPlayer built (codec, channels, sample rate,
+    profile, Atmos, language), ids from 400000. `selectAudioTrack` is informational on this route and
+    logs instead of acting.
+  - `sourceVideoWidth`, `sourceVideoHeight` and `sourceVideoStreamFormat` describe the stream AVPlayer
+    plays. Under a server-side transcode that is the transcode, not the library's file.
+
+## [7.21.1] - 2026-09-27
+
+### Fixed
+
+- **A software session keeps the volume the host app set.** The engine applies its stored volume to a
+  new host before `load()`, and `SoftwarePlaybackHost` and `AudioPlaybackHost` forwarded that only to
+  the `AudioOutput` that `load()` builds later, so the write was dropped and every software session
+  started at full volume, with `volume` reading 1.0 until then. Both hosts now hold the volume and
+  hand it to each output they build (#660).
+
+## [7.21.0] - 2026-09-27
+
+### Added
+
+- **The stream format a stats panel needs, from the engine (#658).** `sourceVideoStreamFormat` (and
+  `SourceProbe.videoStreamFormat`) is a `VideoStreamFormat`: pixel format, bit depth, colour primaries,
+  transfer, matrix, range and profile in libav's names, with viewer labels alongside ("BT.2020",
+  "PQ (SMPTE ST 2084)", "Limited"). A field the stream leaves unspecified stays nil rather than reading
+  as BT.709. `decodedVideoFormat` is what the engine's own decoder produced and the CoreVideo buffer it
+  was displayed from ("P010 (x420)"), republished on change; it is nil on the native routes, where
+  AVPlayer decodes and no frame passes through the engine. `TrackInfo` gains `sampleRate`,
+  `bitsPerSample`, `sampleFormat`, `channelLayout` and `profile`, the last being where DTS:X and
+  TrueHD Atmos show up. `aetherctl probe` and `aetherctl play` print all of it.
+
+## [7.20.1] - 2026-09-27
+
+### Fixed
+
+- **An in-place load on a reused native host no longer publishes a pause at the seam.** The host
+  stopped observing `timeControlStatus` before pausing the outgoing item, so it kept publishing
+  `.playing`; the next load replayed that on subscribe, treated the transport as already rolled, and
+  let its own pre-roll `.paused` through as a real pause (`loading, playing, paused, playing` within a
+  millisecond). A host raising its transport on an external pause showed it over every
+  auto-advanced episode. `aetherctl play --host-calls reloadnext` reproduces the seam (#661).
+
+## [7.20.0] - 2026-09-27
+
+### Added
+
+- **`airPlayPictureStaysLocal`.** iOS publishes true while a wireless AirPlay receiver holds the audio
+  route and the session runs on the software host, whose picture stays on the device while its sound
+  goes to the TV. Nothing fails there, so a host had no way to tell the viewer why the receiver showed
+  no picture.
+
+### Fixed
+
+- **A URL source that can only be read front to back plays on the native path, and AirPlays with a
+  picture.** An origin that ignores `Range` and names no length (a remote MKV on filesamples.com)
+  was forced onto the software host, which cannot seek on it either and never hands a receiver its
+  picture: AirPlay played the sound only. When the container states a duration the engine now serves
+  such a source as a sequential origin, and an AirPlay hop swaps the item onto the LAN address rather
+  than reopening a source that could only restart from byte 0.
+- **A forward-only source no longer loses its opening.** The cursor reset after the segment plan
+  seeked a source that cannot rewind, which drops the packets the probe had buffered and leaves the
+  Matroska demuxer resyncing wherever the stream had got to: the first GOP of a 30 s clip, 30 s into
+  a remote MKV on the software path.
+- **A sequential origin whose GOP is longer than the segment stride lists all of its media.** Audio
+  opened segments by time while the playlist is built from the video keyframe cuts, so the video
+  after an audio-opened boundary landed in a file the playlist never listed (4 to 11 s of an 11 s
+  first GOP), and AVPlayer stalled at the end of seg0. Audio now follows the video cut there, as on
+  live. The finalize reports are also anchored on the pump's first segment, so a skipped index known
+  before seg0 is captured no longer holds back every later one.
+- **A backward jump on a sequential origin is served from the cache.** The residency scan read the
+  holes its cutter leaves as a gap and asked for a restart the origin cannot give, which published
+  "Source cannot be repositioned" over a session that held every segment it needed (an AirPlay hop
+  back to the device, 22 s in).
+
+- **A `FrameExtractor` still carries the colour space playback shows the picture in.** SDR stills
+  were tagged sRGB while their pixels are in the source's own primaries and video transfer. They now
+  carry the space CoreVideo builds from the tags the displayed buffer carries
+  (`kCGColorSpaceCoreMedia709` for BT.709). Against VideoToolbox's own conversion of the same frame,
+  max channel error 9 -> 2 on BT.709, 52 -> 2 on NTSC SMPTE-C, 57 -> 2 on SDR BT.2020.
+
+## [7.19.0] - 2026-09-26
+
+### Fixed
+
+- **A software-decoded picture carries the colour tags VideoToolbox would give it (AE#654).** The
+  software decoder attached a tag only where the frame declared one and CoreVideo had a mapping, so
+  an untagged source reached the display layer with no primaries, transfer or matrix, while the same
+  file through VideoToolbox arrives tagged BT.709. It now fills the gaps the way VideoToolbox does,
+  measured on its output: nothing declared means BT.709 in all three at any size and codec, and a
+  lone BT.601 matrix gets SMPTE-C primaries. Affects the software route (MPEG-4 ASP, MPEG-2, VC-1,
+  VP9, AV1 without hardware decode). `ColorDescription` keeps its gaps, so the HDR gate and the
+  tone mapper still see an untagged stream as untagged.
+- **Tagged SD sources keep their tags on the software path.** `ColorAttachments` had no mapping for
+  BT.601 matrices, SMPTE-C or EBU 3213 primaries, so a correctly tagged PAL or NTSC source lost all
+  three. Added with DCI-P3, SMPTE 240M, sRGB and linear transfer.
+- **A `FrameExtractor` still is converted with the picture's own matrix and range.** The SDR still
+  path never called `sws_setColorspaceDetails`, so every still went through swscale's BT.601
+  default and a range read from the pixel format alone: HD colour bars were up to 33 levels off, and
+  a 10-bit full-range picture (no `yuvj` variant exists) was read as limited. The matrix now follows
+  the rule the displayed buffer is tagged by, so an untagged still resolves exactly as playback.
+
+### Added
+
+- **`SoftwareDecodeProbeResult.firstFrameColor`**: the colour tags the first picture reaches the
+  display layer with, as `primaries / transfer / matrix`. Printed by `aetherctl swdecode`.
+
+## [7.18.2] - 2026-09-26
+
+### Fixed
+
+- **A software-path escalation reports the position its rebuild resumes at (AE#629).** Under a
+  mount raised by a host `load()`, AVPlayer's clock reads the start of the segment it decodes up
+  from until the mount seek lands, and a refusal in that window put that reading on the `#561` line
+  and on `SoftwarePathEscalationEvent.positionSeconds`, while the rebuild itself resumed at the
+  position the load was handed: 12.00 s against 15.90 s on the reporter's Apple TV. Both now carry
+  the rebuild's position.
+
+## [7.18.1] - 2026-09-26
+
+### Fixed
+
+- **A VOD consumer that goes quiet while it keeps playing no longer trips the #65 wedge breaker.**
+  AVPlayer on a cellular iPhone fetches in bursts, several segments at once and then nothing for
+  half a minute to almost two while it plays out a forward buffer of up to 113 s. The slow path
+  counted that silence alone, broke the park every few minutes and nudge-seeked a healthy session,
+  which flushed the buffer on screen: a half-second freeze of picture and sound each time, and a
+  re-anchor that fetched the source it already held a second time. The slow path now counts only
+  seconds in which the consumer neither fetched nor rendered; one that really stopped fetching
+  still breaks on the fast path once its buffer runs dry. The `PARK` line carries the new count as
+  `idle=` and names a quiet but playing consumer as such (AE#649, thanks @tschuegy).
+
+## [7.18.0] - 2026-09-26
+
+### Changed
+
+- **A remote disc image adopts a warm (#647).** `AetherEngine.prewarm` on an `.iso` / `.img` /
+  `.udf` URL was fetched and then never used: the disc reader kept its own buffer, probed the size
+  with `bytes=0-0` and fetched the head again, and the warm stayed in the store. The disc reader now
+  takes the size from the warm, serves the disc structure and the title's opening extents out of it,
+  and starts its first request at the warm frontier; its forks share the same bytes without a copy
+  and no longer re-probe the size. A disc-image URL that turns out not to be a disc hands the warm
+  on to the streaming reader. Measured on an authored DVD over a 20 Mbit/s, 100 ms origin: 10
+  requests after the warm instead of 19, first frame 5.7 s sooner.
+
+### Fixed
+
+- **A DVD title opens without reading 50 MB first, and lists every subtitle it has (#651).**
+  MPEG-PS never lets `find_stream_info` finish early, so every DVD open read the whole playback
+  probe budget (50 MB / 60 s) and still missed any subtitle stream whose first packet came later.
+  The subpicture streams the title's VTS IFO declares are now created before the probe, their
+  fragments are joined in the engine the way libavformat's `dvdsub` parser joins them for streams
+  it creates itself, and a title with a readable IFO probes 8 MB / 5 s. Measured on an authored
+  DVD over a 20 Mbit/s, 100 ms origin: first frame at 6.5 s instead of 29.6 s, 0.5 s after a
+  prewarm. A subtitle whose first packet sits at 100 s is a track from the first frame and
+  decodes. Discs without a readable VTS IFO, and plain `.mpg` / `.vob` URLs, keep the old budget.
+
+## [7.17.1] - 2026-09-26
+
+### Fixed
+
+- **A session revived by the #93 item swap keeps its playhead until the fresh item lands there.**
+  Until then AVPlayer reports the start of the segment it decodes up from, so the playhead stepped
+  back by up to a segment, and a software-path rebuild raised in that window resumed there and
+  replayed the gap (3.97 s on a 15.97 s revive) (AE#629).
+- **A software-path rebuild that fails after its teardown surfaces one `.error`, its own.** The
+  rung then published the failure it had absorbed on top, a second `.error` that contradicted what
+  a `load()` following the rebuild threw. The absorbed failure stays on `softwarePathEscalations`
+  (AE#629).
+- **A live H.264 join opens on an intra recovery point, not only on an IDR.** Feeds whose encoder
+  never sends an IDR (entry points are I-pictures behind a recovery point SEI with
+  `recovery_frame_cnt` 0) never started on the native route; the join gate refused every entry
+  point and gave up after three 15 s reopen cycles (AE#627).
+- **A live join that finds no entry point at all goes to the software path after one wait**, instead
+  of three reopen cycles into the same bitstream, or to `liveSourceReset` when the host declined
+  that rung (AE#627).
+- **A live channel whose audio the bridge cannot decode plays video-only instead of stalling.** A
+  FLAC bridge builds its sample entry from the encoder's extradata, so a bridge that decoded nothing
+  left segments with an audio track that never carried a sample, and AVPlayer showed the first
+  picture and waited on it for the rest of the session. The engine now rebuilds the session without
+  that track and `audioDelivery` reads `.droppedNoPipeline` (AE#641).
+- **A VOD audio track the bridge cannot decode surfaces `.audioBridgeProducedNoOutput` on the FLAC
+  route too.** Only the E-AC-3 route reached that verdict, through its failed first cut; a FLAC
+  bridge builds its sample entry from the encoder's extradata, so the session played silently while
+  `audioDelivery` read `.bridged`, and a host ladder never heard of it. The verdict reaches the host
+  once, whichever arm finds it first (AE#641).
+- **`audioDelivery` reads `.droppedNoPipeline` for a source whose audio stream could not be picked**,
+  not `.noAudioInSource`. `av_find_best_stream` passes over a stream whose parameters the probe left
+  empty and only live fell back to it, so on VOD (and on the software path) a source with an
+  undecodable track read as one without audio (AE#641).
+- **FFmpegBuild 3.6.0: an MPEG-TS audio PID is identified by its payload.** The raw `dts`, `truehd`
+  and `loas` demuxers were missing, so the mpegts content probe could never confirm DTS, TrueHD or
+  LATM and the lenient mp3 probe named the track; a PID labelled 0x03 (MPEG-1 audio) was not probed
+  at all. A DTS-HD IPTV channel opened as mp3, and every packet failed with "Header missing"
+  (AE#641).
+- **The keyframe wait log counts the keyframes it dropped** (`keyframes=N`), so a gate refusing
+  every entry point no longer reads as a feed without keyframes (AE#627).
+
+## [7.17.0] - 2026-09-25
+
+### Added
+
+- **`LoadOptions.escalatesToSoftwarePath` (default `true`) lets a host decline the AE#561 rebuild**
+  onto the software path and get the native failure as `.error`, for hosts that re-plan a failing
+  title with a ladder of their own (AE#629).
+- **`softwarePathEscalations` publishes that rebuild when it is taken**, with the failure it
+  absorbed, where a host used to see only `videoRoute` change (AE#629).
+
+### Security
+
+- **The origin relay no longer writes the media server's access token into its local URLs.** They
+  name the origin by a per-session sealed reference, so the token no longer reaches the request
+  log, `load url=` lines, rewritten playlists or an AirPlay receiver (audit NET-1).
+- **Log redaction also catches credentials that are percent-encoded, or encoded twice, inside
+  another URL.** `api%5Fkey%3D...` is now stripped the same as `api_key=...` (audit NET-1).
+- **Credential headers stay with the host's own origin when a playlist names another host or drops
+  to http.** Other headers still go everywhere, the same rule redirects already follow (audit NET-7).
+- **A LAN peer can no longer hold the loopback server's connection slots.** Connections without the
+  session token must send a request head within 10 s, and LAN peers are held to 24 of the 32 slots
+  (audit NET-6).
+- **A crafted Matroska SeekHead no longer crashes the app during prewarm.** A SeekPosition near the
+  top of the 64-bit range is skipped instead of overflowing (audit DMX-2).
+- **The held source connection no longer sends media-server credentials to a redirect target on
+  another origin**, and writes the request path as the URL spells it, so an encoded line break can
+  no longer inject header lines and IPv6 hosts get a valid Host header (audit DMX-3, DMX-4).
+- **A sidecar subtitle name can no longer add lines to the served HLS master.** Line breaks and other
+  control characters in a name or language are neutralised (audit NAT-6).
+- **A crafted or broken source timestamp no longer crashes the app.** Demuxed pts/dts beyond
+  plus or minus 2^60 are treated as unset, and the segment pump's timestamp arithmetic saturates
+  instead of trapping (audit SEG-1).
+- **The Dolby Vision profile check can no longer read a whole file while playback is starting.** It
+  stops after a fixed number of packets from any stream, or 64 MiB (audit BIT-2).
+- **Hostile playlists and disc images no longer crash the app.** An `EXT-X-MEDIA-SEQUENCE` near
+  `Int.max`, a crafted UDF partition map or descriptor sequence, a 4 GB ISO9660 directory length and a
+  `#EXTINF:inf` behind an injected subtitle sidecar all trapped; each is now rejected or bounded at
+  parse, and the sidecar playlist fetch is size-capped (audit NET-3, NET-4, NET-5, NET-11, NAT-1,
+  NAT-5).
+- **SECURITY.md names the current supported release line** instead of 2.1.x, CI pins third-party
+  GitHub Actions to commit SHAs with Dependabot proposing updates, and aetherctl writes its debug
+  files into a private per-run temporary directory instead of fixed names in `/tmp` (audit OPS-1,
+  OPS-2, OPS-3).
+- **The HDR10+ and Atmos probes no longer read a crafted file to its end.** Blocks of the streams
+  they ignore are now counted against a byte budget below the demuxer, so one target packet followed
+  by gigabytes of another stream stops the probe instead of downloading it.
+
+### Fixed
+
+- **A `load()` still waiting when the engine rebuilds its session on the software path now returns
+  with the rebuilt session** instead of throwing the `CancellationError` a host's own supersession
+  throws, which a host read as a failed load and answered by stopping the session that had just come
+  back (AE#629).
+- **Stopping playback during a restart after a stalled read aborts the replacement connection**,
+  instead of letting it finish its connect and stream probe after the session was gone.
+- **A non-finite segment or cadence duration can no longer crash the live playlist writer.**
+- **Live AV1 High and Professional streams play on hardware-AV1 devices**, through the software host
+  like VOD.
+- **A seek on the software path no longer lets one pre-seek frame wedge the picture.** A seek that
+  landed while the decoder was retrying a full queue, or while the hardware decoder was preparing a
+  packet, still let that packet through after the flush (audit DEC-1, DEC-4, AE#492).
+- **Seeking in audio-only playback no longer leaves stale audio queued ahead of the new position**
+  (audit DEC-2).
+- **Subtitles in Picture in Picture no longer squash anamorphic video or turn HDR to SDR while a line
+  is showing.** Composited frames keep the source's pixel aspect ratio, colour tags and colour space,
+  and the compositor's buffer pool is no longer raced at stop (audit DEC-3, DEC-5).
+- **A bridged audio track no longer goes silent for the rest of the session after one frame the
+  resampler rejects.** The frame is dropped and logged, and the previous resampler keeps running
+  (audit DEC-6).
+- **Stopping a live recording no longer blocks the main thread while the backlog is written.**
+  `recordingState` turns `.ended` once the file is closed, a moment after the stop (audit REC-1).
+- **CRLF-terminated HLS playlists parse.** In Swift `"\r\n"` is one Character, so splitting on `"\n"`
+  read the whole playlist as one line and rejected it on the live/VOD ingest, the audio tap and the
+  subtitle proxy (audit NET-2).
+- **A remote disc image only accepts a 206 that starts at the requested offset**, instead of placing
+  wrong bytes or buffering a whole-file 200. The UDF descriptor scan also stops at its Terminating
+  Descriptor again (audit NET-9, NET-11).
+- **Closing the player during a scrub restart no longer spins segment requests at full CPU**
+  (audit SEG-3).
+- **A re-cut segment can no longer be dropped by a request that is reading it at the same moment**,
+  and a replaced pump no longer stores a cut-off segment (audit SEG-4, SEG-5).
+- **Segments with a 256 to 511 byte first NAL are covered by the AE#561 repair**, instead of being
+  mistaken for Annex B and failing with -19602 (audit BIT-1).
+- **Matroska H.264 timing repair no longer gives two frames the same time at a GOP boundary**
+  (audit BIT-3).
+- **A slow source no longer ends a healthy session with "Source read failed" after a few scrubs.**
+  When the engine replaced a producer stuck in a read, the old producer's aborted read was treated as
+  the session failing: it spent the read-error revive budget, forced an extra reconnect and re-seeked
+  to a stale position. Exits from replaced producers and reads aborted by a stop are now ignored
+  (audit HLS-1).
+- **Changing channel during a live reconnect no longer opens the old channel again**, which on
+  single-connection tuners took the slot the new channel needed. A stop that lands during an open
+  now cancels it (audit HLS-2).
+- **8-bit HEVC in MPEG-TS is no longer advertised as Main10.** The CODECS string for Annex-B HEVC is
+  read from the stream's SPS, so the master playlist matches the init segment (audit HLS-3).
+- **Seeks that need a re-cut stay within their time limit** on slow sources (audit HLS-4).
+- **AV1 4:4:4, 4:2:2 and 12-bit play on devices with hardware AV1.** Apple's decoder handles AV1 Main
+  profile only; other profiles now take the dav1d software path for VOD (audit HLS-5).
+- **Scrub previews on large segments use far less memory.** The segment file is memory-mapped instead
+  of copied twice per preview, and nothing is read when a cached preview decoder already covers the
+  segment (audit SEG-2).
+- **Leaving a session while its software rebuild is running no longer leaves an error behind.** A
+  `stop()` or new `load()` during the AE#561 rebuild used to put the engine into `.error`, including
+  onto the next title's startup. The rebuild also runs in its own task now, so its waits no longer
+  spin inside the cancelled item-death task (audit CORE-1).
+- **A title started just before pressing the TV button no longer plays on in the background.** A
+  load or scrub still in flight when the app backgrounds gets the background teardown once it
+  settles, instead of carrying a live pipeline through the tvOS suspension (audit CORE-2, AE#597).
+- **Track selections survive a second background teardown on iOS** (audit CORE-3).
+- **Music plays again after a media services reset.** The reset rebuilds the audio-only AVPlayer too,
+  not only the video player (audit CORE-4, AE#597).
+- **A recording that fails while zapping no longer ends the next channel's recording**, and the live
+  edge snap no longer writes the previous channel's position after a zap (audit CORE-5, CORE-7).
+- **Load-time sidecar subtitles on the remote-HLS path select the right track** when names repeat,
+  match an origin rendition, or contain a quote (audit NAT-2).
+- **A superseded load or live-join probe no longer acts on the session that replaced it** (audit
+  CORE-6, NAT-4).
+- **An origin that ignores Range no longer streams the whole file into memory.** Bytes past the
+  requested range are dropped and the connection is ended. Such an origin could never seek, and a
+  file larger than memory got the app killed; it now ends in a read error instead, and
+  `LoadOptions.sequentialOrigin` stays the way to play one (audit DMX-1).
+- **A 206 that starts somewhere other than the requested offset is refused** instead of shifting every
+  later read (audit DMX-5).
+- **A length-less stream that drops or stalls reports an error** instead of ending playback as if the
+  title had finished, and its buffer has a hard 128 MB bound for a transport that ignores the suspend
+  (audit DMX-6, DMX-7).
+- **A failed chunk fetch during a probe or still extraction reports an error** instead of a truncated
+  file (audit DMX-10).
+- **Tail prefetch checks its span against the file size and tolerates over-delivered bytes**, instead
+  of giving up suffix ranges for that origin until restart (audit DMX-8, DMX-9).
+- **Two demuxer races closed:** the provider reference during a cross-thread abort, and stream lookups
+  while an MPEG-TS read adds streams (audit DMX-11, NAT-7).
+- **Playlist and held relay bodies are capped while they download, not after.** A runaway origin can
+  no longer grow one until the app is killed (audit NET-10).
+- **The accept loop backs off when the process runs out of file descriptors**, instead of spinning a
+  core and flooding the log (audit NET-13).
+- **The server's stop line names the port it released** (audit NET-12).
+
+### Performance
+
+- **Faster first segment after a seek on TrueHD sources, and less CPU for HDR10+ detection on sources
+  without HDR10+** (audit SEG-6, BIT-4).
+- **The live ingest FIFO no longer re-copies its whole buffer on every read** (audit NET-8).
+- **Stripping ASS override tags from a cue is linear.** A cue of 200k tags took 525 s and now takes
+  0.15 s on the PiP and AirPlay subtitle track (audit SUB-1).
+- **PGS and other bitmap subtitles decode off the main thread.** The overlay drain and the PiP/AirPlay
+  OCR worker used to expand every display set on the MainActor, including the whole window a
+  selection or seek backfills at once. Each bitmap is also about 4x cheaper to convert (a full
+  1080p set measured 5 ms before, 1.3 ms after, in a release build on an M1) (AE#628).
+
+## [7.16.1] - 2026-09-24
+
+### Fixed
+
+- **The media fallback comes back where the rejected item was placed, not where the session
+  started (#98).** The fallback replayed the start position of the session's first mount. The
+  #93/#65 stage-2 recovery swaps a fresh item in at the position playback held, so when THAT item
+  was refused at startup (-11868), the session rewound to wherever it had first been loaded. Field
+  log, Apple TV 4K 3rd gen, tvOS 27.0, HDR10+ HEVC Matroska opened with a resume at 1844 s:
+  paused at 2099.69 s, the item died behind the screensaver, the recovery item was refused, and
+  playback resumed at 1834.79 s, the keyframe before the session's first mount and four minutes
+  behind the pause. A title started from its beginning resumes at its first frame. `NativeAVPlayerHost`
+  now records where every mount places its item, in-place swaps included, and the fallback reads
+  that.
+- **A recovery reload leaves a paused viewer paused (#93, #98).** Item death parks AVPlayer at
+  `.paused` whatever the viewer wanted, so the #93/#65 stage-2 reload runs for a paused consumer
+  too, and it and the #98 media fallback then called `play()` on the fresh item unconditionally.
+  Field log, Apple TV 4K 3rd gen, tvOS 27.0, HDR10+ HEVC Matroska: paused, the tvOS screensaver
+  took the display two minutes later, the item died with -11868, and the recovery started the
+  title and dismissed the screensaver. Both now resume only when the host's durable intent (#122),
+  which the in-place swap keeps, says the viewer was playing; a playing viewer is resumed as before.
+  `aetherctl play --host-calls pausereload,playreload,extplayreload` drills it headless: before,
+  a paused session came back from a forced stage-2 reload at `+7.20 s, state=playing`; after, it
+  holds at `+0.00 s, state=paused`, and a session resumed past the engine through AVKit still
+  comes back playing.
+
+## [7.16.0] - 2026-09-24
+
+### Added
+- `clock.sourceTimeFollowsPicture` (and the `sourceTimeFollowsPicture` mirror): false on `nativeRemoteHLS` from a time jump until an injected rendition line has re-measured the lead, so a host can hold its overlay across that window instead of detecting seeks itself (AE#616 follow-up).
+- `EngineLog.registerSecret(_:)` / `unregisterSecret(_:)`: a host names a value that must never be logged, and every line has it replaced, raw or percent-encoded, before it reaches os_log or the handler.
+
+### Security
+- **Log redaction covers credentials carried as plain path segments.** IPTV panels speaking the Xtream Codes API put the account password in the path of every stream URL (`/live/{user}/{password}/{id}.ts`, likewise `/movie/`, `/series/`, `/timeshift/`, and the `/hls/` and `/hlsr/` redirect targets), where no named parameter, userinfo or encoded payload points at it, so `load url=` lines carried it in clear text. The layout is now matched, the user name stays readable, and ordinary paths such as `/live/master.m3u8` are untouched. The short form without a prefix has no layout to match, which is what `registerSecret(_:)` is for.
+
+## [7.15.2] - 2026-09-24
+
+### Fixed
+
+- **`sourceTime` on the `nativeRemoteHLS` bypass follows the presented frame (AE#616).** It was
+  AVPlayer's item time. An origin whose playlist places a segment at its slot while the segment
+  starts at the keyframe before it (a Jellyfin transcode restarted with `-noaccurate_seek -copyts`)
+  makes item time lead the picture, by 1.1 to 8.3 s in the report. A legible output on the bypass
+  item now matches presented lines of the injected #316 WebVTT renditions back to the cues the
+  engine wrote, and `sourceTime` is item time less that measured lead. `currentTime` and
+  `seek(to:)` stay on item time. With no injected rendition selected nothing is measured and
+  `sourceTime` stays item time, which the API docs now say.
+
+### Performance
+
+- **The persistent HTTP reader no longer copies its read window on every trim (AE#619).**
+  `AVIOReader` dropped the consumed head of its window with `subdata(in:)`, copying up to ~18 MB
+  once per 4 MB read, and grew the fresh buffer again on every append. The window now keeps the
+  chunks as delivered and a trim only advances an offset. CPU is unchanged within noise. Peak
+  memory footprint on a 91.6 Mbit/s 4K HEVC session over HTTP fell from 828 to 911 MB to 551 to
+  553 MB on the native route and from 604 to 651 MB to 193 to 197 MB on the software route
+  (M1, `/usr/bin/time -l`, three runs per arm). Local files are read by `FileIOReader` and are
+  not affected.
+- **The software VOD packet spool no longer serializes through a property list (AE#592).** The
+  binary plist encoder uniqued every object through a `Set`, hashing the whole payload of every
+  packet written to the read-ahead spool. The envelope is now a fixed little-endian header and the
+  raw bytes. Encode fell from 375 to 43 us per 425 KB packet, and process CPU on the same session
+  from 0.220 to 0.223 to 0.205 to 0.208 cores. The spool is per session, so there is no format
+  compatibility to keep.
+
+## [7.15.1] - 2026-09-23
+
+### Fixed
+
+- **The software VOD buffer frontier on HEVC, and after a long session (AE#613).** HEVC kept the
+  strict `pts + duration` packet coverage, so a Matroska file muxed with 41 ms durations against
+  41/42 ms deltas split it at every 42 ms step: `bufferedPosition` read about half a second ahead
+  of the playhead over a twenty-second reservoir, and cached seeks saw the same short frontier.
+  HEVC now takes the successor-timestamp model H.264 already used, under FFmpeg's own reorder
+  bound. Separately, a coverage that reached its 4096-range cap stopped describing new packets
+  (or, on the successor model, invalidated itself), so every frontier after the cap was nil; it
+  now forgets the ranges behind the playhead instead.
+- **A master refused while the display is ineligible for HDR no longer latches (AE#535).** An
+  audio route death right after a display mode switch opens a window in which the criteria readout
+  reads `hdrEligible=no`. A session-preserving reload that landed in it got -11868 from AVPlayer
+  and latched `panelRefusedHDRMaster`, so every later HDR title in the session went media-direct.
+  The latch now also needs `AVPlayer.eligibleForHDRPlayback` to read true at the refusal; the item
+  still takes its media fallback either way, and a refusal that is not latched says so in the log.
+- **An audio-delay rebuild raised the moment one returned keeps the playhead (AE#464).**
+  `rebuildPosition` honoured the parked position only while `state == .loading`, but `load()`'s
+  autostart writes `.playing` before the new host publishes a position, so for about 50 ms the
+  clock still read zero and a correction in that window rebuilt the session at its head. A
+  playable session whose clock reads exactly the reset zero now answers with the parked position;
+  an accepted seek retires it, so a genuine seek to 0 is never overridden.
+- **`aetherctl` builds in Release again (AE#610).** The stallclock drill called two DEBUG-only test
+  hooks unguarded, so `swift build -c release` failed from 7.6.0 through 7.15.0. The library
+  products were never affected. A Release binary now reports that the drill needs a DEBUG build,
+  and CI builds `aetherctl` in Release.
+
+## [7.15.0] - 2026-09-23
+
+### Added
+
+- **Scrub stills on the software VOD path, with no second connection (AE#605).** A VOD session the
+  device cannot hardware-decode (MPEG-4 Part 2, MPEG-2, interlaced H.264, everything on the iOS
+  Simulator) already spools its packets to a disk cache its seeks land in, but `scrubThumbnail`
+  had no arm for it, so every such session scrubbed blind on a source that refuses a second
+  request. It now decodes the still out of that cache, keyframe to target, through the same
+  extractor, queue and newest-wins ticket the live software path uses (#544), and the consumer
+  cursor is never moved, so playback reads on undisturbed. A target past what is retained answers
+  nil rather than the frame before it. `supportsCacheBackedStills` is true for such a session, and
+  now also for a software live session, which already served stills but reported false.
+
+## [7.14.0] - 2026-09-22
+
+### Fixed
+
+- **A seek could leave the software VP9 decoder pointing at frames it had already released
+  (FFmpegBuild 3.5.0, FFmpeg n8.1.3).** `SoftwareVideoDecoder` opens VP9 with frame and slice
+  threading and flushes the codec context on every reposition, which is exactly the shape upstream's
+  `vp9_decode_flush()` mishandled: it released `frames[]`, `refs[]` and `ref_frames[]` but left
+  `next_refs[]` referenced, and a worker seeds its own references from another worker's `next_refs[]`,
+  so the pre-flush set survived and the first inter frame after a seek could decode against buffers
+  that were gone. A heap out-of-bounds read and write, found by Mozilla's bugmon automation.
+
+- **A Dolby Vision RPU with trailing zero padding keeps its dynamic metadata.** The RPU parser
+  stopped trimming zero padding in `ef167512ab`, which shipped in n8.1.2, so a heavily padded RPU
+  could fail the extension block size check and the file played without its dynamic metadata. Both
+  the HEVC and the AV1 decoder pull in the RPU parser, so this was on the path of every Dolby Vision
+  source, and a second fix bounds the RPU partition counts that were read without one.
+
+- **A VC-1 picture no longer loses its last macroblock.** The per-macroblock guards upstream added
+  in n8.1.2 bail out to error concealment when one bit is left, but a skipped P or B macroblock can
+  legitimately cost exactly one bit, and a Simple or Main profile picture is byte-aligned with no
+  stop bit, so a picture ending on such a macroblock lost it.
+
+- **The DTS core bitstream filter no longer passes on a profile it has just stripped.** It removes
+  the extension substreams, so a declared DTS-HD MA profile no longer described the bitstream that
+  came out of it.
+
+- **A channel layout read from the container survives a decoder that fails to open.** Probing copies
+  codec parameters back from the decoder context even after a failed `avcodec_open2()`, and the
+  failure zeroes the layout, so what the demuxer had read from the container was overwritten with
+  nothing.
+
+### Changed
+
+- **FFmpegBuild 3.5.0, built on FFmpeg n8.1.3.** 268 upstream commits over n8.1.2, of which the five
+  above touch code this engine ships. dav1d 1.5.4, zimg 3.0.6 and libzvbi 0.2.45 are unchanged (they
+  are the newest upstream releases), the component set and the six local FFmpeg patches are
+  unchanged, and the soname majors are the same, so nothing in the public API moves.
 
 ## [7.13.0] - 2026-09-22
 

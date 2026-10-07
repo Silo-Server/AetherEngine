@@ -40,6 +40,11 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
         readDeadline = .distantFuture
     }
 
+    private var readByteBudget = ReadByteBudget()
+    var readByteBudgetExhausted: Bool { readByteBudget.exhausted }
+    func beginReadByteBudget(_ bytes: Int64) { readByteBudget.begin(bytes) }
+    func endReadByteBudget() { readByteBudget.end() }
+
     /// #112 round 9: the byte axis libavformat sees through this bridge (for a disc adapter, the
     /// virtual concat stream length via AVSEEK_SIZE), backing the byte-estimate seek fallback.
     var resolvedByteSize: Int64? {
@@ -180,8 +185,10 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
         // -1 = forced abort (not EOF); mirrors AVIOReader.read so FFmpeg doesn't run EOS handling.
         guard !isClosed else { return -1 }
         if isPastReadDeadline { readDeadlineFired = true; return -1 }
-        let n = callingHost { reader.read(buf, size: size) }
+        guard let allowed = readByteBudget.allowance(size) else { return -1 }
+        let n = callingHost { reader.read(buf, size: allowed) }
         if n == 0 { return FFmpegErr.eof }  // IOReader uses 0 for EOF; avio expects AVERROR_EOF.
+        readByteBudget.consumed(n)
         return n
     }
 

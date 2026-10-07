@@ -28,6 +28,10 @@ final class SoftwareStillExtractor: @unchecked Sendable {
         /// Packets are stored in decode order, so the frame at the target can sit behind the first
         /// packet that reaches it. Two B-frames is the common broadcast shape; four covers the rest.
         var reorderTail: Int = 4
+
+        /// AE#605: a file's GOP is not a broadcast one. x264's default keyint is 250 pictures,
+        /// ten seconds at 25 fps and four at 60, and B-pyramids reorder deeper than two B-frames.
+        static let vod = Limits(maxPackets: 900, maxSpanSeconds: 12, reorderTail: 16)
     }
 
     private let decoder = SoftwareVideoDecoder()
@@ -72,6 +76,30 @@ final class SoftwareStillExtractor: @unchecked Sendable {
                                       reorderTail: limits.reorderTail),
               !run.isEmpty else { return nil }
 
+        return decodeRun(targetPts: targetPts, maxWidth: maxWidth) {
+            for packet in run { feed(packet) }
+        }
+    }
+
+    /// AE#605: the same still out of a software VOD session's retained packets. They arrive as the
+    /// demuxer produced them, envelope and all, so they are replayed as is: a VOD stream carries real
+    /// decode timestamps and side data that the ring's pts-only shape has no room for.
+    func still(from run: [SoftwareStoredPacket], targetPts: Double, maxWidth: Int) -> CGImage? {
+        guard isOpen, maxWidth > 0, let first = run.first, first.flags & AV_PKT_FLAG_KEY != 0 else {
+            return nil
+        }
+        return decodeRun(targetPts: targetPts, maxWidth: maxWidth) {
+            for stored in run {
+                guard let p = try? stored.makeAVPacket() else { continue }
+                var packet: UnsafeMutablePointer<AVPacket>? = p
+                defer { trackedPacketFree(&packet) }
+                p.pointee.stream_index = videoStreamIndex
+                decoder.decode(packet: p, epoch: nil)
+            }
+        }
+    }
+
+    private func decodeRun(targetPts: Double, maxWidth: Int, feedRun: () -> Void) -> CGImage? {
         let collector = FrameCollector(target: targetPts)
         decoder.onFrame = { pixelBuffer, pts, _ in
             collector.append(pixelBuffer: pixelBuffer, seconds: pts.seconds)
@@ -79,9 +107,7 @@ final class SoftwareStillExtractor: @unchecked Sendable {
         decoder.flush(resetFilterGraph: false)
         defer { decoder.onFrame = nil }
 
-        for packet in run {
-            feed(packet)
-        }
+        feedRun()
 
         guard let best = collector.best else { return nil }
         return Self.image(from: best, maxWidth: maxWidth)
@@ -102,7 +128,7 @@ final class SoftwareStillExtractor: @unchecked Sendable {
                 memcpy(dst, base, packet.bytes.count)
             }
         }
-        p.pointee.pts = Int64((packet.pts / timeBaseSeconds).rounded())
+        p.pointee.pts = SourceTimestampBounds.roundedTicks(packet.pts / timeBaseSeconds) ?? Int64.min
         p.pointee.dts = p.pointee.pts
         p.pointee.flags = packet.isKeyframe ? AV_PKT_FLAG_KEY : 0
         p.pointee.stream_index = videoStreamIndex

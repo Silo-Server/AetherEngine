@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 
 /// Sliding-window disk-backed cache for HLS-fMP4 segments. Bytes go to
-/// <NSTemporaryDirectory>/aether-segments/<uuid>/seg-N.m4s; only URLs stay in RAM.
+/// <NSTemporaryDirectory>/aether-segments/<uuid>/seg-N-G.m4s; only URLs stay in RAM.
 /// Reads use .alwaysMapped (kernel pages in/out under memory pressure). Window:
 /// [currentTargetIndex - backwardWindow, currentTargetIndex + forwardWindow].
 /// The producer pauses via awaitFetchHighWater once forwardWindow ahead of target.
@@ -68,26 +68,28 @@ final class SegmentCache: @unchecked Sendable {
 
     let sessionDir: URL
 
-    /// AE#451: an flock(2) held on `sessionDir/session.lock` for as long as this cache lives.
-    /// This is the liveness half of the stale-session sweep: the age check alone cannot tell a
-    /// session an hour into a film from one that crashed an hour ago, because the directory's
-    /// creation date IS the session's start time.
-    ///
-    /// flock and not fcntl: flock locks belong to the open file description, so a second cache in
-    /// the SAME process fails to take it too, which is the case the report is about. fcntl locks
-    /// are per-process and a process never blocks itself.
-    ///
-    /// The kernel drops it when the process dies, so a crashed session leaves an unheld marker and
-    /// sweeps exactly as before. -1 means unheld (open or flock failed); such a session is swept
-    /// like today's, which is the pre-AE#451 behaviour rather than a new failure.
+    /// AE#451: the `SessionDirectoryLiveness` marker held for as long as this cache lives. -1 means
+    /// unheld (open or flock failed); such a session is swept by age like before AE#451.
     private var lockFD: Int32 = -1
-    private static let liveMarkerName = "session.lock"
 
     private var _totalBytes: Int = 0
 
     /// Monotonic across prunes; NOT decremented by pruneOutsideWindow. Lets VideoSegmentProvider
     /// detect gaps below the producer's write head after eviction erases them from indexRange().
     private var _highestStoredIndex: Int = -1
+
+    /// Audit SEG-4: every stored generation of an index gets its own file name, so a URL names exactly
+    /// one set of bytes. A reader dropping a vanished entry, or a prune deleting a doomed one after
+    /// unlocking, can then never hit a newer adoption of the same index.
+    private var fileGeneration: UInt64 = 0
+
+    private func nextSegmentFileURL(index: Int) -> URL {
+        condition.lock()
+        fileGeneration += 1
+        let generation = fileGeneration
+        condition.unlock()
+        return sessionDir.appendingPathComponent("seg-\(index)-\(generation).m4s")
+    }
     /// Plan index -> how many pumps passed it without opening a segment (#358). Survives producer
     /// restarts on purpose: the repeat across a restart is the signal.
     private var foldCounts: [Int: Int] = [:]
@@ -136,20 +138,7 @@ final class SegmentCache: @unchecked Sendable {
     }
 
     private static func acquireLiveMarker(sessionDir: URL) -> Int32 {
-        let path = sessionDir.appendingPathComponent(liveMarkerName).path
-        let fd = open(path, O_CREAT | O_RDWR, 0o600)
-        guard fd >= 0 else {
-            EngineLog.emit("[SegmentCache] live marker open failed at \(path): errno=\(errno)",
-                           category: .session)
-            return -1
-        }
-        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
-            EngineLog.emit("[SegmentCache] live marker lock failed at \(path): errno=\(errno)",
-                           category: .session)
-            Darwin.close(fd)
-            return -1
-        }
-        return fd
+        SessionDirectoryLiveness.acquire(sessionDir: sessionDir, logPrefix: "[SegmentCache]")
     }
 
     private func releaseLiveMarker() {
@@ -158,20 +147,6 @@ final class SegmentCache: @unchecked Sendable {
         lockFD = -1
         condition.unlock()
         if fd >= 0 { Darwin.close(fd) }
-    }
-
-    /// Whether some open file description still holds `entry`'s marker. A missing marker answers
-    /// false: it is a directory from a build without one, and the age check decides it as before.
-    private static func isSessionDirLive(_ entry: URL) -> Bool {
-        let path = entry.appendingPathComponent(liveMarkerName).path
-        let fd = open(path, O_RDONLY)
-        guard fd >= 0 else { return false }
-        defer { Darwin.close(fd) }
-        if flock(fd, LOCK_EX | LOCK_NB) == 0 {
-            flock(fd, LOCK_UN)
-            return false
-        }
-        return true
     }
 
     private static func sweepStaleSessionDirs(baseDir: URL, currentSession: String) {
@@ -186,7 +161,7 @@ final class SegmentCache: @unchecked Sendable {
             let created = (try? entry.resourceValues(forKeys: [.creationDateKey]))?.creationDate
             guard created == nil || created! < cutoff else { continue }
             // AE#451: age says how long it has been there, not whether anyone is still using it.
-            if isSessionDirLive(entry) {
+            if SessionDirectoryLiveness.isLive(entry) {
                 EngineLog.emit("[SegmentCache] sweep spared live session dir \(entry.lastPathComponent)",
                                category: .session)
                 continue
@@ -264,7 +239,7 @@ final class SegmentCache: @unchecked Sendable {
     }
 
     func store(index: Int, data: Data) {
-        let fileURL = sessionDir.appendingPathComponent("seg-\(index).m4s")
+        let fileURL = nextSegmentFileURL(index: index)
         var writeOK: Bool
         do {
             try data.write(to: fileURL, options: [.atomic])
@@ -289,11 +264,14 @@ final class SegmentCache: @unchecked Sendable {
         // A re-store of a resident index changes bytes, not residency; only an insertion or an
         // eviction moves the set, and both are already known here without walking it.
         var residentSetChanged = false
+        var supersededFile: URL?
         if writeOK {
             if let oldBytes = entryBytes[index] {
                 _totalBytes -= oldBytes
             }
-            residentSetChanged = entries.updateValue(fileURL, forKey: index) == nil
+            let superseded = entries.updateValue(fileURL, forKey: index)
+            residentSetChanged = superseded == nil
+            if let superseded { supersededFile = superseded }
             entryBytes[index] = data.count
             _totalBytes += data.count
             if index > _highestStoredIndex { _highestStoredIndex = index }
@@ -302,6 +280,7 @@ final class SegmentCache: @unchecked Sendable {
         if !doomed.isEmpty { residentSetChanged = true }
         condition.broadcast()
         condition.unlock()
+        if let supersededFile { try? FileManager.default.removeItem(at: supersededFile) }
         for url in doomed { try? FileManager.default.removeItem(at: url) }
         if residentSetChanged { onResidentSetChanged?() }
     }
@@ -311,12 +290,9 @@ final class SegmentCache: @unchecked Sendable {
     /// `videoReach` (AE#412) is what this segment's video offers a cold arrival; nil leaves the
     /// previous claim in place only if the index is re-adopted without one, which no caller does.
     func adopt(index: Int, stagingPath: URL, byteCount: Int, videoReach: VideoReach? = nil) {
-        let fileURL = sessionDir.appendingPathComponent("seg-\(index).m4s")
+        let fileURL = nextSegmentFileURL(index: index)
         var renameOK: Bool
         do {
-            if FileManager.default.fileExists(atPath: fileURL.path) {
-                try FileManager.default.removeItem(at: fileURL)
-            }
             try FileManager.default.moveItem(at: stagingPath, to: fileURL)
             renameOK = true
         } catch {
@@ -338,11 +314,14 @@ final class SegmentCache: @unchecked Sendable {
             return
         }
         var residentSetChanged = false
+        var supersededFile: URL?
         if renameOK {
             if let oldBytes = entryBytes[index] {
                 _totalBytes -= oldBytes
             }
-            residentSetChanged = entries.updateValue(fileURL, forKey: index) == nil
+            let superseded = entries.updateValue(fileURL, forKey: index)
+            residentSetChanged = superseded == nil
+            if let superseded { supersededFile = superseded }
             entryBytes[index] = byteCount
             _totalBytes += byteCount
             if index > _highestStoredIndex { _highestStoredIndex = index }
@@ -357,6 +336,7 @@ final class SegmentCache: @unchecked Sendable {
         if !doomed.isEmpty { residentSetChanged = true }
         condition.broadcast()
         condition.unlock()
+        if let supersededFile { try? FileManager.default.removeItem(at: supersededFile) }
         for url in doomed { try? FileManager.default.removeItem(at: url) }
         if residentSetChanged { onResidentSetChanged?() }
     }
@@ -455,6 +435,12 @@ final class SegmentCache: @unchecked Sendable {
         condition.unlock()
         EngineLog.emit("[SegmentCache] seg-\(index) vanished from disk; entry dropped (AE#451)",
                        category: .session)
+    }
+
+    var isClosed: Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        return closed
     }
 
     func fetch(index: Int, timeout: TimeInterval = 15.0) -> Data? {

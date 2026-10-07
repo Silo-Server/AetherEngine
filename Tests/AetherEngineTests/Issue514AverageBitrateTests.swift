@@ -1,140 +1,210 @@
 import Foundation
 import Testing
-import AVFoundation
 @testable import AetherEngine
 
-/// AE#514: `LiveTelemetry.averageBitrateMbps` divided the session's lifetime bytes by pure wall-clock
-/// time. Bytes stop arriving while the transport is paused (the forward buffer is already full), the
-/// divisor does not, so the reported average decayed toward zero for as long as the pause lasted and
-/// never came back: the paused seconds stayed in the divisor for the rest of the session. The fix
-/// charges a tick's second only when the session is in a phase that consumes media.
-@MainActor
+/// AE#514: both bitrate fields in `LiveTelemetry` were metered from the reader's transfer counter.
+/// Round one fixed the divisor (a pause dragged the average toward zero); round two, from the
+/// reporter's retest, fixes the numerator: transfer and playback part ways on every route that reads
+/// ahead. VOD prefetch put a 20 Mbps stream at ~35 Mbps, and a paused live session kept draining the
+/// origin into its DVR window while the divisor stood still, so its average climbed for as long as the
+/// pause ran. Both fields now meter the bytes of the packets the playhead crossed over the media
+/// seconds it crossed.
 struct Issue514AverageBitrateTests {
 
-    // MARK: - Which seconds belong in the divisor
+    /// 20 Mbps split over a 25 fps video track and a ~47 Hz audio track, recorded as a pump would.
+    private static let videoBytesPerSecond = 2_400_000
+    private static let audioBytesPerSecond = 100_000
+    private static let mbps = Double(videoBytesPerSecond + audioBytesPerSecond) * 8 / 1_000_000
 
-    /// A pause and the three terminal phases are the session standing still. Everything else is the
-    /// session working, and the bytes it did or did not get in those seconds are part of its average.
-    @Test("only the phases that consume media charge a second to the divisor")
-    func pausedAndTerminalPhasesDoNotCharge() {
-        #expect(LiveTelemetrySampler.chargesActiveTime(.paused) == false)
-        #expect(LiveTelemetrySampler.chargesActiveTime(.idle) == false)
-        #expect(LiveTelemetrySampler.chargesActiveTime(.ended) == false)
-        #expect(LiveTelemetrySampler.chargesActiveTime(.error("boom")) == false)
-
-        #expect(LiveTelemetrySampler.chargesActiveTime(.playing))
-        #expect(LiveTelemetrySampler.chargesActiveTime(.loading))
-        #expect(LiveTelemetrySampler.chargesActiveTime(.rebuffering))
-        #expect(LiveTelemetrySampler.chargesActiveTime(.stalled(reconnecting: true)))
-        #expect(LiveTelemetrySampler.chargesActiveTime(.stalled(reconnecting: false)))
-    }
-
-    /// Deliberately NOT excluded, against the report's own suggestion: a seek is where the session
-    /// fetches hardest (the buffer is discarded and a new range pulled). Dropping those seconds while
-    /// keeping their bytes would push the average above the media's real rate on every scrub.
-    @Test("a seek charges its seconds, because it is also where the bytes arrive")
-    func seekingCharges() {
-        #expect(LiveTelemetrySampler.chargesActiveTime(.seeking))
-    }
-
-    // MARK: - The quotient
-
-    @Test("the average is the lifetime bytes over the active seconds")
-    func averageIsBytesOverActiveSeconds() {
-        // 2 Mbps for ten active seconds: 2 500 000 bytes.
-        let rate = LiveTelemetrySampler.averageBitrateMbps(lifetimeBytes: 2_500_000, activeSeconds: 10)
-        #expect(abs((rate ?? 0) - 2.0) < 0.001)
-    }
-
-    /// Same rule as `observedTransferMbps` one field over: "not measurable yet" is a gap, never a
-    /// confident zero. Before the fix the very first tick published 0.00 Mbps, because it seeds
-    /// `sessionStartBytes` from the same counter it then subtracts.
-    @Test("a session with no active time and no bytes publishes nil, not zero")
-    func unmeasurableSessionPublishesNil() {
-        #expect(LiveTelemetrySampler.averageBitrateMbps(lifetimeBytes: 0, activeSeconds: 0) == nil)
-        #expect(LiveTelemetrySampler.averageBitrateMbps(lifetimeBytes: 350_000, activeSeconds: 0) == nil)
-        #expect(LiveTelemetrySampler.averageBitrateMbps(lifetimeBytes: 0, activeSeconds: 30) == nil)
-    }
-
-    // MARK: - The reported session shape
-
-    /// The reporter's steps, folded tick by tick: 30 s of a 2.8 Mbps file, a three-minute pause during
-    /// which the demuxer counter stands still, then playback again.
-    @Test("a three-minute pause leaves the average flat instead of collapsing it")
-    func pauseDoesNotDragTheAverageDown() {
-        let bytesPerSecond: Int64 = 350_000        // 2.8 Mbps
-        var lifetimeBytes: Int64 = 0
-        var activeSeconds: Double = 0
-        var wallClockSeconds: Double = 0
-
-        func tick(_ phase: PlaybackPhase, bytes: Int64) {
-            lifetimeBytes += bytes
-            wallClockSeconds += 1
-            if LiveTelemetrySampler.chargesActiveTime(phase) { activeSeconds += 1 }
+    private static func feed(_ ledger: PlayedMediaLedger, from start: Double, to end: Double) {
+        var pts = start
+        while pts < end - 1e-9 {
+            ledger.record(.video, pts: pts, bytes: videoBytesPerSecond / 25)
+            pts += 1.0 / 25
         }
-
-        for _ in 0..<30 { tick(.playing, bytes: bytesPerSecond) }
-        let beforePause = LiveTelemetrySampler.averageBitrateMbps(
-            lifetimeBytes: lifetimeBytes, activeSeconds: activeSeconds)
-        #expect(abs((beforePause ?? 0) - 2.8) < 0.001)
-
-        // Paused: the forward buffer is full, so the demuxer counter does not move.
-        for _ in 0..<180 { tick(.paused, bytes: 0) }
-        let duringPause = LiveTelemetrySampler.averageBitrateMbps(
-            lifetimeBytes: lifetimeBytes, activeSeconds: activeSeconds)
-        #expect(duringPause == beforePause, "the pause must not move the average at all")
-
-        // What used to ship, for the record: the same bytes over wall-clock time.
-        let wallClockAverage = Double(lifetimeBytes) * 8.0 / wallClockSeconds / 1_000_000.0
-        #expect(wallClockAverage < 0.5, "the old divisor collapsed a 2.8 Mbps session to \(wallClockAverage)")
-
-        // And on resume it is still the media's rate, not a value climbing back out of a hole.
-        for _ in 0..<30 { tick(.playing, bytes: bytesPerSecond) }
-        let afterResume = LiveTelemetrySampler.averageBitrateMbps(
-            lifetimeBytes: lifetimeBytes, activeSeconds: activeSeconds)
-        #expect(abs((afterResume ?? 0) - 2.8) < 0.001)
-    }
-
-    /// End of media is the other unbounded divisor: the sampler runs until the host tears the session
-    /// down, so a snapshot left on screen after the last frame used to decay exactly like a pause.
-    @Test("the average stops moving once the source has ended")
-    func endedSessionFreezesTheAverage() {
-        var activeSeconds: Double = 0
-        for _ in 0..<30 where LiveTelemetrySampler.chargesActiveTime(.playing) { activeSeconds += 1 }
-        let atEnd = activeSeconds
-        for _ in 0..<120 where LiveTelemetrySampler.chargesActiveTime(.ended) { activeSeconds += 1 }
-        #expect(activeSeconds == atEnd)
-    }
-
-    // MARK: - Wiring
-
-    /// The two functions above are only right if the tick actually asks them. A paused session accrues
-    /// no active time however long its sampler runs; the same sampler starts accruing on play.
-    @Test("the running sampler charges no active time while the transport is paused")
-    func samplerAccruesNoActiveTimeWhilePaused() async throws {
-        let engine = try AetherEngine()
-        engine.playbackBackend = .native
-        let item = AVPlayerItem(url: URL(fileURLWithPath: "/nonexistent-514.mp4"))
-        engine.currentAVPlayer = AVPlayer(playerItem: item)
-        engine.state = .paused
-        #expect(engine.playbackPhase == .paused)
-
-        let sampler = LiveTelemetrySampler(engine: engine, nativeRead: { _, _ in
-            NativeAVFReadings(forwardBufferSeconds: 12.0)
-        })
-        sampler.start()
-        defer { sampler.stop() }
-
-        // Long enough for several 1 Hz ticks to have run and charged nothing.
-        try await Task.sleep(for: .milliseconds(2_500))
-        #expect(sampler.activeSeconds == 0)
-
-        engine.state = .playing
-        let started = ContinuousClock().now
-        while sampler.activeSeconds == 0 {
-            if ContinuousClock().now - started > .seconds(30) { break }
-            try await Task.sleep(for: .milliseconds(50))
+        pts = start
+        while pts < end - 1e-9 {
+            ledger.record(.audio, pts: pts, bytes: audioBytesPerSecond * 1024 / 48_000)
+            pts += 1024.0 / 48_000
         }
-        #expect(sampler.activeSeconds > 0)
+    }
+
+    private static func play(_ meter: inout PlayedBitrateMeter, _ ledger: PlayedMediaLedger,
+                             from start: Double, seconds: Int) -> Double {
+        var playhead = start
+        for _ in 0..<seconds {
+            playhead += 1
+            meter.advance(to: playhead, wallSeconds: 1, ledger: ledger)
+        }
+        return playhead
+    }
+
+    private static func near(_ value: Double?, _ expected: Double, tolerance: Double = 0.05) -> Bool {
+        guard let value else { return false }
+        return abs(value - expected) <= tolerance * expected
+    }
+
+    // MARK: - The reporter's table
+
+    /// VOD, playing: minutes of read-ahead sit in the ledger the moment they are fetched, and count
+    /// only once the playhead crosses them.
+    @Test("VOD read-ahead does not inflate either field")
+    func vodReadAheadIsNotCounted() {
+        let ledger = PlayedMediaLedger()
+        Self.feed(ledger, from: 0, to: 240)
+        var meter = PlayedBitrateMeter()
+        meter.advance(to: 0, wallSeconds: 0, ledger: ledger)
+        _ = Self.play(&meter, ledger, from: 0, seconds: 30)
+        #expect(Self.near(meter.averageMbps, Self.mbps))
+        #expect(Self.near(meter.instantMbps, Self.mbps))
+    }
+
+    /// VOD, paused: the reader keeps topping up the buffer, the playhead does not move.
+    @Test("a VOD pause leaves both fields standing")
+    func vodPauseFreezes() {
+        let ledger = PlayedMediaLedger()
+        Self.feed(ledger, from: 0, to: 60)
+        var meter = PlayedBitrateMeter()
+        meter.advance(to: 0, wallSeconds: 0, ledger: ledger)
+        let playhead = Self.play(&meter, ledger, from: 0, seconds: 30)
+        let average = meter.averageMbps, instant = meter.instantMbps
+        Self.feed(ledger, from: 60, to: 120)
+        for _ in 0..<180 { meter.advance(to: playhead, wallSeconds: 1, ledger: ledger) }
+        #expect(meter.averageMbps == average)
+        #expect(meter.instantMbps == instant)
+    }
+
+    /// Live, paused: the pump keeps draining the origin at the broadcast rate for the whole pause
+    /// (AE#443). Nothing is played, so nothing may move; on resume the backlog counts as it plays.
+    @Test("a live pause does not climb, and the backlog counts at its real rate once played")
+    func livePauseDoesNotClimb() {
+        let ledger = PlayedMediaLedger()
+        var meter = PlayedBitrateMeter()
+        var edge = 1_000.0
+        Self.feed(ledger, from: edge, to: edge + 2)
+        meter.advance(to: edge, wallSeconds: 0, ledger: ledger)
+        var playhead = edge
+        for _ in 0..<30 {
+            edge += 1
+            Self.feed(ledger, from: edge + 1, to: edge + 2)
+            playhead += 1
+            meter.advance(to: playhead, wallSeconds: 1, ledger: ledger)
+        }
+        let average = meter.averageMbps
+        #expect(Self.near(average, Self.mbps))
+
+        for _ in 0..<300 {
+            edge += 1
+            Self.feed(ledger, from: edge + 1, to: edge + 2)
+            meter.advance(to: playhead, wallSeconds: 1, ledger: ledger)
+        }
+        #expect(meter.averageMbps == average, "five minutes of paused live must not move the average")
+
+        _ = Self.play(&meter, ledger, from: playhead, seconds: 60)
+        #expect(Self.near(meter.averageMbps, Self.mbps))
+        #expect(Self.near(meter.instantMbps, Self.mbps))
+    }
+
+    /// Live, playing: this was right before by accident of the clock, and must stay right.
+    @Test("live at the edge reads the broadcast rate")
+    func livePlayingReadsTheRate() {
+        let ledger = PlayedMediaLedger()
+        var meter = PlayedBitrateMeter()
+        Self.feed(ledger, from: 50, to: 53)
+        meter.advance(to: 50, wallSeconds: 0, ledger: ledger)
+        var playhead = 50.0
+        for _ in 0..<60 {
+            Self.feed(ledger, from: playhead + 3, to: playhead + 4)
+            playhead += 1
+            meter.advance(to: playhead, wallSeconds: 1, ledger: ledger)
+        }
+        #expect(Self.near(meter.averageMbps, Self.mbps))
+        #expect(Self.near(meter.instantMbps, Self.mbps))
+    }
+
+    // MARK: - Seeks
+
+    /// The span a seek jumps over was never played, and the buffer the seek discarded is fetched again:
+    /// neither may land in the fields.
+    @Test("a seek charges nothing for the jump, and a re-fetched range counts once")
+    func seekAndRefetch() {
+        let ledger = PlayedMediaLedger()
+        Self.feed(ledger, from: 0, to: 120)
+        var meter = PlayedBitrateMeter()
+        meter.advance(to: 0, wallSeconds: 0, ledger: ledger)
+        _ = Self.play(&meter, ledger, from: 0, seconds: 20)
+        let secondsBefore = meter.lifetimeSeconds
+
+        // Forward seek to 600: a new range is fetched from there.
+        Self.feed(ledger, from: 600, to: 700)
+        meter.advance(to: 600, wallSeconds: 1, ledger: ledger)
+        #expect(meter.lifetimeSeconds == secondsBefore)
+        _ = Self.play(&meter, ledger, from: 600, seconds: 10)
+
+        // Back to 100: the reader delivers 100..200 again, over entries it already held.
+        Self.feed(ledger, from: 100, to: 200)
+        meter.advance(to: 100, wallSeconds: 1, ledger: ledger)
+        _ = Self.play(&meter, ledger, from: 100, seconds: 30)
+
+        #expect(abs(meter.lifetimeSeconds - 60) < 1e-6)
+        #expect(Self.near(meter.averageMbps, Self.mbps))
+    }
+
+    /// A playhead the ledger holds nothing for (not fed there, or on another axis) is unmeasured.
+    @Test("a playhead off the ledger's span publishes nil, never zero")
+    func unmeasuredSpanIsNil() {
+        let ledger = PlayedMediaLedger()
+        Self.feed(ledger, from: 5_000, to: 5_100)
+        var meter = PlayedBitrateMeter()
+        meter.advance(to: 0, wallSeconds: 0, ledger: ledger)
+        _ = Self.play(&meter, ledger, from: 0, seconds: 30)
+        #expect(meter.averageMbps == nil)
+        #expect(meter.instantMbps == nil)
+    }
+
+    // MARK: - The ledger
+
+    @Test("the same packet delivered twice is held once")
+    func duplicatePacketOverwrites() {
+        let ledger = PlayedMediaLedger()
+        ledger.record(.video, pts: 1.0, bytes: 100)
+        ledger.record(.video, pts: 1.04, bytes: 100)
+        ledger.record(.video, pts: 1.0, bytes: 100)
+        #expect(ledger.entryCount == 2)
+        #expect(ledger.consume(from: 0, to: 2) == 200)
+    }
+
+    @Test("B-frame reorder inserts in place, a re-read from far behind drops what lies ahead")
+    func reorderAndReread() {
+        let ledger = PlayedMediaLedger()
+        for pts in [0.0, 0.12, 0.04, 0.08, 0.24, 0.16, 0.20] { ledger.record(.video, pts: pts, bytes: 10) }
+        #expect(ledger.consume(from: 0.04, to: 0.20) == 40)
+        ledger.record(.video, pts: 10, bytes: 10)
+        ledger.record(.video, pts: 11, bytes: 10)
+        ledger.record(.video, pts: 5, bytes: 10)
+        #expect(ledger.consume(from: 5, to: 12) == 10, "10 and 11 lie ahead of the re-read and are gone")
+    }
+
+    @Test("consuming a span forgets everything before it")
+    func consumePrunes() {
+        let ledger = PlayedMediaLedger()
+        Self.feed(ledger, from: 0, to: 10)
+        _ = ledger.consume(from: 4, to: 5)
+        #expect(ledger.consume(from: 0, to: 5) == 0)
+        #expect(ledger.consume(from: 5, to: 10) > 0)
+    }
+
+    // MARK: - The playhead
+
+    @Test("native folds AVPlayer's clock back with the producer's shift; routes without a pump read nil")
+    func ledgerPlayheadPerBackend() {
+        #expect(LiveTelemetrySampler.ledgerPlayhead(
+            backend: .native, nativeClock: 12, playlistShift: 3_600, softwareSourceClock: nil) == 3_612)
+        #expect(LiveTelemetrySampler.ledgerPlayhead(
+            backend: .native, nativeClock: nil, playlistShift: 3_600, softwareSourceClock: nil) == nil)
+        #expect(LiveTelemetrySampler.ledgerPlayhead(
+            backend: .software, nativeClock: 12, playlistShift: 3_600, softwareSourceClock: 90) == 90)
+        #expect(LiveTelemetrySampler.ledgerPlayhead(
+            backend: .audio, nativeClock: 12, playlistShift: 0, softwareSourceClock: 12) == nil)
     }
 }

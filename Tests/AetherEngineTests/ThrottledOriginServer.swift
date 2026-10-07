@@ -30,6 +30,12 @@ final class ThrottledOriginServer: @unchecked Sendable {
         /// ended SHORT of its Content-Length - the observable behind the sequential reader's
         /// EIO-not-EOF distinction (a lost source must not read as end-of-media).
         case serveThenDrop(afterBytes: Int64)
+        /// Audit DMX-5: a 206 that starts `start` rather than where it was asked, the way an edge
+        /// that aligns ranges to its own chunk boundary answers. The body is that range's.
+        case serve206From(start: Int64)
+        /// Audit DMX-101: a server that cannot address bytes. Whatever range was asked for, the
+        /// answer is a 200 with the whole source from byte 0 and its full Content-Length.
+        case serve200
     }
 
     let port: UInt16
@@ -43,6 +49,16 @@ final class ThrottledOriginServer: @unchecked Sendable {
     /// its own chunk boundary does this. Default off keeps every existing test on the historical
     /// behaviour.
     private let ignoreRangeEnd: Bool
+    /// AE#619: serve `patternByte(at:)` instead of a constant, so a test can check that the bytes
+    /// the reader returns are the bytes at the offset it claims. Default off keeps every existing
+    /// test on the historical constant body.
+    private let patternedBody: Bool
+
+    /// The byte a `patternedBody` origin serves at `offset`. Varies within every 256-byte run and
+    /// between runs, so a shifted or reordered read cannot match by accident.
+    static func patternByte(at offset: Int64) -> UInt8 {
+        UInt8(truncatingIfNeeded: offset ^ (offset >> 8) ^ (offset >> 16) ^ (offset >> 24))
+    }
     private let chunkBytes: Int
     private let throttleUs: useconds_t
     private let firstByteDelayUs: @Sendable (_ isSuffix: Bool) -> useconds_t
@@ -133,10 +149,12 @@ final class ThrottledOriginServer: @unchecked Sendable {
     init?(totalSize: Int64, chunkBytes: Int = 256 * 1024, throttleUs: useconds_t = 5000,
           refuseAboveConcurrency: Int? = nil,
           ignoreRangeEnd: Bool = false,
+          patternedBody: Bool = false,
           firstByteDelayUs: @escaping @Sendable (_ isSuffix: Bool) -> useconds_t = { _ in 0 },
           respond: @escaping @Sendable (_ requestIndex: Int, _ offset: Int64, _ path: String) -> Directive = { _, _, _ in .serve206 }) {
         self.totalSize = totalSize
         self.ignoreRangeEnd = ignoreRangeEnd
+        self.patternedBody = patternedBody
         self.chunkBytes = chunkBytes
         self.throttleUs = throttleUs
         self.refuseAboveConcurrency = refuseAboveConcurrency
@@ -299,9 +317,15 @@ final class ThrottledOriginServer: @unchecked Sendable {
 
         var silentAfter: Int64? = nil
         var dropAfter: Int64? = nil
+        var answersWholeSource = false
         switch respond(requestIndex, offset, path) {
         case .serve206:
             break
+        case .serve200:
+            answersWholeSource = true
+            offset = 0
+        case .serve206From(let start):
+            offset = max(0, min(start, totalSize - 1))
         case .serveThenGoSilent(let afterBytes):
             silentAfter = max(0, afterBytes)
         case .serveThenDrop(let afterBytes):
@@ -331,15 +355,19 @@ final class ThrottledOriginServer: @unchecked Sendable {
             pendingDelay -= slice
         }
 
-        let last = (ignoreRangeEnd ? nil : rangeEnd) ?? (totalSize - 1)
+        let last = answersWholeSource ? totalSize - 1 : (ignoreRangeEnd ? nil : rangeEnd) ?? (totalSize - 1)
         let remaining = last - offset + 1
         // Keep-alive, not close: a bounded range that tears the socket down would make every
         // refill a fresh connection and would hide exactly the pooling question under test.
-        let header = "HTTP/1.1 206 Partial Content\r\n"
-            + "Content-Range: bytes \(offset)-\(last)/\(totalSize)\r\n"
-            + "Content-Length: \(remaining)\r\n"
-            + "Accept-Ranges: bytes\r\n"
-            + "Connection: keep-alive\r\n\r\n"
+        let header = answersWholeSource
+            ? "HTTP/1.1 200 OK\r\n"
+                + "Content-Length: \(remaining)\r\n"
+                + "Connection: keep-alive\r\n\r\n"
+            : "HTTP/1.1 206 Partial Content\r\n"
+                + "Content-Range: bytes \(offset)-\(last)/\(totalSize)\r\n"
+                + "Content-Length: \(remaining)\r\n"
+                + "Accept-Ranges: bytes\r\n"
+                + "Connection: keep-alive\r\n\r\n"
         guard writeFully(fd, Array(header.utf8)) else { return false }
 
         let chunk = [UInt8](repeating: 0x55, count: chunkBytes)
@@ -370,7 +398,10 @@ final class ThrottledOriginServer: @unchecked Sendable {
             var n = Int(min(Int64(chunkBytes), remaining - served))
             if let silentAfter { n = Int(min(Int64(n), silentAfter - served)) }
             if let dropAfter { n = Int(min(Int64(n), dropAfter - served)) }
-            guard writeBody(fd, Array(chunk[0..<n])) else { return false }
+            let body = patternedBody
+                ? (0..<n).map { Self.patternByte(at: offset + served + Int64($0)) }
+                : Array(chunk[0..<n])
+            guard writeBody(fd, body) else { return false }
             served += Int64(n)
             if throttleUs > 0 { usleep(throttleUs) }
         }

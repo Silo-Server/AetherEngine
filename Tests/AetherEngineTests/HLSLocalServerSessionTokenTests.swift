@@ -69,10 +69,105 @@ struct HLSLocalServerSessionTokenTests {
         #expect(Self.status(port: server.port, path: "/seg0.mp4") == 404)
     }
 
+    // MARK: - The token in the log (audit SUB-107)
+
+    @Test("A running server's token is redacted from every log line, and released on stop")
+    func tokenIsRedactedWhileTheServerRuns() throws {
+        let server = HLSLocalServer(provider: StubProvider())
+        try server.start()
+        let token = server.pathToken
+        let line = "[NativeAVPlayerHost] #2 load url=http://127.0.0.1:\(server.port)/\(token)/master.m3u8"
+        #expect(LogRedaction.isRegistered(token))
+        #expect(!LogRedaction.redact(line).contains(token))
+        #expect(LogRedaction.redact("[HLSLocalServer] GET /\(token)/seg_1.m4s HTTP/1.1")
+                == "[HLSLocalServer] GET /<redacted>/seg_1.m4s HTTP/1.1")
+
+        server.stop()
+        #expect(!LogRedaction.isRegistered(token))
+        server.stop()
+        #expect(!LogRedaction.isRegistered(token))
+    }
+
+    @Test("Stopping one server leaves the other's token redacted")
+    func twoServersKeepTheirOwnRegistration() throws {
+        let first = HLSLocalServer(provider: StubProvider())
+        let second = HLSLocalServer(provider: StubProvider())
+        try first.start()
+        try second.start()
+        defer { second.stop() }
+
+        first.stop()
+        #expect(!LogRedaction.isRegistered(first.pathToken))
+        #expect(LogRedaction.isRegistered(second.pathToken))
+    }
+
+    @Test("The logged request line names the route, not the token")
+    func requestLineOmitsTheToken() {
+        #expect(HLSLocalServer.requestLineForLog(
+            method: "GET", routePath: "/seg_1.m4s", query: "", version: "HTTP/1.1")
+                == "GET /seg_1.m4s HTTP/1.1")
+        #expect(HLSLocalServer.requestLineForLog(
+            method: "GET", routePath: "/media.m3u8", query: "_HLS_msn=12", version: "HTTP/1.1")
+                == "GET /media.m3u8?_HLS_msn=12 HTTP/1.1")
+    }
+
+    // MARK: - Credential headers in the log (audit Vcred-102)
+
+    /// On the #316 / AE#495 stand-in route AVPlayer carries the host's own headers to this server, so
+    /// the once-per-session header dump printed whatever credential the host passed.
+    @Test("The first-request header dump names a credential header but never prints its value")
+    func headerDumpOmitsCredentialValues() throws {
+        let tap = EngineLogCapture()
+        defer { tap.end() }
+        let server = HLSLocalServer(provider: StubProvider())
+        try server.start()
+        defer { server.stop() }
+        let marker = "X-Probe-\(UUID().uuidString.prefix(8))"
+
+        let status = Self.status(
+            port: server.port, path: "/\(server.pathToken)/media.m3u8",
+            extraHeaders: [#"Authorization: Digest username="bob", response="6629fae49393a05397450978507c4ef1""#,
+                           "X-Portal-Auth: SECRETportal123", "\(marker): 1", "Range: bytes=0-1"])
+        #expect(status == 200)
+
+        // Header names no redactor rule knows, which is the point: the dump must not depend on one.
+        let dumped = tap.lines.filter { $0.contains("first request headers") && $0.contains(marker) }
+        #expect(dumped.count == 1)
+        for line in dumped {
+            #expect(!line.contains("6629fae49393a05397450978507c4ef1"), "\(line)")
+            #expect(!line.contains("SECRETportal123"), "\(line)")
+            #expect(line.contains("Authorization"))
+            #expect(line.contains("X-Portal-Auth"))
+            #expect(line.contains("Range: bytes=0-1"))
+        }
+    }
+
+    @Test("Only the capability headers keep their values in the dump")
+    func headerDumpFormat() {
+        let dumped = HLSLocalServer.requestHeadersForLog([
+            "Host: 127.0.0.1:50123", "Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123",
+            "Cookie: session=SECRETsess123", "Range: bytes=0-1", "X-Playback-Session-Id: 5A0C",
+            "Accept: */*", "User-Agent: AppleCoreMedia/1.0", "garbage",
+        ])
+        #expect(dumped == "Host: 127.0.0.1:50123 | Authorization | Cookie | Range: bytes=0-1 | "
+                + "X-Playback-Session-Id: 5A0C | Accept: */* | User-Agent: AppleCoreMedia/1.0 | ?")
+    }
+
     // MARK: - Helpers
 
-    /// Status line of a plain GET, or 0 when the request could not be completed.
-    private static func status(port: UInt16, path: String) -> Int {
+    /// Status line of a plain GET, or 0 when the request could not be completed. A 0 is never the
+    /// answer under test, and a loaded CI runner has dropped one exchange mid-suite while the
+    /// requests around it on the same server were answered, so it is retried before it counts.
+    private static func status(port: UInt16, path: String, extraHeaders: [String] = []) -> Int {
+        for attempt in 0..<3 {
+            if attempt > 0 { usleep(100_000) }
+            let code = singleStatus(port: port, path: path, extraHeaders: extraHeaders)
+            if code != 0 { return code }
+        }
+        return 0
+    }
+
+    private static func singleStatus(port: UInt16, path: String, extraHeaders: [String]) -> Int {
         let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
         guard fd >= 0 else { return 0 }
         defer { close(fd) }
@@ -87,7 +182,8 @@ struct HLSLocalServerSessionTokenTests {
             }
         }
         guard connected == 0 else { return 0 }
-        let request = "GET \(path) HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        let extra = extraHeaders.map { "\($0)\r\n" }.joined()
+        let request = "GET \(path) HTTP/1.1\r\nHost: 127.0.0.1\r\n\(extra)Connection: close\r\n\r\n"
         let sent = Array(request.utf8).withUnsafeBytes { send(fd, $0.baseAddress, $0.count, 0) }
         guard sent > 0 else { return 0 }
         var buffer = [UInt8](repeating: 0, count: 256)

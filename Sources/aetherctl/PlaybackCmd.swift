@@ -98,8 +98,8 @@ enum LoadOptionChange {
 /// and optionally activate an embedded subtitle track (`--subs <codec-or-lang>`)
 /// and log every overlay cue that arrives. Repro harness for "loads but never
 /// plays" reports and for live teletext end-to-end validation (#107).
-func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liveIngest: Bool = false, fastZap: Bool = false, liveStartImmediately: Bool = true, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool = false, seekEvery: Double? = nil, seekPattern: [Double] = [], seekCount: Int? = nil, startPosition: Double? = nil, mallocCensus: Bool = false, forceSoftware: Bool = false,
-                    censusThresholdMB: Int? = nil, censusHz: Double? = nil, frameTimes: Bool = false, presentTimes: Bool = false, pictureProbe: Bool = false, pictureOrigin: Double = 0,
+func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liveIngest: Bool = false, fastZap: Bool = false, liveStartImmediately: Bool = true, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool = false, seekEvery: Double? = nil, seekPattern: [Double] = [], seekCount: Int? = nil, startPosition: Double? = nil, mallocCensus: Bool = false, forceSoftware: Bool = false, softwareEscalation: Bool = true,
+                    censusThresholdMB: Int? = nil, censusHz: Double? = nil, frameTimes: Bool = false, presentTimes: Bool = false, servedURL: Bool = false, pictureProbe: Bool = false, pictureOrigin: Double = 0,
                     sidecars: [ExternalSubtitleTrack] = [], audioSwitch: AudioSwitchRequest? = nil,
                     teletextPage: Int? = nil, teletextSwitch: TeletextPageSwitchRequest? = nil,
                     audioDelayMs: Int = 0, audioDelaySwitches: [AudioDelaySwitchRequest] = [],
@@ -122,16 +122,17 @@ func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liv
     // rather than the process-global test hook it used before. The hook forces every session on the
     // engine, so it could never exercise the thing a host actually calls.
     if forceSoftware { print("[aetherctl] decode path: preferredDecodePath=.software (#461)") }
+    if !softwareEscalation { print("[aetherctl] escalatesToSoftwarePath=false (AE#629)") }
     if let audioSwitch {
         print("[aetherctl] audio switch: selectAudioTrack(index: \(audioSwitch.index)) "
               + "\(audioSwitch.delayMilliseconds) ms after the load returns")
     }
-    print("aetherctl play: \(url.absoluteString) (seconds=\(seconds) live=\(live) nativeHLS=\(nativeHLS) liveIngest=\(liveIngest) dvrWindow=\(dvrWindow.map { String($0) } ?? "nil") subs=\(subsPick ?? "off") hostCalls=\(hostCalls.isEmpty ? "none" : hostCalls.joined(separator: "+")) audioStats=\(audioStats) seekEvery=\(seekEvery.map { String($0) } ?? "off") seekCount=\(seekCount.map { String($0) } ?? "unbounded") seekPattern=\(seekPattern.isEmpty ? "off" : seekPattern.map { String($0) }.joined(separator: "/")) startPosition=\(startPosition.map { String($0) } ?? "0"))")
+    print(EngineLog.redacted("aetherctl play: \(url.absoluteString) (seconds=\(seconds) live=\(live) nativeHLS=\(nativeHLS) liveIngest=\(liveIngest) dvrWindow=\(dvrWindow.map { String($0) } ?? "nil") subs=\(subsPick ?? "off") hostCalls=\(hostCalls.isEmpty ? "none" : hostCalls.joined(separator: "+")) audioStats=\(audioStats) seekEvery=\(seekEvery.map { String($0) } ?? "off") seekCount=\(seekCount.map { String($0) } ?? "unbounded") seekPattern=\(seekPattern.isEmpty ? "off" : seekPattern.map { String($0) }.joined(separator: "/")) startPosition=\(startPosition.map { String($0) } ?? "0"))"))
     print("")
     // CFRunLoopRun, not a blocking semaphore: AetherEngine is @MainActor, so parking the main thread would deadlock the executor.
     let box = UncheckedBox<Int32?>(nil)
     Task { @MainActor in
-        box.value = await playSmokeTest(url: url, seconds: seconds, live: live, forceSoftware: forceSoftware, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: fastZap, liveStartImmediately: liveStartImmediately, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: startPosition, frameTimes: frameTimes, presentTimes: presentTimes, pictureProbe: pictureProbe, pictureOrigin: pictureOrigin, sidecars: sidecars, audioSwitch: audioSwitch, teletextPage: teletextPage, teletextSwitch: teletextSwitch, audioDelayMs: audioDelayMs, audioDelaySwitches: audioDelaySwitches, pausedMount: pausedMount, optionCorrection: optionCorrection, sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests, heldConnection: heldConnection, declaredDuration: declaredDuration, httpHeaders: httpHeaders, deinterlaceFieldRate: deinterlaceFieldRate, assertDolbyVision: assertDolbyVision, preserveASSMarkup: preserveASSMarkup, dolbyVisionHandling: dolbyVisionHandling, record: record)
+        box.value = await playSmokeTest(url: url, seconds: seconds, live: live, forceSoftware: forceSoftware, softwareEscalation: softwareEscalation, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: fastZap, liveStartImmediately: liveStartImmediately, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: startPosition, frameTimes: frameTimes, presentTimes: presentTimes, servedURL: servedURL, pictureProbe: pictureProbe, pictureOrigin: pictureOrigin, sidecars: sidecars, audioSwitch: audioSwitch, teletextPage: teletextPage, teletextSwitch: teletextSwitch, audioDelayMs: audioDelayMs, audioDelaySwitches: audioDelaySwitches, pausedMount: pausedMount, optionCorrection: optionCorrection, sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests, heldConnection: heldConnection, declaredDuration: declaredDuration, httpHeaders: httpHeaders, deinterlaceFieldRate: deinterlaceFieldRate, assertDolbyVision: assertDolbyVision, preserveASSMarkup: preserveASSMarkup, dolbyVisionHandling: dolbyVisionHandling, record: record)
         CFRunLoopStop(CFRunLoopGetMain())
     }
     CFRunLoopRun()
@@ -152,6 +153,8 @@ func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liv
 private func networkTelemetryFragment(_ telemetry: LiveTelemetry?) -> String {
     guard let telemetry else { return "" }
     var out = ""
+    if let inst = telemetry.instantBitrateMbps { out += String(format: " inst=%.2fMbps", inst) }
+    if let avg = telemetry.averageBitrateMbps { out += String(format: " avg=%.2fMbps", avg) }
     if let mbps = telemetry.networkThroughputMbps { out += String(format: " net=%.2fMbps", mbps) }
     if let rx = telemetry.networkTransferredBytes { out += String(format: " rx=%.1fMB", Double(rx) / 1_048_576) }
     out += String(format: " origin=%.1fMB", Double(telemetry.demuxerBytesFetched) / 1_048_576)
@@ -450,7 +453,7 @@ private func seekIntentDrill(
 }
 
 @MainActor
-private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware: Bool = false, nativeHLS: Bool = false, liveIngest: Bool = false, fastZap: Bool = false, liveStartImmediately: Bool = true, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool, seekEvery: Double? = nil, seekPattern: [Double] = [], seekCount: Int? = nil, startPosition: Double? = nil, frameTimes: Bool = false, presentTimes: Bool = false, pictureProbe: Bool = false, pictureOrigin: Double = 0, sidecars: [ExternalSubtitleTrack] = [], audioSwitch: AudioSwitchRequest? = nil, teletextPage: Int? = nil, teletextSwitch: TeletextPageSwitchRequest? = nil, audioDelayMs: Int = 0, audioDelaySwitches: [AudioDelaySwitchRequest] = [], pausedMount: Bool = false, optionCorrection: LoadOptionCorrectionRequest? = nil, sequentialOrigin: Bool = false, maxConcurrentRequests: Int? = nil, heldConnection: Bool = false, declaredDuration: Double? = nil, httpHeaders: [String: String] = [:], deinterlaceFieldRate: DeinterlaceFieldRate = .field, assertDolbyVision: Bool = false, preserveASSMarkup: Bool = false, dolbyVisionHandling: DolbyVisionHandling = .automatic, record: URL? = nil) async -> Int32 {
+private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware: Bool = false, softwareEscalation: Bool = true, nativeHLS: Bool = false, liveIngest: Bool = false, fastZap: Bool = false, liveStartImmediately: Bool = true, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool, seekEvery: Double? = nil, seekPattern: [Double] = [], seekCount: Int? = nil, startPosition: Double? = nil, frameTimes: Bool = false, presentTimes: Bool = false, servedURL: Bool = false, pictureProbe: Bool = false, pictureOrigin: Double = 0, sidecars: [ExternalSubtitleTrack] = [], audioSwitch: AudioSwitchRequest? = nil, teletextPage: Int? = nil, teletextSwitch: TeletextPageSwitchRequest? = nil, audioDelayMs: Int = 0, audioDelaySwitches: [AudioDelaySwitchRequest] = [], pausedMount: Bool = false, optionCorrection: LoadOptionCorrectionRequest? = nil, sequentialOrigin: Bool = false, maxConcurrentRequests: Int? = nil, heldConnection: Bool = false, declaredDuration: Double? = nil, httpHeaders: [String: String] = [:], deinterlaceFieldRate: DeinterlaceFieldRate = .field, assertDolbyVision: Bool = false, preserveASSMarkup: Bool = false, dolbyVisionHandling: DolbyVisionHandling = .automatic, record: URL? = nil) async -> Int32 {
     let engine: AetherEngine
     do {
         engine = try AetherEngine()
@@ -526,6 +529,17 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         }
         .store(in: &cancellables)
 
+    // AE#658: what the engine's own decoder produced; silent on the native path, where AVPlayer decodes.
+    engine.$decodedVideoFormat
+        .compactMap { $0 }
+        .removeDuplicates()
+        .sink { d in
+            print("  DECODED \(d.frame.pixelFormat ?? "?") depth=\(d.frame.bitDepth.map(String.init) ?? "?") "
+                  + "primaries=\(d.frame.colorPrimaries ?? "-") transfer=\(d.frame.transfer ?? "-") "
+                  + "matrix=\(d.frame.matrix ?? "-") range=\(d.frame.range ?? "-") -> \(d.pixelBufferLabel)")
+        }
+        .store(in: &cancellables)
+
     let options = LoadOptions(
         suppressDisplayCriteria: true,
         httpHeaders: httpHeaders,
@@ -567,12 +581,31 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         // separates "the deinterlaced path loses frames" from "it emits 2.5x as many of them" could
         // only be asked of a reporter. send_frame halves the output rate and changes nothing else.
         deinterlaceFieldRate: deinterlaceFieldRate,
-        preferredDecodePath: forceSoftware ? .software : .automatic
+        preferredDecodePath: forceSoftware ? .software : .automatic,
+        escalatesToSoftwarePath: softwareEscalation
     )
+    // AE#629: the rescue a host used to see only as a route change.
+    let escalationSub = engine.softwarePathEscalations.sink { event in
+        let failure = event.absorbedFailure
+        print(String(format: "ESCALATION at %.2fs duringStartup=%@ absorbed=%@/%@ %@",
+                     event.positionSeconds, String(event.duringStartup),
+                     failure.underlyingDomain ?? "-", failure.underlyingCode.map(String.init) ?? "-",
+                     failure.kind.rawValue))
+    }
+    defer { escalationSub.cancel() }
+    // `reloadnext`: every published state, because what a host reacts to at an episode seam is a
+    // transition that lasts a millisecond and never shows up in the once-a-second status line.
+    let stateTraceStart = Date()
+    let stateTrace = hostCalls.contains("reloadnext") ? engine.$state.sink { state in
+        print(String(format: "  STATE %@ t=%.3f", String(describing: state),
+                     Date().timeIntervalSince(stateTraceStart)))
+    } : nil
+    defer { stateTrace?.cancel() }
     // #311: installed BEFORE the load on purpose. The engine holds it and arms the host it builds,
     // which is the documented usage and the part a host would otherwise have to re-do per load.
     let frameProbe = frameTimes ? FrameTimeProbe() : nil
     let presentProbe = presentTimes ? PresentedFrameProbe() : nil
+    var servedURLItem: ObjectIdentifier?
     let picture = pictureProbe ? PictureProbe(sourceOrigin: pictureOrigin) : nil
     if let frameProbe {
         engine.setSoftwareVideoFrameTimeObserver { [weak frameProbe] frame in
@@ -602,6 +635,13 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
             liveOptions.isLive = true
             liveOptions.dvrWindowSeconds = 1800
             try await engine.load(url: url, options: liveOptions)
+        }
+        // The host's episode seam: the next load on the same engine while the first is still playing,
+        // with no stop() in between, so the native host is reused.
+        if hostCalls.contains("reloadnext") {
+            try await Task.sleep(for: .seconds(4))
+            print("  HOSTCALL reload in place")
+            _ = try await engine.load(url: url, startPosition: startPosition, options: options)
         }
     } catch {
         print("LOAD FAILED: \(error)")
@@ -666,7 +706,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
             // exists (the foreground retune's hold-paused policy). Resumed at tick 8.
             print("  HOSTCALL pause() right after load")
             engine.pause()
-        case "reloadlive", "seekback", "overlapseek", "ratehold-tail", "pauseseek", "pausehold", "still", "stallclock":
+        case "reloadlive", "reloadnext", "seekback", "overlapseek", "ratehold-tail", "pauseseek", "pausehold", "still", "stallclock", "pausereload", "playreload", "extplayreload":
             break  // reloadlive handled at load time, seekback/overlapseek/pauseseek in the telemetry loop
         case "nativesubs":
             break  // Sodalite#156, read at load time into LoadOptions.prepareNativeSubtitles
@@ -674,7 +714,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
             || call.hasPrefix("subson") || call.hasPrefix("nativerender"):
             break  // #433 / Sodalite#156, all in the telemetry loop; `@N` picks the tick
         default:
-            print("  HOSTCALL unknown '\(call)' (use play,extractor,setrate,ratehold,pausestart,reloadlive,seekback,seekfar,overlapseek,pauseseek,pausehold,still,stallclock,nativesubs,nativerender,subsoff,subson)")
+            print("  HOSTCALL unknown '\(call)' (use play,extractor,setrate,ratehold,pausestart,reloadlive,reloadnext,seekback,seekfar,overlapseek,pauseseek,pausehold,still,stallclock,pausereload,playreload,extplayreload,nativesubs,nativerender,subsoff,subson)")
         }
     }
     defer { if let frameExtractor { Task { await frameExtractor.shutdown() } } }
@@ -686,6 +726,9 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
     var stallClockAtStall: Double?
     var stallClockBeforeResume: Double?
     var stallClockAtEnd: Double?
+    // AE#626: the clock just after the forced stage-2 reload, and at the last tick.
+    var recoveryReloadClockAfter: Double?
+    var recoveryReloadClockAtEnd: Double?
     var monitor: AudioContinuityMonitor?
     var tapTask: Task<Void, Never>?
     if audioStats {
@@ -717,7 +760,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
     for (delay, group) in Dictionary(grouping: audioDelaySwitches, by: \.delayMilliseconds)
         .sorted(by: { $0.key < $1.key }) {
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: UInt64(max(0, delay)) * 1_000_000)
+            try? await Task.sleep(nanoseconds: sleepNanoseconds(milliseconds: delay))
             for audioDelaySwitch in group {
                 print("  HOSTCALL setAudioDelay(\(audioDelaySwitch.milliseconds) ms) at "
                       + "+\(delay) ms "
@@ -730,7 +773,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
 
     if let teletextSwitch {
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: UInt64(max(0, teletextSwitch.delayMilliseconds)) * 1_000_000)
+            try? await Task.sleep(nanoseconds: sleepNanoseconds(milliseconds: teletextSwitch.delayMilliseconds))
             let target = teletextSwitch.page.map(String.init) ?? "auto"
             print("  HOSTCALL setTeletextPage(\(target)) at +\(teletextSwitch.delayMilliseconds) ms "
                   + "(was \(engine.teletextPage.map(String.init) ?? "auto"))")
@@ -744,7 +787,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
     // exactly the pair a host's recovery ladder has to tell apart.
     if let optionCorrection {
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: UInt64(max(0, optionCorrection.delayMilliseconds)) * 1_000_000)
+            try? await Task.sleep(nanoseconds: sleepNanoseconds(milliseconds: optionCorrection.delayMilliseconds))
             let labels = optionCorrection.changes.map(\.label).joined(separator: ", ")
             let before = engine.currentTime
             print("  HOSTCALL reloadAtCurrentPosition(applying: \(labels)) at +\(optionCorrection.delayMilliseconds) ms "
@@ -783,7 +826,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
     if let audioSwitch {
         let mon = monitor
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: UInt64(max(0, audioSwitch.delayMilliseconds)) * 1_000_000)
+            try? await Task.sleep(nanoseconds: sleepNanoseconds(milliseconds: audioSwitch.delayMilliseconds))
             print("  HOSTCALL selectAudioTrack(index: \(audioSwitch.index)) "
                   + "at +\(audioSwitch.delayMilliseconds) ms (was \(engine.activeAudioTrackIndex.map(String.init) ?? "none"))")
             engine.selectAudioTrack(index: audioSwitch.index)
@@ -902,6 +945,12 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
             presentProbe.attachIfNeeded(engine.currentAVPlayerItem)
             line += " pres=\(presentProbe.drainTick())"
         }
+        if servedURL, let item = engine.currentAVPlayerItem, ObjectIdentifier(item) != servedURLItem,
+           let asset = item.asset as? AVURLAsset {
+            servedURLItem = ObjectIdentifier(item)
+            // Deliberately unredacted: the path token is the only way in, and this is a local harness.
+            FileHandle.standardOutput.write(Data("  SERVED \(asset.url.absoluteString)\n".utf8))
+        }
         // AE#441: the live rewind surfaces a host actually scales its strip on. Sampling them needed a
         // patched copy of this CLI before, which is how an over-promising lower bound stayed unseen.
         if engine.isLive {
@@ -990,26 +1039,44 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         if hostCalls.contains("still"), [15, 20, 25].contains(tick) {
             // The third aim is the live EDGE itself, not the playhead: a target a fraction past the
             // newest packet is the clamp case, and it is where a live viewer sits most.
+            // AE#605: a VOD session aims behind the playhead (retained history), ahead of it (the
+            // forward buffer) and far past what is retained, where the right answer is a MISS: the
+            // frame there exists, the cache just does not hold it, and the one before it is wrong.
+            let isLive = engine.isLive
             let target: Double
             let label: String
-            switch tick {
-            case 15:
+            switch (tick, isLive) {
+            case (15, true):
                 target = max(0, engine.currentTime - 20)
                 label = "playhead-20"
-            case 20:
+            case (20, true):
                 target = max(0, engine.currentTime - 5)
                 label = "playhead-5"
-            default:
+            case (_, true):
                 target = engine.seekableLiveRange?.upperBound ?? engine.currentTime
                 label = "edge"
+            case (15, false):
+                target = max(0, engine.currentTime - 10.5)
+                label = "playhead-10.5"
+            case (20, false):
+                target = engine.currentTime + 4.5
+                label = "playhead+4.5"
+            default:
+                target = min(engine.currentTime + 600, max(0, engine.duration - 1))
+                label = "past-frontier"
+            }
+            if tick == 15 {
+                print("  HOSTCALL supportsCacheBackedStills -> \(engine.supportsCacheBackedStills)")
             }
             let started = Date()
-            let image = await engine.liveScrubThumbnail(atSessionSeconds: target, maxWidth: 320)
+            let image = isLive
+                ? await engine.liveScrubThumbnail(atSessionSeconds: target, maxWidth: 320)
+                : await engine.scrubThumbnail(atSeconds: target, maxWidth: 320)
             let ms = Int(Date().timeIntervalSince(started) * 1000)
             stillAttempts += 1
             if let image {
                 stillHits += 1
-                let path = "/tmp/aetherctl-still-\(tick).png"
+                let path = debugOutputPath("aetherctl-still-\(tick).png")
                 let written = writeStillPNG(image, to: path)
                 print(String(format: "  HOSTCALL still(at: %.2f, %@) -> %dx%d in %d ms  %@",
                              target, label, image.width, image.height, ms,
@@ -1080,19 +1147,52 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         // staged on macOS; its outcome can.
         if hostCalls.contains("stallclock") {
             if tick == 4 {
+                #if DEBUG
                 stallClockStalled = engine.stallRendererClockForTesting()
                 stallClockAtStall = engine.currentTime
                 print(String(format: "  HOSTCALL AE#549 stopped the master clock behind the host's back at %.2f%@",
                              engine.currentTime,
                              stallClockStalled ? "" : " -- NO renderer clock on this backend"))
+                #else
+                print("  HOSTCALL stallclock needs a DEBUG build (its engine hooks are compiled out of Release): "
+                      + "swift build --product aetherctl")
+                #endif
             }
             if tick == 6 { stallClockBeforeResume = engine.currentTime }
             if tick == 7 {
+                #if DEBUG
+                let stalledRate = engine.rendererClockRateForTesting ?? -1
+                #else
+                let stalledRate: Float = -1
+                #endif
                 print(String(format: "  HOSTCALL play() on the stalled clock (playhead %.2f, rate %.2f)",
-                             engine.currentTime, engine.rendererClockRateForTesting ?? -1))
+                             engine.currentTime, stalledRate))
                 engine.play()
             }
             if tick >= 9 { stallClockAtEnd = engine.currentTime }
+        }
+        // AE#626: force the #93/#65 stage-2 reload on a session the host paused (`pausereload`) or
+        // left playing (`playreload`), and watch whether the fresh item keeps that transport.
+        let pauseReload = hostCalls.contains("pausereload")
+        let externalPlayReload = hostCalls.contains("extplayreload")
+        if pauseReload || externalPlayReload || hostCalls.contains("playreload") {
+            if pauseReload || externalPlayReload, tick == 6 {
+                print("  HOSTCALL pause()")
+                engine.pause()
+            }
+            // The resume AVKit's transport bar or a remote command makes: straight on the player,
+            // past the engine, so the engine's intent still reads paused while the player runs.
+            if externalPlayReload, tick == 8 {
+                print("  HOSTCALL play() straight on the AVPlayer, as AVKit does")
+                engine.currentAVPlayer?.play()
+            }
+            if tick == 10 {
+                print(String(format: "  HOSTCALL AE#626 forcing the stage-2 reload at %.2f (state=%@)",
+                             engine.currentTime, String(describing: engine.state)))
+                engine.forceStalledConsumerReloadForTesting()
+            }
+            if tick == 13 { recoveryReloadClockAfter = engine.currentTime }
+            if tick >= 13 { recoveryReloadClockAtEnd = engine.currentTime }
         }
         if hostCalls.contains("pausestart"), tick == 8 {
             print(String(format: "  HOSTCALL play() after the start pause (playhead %.2f)", engine.currentTime))
@@ -1204,7 +1304,10 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
             print("  HOSTCALL setNativeSubtitleRendering(true)")
             engine.setNativeSubtitleRendering(true)
         }
-        if let t = nativeRenderTick, tick == t + 2 { await reportLegibleSelection(engine, "after render on") }
+        if let t = nativeRenderTick, tick == t + 2 {
+            await reportLegibleSelection(engine, "after render on")
+            await reportServedVTT(engine, "after render on", around: engine.currentTime, sessionStart: startPosition ?? 0)
+        }
         if let subsOffTick, tick == subsOffTick {
             print("  HOSTCALL subtitles off")
             engine.clearSubtitle()
@@ -1222,7 +1325,10 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         // seconds rather than a runloop turn. Reading at +1 caught the off correctly and reported
         // every on as a failure, which is the harness lying in the more expensive direction.
         if let t = subsOffTick, tick == t + 1 { await reportLegibleSelection(engine, "after off") }
-        if let t = subsOnTick, tick == t + 4 { await reportLegibleSelection(engine, "after on") }
+        if let t = subsOnTick, tick == t + 4 {
+            await reportLegibleSelection(engine, "after on")
+            await reportServedVTT(engine, "after on", around: engine.currentTime, sessionStart: startPosition ?? 0)
+        }
     }
 
     let finalTime = engine.currentTime
@@ -1231,6 +1337,16 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
     // one when the question is what a host's picker ends up showing.
     let finalSubtitleTracks = engine.subtitleTracks
     let finalActiveSubtitle = engine.activeSubtitleTrackIndex
+    // The settled stats-panel identity. The SOURCE line at load prints before the remote-HLS bypass has
+    // read anything back from AVPlayer's item, so it reads empty there by construction.
+    let settledSource = "SOURCE codec=\(engine.sourceVideoCodecName ?? "nil") "
+        + "\(engine.sourceVideoWidth)x\(engine.sourceVideoHeight) "
+        + "fmt=\(engine.sourceVideoFormat) stream=\(engine.sourceVideoStreamFormat.map { String(describing: $0) } ?? "nil")"
+    let settledAudio = engine.audioTracks.map {
+        "#\($0.id) \($0.name) codec=\($0.codec) ch=\($0.channels) sr=\($0.sampleRate)"
+            + "\($0.profile.map { " profile=\($0)" } ?? "")\($0.isAtmos ? " atmos" : "")"
+    }.joined(separator: ", ")
+    let settledActiveAudio = engine.activeAudioTrackIndex
     if record != nil {
         await engine.stopRecording()
         print("  RECORD final state: \(engine.recordingState)")
@@ -1273,6 +1389,8 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         print("subtitle tracks (* = external): \(listed)")
         print("active subtitle: \(finalActiveSubtitle.map(String.init) ?? "none")")
     }
+    print("settled \(settledSource)")
+    print("audio tracks: \(settledAudio.isEmpty ? "none" : settledAudio) active=\(settledActiveAudio.map(String.init) ?? "none")")
     print("final t=\(String(format: "%.2f", finalTime))s state=\(String(describing: endState)) cues=\(cueCount)")
     let closingWindow = await MainActor.run { lastCues }
     print("WINDOW \(closingWindow.count) cues in the last published window")
@@ -1309,6 +1427,24 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         if let atEnd = rateHoldAtEnd, abs(atEnd - Issue436RateHold.rate) > 0.01 {
             print(String(format: "VERDICT: #436 held across the resume but lost later (%.2f at the last tick); "
                          + "a rebuild in between dropped it", atEnd))
+            return 4
+        }
+    }
+    if hostCalls.contains("pausereload") || hostCalls.contains("playreload")
+        || hostCalls.contains("extplayreload") {
+        guard let after = recoveryReloadClockAfter, let atEnd = recoveryReloadClockAtEnd else {
+            print("VERDICT: AE#626 drill inconclusive (run it for at least 20 s)")
+            return 5
+        }
+        let moved = atEnd - after
+        print(String(format: "AE#626 after the reload: %.2f, at the last tick %.2f (%+.2f s), state=%@",
+                     after, atEnd, moved, String(describing: endState)))
+        if hostCalls.contains("pausereload"), moved > 0.25 {
+            print("VERDICT: AE#626 reproduced (the reload of a paused session played it)")
+            return 4
+        }
+        if hostCalls.contains("playreload") || hostCalls.contains("extplayreload"), moved <= 0.25 {
+            print("VERDICT: AE#626 regression (the reload of a playing session came back stopped)")
             return 4
         }
     }
@@ -1431,4 +1567,129 @@ private func reportLegibleSelection(_ engine: AetherEngine, _ label: String) asy
     let name = selection.map { $0.displayName } ?? "none"
     print("  LEGIBLE \(label): selected=\(name) options=\(group.options.count) "
           + "engineActive=\(engine.activeSubtitleTrackIndex.map(String.init) ?? "nil")")
+}
+
+/// Sodalite#156 round 2: what the RECEIVER would actually get, which is not the same question as
+/// whether a selection is held.
+///
+/// The first version of this harness asked `currentMediaSelection` and called a run green when it
+/// read back the language the host picked. On the device the same transition produced a caption box
+/// with no text in it, so the selection was held and the payload behind it was empty. AVKit fetches
+/// the whole forward window in one burst at selection and never re-fetches a segment it already has,
+/// which makes the payload at that instant the only thing that matters.
+///
+/// So this fetches the served WebVTT the way a receiver does: master -> the selected rendition's
+/// media playlist -> the segments covering the playhead, and counts CUE TEXT, not segments.
+private enum Self_VTT {}
+extension AetherEngine {
+    /// `HH:MM:SS.mmm` or `MM:SS.mmm` as seconds.
+    static func vttSeconds(_ s: String) -> Double? {
+        let parts = s.split(separator: ":").map(String.init)
+        guard !parts.isEmpty, let last = Double(parts.last!) else { return nil }
+        var total = last
+        if parts.count >= 2 { total += (Double(parts[parts.count - 2]) ?? 0) * 60 }
+        if parts.count >= 3 { total += (Double(parts[parts.count - 3]) ?? 0) * 3600 }
+        return total
+    }
+}
+
+@MainActor
+private func reportServedVTT(_ engine: AetherEngine, _ label: String, around playhead: Double,
+                             sessionStart: Double) async {
+    guard let item = engine.currentAVPlayerItem,
+          let asset = item.asset as? AVURLAsset else {
+        print("  VTT \(label): no item")
+        return
+    }
+    let master = asset.url
+    func get(_ url: URL) async -> String? {
+        guard let (data, _) = try? await URLSession.shared.data(from: url) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+    guard let masterBody = await get(master) else {
+        print("  VTT \(label): master unreachable at \(master.absoluteString)")
+        return
+    }
+    // The rendition AVPlayer is on, named by the legible selection so the harness follows the same
+    // pick the receiver does rather than guessing an ordinal.
+    var wantedName: String?
+    if let group = try? await item.asset.loadMediaSelectionGroup(for: .legible) {
+        wantedName = item.currentMediaSelection.selectedMediaOption(in: group)?.displayName
+    }
+    let renditions: [(name: String, uri: String)] = masterBody
+        .split(separator: "\n")
+        .filter { $0.hasPrefix("#EXT-X-MEDIA:TYPE=SUBTITLES") }
+        .compactMap { line in
+            func field(_ key: String) -> String? {
+                guard let r = line.range(of: "\(key)=\"") else { return nil }
+                let rest = line[r.upperBound...]
+                guard let end = rest.firstIndex(of: "\"") else { return nil }
+                return String(rest[..<end])
+            }
+            guard let name = field("NAME"), let uri = field("URI") else { return nil }
+            return (name, uri)
+        }
+    guard let pick = renditions.first(where: { $0.name == wantedName }) ?? renditions.first else {
+        print("  VTT \(label): no SUBTITLES rendition in the master")
+        return
+    }
+    guard let media = await get(master.deletingLastPathComponent().appendingPathComponent(pick.uri)) else {
+        print("  VTT \(label): \(pick.uri) unreachable")
+        return
+    }
+    // Walk EXTINF rather than assuming a uniform grid. A source with irregular keyframes (scene cuts,
+    // which is most real content) has segments of unequal length, and the reporter's log shows exactly
+    // that: `planSource` and `sourceStart` 1.96 s apart on every segment. Dividing the playhead by a
+    // nominal 4 s picked nothing there, and a harness that checks zero segments reports a clean run.
+    var offsets: [(name: String, start: Double)] = []
+    var acc = 0.0
+    var pending: Double?
+    for line in media.split(separator: "\n", omittingEmptySubsequences: false) {
+        if line.hasPrefix("#EXTINF:") {
+            pending = Double(line.dropFirst(8).split(separator: ",").first ?? "") ?? 0
+        } else if line.hasSuffix(".vtt") {
+            offsets.append((String(line), acc))
+            acc += pending ?? 0
+            pending = nil
+        }
+    }
+    // The playlist is the WHOLE VOD from segment 0, not a window around the mount, so the accumulated
+    // EXTINF is absolute item time and the playhead is read directly. Subtracting the session start
+    // here picked `subs_0_2.vtt`, eight seconds into the film, and reported it empty, which is true
+    // and says nothing: a harness that checks the wrong segments fails the same way it would succeed.
+    let relative = max(0, playhead)
+    let startIndex = offsets.lastIndex(where: { $0.start <= relative }) ?? 0
+    var checked = 0, nonEmpty = 0, cues = 0, misplaced = 0
+    var firstMismatch: String?
+    for (name, start) in offsets[startIndex...] where checked < 8 {
+        checked += 1
+        guard let body = await get(master.deletingLastPathComponent().appendingPathComponent(name)) else { continue }
+        // A cue is a timestamp line plus text under it; counting "-->" counts cues without parsing.
+        let c = body.components(separatedBy: "-->").count - 1
+        cues += c
+        if c > 0 { nonEmpty += 1 }
+        // Sodalite#156: a POPULATED segment whose cues sit outside the window the playlist declares for
+        // it is as invisible as an empty one, and it reads identically in every count above. The device
+        // capture ruled the empty case out (nothing served empty, 22 segments fetched, still a blank
+        // box), and irregular keyframes make segments as much as 7.5 s long against a nominal 4, so the
+        // declared window and the cue times are exactly the pair worth comparing.
+        let end = offsets.first(where: { $0.start > start })?.start ?? (start + 4)
+        for line in body.split(separator: "\n") where line.contains("-->") {
+            let parts = line.split(separator: " ")
+            guard let t = parts.first.map(String.init), let cueStart = AetherEngine.vttSeconds(t) else { continue }
+            if cueStart < start - 1 || cueStart > end + 1 {
+                misplaced += 1
+                if firstMismatch == nil {
+                    firstMismatch = String(format: "%@ declares [%.1f,%.1f) but carries a cue at %.1f",
+                                           name, start, end, cueStart)
+                }
+            }
+            break
+        }
+    }
+    print("  VTT \(label): rendition=\(pick.name) segments=\(checked) nonEmpty=\(nonEmpty) cues=\(cues)"
+          + (misplaced > 0 ? " MISPLACED=\(misplaced) \(firstMismatch ?? "")" : "")
+          + " picked=\(offsets[startIndex...].prefix(2).map(\.name).joined(separator: ",")) "
+          + "of=\(offsets.count) relative=\(String(format: "%.1f", relative)) playhead=\(String(format: "%.1f", playhead))"
+          + (checked > 0 && nonEmpty == 0 ? "   <- a caption box with nothing in it" : ""))
 }

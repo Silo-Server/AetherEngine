@@ -44,7 +44,13 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
          vttFillWaitSeconds: TimeInterval = defaultVTTFillWaitSeconds) {
         self.tracks = tracks
         self.staticMasterPlaylistBody = masterBody
-        self.programDuration = max(1, programDuration)
+        // `RemoteHLSSubtitleProxy.sumSegmentDurations` already refuses a non-finite, negative or
+        // absurd EXTINF sum before it reaches here; this is the last stop before the value leaves
+        // the provider (`segmentDuration(at:)`) for `wholeSecondsCovering`'s `Int(Double)`, which
+        // traps on `+inf` (audit NAT-1). Bounded again here so a caller that builds this provider
+        // directly, bypassing the proxy, cannot reintroduce the trap.
+        let finiteDuration = programDuration.isFinite ? programDuration : 1
+        self.programDuration = min(max(1, finiteDuration), RemoteHLSSubtitleProxy.maxProgramDurationSeconds)
         self.defaultHeaders = defaultHeaders
         self.vttFillWaitSeconds = vttFillWaitSeconds
         self.stores = tracks.map { _ in NativeSubtitleCueStore() }
@@ -100,6 +106,14 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
     /// cooperative pool, where the detached decode does not get a thread at all.
     func awaitFill() async {
         await currentFillTask()?.value
+    }
+
+    /// AE#616: every sidecar's decode has finished, so `allCueStarts()` is the whole program.
+    var isFillFinished: Bool { stores.allSatisfy(\.isFinished) }
+
+    /// AE#616: cue starts and texts across every injected rendition, on the axis the `.vtt` serves.
+    func allCueStarts() -> [(start: Double, text: String)] {
+        stores.flatMap { $0.allCues().map { (start: $0.start, text: $0.text) } }
     }
 
     /// Reading the handle stays synchronous: `NSLock` is unavailable from an async context.
@@ -164,11 +178,14 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
     /// serves a finished master instead. The EXT-X-MEDIA tags were written by `RemoteHLSMasterRewrite`.
     var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] { [] }
 
-    /// Whole-program WebVTT on the origin item's timeline. The host can declare
-    /// an upstream reanchor offset; unfinished stores must not be served because
-    /// AVPlayer caches this response for the rest of the session.
+    /// Whole-program WebVTT for one sidecar. Cue times are the sidecar's own, moved by the track's
+    /// declared `nativeTimelineOffsetSeconds`: this bypass has no loopback producer and therefore no
+    /// playlist shift, and AVPlayer places the cues by media timestamp, so the sidecar's absolute
+    /// seconds line up with the frames. They do NOT line up with item time where an origin's segments
+    /// start before their playlist slot; AE#616 measures that gap off them. An unfinished store is
+    /// answered `.pending`, never served: AVPlayer caches this response for the rest of the session.
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> NativeSubtitleVTTResponse {
-        guard tracks.indices.contains(ordinal), segmentIndex == 0 else { return .missing }
+        guard ordinal >= 0, ordinal < stores.count, segmentIndex == 0 else { return .missing }
         let store = stores[ordinal]
         let deadline = Date().addingTimeInterval(vttFillWaitSeconds)
         while !store.isFinished, Date() < deadline {

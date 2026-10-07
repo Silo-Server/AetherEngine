@@ -169,6 +169,7 @@ final class AudioBridge: @unchecked Sendable {
     /// before overwrite and in cleanup.
     private var swrInFmt: AVSampleFormat = AV_SAMPLE_FMT_NONE
     private var swrInRate: Int32 = 0
+    private var swrReconfigureFailures = 0
     private var swrInLayout = AVChannelLayout()
     /// FIFO buffering resampled PCM until >= encoderCtx.frame_size samples. FLAC's wrapper has
     /// AV_CODEC_CAP_SMALL_LAST_FRAME but not VARIABLE_FRAME_SIZE, so non-final frames must hit frame_size exactly
@@ -180,9 +181,16 @@ final class AudioBridge: @unchecked Sendable {
     /// source), the abandoned pump can still be inside feed() while the restart thread calls
     /// startSegment() on this otherwise lock-free bridge; concurrent libswresample/libavcodec calls on
     /// the same contexts are a data race. Uncontended in the normal single-pump case. Mirrors
-    /// AudioDecoder.stateLock. Diagnostic reads (fifoSampleCount/liveBytes) stay lock-free; the engine
-    /// lifecycle (restartLock ref-handoff + waitForFinish-gated cleanup) forecloses their races.
+    /// AudioDecoder.stateLock. Diagnostic reads (fifoSampleCount/liveBytes) never touch a context: they read
+    /// a snapshot published under `opLock` (audit DEC-104, Vpipeline-101), because feed() and startSegment()
+    /// free and replace `swrCtx` / `encoderCtx` mid-session and the lifecycle only forecloses that for cleanup().
     private let opLock = NSLock()
+
+    /// The figures `liveBytes` and `fifoSampleCount` report, written at the end of every operation that
+    /// can change them while `opLock` is held. Its own lock, so a 1 Hz reader neither waits on a long
+    /// feed() nor sees a torn struct.
+    private let liveBytesLock = NSLock()
+    private var publishedLiveBytes = LiveBytes(fifoSamples: 0, fifoBytes: 0, swrDelaySamples: 0, swrDelayBytes: 0)
 
     /// PCM intermediate format end-to-end (resampler -> FIFO -> encoder). S16 for lossy sources (EAC3/AC3);
     /// S32 @ bits_per_raw_sample=24 for lossless sources (TrueHD, DTS-HD MA, FLAC, ALAC, raw 24/32-bit PCM) so
@@ -486,14 +494,12 @@ final class AudioBridge: @unchecked Sendable {
         opLock.lock()
         defer { opLock.unlock() }
         cleanup()
+        publishLiveBytes()
     }
 
     /// FIFO depth in samples/channel, for the engine memory probe. Steady-state below frame_size (~4608 @48kHz);
     /// a growing value means the encoder isn't keeping up with the resampler.
-    var fifoSampleCount: Int {
-        guard let f = fifo else { return 0 }
-        return Int(av_audio_fifo_size(f))
-    }
+    var fifoSampleCount: Int { liveBytes.fifoSamples }
 
     /// Cumulative bytes of encoded audio the bridge has emitted this session (sum of every output packet's size).
     /// Monotonic across producer restarts and encoder rebuilds; the telemetry sampler diffs it into a live output
@@ -576,9 +582,16 @@ final class AudioBridge: @unchecked Sendable {
     /// One-shot: a bridge that stays silent for an hour costs one line, not one per packet.
     private(set) var silentFeedReported = false
 
+    /// AE#641: called once, on the pump thread, when the silence is structural AND the decoder is the
+    /// arm that failed (`decodedNothing`). A live session has no muxer death to learn it from: a FLAC
+    /// sample entry is built from the encoder's extradata, so segments keep being cut with an audio
+    /// track that never carries a sample, and AVPlayer shows the first picture and waits on the audio
+    /// forever. Set before the producer starts feeding.
+    var onDecoderProducedNothing: (@Sendable (FeedStats) -> Void)?
+
     /// AE#474: the DECODER arm's unit, and only its unit. Source went in and the FIFO got nothing
     /// back, so there is no sample count to bound anything with and packets are all there is.
-    private static let silentFeedPacketThreshold = 64
+    static let silentFeedPacketThreshold = 64
 
     /// AE#474: the ENCODER arm's unit. `drainFIFOIntoEncoder(requireFull: true)` cannot encode below
     /// `frame_size`, so nothing can be emitted until that many samples have been enqueued, and the
@@ -615,37 +628,30 @@ final class AudioBridge: @unchecked Sendable {
     }
 
     var liveBytes: LiveBytes {
-        let fifoSamples: Int
-        if let f = fifo {
-            fifoSamples = Int(av_audio_fifo_size(f))
-        } else {
-            fifoSamples = 0
-        }
+        liveBytesLock.lock()
+        defer { liveBytesLock.unlock() }
+        return publishedLiveBytes
+    }
 
-        let channels: Int
-        let bytesPerSample: Int = Int(pcmBytesPerSample)
-        if let enc = encoderCtx {
-            channels = Int(enc.pointee.ch_layout.nb_channels)
-        } else {
-            channels = 0
-        }
-
-        let fifoBytes = fifoSamples * channels * bytesPerSample
-
-        let swrDelaySamples: Int
+    /// Reads the FFmpeg contexts and publishes the result for `liveBytes`. Callers hold `opLock`, which
+    /// is what makes the reads safe against the swaps.
+    private func publishLiveBytes() {
+        let fifoSamples = fifo.map { Int(av_audio_fifo_size($0)) } ?? 0
+        let channels = encoderCtx.map { Int($0.pointee.ch_layout.nb_channels) } ?? 0
+        let bytesPerSample = Int(pcmBytesPerSample)
+        var swrDelaySamples = 0
         if let swr = swrCtx, let enc = encoderCtx {
             swrDelaySamples = Int(swr_get_delay(swr, Int64(enc.pointee.sample_rate)))
-        } else {
-            swrDelaySamples = 0
         }
-        let swrDelayBytes = swrDelaySamples * channels * bytesPerSample
-
-        return LiveBytes(
+        let snapshot = LiveBytes(
             fifoSamples: fifoSamples,
-            fifoBytes: fifoBytes,
+            fifoBytes: fifoSamples * channels * bytesPerSample,
             swrDelaySamples: swrDelaySamples,
-            swrDelayBytes: swrDelayBytes
+            swrDelayBytes: swrDelaySamples * channels * bytesPerSample
         )
+        liveBytesLock.lock()
+        publishedLiveBytes = snapshot
+        liveBytesLock.unlock()
     }
 
     /// Mark a producer restart boundary: drain the FIFO (drops the buffered partial frame, max ~96 ms @48kHz) and
@@ -654,6 +660,7 @@ final class AudioBridge: @unchecked Sendable {
     func startSegment() {
         opLock.lock()
         defer { opLock.unlock() }
+        defer { publishLiveBytes() }
         // A prior pump reached EOF and flush() drained the encoder into its terminal state; rebuild it
         // before this restart feeds new frames (#99 failure mode B).
         if drainedAtEOF {
@@ -689,6 +696,7 @@ final class AudioBridge: @unchecked Sendable {
         guard let dec = decoderCtx, let enc = encoderCtx,
               let swr = swrCtx, let fifoPtr = fifo else { return [] }
         drainedAtEOF = true
+        defer { publishLiveBytes() }
         var results: [UnsafeMutablePointer<AVPacket>] = []
 
         // 1. Drain the decoder's internal delay.
@@ -825,6 +833,7 @@ final class AudioBridge: @unchecked Sendable {
               let fifoPtr = fifo else {
             return []
         }
+        defer { publishLiveBytes() }
 
         stats.packetsFed += 1
         stats.packetsFedSinceLastEnqueue += 1
@@ -965,6 +974,7 @@ final class AudioBridge: @unchecked Sendable {
             + "written, so this session will fail its first segment cut unless output starts.",
             category: .session
         )
+        if stats.decodedNothing { onDecoderProducedNothing?(stats) }
     }
 
     /// Align swr's INPUT side to the frame the decoder actually produced. libswresample reads `extended_data`
@@ -974,24 +984,30 @@ final class AudioBridge: @unchecked Sendable {
     /// probe), and reading S32 integers as FLTP floats is noise. Re-derive the input from the frame, keeping
     /// the output side pinned to the encoder, exactly as AudioDecoder configures its resampler from the frame.
     /// No-op in the common case where find_stream_info already resolved the format (frame == seed), so working
-    /// paths are untouched; only a wrong seed or a genuine mid-stream format change rebuilds. swr_alloc_set_opts2
-    /// reuses the context pointer on success and frees it on failure (the caller re-binds swrCtx); swr_init drops
+    /// paths are untouched; only a wrong seed or a genuine mid-stream format change rebuilds. A rebuild drops
     /// the sub-frame resampler delay, as startSegment already does. Runs under feed()'s opLock (never re-lock).
+    ///
+    /// Audit DEC-6: built on a scratch context and swapped in only once it initialised. Rebuilding the
+    /// live one lost it for good on a rejected format (set-opts frees it), after which every feed
+    /// returned early, the bridge stayed mute, and not even the AE#396 detector could see it. A frame
+    /// the resampler cannot take is now dropped and counted, and the old context keeps serving the
+    /// format it was built for. Returns false when this frame must not reach `swr_convert`.
     private func reconfigureSwrInputIfNeeded(
         forFrame sf: UnsafeMutablePointer<AVFrame>,
         enc: UnsafeMutablePointer<AVCodecContext>
-    ) {
+    ) -> Bool {
         let frameFmtRaw = sf.pointee.format
         let frameRate = sf.pointee.sample_rate
-        guard frameFmtRaw >= 0, frameRate > 0, sf.pointee.ch_layout.nb_channels > 0 else { return }
+        guard frameFmtRaw >= 0, frameRate > 0, sf.pointee.ch_layout.nb_channels > 0 else { return true }
         let matchesCurrent = frameFmtRaw == swrInFmt.rawValue
             && frameRate == swrInRate
             && av_channel_layout_compare(&swrInLayout, &sf.pointee.ch_layout) == 0
-        guard !matchesCurrent else { return }
+        guard !matchesCurrent else { return true }
 
         let frameFmt = AVSampleFormat(rawValue: frameFmtRaw)
+        var scratch: OpaquePointer?
         let setRet = swr_alloc_set_opts2(
-            &swrCtx,
+            &scratch,
             &enc.pointee.ch_layout,
             pcmSampleFmt,
             enc.pointee.sample_rate,
@@ -1001,7 +1017,22 @@ final class AudioBridge: @unchecked Sendable {
             0,
             nil
         )
-        guard setRet >= 0, swrCtx != nil, swr_init(swrCtx) >= 0 else { return }
+        let initRet = setRet >= 0 && scratch != nil ? swr_init(scratch) : setRet
+        guard initRet >= 0 else {
+            swr_free(&scratch)
+            swrReconfigureFailures += 1
+            if swrReconfigureFailures == 1 || swrReconfigureFailures % 500 == 0 {
+                EngineLog.emit(
+                    "[AudioBridge] ERROR: resampler rejected decoded \(frameRate)Hz/"
+                    + "\(sf.pointee.ch_layout.nb_channels)ch fmt=\(frameFmtRaw) (ret=\(initRet)); "
+                    + "\(swrReconfigureFailures) frame(s) dropped",
+                    category: .session
+                )
+            }
+            return false
+        }
+        swr_free(&swrCtx)
+        swrCtx = scratch
 
         av_channel_layout_uninit(&swrInLayout)
         av_channel_layout_copy(&swrInLayout, &sf.pointee.ch_layout)
@@ -1023,6 +1054,7 @@ final class AudioBridge: @unchecked Sendable {
                 category: .session
             )
         }
+        return true
     }
 
     /// Resample sf (decoded source frame) to encoder format and push into the FIFO (swr_convert may produce
@@ -1047,10 +1079,8 @@ final class AudioBridge: @unchecked Sendable {
 
         // Align swr's INPUT to the frame the decoder actually produced before converting. No-op once the seed
         // matched (the usual case); only a wrong init seed or a genuine mid-stream format change rebuilds swr.
-        reconfigureSwrInputIfNeeded(forFrame: sf, enc: enc)
-        // The rebuild reuses the context pointer on success, but swr_alloc_set_opts2 frees it on a set-opts
-        // failure (swr_free(ps) -> swrCtx == nil), which would dangle the caller's `swr`. Re-bind to the live one.
-        guard let swr = swrCtx else {
+        // A successful rebuild replaces the context, which would dangle the caller's `swr`. Re-bind to the live one.
+        guard reconfigureSwrInputIfNeeded(forFrame: sf, enc: enc), let swr = swrCtx else {
             stats.framesDroppedBeforeFIFO += 1
             return
         }

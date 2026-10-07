@@ -72,6 +72,13 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     private var stats = AudioBridge.FeedStats()
     private(set) var outputBytesLifetime: Int64 = 0
 
+    /// AE#641: called once, on the pump thread, when the object decoder has been fed
+    /// `AudioBridge.silentFeedPacketThreshold` packets in a row without returning a block. The APAC
+    /// sample entry is written up front, like FLAC's, so nothing downstream fails on its own and the
+    /// session would otherwise play the picture over silence. Set before the producer starts feeding.
+    var onDecoderProducedNothing: (@Sendable (AudioBridge.FeedStats) -> Void)?
+    private var decodedNothingReported = false
+
     private static let avNoPTS: Int64 = -0x7FFFFFFFFFFFFFFF - 1
 
     init(
@@ -140,6 +147,8 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         defer { opLock.unlock() }
         stats.packetsFed += 1
         stats.packetsFedSinceLastEnqueue += 1
+        // Every exit: a decoder that rejects each packet has decoded nothing too.
+        defer { noteDecodedNothingIfNeeded() }
 
         if originFrame == nil, packet.pointee.pts != Self.avNoPTS {
             originFrame = av_rescale_q(packet.pointee.pts, srcTimeBase, encoderTimeBase)
@@ -164,6 +173,17 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
             throw error
         }
         return results
+    }
+
+    /// Caller holds `opLock`.
+    private func noteDecodedNothingIfNeeded() {
+        guard !decodedNothingReported, stats.decodedNothing,
+              stats.packetsFedSinceLastEnqueue >= AudioBridge.silentFeedPacketThreshold else { return }
+        decodedNothingReported = true
+        EngineLog.emit(
+            "[SpatialAudioBridge] ERROR: AE#641 the TrueHD object decoder has produced nothing: "
+            + "\(stats.summary)", category: .session)
+        onDecoderProducedNothing?(stats)
     }
 
     func flush() -> [UnsafeMutablePointer<AVPacket>] {

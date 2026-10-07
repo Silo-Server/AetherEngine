@@ -163,6 +163,29 @@ struct HDR10PlusMetadataScanTests {
         #expect(scan(Self.annexB([0x4E, 0x01] + escaped)))
     }
 
+    /// Audit BIT-4: the prefilter must never hide a payload the full walk would confirm, in any
+    /// framing, and must turn away a packet that has no T.35 header at all.
+    @Test("The T.35 header prefilter keeps every carriage and rejects packets without the header")
+    func t35PrefilterIsExact() {
+        let carriers: [[UInt8]] = [
+            Self.annexB(Self.sei()),
+            Self.annexB(Self.sei(hevc: false), fourBytes: true),
+            Self.lengthPrefixed(Self.sei(), width: 4),
+            Self.annexB([0x4E, 0x01] + Self.escaped(
+                Self.message(Self.t35(windows: 3, grids: true, toneMapping: true)) + [0x80])),
+        ]
+        for bytes in carriers {
+            #expect(bytes.withUnsafeBufferPointer {
+                HDR10PlusMetadataScan.mayContainT35Header($0.baseAddress!, size: $0.count)
+            })
+        }
+        let slice = Self.annexB([0x26, 0x01] + [UInt8](repeating: 0x5A, count: 4096))
+        #expect(!slice.withUnsafeBufferPointer {
+            HDR10PlusMetadataScan.mayContainT35Header($0.baseAddress!, size: $0.count)
+        })
+        #expect(!scan(slice))
+    }
+
     @Test("Raw markers, slices, parameter sets, and unregistered SEI never confirm")
     func nonMetadataMarkers() {
         #expect(!scan(Self.header))

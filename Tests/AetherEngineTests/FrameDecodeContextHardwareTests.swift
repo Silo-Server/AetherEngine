@@ -30,6 +30,38 @@ struct FrameDecodeContextHardwareTests {
         #expect(context.hardwareDecoderName == "none")
     }
 
+    /// Audit BIT-102: a cache-backed still went through VideoToolbox for every title, including Dolby
+    /// Vision Profile 5 / 10.0 whose planes are IPT-PQ-C2. VideoToolbox's P010 output skips the DV
+    /// converter, which only takes `yuv420p10le`, so those thumbnails carried the #103 cast again.
+    @Test("a no-base-layer Dolby Vision record never takes the hardware path")
+    func noBaseLayerStaysOnSoftware() {
+        #expect(FrameDecodeContext.stillUsesHardware(allows: true, disabled: false, dvNoBaseLayer: false))
+        #expect(!FrameDecodeContext.stillUsesHardware(allows: true, disabled: false, dvNoBaseLayer: true))
+        #expect(!FrameDecodeContext.stillUsesHardware(allows: true, disabled: true, dvNoBaseLayer: false))
+        #expect(!FrameDecodeContext.stillUsesHardware(allows: false, disabled: false, dvNoBaseLayer: false))
+    }
+
+    private static let profile5FixtureURL = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent(
+            "Fixtures/user/Patterns_Of_Nature_DoVi_24_P5_UHD_HEVC-10mbps_DD+JOC-768kbps_iOS.mp4")
+
+    /// Dolby's own Profile 5 signal (see `DolbyVisionRecordAuditTests`), which cannot be committed.
+    @Test("a real Profile 5 title opened from a cache reader decodes in software",
+          .enabled(if: FileManager.default.fileExists(atPath: FrameDecodeContextHardwareTests.profile5FixtureURL.path)))
+    func profile5FromCacheReaderIsSoftware() throws {
+        let data = try Data(contentsOf: Self.profile5FixtureURL, options: .alwaysMapped)
+        let context = FrameDecodeContext(reader: DataIOReader(data: data), formatHint: "mp4")
+        defer { context.close() }
+
+        try context.ensureOpen()
+
+        #expect(context.isDolbyVisionNoBaseLayer)
+        #expect(context.hardwareDecoderName == "none")
+    }
+
     /// One 64x64 MPEG-4 Part 2 frame. VideoToolbox does not offer that legacy codec, while
     /// FFmpeg's software decoder does; this is the deterministic decline/fallback witness.
     /// Regenerate with:

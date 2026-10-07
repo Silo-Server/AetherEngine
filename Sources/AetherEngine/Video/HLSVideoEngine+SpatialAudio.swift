@@ -86,6 +86,13 @@ extension HLSVideoEngine {
         )
         savedAudioConfig = cfg
         audioBridge = bridge
+        // Same surfacing as the channel bridge: a decoder that never answers is a failure, not silence.
+        if sideAudioDemuxer == nil {
+            let streamIndex = sourceAudioStreamIndex
+            bridge.onDecoderProducedNothing = { [weak self] stats in
+                self?.handleBridgeDecodedNothing(streamIndex: streamIndex, summary: stats.summary)
+            }
+        }
         do {
             let producer = try makeProducer(baseIndex: initialProducerBaseIndex)
             audioHLSCodecs = bridge.hlsCodecs

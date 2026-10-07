@@ -94,7 +94,7 @@ struct Issue587PreserveASSMarkupCodecGateTests {
         #expect(bodies == ["styled ass line", "second ass line"])
     }
 
-    private static let base64 = [
+    static let base64 = [
         "GkXfo6NChoEBQveBAULygQRC84EIQoKIbWF0cm9za2FCh4EEQoWBAhhTgGcBAAAAAAAIqBFNm3TAv4QrfW8sTbuLU6uEFUmpZlOs",
         "gaFNu4tTq4QWVK5rU6yB8U27jFOrhBJUw2dTrIID9k27jFOrhBxTu2tTrIIIPOwBAAAAAAAAUwAAAAAAAAAAAAAAAAAAAAAAAAAA",
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFUmpZsu/hGgSNtMq",
