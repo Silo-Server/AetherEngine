@@ -17,13 +17,15 @@ import AVFoundation
 struct InjectedASSRenditionSuppressionTests {
 
     private static let script = #"""
-    import http.server, time
+    import http.server, os, time
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         def log_message(self, *args): pass
         def do_GET(self):
-            if self.path == "/slow.ass":
-                time.sleep(2)
+            if self.path == "/held.ass":
+                deadline = time.time() + 60
+                while not os.path.exists("release") and time.time() < deadline:
+                    time.sleep(0.05)
                 body = open("sub.ass", "rb").read()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/x-ssa")
@@ -159,13 +161,13 @@ struct InjectedASSRenditionSuppressionTests {
     @Test("The hidden rendition waits for its extraction, and Off takes it down at once")
     func hiddenRenditionWaitsForExtraction() async throws {
         let origin = try #require(await PythonOrigin.launch(
-            prefix: "aether-ass-slow", script: Self.script, files: ["sub.ass": Self.assScript]))
+            prefix: "aether-ass-held", script: Self.script, files: ["sub.ass": Self.assScript]))
         defer { origin.stop() }
         let engine = try AetherEngine()
         defer { engine.stop(finalTeardown: true) }
         engine.hiddenRenditionIgnoresPlaybackForTesting = true
         let master = try #require(URL(string: "http://127.0.0.1:\(origin.port)/master.m3u8"))
-        let sidecar = try #require(URL(string: "http://127.0.0.1:\(origin.port)/slow.ass"))
+        let sidecar = try #require(URL(string: "http://127.0.0.1:\(origin.port)/held.ass"))
         _ = try await engine.load(url: master, options: LoadOptions(
             nativeRemoteHLS: true, preserveASSMarkup: true,
             externalSubtitles: [ExternalSubtitleTrack(url: sidecar, name: "Styled ASS")], autoplay: false))
@@ -175,11 +177,14 @@ struct InjectedASSRenditionSuppressionTests {
         let group = try #require(try await item.asset.loadMediaSelectionGroup(for: .legible))
         let provider = try #require(engine.remoteHLSSubtitleProxy?.provider)
 
+        // The origin holds the sidecar until the test lets it go, so the extraction is still running.
         engine.selectSubtitleTrack(index: id)
         try await Task.sleep(for: .milliseconds(800))
-        #expect(!provider.isFillFinished, "the origin holds the sidecar for two seconds")
+        try #require(!provider.isFillFinished)
         #expect(Self.selectedName(item, in: group) == nil)
 
+        FileManager.default.createFile(
+            atPath: origin.workDir.appendingPathComponent("release").path, contents: Data())
         try await waitFor { provider.isFillFinished }
         try await waitFor { Self.selectedName(item, in: group) == name && Self.suppressed(item) }
 
