@@ -1144,3 +1144,15 @@ Public for the CLI, the test suite, or a diagnostic overlay, and outside the sha
 - **`DiscInspector` / `DiscInspection`**, `DoviRpuConverter` and its probe, `AudioTapProbe`, `SoftwareDecodeProbeResult`, `A53SEIParser`: repro and inspection surfaces behind `aetherctl` subcommands.
 - **`HLSLiveIngestReader`'s internals** (`terminalError`, `upstreamTargetDuration`, `observedLiveCadenceSeconds`, `closedLiveCadenceSeconds`, `upstreamSegmentDurationSeconds`, `companionAudioReader`): fixture and diagnostic reads. The last two are the closed evidence the served TARGETDURATION is sealed from (AE#447); `upstreamTargetDuration` is the upstream's own claim, reported in the seal line and derived from nowhere.
 - **`SubtitleChannel`**: the primary / secondary selector on the engine's internal subtitle routing. No public signature takes one; a host picks the channel by calling the primary or the secondary method.
+
+### Software PiP subtitle timing
+
+`setSoftwareSubtitleDelay(_:)` applies an engine-wide media-time offset to both subtitle
+channels composited into software PiP frames. Positive values delay cues; negative values
+advance them. `softwareSubtitleDelaySeconds` reports the current preference. Non-finite
+values are ignored; the default is zero and the value survives subsequent loads on the same
+engine. It takes effect on the next composited frame without a seek, source reopen or A/V
+clock change. An inline overlay can use the same value with `clock.sourceTime - delay`.
+
+This setting does not shift AVPlayer-owned native subtitle renditions, native PiP or AirPlay.
+Hosts should expose that renderer limit when offering subtitle timing controls.

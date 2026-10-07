@@ -736,6 +736,22 @@ public final class AetherEngine: ObservableObject {
         }
     }
 
+    /// Timing adjustment for subtitles composited into software PiP frames, in media seconds.
+    /// Positive values delay subtitles; negative values advance them. Host overlays must apply
+    /// the same value against `clock.sourceTime`. Native AVPlayer renditions are not affected.
+    /// Persists across loads on this engine, like a host presentation preference.
+    public private(set) var softwareSubtitleDelaySeconds: Double = 0
+
+    /// Updates software subtitle composition without reopening media or shifting the A/V clock.
+    /// Non-finite values are ignored. Takes effect on the next composited video frame.
+    public func setSoftwareSubtitleDelay(_ seconds: Double) {
+        guard seconds.isFinite, seconds != softwareSubtitleDelaySeconds else { return }
+        softwareSubtitleDelaySeconds = seconds
+        softwareHost?.updateSubtitleCompositor(cues: subtitleCues + secondarySubtitleCues,
+            enabled: pictureInPictureActive, delaySeconds: seconds)
+        EngineLog.emit("[AetherEngine] software subtitle delay=\(seconds)s", category: .engine)
+    }
+
     /// Master enable for background playback (iOS: PiP + background audio; tvOS: PiP keepalive). Default on.
     public var backgroundPlaybackEnabled = true
     /// Set by the host from its PiP delegate (iOS: AVKit; tvOS: host-built AVPictureInPictureController);
@@ -744,7 +760,7 @@ public final class AetherEngine: ObservableObject {
         didSet {
             // SW-PiP Phase C: flip the frame compositor with the PiP state so subtitles appear in the
             // window and never double-draw under the fullscreen host overlay.
-            softwareHost?.updateSubtitleCompositor(cues: subtitleCues + secondarySubtitleCues, enabled: pictureInPictureActive)
+            softwareHost?.updateSubtitleCompositor(cues: subtitleCues + secondarySubtitleCues, enabled: pictureInPictureActive, delaySeconds: softwareSubtitleDelaySeconds)
             #if os(tvOS)
             // PiP window closed while backgrounded: nothing keeps the app running anymore, so the
             // wedge-safe teardown is due before idle suspension (mirrors the iOS pause-while-backgrounded path).

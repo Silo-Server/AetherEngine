@@ -112,8 +112,8 @@ final class SoftwarePlaybackHost {
     var displayLayer: AVSampleBufferDisplayLayer { renderer.displayLayer }
 
     /// SW-PiP Phase C: engine-fed cue mirror + PiP gate for the renderer's frame compositor.
-    func updateSubtitleCompositor(cues: [SubtitleCue], enabled: Bool) {
-        renderer.subtitleCompositor.update(cues: cues, enabled: enabled)
+    func updateSubtitleCompositor(cues: [SubtitleCue], enabled: Bool, delaySeconds: Double = 0) {
+        renderer.subtitleCompositor.update(cues: cues, enabled: enabled, delaySeconds: delaySeconds)
     }
 
     // MARK: - Internals
