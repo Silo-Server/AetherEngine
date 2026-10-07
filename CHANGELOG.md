@@ -10,7 +10,9 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- Video routing consults the AV1 hardware decoder only for AV1 sources, avoiding supplemental decoder registration on unrelated playback starts.
 
 ## [7.28.3] - 2026-10-07
 
