@@ -3462,15 +3462,12 @@ public final class AetherEngine: ObservableObject {
     private(set) var audioSelectionTask: Task<Void, Never>?
     private var pendingAudioSelection: Int?
     private var audioSelectionEpoch = UUID()
-    // Non-nil only during an audio rebuild. Transport received across awaits wins.
-    var audioSelectionTransportIntent: Bool?
 
     private func cancelPendingAudioSelection() {
         audioSelectionEpoch = UUID()
         audioSelectionTask?.cancel()
         audioSelectionTask = nil
         pendingAudioSelection = nil
-        audioSelectionTransportIntent = nil
     }
 
     /// AE#464 round 3: true while a re-anchor raised by `setAudioDelay` is running, so the presses
@@ -3487,6 +3484,15 @@ public final class AetherEngine: ObservableObject {
     /// The transport state a rebuild of this session has to come back in (#464 round 2). Asks the
     /// native host for its durable intent where there is one to ask, exactly as `togglePlayPause`
     /// does, and falls back to `state` on the routes that have no competing transport owner.
+    /// AE#711 follow-up: a play/pause that arrives while a session-preserving rebuild runs is the
+    /// transport that rebuild has to come back in. Recorded on the flag both rebuild routes raise
+    /// rather than on `.loading`, because `play()` itself moves `.loading` to `.playing` and a pause
+    /// after it would otherwise go unrecorded. Read back where each rebuild settles its transport.
+    func recordTransportDuringRebuild(playing: Bool) {
+        guard sessionPreservingReloadInFlight else { return }
+        transportIntentUnderReconstruction = playing
+    }
+
     var sessionRebuildResumesPlaying: Bool {
         let nativeIntent = (nativeHost != nil && !audioAVPlayerActive && audioHost == nil && softwareHost == nil)
             ? nativeHost?.transportIntentIsPlaying
@@ -5254,7 +5260,7 @@ public final class AetherEngine: ObservableObject {
     }
 
     public func play() {
-        if audioSelectionTransportIntent != nil { audioSelectionTransportIntent = true }
+        recordTransportDuringRebuild(playing: true)
         // AetherEngine#164: a VOD parked at its final frame (scrubbed to the end, or paused there)
         // cannot advance; AVPlayer.play() would no-op and leave the button frozen. Rewind to the start
         // first, then resume. `.ended` is excluded (see shouldRewindBeforePlay): it stays terminal so a
@@ -5276,7 +5282,7 @@ public final class AetherEngine: ObservableObject {
     }
 
     public func pause() {
-        if audioSelectionTransportIntent != nil { audioSelectionTransportIntent = false }
+        recordTransportDuringRebuild(playing: false)
         resumeAfterInterruption = false
         activeTransportHost?.pause()
         isBuffering = false
@@ -5422,6 +5428,11 @@ public final class AetherEngine: ObservableObject {
         options.subtitleSessionCarryover = carryover
         try await load(url: url, startPosition: resume, options: options,
                        audioSourceStreamIndex: audioToRestore.map { Int32($0) }, discTitleID: titleID)
+        // AE#711 follow-up: `load` autostarts from the flag it was handed; a play/pause that arrived
+        // while it ran is the newer word.
+        if let intent = transportIntentUnderReconstruction, intent != options.autoplay {
+            if intent { play() } else { pause() }
+        }
         restoreSubtitleSelection(from: carryover, resumeAnchor: resume)
         // Arm the watchdog so a live reopen whose AVPlayer never becomes ready fails visibly instead of freezing.
         if options.isLive, !options.nativeRemoteHLS, playbackBackend == .native {
@@ -6942,14 +6953,12 @@ public final class AetherEngine: ObservableObject {
             defer {
                 if self.audioSelectionEpoch == epoch {
                     self.audioSelectionTask = nil
-                    self.audioSelectionTransportIntent = nil
                 }
             }
             while let selected = self.pendingAudioSelection {
                 self.pendingAudioSelection = nil
                 guard !Task.isCancelled, self.audioSelectionEpoch == epoch else { return }
                 if self.activeAudioTrackIndex == selected { continue }
-                self.audioSelectionTransportIntent = self.sessionRebuildResumesPlaying
                 let beforeReload = self.loadGeneration
                 let failure = await self.reloadWithAudioOverride(
                     url: url, audioStreamIndex: Int32(selected), expectedGeneration: beforeReload)

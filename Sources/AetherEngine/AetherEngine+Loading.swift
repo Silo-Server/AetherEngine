@@ -2485,7 +2485,7 @@ extension AetherEngine {
                 )
                 presentCurrentLayer()
                 // Keep the latest transport intent if play/pause changed while the rebuild awaited I/O.
-                if audioSelectionTransportIntent ?? resumesPlaying { softwareHost?.play() }
+                if transportIntentUnderReconstruction ?? resumesPlaying { softwareHost?.play() }
                 else { softwareHost?.pause() }
             } else {
                 EngineLog.emit("[AetherEngine] reload: loadNative enter audio=\(audioStreamIndex.map(String.init) ?? "nil") resumeAt=\(String(format: "%.2f", resumeAt))s", category: .engine)
@@ -2576,11 +2576,11 @@ extension AetherEngine {
                     settleCap: loadedOptions.isLive ? .standard : .awaitObservedEnd,
                     isCurrent: { self.loadGeneration == gen })
                 try checkLoadCurrent(gen)
-                if audioSelectionTransportIntent ?? resumesPlaying { nativeHost?.play() }
+                if transportIntentUnderReconstruction ?? resumesPlaying { nativeHost?.play() }
                 else { nativeHost?.pause() }
             }
             try checkLoadCurrent(gen)
-            state = (audioSelectionTransportIntent ?? resumesPlaying) ? .playing : .paused
+            state = (transportIntentUnderReconstruction ?? resumesPlaying) ? .playing : .paused
             // Re-arm samplers: stopInternal nilled them, and the reload path bypasses public load() that normally restarts them. Without this, liveTelemetry stays nil and the stats overlay shows "-" after every audio switch.
             startMemoryProbe()
             startLiveTelemetrySampler()

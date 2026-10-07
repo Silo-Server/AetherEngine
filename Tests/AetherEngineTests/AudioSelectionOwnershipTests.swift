@@ -44,18 +44,6 @@ final class AudioSelectionOwnershipTests: XCTestCase {
         XCTAssertEqual(engine.state, .idle)
     }
 
-    func testTransportCommandsDuringAudioRebuildKeepLatestIntent() throws {
-        let engine = try fixture()
-        defer { engine.stop() }
-        engine.audioSelectionTransportIntent = true
-        engine.pause()
-        XCTAssertEqual(engine.audioSelectionTransportIntent, false)
-        engine.play()
-        XCTAssertEqual(engine.audioSelectionTransportIntent, true)
-        engine.stop()
-        XCTAssertNil(engine.audioSelectionTransportIntent)
-    }
-
     func testLiveURLDoesNotRequireHostReload() throws {
         let engine = try fixture()
         defer { engine.stop() }

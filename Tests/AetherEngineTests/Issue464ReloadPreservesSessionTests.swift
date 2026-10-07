@@ -213,6 +213,92 @@ struct Issue464RebuildCallSiteTransportTests {
         try await waitFor { engine.state == .paused }
     }
 
+    /// AE#711 follow-up: a press that lands while the rebuild runs is the newer word. `body` runs at
+    /// the rebuild's first suspension after `.loading` is published, where a host's button would.
+    private static func duringRebuild(
+        of engine: AetherEngine, _ body: @escaping @MainActor () -> Void,
+        rebuild: () async throws -> Void
+    ) async throws {
+        var fired: Task<Void, Never>?
+        let observer = engine.$state.sink { next in
+            MainActor.assumeIsolated {
+                guard fired == nil, next == .loading else { return }
+                fired = Task { @MainActor in body() }
+            }
+        }
+        defer { observer.cancel() }
+        try await rebuild()
+        await fired?.value
+        #expect(fired != nil)
+    }
+
+    @Test("a pause pressed during an audio rebuild of a playing session holds")
+    func pauseDuringAudioRebuildHolds() async throws {
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        _ = try await engine.load(source: Self.customSource())
+        #expect(engine.state == .playing)
+        let url = try #require(engine.loadedURL)
+
+        try await Self.duringRebuild(of: engine, { engine.pause() }) {
+            _ = await engine.reloadWithAudioOverride(
+                url: url, audioStreamIndex: nil, expectedGeneration: engine.loadGeneration)
+        }
+
+        #expect(engine.state != .playing)
+        #expect(engine.nativeHost?.transportIntentIsPlaying == false)
+    }
+
+    @Test("a play pressed during a reload of a paused session holds")
+    func playDuringReloadHolds() async throws {
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        _ = try await engine.load(source: Self.customSource())
+        engine.pause()
+        try await waitFor { engine.state == .paused }
+
+        try await Self.duringRebuild(of: engine, { engine.play() }) {
+            try await engine.reloadAtCurrentPosition()
+        }
+
+        #expect(engine.state == .playing)
+        #expect(engine.nativeHost?.transportIntentIsPlaying == true)
+    }
+
+    @Test("a pause pressed during a URL reload of a playing session holds")
+    func pauseDuringURLReloadHolds() async throws {
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ae711-intent-\(UUID().uuidString).mp4")
+        try ProbeTestFixtures.hdr10Plus().write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        _ = try await engine.load(url: file)
+        #expect(engine.state == .playing)
+        #expect(!engine.isCustomSource)
+
+        try await Self.duringRebuild(of: engine, { engine.pause() }) {
+            try await engine.reloadAtCurrentPosition()
+        }
+
+        #expect(engine.state != .playing)
+        #expect(engine.nativeHost?.transportIntentIsPlaying == false)
+    }
+
+    @Test("outside a rebuild a press parks nothing for the next one")
+    func pressOutsideARebuildParksNothing() throws {
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        engine.transportIntentUnderReconstruction = nil
+        engine.pause()
+        engine.play()
+        #expect(engine.transportIntentUnderReconstruction == nil)
+        engine.sessionPreservingReloadInFlight = true
+        engine.pause()
+        #expect(engine.transportIntentUnderReconstruction == false)
+        engine.sessionPreservingReloadInFlight = false
+    }
+
     @Test("a playing session still comes back playing")
     func playingSessionComesBackPlaying() async throws {
         let engine = try AetherEngine()
