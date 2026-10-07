@@ -10,7 +10,9 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- `needsForegroundVideoRestore` exposes actual background video teardown so a host can rebuild through the existing reload API before resuming.
 
 ## [7.28.3] - 2026-10-07
 
