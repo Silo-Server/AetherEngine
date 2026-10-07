@@ -650,7 +650,7 @@ suppressing `AVPlayerItemLegibleOutput` to keep the measurement running.
 | --- | --- |
 | `$audioTracks` | `[TrackInfo]`. Republished when `LoadOptions.confirmAtmos` confirms a track. On `.remoteBypass` it lists the audio tracks AVPlayer built for the item (normally just the one playing), read from their format descriptions: `codec` in libavcodec's spelling (`eac3`, `ac3`, `aac`), `channels`, `sampleRate`, `profile` (AAC's object type; "Dolby Digital Plus + Dolby Atmos" with `isAtmos` when the E-AC-3 dec3 record announces JOC) and `language` from the track or the selected audible option. The ids are synthetic (from 400000 up) because there is no stream index on that route; compare them only with `activeAudioTrackIndex`. |
 | `$activeAudioTrackIndex` | The selected track's id. On `.remoteBypass`, the enabled item track's. |
-| `selectAudioTrack(index:)` | Session-preserving reload, roughly 0.5 to 1 s of black. It comes back in the session's transport like `reloadAtCurrentPosition()`: a paused session stays paused. `index` is `TrackInfo.id`. A no-op when out of range, already active, or on a forward-only custom source (live ingest included), which cannot rebuild its pipeline: there a track change is a fresh `load` naming the stream. Every refusal is logged, so a picker that does nothing is explainable. Also a no-op on `.remoteBypass`, where AVPlayer owns the audio selection and the list above is informational; a different language there is a different URL. |
+| `selectAudioTrack(index:)` | Session-preserving reload. On the native path the old item stays mounted until its replacement is ready (not gapless; a media-services reset still discards it); elsewhere expect roughly 0.5 to 1 s of black. Rapid picks coalesce into one rebuild at a time, a pick back to the active track costs nothing, and `stop()` or a new `load` drops what is queued. It comes back in the session's transport like `reloadAtCurrentPosition()`: a paused session stays paused, and a `play()` or `pause()` that arrives while the rebuild awaits I/O decides the final state. `index` is `TrackInfo.id`. A no-op when out of range, already active, or on a forward-only custom source (live ingest included), which cannot rebuild its pipeline: there a track change is a fresh `load` naming the stream. Every refusal is logged, so a picker that does nothing is explainable. Also a no-op on `.remoteBypass`, where AVPlayer owns the audio selection and the list above is informational; a different language there is a different URL. |
 | `installAudioTap()`, `removeAudioTap()`, `audioTapHasDeliverySource`, `AetherEngine.audioTapFormat` | Opt-in decoded PCM, mono Float32 48 kHz with source-PTS stamps, off the render path. See the contract above. |
 
 ## Subtitles
@@ -1146,14 +1146,3 @@ Public for the CLI, the test suite, or a diagnostic overlay, and outside the sha
 - **`DiscInspector` / `DiscInspection`**, `DoviRpuConverter` and its probe, `AudioTapProbe`, `SoftwareDecodeProbeResult`, `A53SEIParser`: repro and inspection surfaces behind `aetherctl` subcommands.
 - **`HLSLiveIngestReader`'s internals** (`terminalError`, `upstreamTargetDuration`, `observedLiveCadenceSeconds`, `closedLiveCadenceSeconds`, `upstreamSegmentDurationSeconds`, `companionAudioReader`): fixture and diagnostic reads. The last two are the closed evidence the served TARGETDURATION is sealed from (AE#447); `upstreamTargetDuration` is the upstream's own claim, reported in the seal line and derived from nowhere.
 - **`SubtitleChannel`**: the primary / secondary selector on the engine's internal subtitle routing. No public signature takes one; a host picks the channel by calling the primary or the secondary method.
-
-### Audio selection while rebuilding
-
-`selectAudioTrack(index:)` coalesces rapid choices and runs one rebuild at a time.
-A queued choice for the already-active track requires no source reopen. Stop or a
-new load invalidates pending audio selections; a superseded or cancelled rebuild
-cannot publish a stale error. Play/pause commands received while a rebuild awaits
-I/O determine the final transport state.
-
-An ordinary native audio handover retains the old item until replacement, but does
-not promise a gapless switch. A media-services reset still discards the old host.
