@@ -13,6 +13,7 @@ the public-API contract.
 ### Added
 
 - `setSoftwareSubtitleDelay(_:)` applies a persistent, caller-selected subtitle offset to both channels in software PiP without changing the playback clock. Native renditions remain unchanged.
+- `needsForegroundVideoRestore` exposes actual background video teardown so a host can rebuild through the existing reload API before resuming.
 
 ### Fixed
 

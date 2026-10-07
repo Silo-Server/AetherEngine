@@ -3486,6 +3486,10 @@ public final class AetherEngine: ObservableObject {
     /// itself. Claimed by `consumeReloadSelection`, dropped by any other `load()` and by `stop()`.
     var backgroundTeardownSelection: BackgroundTeardownSelection?
 
+    /// The background policy released the video item while retaining the source, playhead,
+    /// selection and native host. A foreground host must rebuild before sending play().
+    public var needsForegroundVideoRestore: Bool { backgroundTeardownSelection != nil }
+
     /// Detached reader that decodes ALL embedded text subtitle streams in one side-demuxer pass into their
     /// ordinal's NativeSubtitleCueStore (#55, all-tracks). Parallel to the packet-store drainer (which drives
     /// subtitleCues for the active track with full styling). Cancelled on stop/clear/load.
