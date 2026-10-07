@@ -2861,8 +2861,12 @@ extension AetherEngine {
         isLoadingSubtitles = false
         Task { @MainActor in
             self.currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically = false
+            // A pick made while the group loaded owns the selection, and may be a hidden ASS
+            // rendition whose suppression this must not take down.
             guard let group = try? await item.asset.loadMediaSelectionGroup(for: .legible),
-                  ordinal < group.options.count else { return }
+                  ordinal < group.options.count,
+                  self.currentAVPlayer?.currentItem === item,
+                  self.activeSubtitleTrackIndex == id else { return }
             // The origin's own rendition is AVPlayer's to draw.
             self.releaseInjectedRenditionSuppression()
             self.injectedRenditionSelection = nil
