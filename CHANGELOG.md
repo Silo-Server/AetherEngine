@@ -12,6 +12,12 @@ the public-API contract.
 
 _Nothing yet._
 
+## [7.28.3] - 2026-10-07
+
+### Fixed
+
+- **A resume or seek onto an open-GOP keyframe keeps the #409 repair (#699).** Two defects on H.264/HEVC MP4s without composition offsets. The repair verdict was reached at the first read, and the software host seeks to its resume position before reading, so the sample started on a CRA (picture order not 0) and was declined: the whole session played in decode order. A seek before the first read now settles the verdict at the head first. Separately, every post-seek re-anchor treated the landing keyframe as the first picture displayed; a CRA with leading pictures is displayed that many slots later, so the axis sat early and B pictures that fell below their decode time went out untouched. The session now holds from the landing to the first trailing picture and anchors with the leading-picture count. Covered by an x265 open-GOP twin (CRA plus four RASL pictures) for a resume-shaped seek and a seek during playback. Reported by cmcpherson274. No API change.
+
 ## [7.28.2] - 2026-10-06
 
 ### Changed
