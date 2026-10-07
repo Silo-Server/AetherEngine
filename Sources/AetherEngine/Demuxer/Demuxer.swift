@@ -1887,6 +1887,16 @@ public final class Demuxer: @unchecked Sendable {
         decideCompositionRepairLocked()
     }
 
+    /// #409: a seek moves the read position, so the repair drops its picture-order anchor and
+    /// re-anchors on the landing keyframe. A seek that comes before the first read (the software
+    /// host's resume, #699) settles the verdict at the head first: sampled at the landing, the
+    /// stream would start on an open-GOP keyframe whose picture order is not 0, and the classifier
+    /// refuses that, so the whole session played in decode order. Caller holds `accessLock`.
+    private func noteCompositionRepairSeekLocked() {
+        if !compositionRepairEvaluated { decideCompositionRepairLocked() }
+        compositionRepair?.noteSeek()
+    }
+
     /// #409: reads far enough into the source for the verdict, holding every
     /// packet it consumed so nothing is lost. Called before anything reads a timestamp axis off this
     /// demuxer: the container index and the packets must describe the same ladder, and only the
@@ -2139,7 +2149,7 @@ public final class Demuxer: @unchecked Sendable {
               let timestamp = Self.ticks(forSeconds: seconds, timeBase: Self.avTimeBase) else { return false }
         // #409: the read position moves, so the repair drops its picture-order anchor and
         // re-anchors on the next keyframe (a seek always lands on one).
-        compositionRepair?.noteSeek()
+        noteCompositionRepairSeekLocked()
         if let reader = timeSeekableReader {
             dropPeekedPacketsLocked()
             guard repositionTimeSeekable(reader, toSourceSeconds: seconds, streamIndex: -1) else { return false }
@@ -2173,7 +2183,7 @@ public final class Demuxer: @unchecked Sendable {
               streamIndex < Int32(ctx.pointee.nb_streams) else { return false }
         // #409: the read position moves, so the repair drops its picture-order anchor and
         // re-anchors on the next keyframe (a seek always lands on one).
-        compositionRepair?.noteSeek()
+        noteCompositionRepairSeekLocked()
         if let reader = timeSeekableReader,
            let stream = ctx.pointee.streams[Int(streamIndex)] {
             let timeBase = stream.pointee.time_base
@@ -2313,7 +2323,7 @@ public final class Demuxer: @unchecked Sendable {
         guard let timestamp = Self.ticks(forSeconds: seconds, timeBase: timeBase) else { return false }
         // #409: the read position moves, so the repair drops its picture-order anchor and
         // re-anchors on the next keyframe (a seek always lands on one).
-        compositionRepair?.noteSeek()
+        noteCompositionRepairSeekLocked()
         // #268: a time-seekable source repositions itself instead of paying libavformat's byte-space
         // binary search, which on an index-less MPEG-TS is either wedged or broken (round 10 below) and
         // over HTTP would additionally be a request storm. No read deadline is armed: the reader's
@@ -2529,7 +2539,7 @@ public final class Demuxer: @unchecked Sendable {
         accessLock.lock()
         defer { accessLock.unlock() }
         guard let ctx = formatContext else { return false }
-        compositionRepair?.noteSeek()  // #409: re-anchor on the next keyframe
+        noteCompositionRepairSeekLocked()  // #409: re-anchor on the next keyframe
         guard isSourceSeekable else { return false }  // audit HLS-103, see `seek(to:)`
         dropPeekedPacketsLocked()
         let ret = avformat_seek_file(ctx, -1, Int64.min, byteTarget, Int64.max, AVSEEK_FLAG_BYTE)

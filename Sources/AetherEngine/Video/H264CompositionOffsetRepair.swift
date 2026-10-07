@@ -444,6 +444,10 @@ enum H264CompositionOffsetRepair {
         private(set) var sequenceBaseOrdinal: Int64?
         /// A seek leaves the parser and the sequence anchor behind; the next keyframe re-anchors.
         private var awaitingReanchor = true
+        /// Pictures that follow the landing keyframe in decode order but precede it in display
+        /// order (an open GOP's leading pictures). The landing is displayed that many slots after
+        /// the one it is decoded in, so the re-anchor has to know the count.
+        private var landingLeadingPictures: Int64 = 0
         /// Pictures emitted untouched because no anchor was available or the arithmetic did not
         /// close. Surfaced so a stream this repair does not describe is visible as a number.
         private(set) var unrepairedPictures = 0
@@ -455,6 +459,11 @@ enum H264CompositionOffsetRepair {
             awaitingReanchor = true
             sequenceAnchorDTS = nil
             sequenceBaseOrdinal = nil
+            landingLeadingPictures = 0
+        }
+
+        mutating func noteLanding(leadingPictures: Int64) {
+            landingLeadingPictures = max(0, leadingPictures)
         }
 
         /// nil when the picture cannot be placed; the caller then emits it untouched.
@@ -482,8 +491,12 @@ enum H264CompositionOffsetRepair {
                     return nil
                 }
                 let landingIndex = pictureOrderCount / plan.pocStep
+                // The landing is decoded in slot k and displayed in slot k + leading, so the
+                // sequence origin sits `landingIndex - leading` slots before its decode time.
+                let (anchorSlots, slotsOverflow) = landingIndex.subtractingReportingOverflow(landingLeadingPictures)
                 // Audit BIT-101: a 64-bit `tfdt` step and a landing order near -2^31 leave Int64.
-                let (landingTicks, productOverflow) = landingIndex.multipliedReportingOverflow(by: plan.step)
+                let (landingTicks, productOverflow) = slotsOverflow
+                    ? (0, true) : anchorSlots.multipliedReportingOverflow(by: plan.step)
                 let (anchor, anchorOverflow) = dts.subtractingReportingOverflow(landingTicks)
                 guard !productOverflow, !anchorOverflow else {
                     unrepairedPictures += 1
@@ -492,7 +505,7 @@ enum H264CompositionOffsetRepair {
                 sequenceAnchorDTS = anchor
                 sequenceBaseOrdinal = plan.presentationOrdinal(ladderTimestamp: dts)
                     .flatMap { ordinal -> Int64? in
-                        let (base, overflow) = ordinal.subtractingReportingOverflow(landingIndex)
+                        let (base, overflow) = ordinal.subtractingReportingOverflow(anchorSlots)
                         return overflow ? nil : base
                     }
                 awaitingReanchor = false
@@ -612,6 +625,10 @@ final class H264CompositionOffsetRepairSession {
     private var held: [(packet: UnsafeMutablePointer<AVPacket>, pictureOrderCount: Int64?)] = []
     private var heldBytes = 0
     private var verdictDescription = "sampling"
+    /// After a seek on a repaired stream: nil until the landing keyframe arrives, then its picture
+    /// order while the packets behind it are held to count its leading pictures.
+    private var relanding = false
+    private var landingPictureOrder: Int64?
 
     /// nil unless this stream is the exact shape the defect needs: ISO-BMFF, H.264 or HEVC, and a
     /// bitstream that declares reordered pictures. Everything else never sees a parser or a held
@@ -676,6 +693,7 @@ final class H264CompositionOffsetRepairSession {
         case .off:
             return monitorsPartialOffsets ? partialRepairCandidate?.ingest(packet) ?? false : false
         case .repairing:
+            if relanding { return ingestAfterSeek(packet) }
             guard packet.pointee.stream_index == streamIndex else { return false }
             applyRepair(to: packet, pictureOrderCount: reader?.pictureOrderCount(for: packet))
             return false
@@ -704,6 +722,58 @@ final class H264CompositionOffsetRepairSession {
         }
     }
 
+    /// A seek lands on a keyframe that may be an open GOP's entry point, displayed after the leading
+    /// pictures decoded behind it. Their number is only known at the first picture that follows the
+    /// landing in display order (leading pictures all precede the trailing ones in decode order), so
+    /// everything from the landing up to that picture is held, every stream, and then repaired with
+    /// the count. Without it the post-seek axis sat that many slots early, which put B pictures
+    /// below their own decode time and left them in decode order (#699, resume onto a CRA).
+    private func ingestAfterSeek(_ packet: UnsafeMutablePointer<AVPacket>) -> Bool {
+        var pictureOrderCount: Int64?
+        if packet.pointee.stream_index == streamIndex {
+            pictureOrderCount = reader?.pictureOrderCount(for: packet)
+            if landingPictureOrder == nil {
+                // Pictures before the landing keyframe cannot be placed; the rewriter passes them
+                // through untouched, as it did before.
+                guard (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0, let pictureOrderCount else {
+                    applyRepair(to: packet, pictureOrderCount: pictureOrderCount)
+                    return false
+                }
+                landingPictureOrder = pictureOrderCount
+            } else if let landing = landingPictureOrder, let pictureOrderCount, pictureOrderCount > landing {
+                held.append((packet, pictureOrderCount))
+                finishLanding()
+                return true
+            }
+        } else if landingPictureOrder == nil {
+            return false
+        }
+        held.append((packet, pictureOrderCount))
+        heldBytes += Int(max(0, packet.pointee.size))
+        if heldBytes >= H264CompositionOffsetRepair.sampleByteBudget
+            || held.count >= H264CompositionOffsetRepair.heldPacketCeiling {
+            finishLanding()
+        }
+        return true
+    }
+
+    private func finishLanding() {
+        relanding = false
+        guard var rewriter else { return }
+        if let landing = landingPictureOrder {
+            let leading = held.filter {
+                $0.packet.pointee.stream_index == streamIndex
+                    && ($0.pictureOrderCount.map { $0 < landing } ?? false)
+            }.count
+            rewriter.noteLanding(leadingPictures: Int64(leading))
+        }
+        for entry in held where entry.packet.pointee.stream_index == streamIndex {
+            applyRepair(to: entry.packet, pictureOrderCount: entry.pictureOrderCount, using: &rewriter)
+        }
+        self.rewriter = rewriter
+        landingPictureOrder = nil
+    }
+
     /// A healthy file usually proves itself on its first packet, and paying twelve packets of hold
     /// for it would tax every well-formed MP4 with B-frames on the platform.
     private var earlyHealthyVerdict: Bool {
@@ -714,6 +784,7 @@ final class H264CompositionOffsetRepairSession {
     /// EOF during sampling. Decides on what is there, so the held packets are still delivered.
     func endOfStream() {
         if phase == .sampling { decide() }
+        if relanding { finishLanding() }
         if monitorsPartialOffsets { partialRepairCandidate?.endOfStream() }
     }
 
@@ -733,6 +804,8 @@ final class H264CompositionOffsetRepairSession {
         case .repairing:
             rewriter?.noteSeek()
             reader?.reset()
+            relanding = true
+            landingPictureOrder = nil
         case .off:
             break
         }
@@ -754,7 +827,7 @@ final class H264CompositionOffsetRepairSession {
     }
 
     func dequeue() -> UnsafeMutablePointer<AVPacket>? {
-        guard phase != .sampling else { return nil }
+        guard phase != .sampling, !relanding else { return nil }
         if !held.isEmpty { return held.removeFirst().packet }
         return monitorsPartialOffsets ? partialRepairCandidate?.dequeue() : nil
     }
