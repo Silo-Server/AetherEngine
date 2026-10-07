@@ -706,6 +706,42 @@ final class SoftwarePlaybackHost {
         ) == .stop
     }
 
+    // MARK: - Start position
+
+    /// How `load` honours a start position.
+    enum StartPlan: Equatable {
+        /// No start to honour: play from the stream origin.
+        case fromOrigin
+        /// Reposition the source to the start.
+        case reposition
+        /// Leave the source where it is and decode forward to the start, dropping what precedes it.
+        case decodeForward
+        /// The start cannot be reached; play from the stream origin.
+        case dropStart
+    }
+
+    /// Furthest start a forward-only source is decoded forward to: the clock anchor's own tolerance.
+    ///
+    /// With no reposition the first audio sample is at the stream origin, and the clock is armed by
+    /// `SWClockAnchorPolicy` from that sample. Inside its tolerance the clock keeps the load anchor,
+    /// so it starts at `start`, the audio before it is late and discarded, and the video before it
+    /// is dropped by the skip threshold. Past the tolerance the policy re-anchors at the first
+    /// sample instead: the pre-roll audio would play with no picture and the position would snap
+    /// back to the origin. Such a start is dropped, and the pre-roll plays with its picture.
+    nonisolated static let forwardOnlyStartSkipLimitSeconds: Double = SWClockAnchorPolicy.toleranceSeconds
+
+    /// A forward-only source (one chunked response with no ranges, a sequential origin, a one-shot
+    /// custom reader) cannot be repositioned, so its start is reached by decoding or not at all.
+    nonisolated static func startPlan(startPosition: Double?, isSourceSeekable: Bool, isLive: Bool) -> StartPlan {
+        guard let start = startPosition, start.isFinite, start > 0 else { return .fromOrigin }
+        // Live keeps what it had: this policy is about finite forward-only sources.
+        if isSourceSeekable || isLive { return .reposition }
+        return start <= forwardOnlyStartSkipLimitSeconds ? .decodeForward : .dropStart
+    }
+
+    /// False when the loaded source cannot be repositioned (see `startPlan`). True with no source.
+    var sourceCanReposition: Bool { demuxer?.isSourceSeekable ?? true }
+
     // MARK: - Load
 
     func load(
@@ -914,14 +950,37 @@ final class SoftwarePlaybackHost {
         // Reset the live feeder state for the new session.
         resetFeederState()
 
-        if let start = startPosition, start > 0 {
-            // #254: same off-main, deadline-bounded reposition the transport seek uses. A resume into a
-            // remote source that has to scan for its landing would otherwise block the main thread here.
-            _ = await dem.seekBounded(to: start, timeout: Self.seekBudgetSeconds, on: seekQueue)
-            // This is load()'s only suspension point, so it is also the only place a stop() can land
-            // mid-load. Arming the clock and publishing isReady on a session already torn down would
-            // hand the engine a host it has stopped.
-            guard !stopRequested else { return }
+        let startPlan = Self.startPlan(startPosition: startPosition,
+                                       isSourceSeekable: dem.isSourceSeekable, isLive: isLive)
+        if startPlan == .dropStart, let start = startPosition {
+            EngineLog.emit(
+                "[SWHost] start at \(String(format: "%.2f", start))s dropped: the source is forward-only "
+                + "and the start is past the \(String(format: "%.0f", Self.forwardOnlyStartSkipLimitSeconds))s "
+                + "the clock anchor holds without a reposition; playing from the stream origin",
+                category: .swPlayback
+            )
+        }
+        if let start = startPosition, startPlan == .reposition || startPlan == .decodeForward {
+            if startPlan == .reposition {
+                // #254: same off-main, deadline-bounded reposition the transport seek uses. A resume into a
+                // remote source that has to scan for its landing would otherwise block the main thread here.
+                _ = await dem.seekBounded(to: start, timeout: Self.seekBudgetSeconds, on: seekQueue)
+                // This is load()'s only suspension point, so it is also the only place a stop() can land
+                // mid-load. Arming the clock and publishing isReady on a session already torn down would
+                // hand the engine a host it has stopped.
+                guard !stopRequested else { return }
+            } else {
+                // The read position already stands at the stream origin and the packets the probe read
+                // are still queued. A seek here flushes them, and a forward-only reader cannot rewind to
+                // read them again (`partial file`, then the read loop ends). The thresholds armed below
+                // drop the video that precedes `start`, and the clock arms at `start` because it is
+                // inside the anchor tolerance (see `forwardOnlyStartSkipLimitSeconds`).
+                EngineLog.emit(
+                    "[SWHost] start at \(String(format: "%.2f", start))s reached by decoding from the stream "
+                    + "origin: the source is forward-only, so it is not repositioned",
+                    category: .swPlayback
+                )
+            }
             // Mirror seek() skip-PTS + clock alignment so demux drops pre-keyframe frames and synchronizer starts at the resume offset.
             let startTime = CMTime(seconds: start, preferredTimescale: 90000)
             videoDecoder.skipUntilPTS = startTime
@@ -1229,6 +1288,17 @@ final class SoftwarePlaybackHost {
     func seek(to seconds: Double) async -> Demuxer.RepositionOutcome {
         guard !stopRequested else { return .superseded }
         guard let dem = demuxer else { return .stalled }
+        // A forward-only source has no other position to offer. Attempting the reposition flushes
+        // both decoders and the demuxer's queued packets, and the reader cannot rewind to read them
+        // again, so the session dies on the next read. Refuse before anything is disturbed; the
+        // session keeps playing where it is. Live seeks stay on their own (DVR ring) path below.
+        if !isLive, !dem.isSourceSeekable {
+            EngineLog.emit(
+                "[SWHost] seek to \(String(format: "%.2f", seconds))s refused: the source is forward-only",
+                category: .swPlayback
+            )
+            return .stalled
+        }
         // Stop loop + bump generation to invalidate in-flight packets. Captured right after, so the
         // reposition can tell on `seekQueue` whether a newer seek has already taken over.
         bumpSeekGeneration()
