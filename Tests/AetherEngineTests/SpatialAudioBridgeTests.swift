@@ -13,7 +13,7 @@ import AetherLibavutil
 /// with the encoder's 2048 frames of priming counted in, so the first packet takes the anchor and
 /// the first content frame plays there. These drive the bridge with a synthetic decoder that
 /// behaves like the real one on exactly those points.
-@Suite("TrueHD Atmos spatial bridge")
+@Suite("TrueHD Atmos spatial bridge", .timeLimit(.minutes(2)))
 struct SpatialAudioBridgeTests {
 
     /// Stand-in object decoder: one pushed byte is one 40-frame access unit (TrueHD's 1/1200 s),
@@ -357,15 +357,30 @@ struct SpatialAudioBridgeTests {
 
         let asset = AVURLAsset(url: file)
         let track = try #require(try await asset.loadTracks(withMediaType: .audio).first)
+        // copyNextSampleBuffer blocks until AVFoundation has decoded the next buffer. Called from the
+        // cooperative pool it held one of a three-core CI runner's threads while that decode waited
+        // for one, and the whole test process stalled. A thread of its own cannot starve the pool.
+        let decoded = await withCheckedContinuation {
+            (continuation: CheckedContinuation<Result<Double?, Error>, Never>) in
+            Thread.detachNewThread {
+                continuation.resume(returning: Result { try Self.clickOnset(asset: asset, track: track) })
+            }
+        }
+        let heard = try #require(try decoded.get(), "the click reaches the left channel")
+        #expect(abs(heard - 0.25) < 0.001, "the click decodes at \(heard) s, not at its source position 0.25 s")
+    }
+
+    /// Decodes the track to PCM and returns when the left channel first rises above the click
+    /// threshold, or nil when it never does. Blocks until AVFoundation has decoded that far.
+    private static func clickOnset(asset: AVURLAsset, track: AVAssetTrack) throws -> Double? {
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
             AVFormatIDKey: kAudioFormatLinearPCM, AVLinearPCMBitDepthKey: 32,
             AVLinearPCMIsFloatKey: true, AVLinearPCMIsNonInterleaved: false,
         ])
         reader.add(output)
-        #expect(reader.startReading())
-        var onset: Double?
-        while onset == nil, let buffer = output.copyNextSampleBuffer() {
+        guard reader.startReading() else { throw reader.error ?? CocoaError(.fileReadUnknown) }
+        while let buffer = output.copyNextSampleBuffer() {
             guard let format = CMSampleBufferGetFormatDescription(buffer),
                   let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee else { continue }
             let channels = Int(asbd.mChannelsPerFrame)
@@ -379,10 +394,9 @@ struct SpatialAudioBridgeTests {
                 blockBufferMemoryAllocator: nil, flags: 0, blockBufferOut: &block)
             guard let samples = list.mBuffers.mData?.assumingMemoryBound(to: Float.self) else { continue }
             if let i = (0..<frames).first(where: { abs(samples[$0 * channels]) > 0.2 }) {
-                onset = start + Double(i) / 48_000
+                return start + Double(i) / 48_000
             }
         }
-        let heard = try #require(onset, "the click reaches the left channel")
-        #expect(abs(heard - 0.25) < 0.001, "the click decodes at \(heard) s, not at its source position 0.25 s")
+        return nil
     }
 }
