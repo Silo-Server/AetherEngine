@@ -152,7 +152,9 @@ struct Issue243ReaderRetentionTests {
         config.protocolClasses = [RetentionRangeURLProtocol.self]
         HTTPDiscIOReader.resetLifetimeFetchedBytes()
         // Deltas, not absolutes: the tally is process-wide, and a reader in another suite may be
-        // fetching in parallel. Concurrent fetches can only add to it.
+        // fetching in parallel. A parallel engine session start also zeroes it (`startMemoryProbe`),
+        // which only the reset count can tell apart from a missed range.
+        let resetsAtStart = HTTPDiscIOReader.lifetimeFetchedResetCount
         let atStart = HTTPDiscIOReader.lifetimeFetchedBytes
         let reader = try #require(HTTPDiscIOReader(
             url: url, baseChunkSize: 256 * 1024, maxChunkSize: 256 * 1024,
@@ -170,7 +172,10 @@ struct Issue243ReaderRetentionTests {
         }
         #expect(read == 1024 * 1024)
         // Four 256 KB refills plus the one-byte size probe from init.
-        #expect(HTTPDiscIOReader.lifetimeFetchedBytes - atStart >= Int64(1024 * 1024 + 1))
+        let fetched = HTTPDiscIOReader.lifetimeFetchedBytes - atStart
+        if HTTPDiscIOReader.lifetimeFetchedResetCount == resetsAtStart {
+            #expect(fetched >= Int64(1024 * 1024 + 1))
+        }
 
         HTTPDiscIOReader.resetLifetimeFetchedBytes()
         #expect(HTTPDiscIOReader.lifetimeFetchedBytes < Int64(1024 * 1024))

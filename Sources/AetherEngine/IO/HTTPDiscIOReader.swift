@@ -397,6 +397,7 @@ final class HTTPDiscIOReader: IOReader, @unchecked Sendable {
     /// counter. Reset per session by the memory probe.
     private static let fetchedLock = NSLock()
     nonisolated(unsafe) private static var fetchedBytesTotal: Int64 = 0
+    nonisolated(unsafe) private static var fetchedResetCount: Int = 0
 
     private static func recordFetched(bytes: Int) {
         guard bytes > 0 else { return }
@@ -410,9 +411,17 @@ final class HTTPDiscIOReader: IOReader, @unchecked Sendable {
         return fetchedBytesTotal
     }
 
+    /// Bumped by every reset, so a reader of `lifetimeFetchedBytes` deltas can tell that a session
+    /// start in between (`startMemoryProbe`) zeroed the tally under it.
+    static var lifetimeFetchedResetCount: Int {
+        fetchedLock.lock(); defer { fetchedLock.unlock() }
+        return fetchedResetCount
+    }
+
     static func resetLifetimeFetchedBytes() {
         fetchedLock.lock()
         fetchedBytesTotal = 0
+        fetchedResetCount &+= 1
         fetchedLock.unlock()
     }
 }
