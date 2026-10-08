@@ -45,7 +45,7 @@ the public-API contract.
 - Closing the DVR packet ring releases the writer's open chunk instead of keeping it until the ring is freed.
 - Remote-HLS cue normalization strips markup in one pass. Removing one tag at a time and searching again from the start took seconds on the main actor for a crafted 64 KiB cue.
 - Log redaction covers an Xtream password containing `,` `'` or `)`, which used to end the path segment early, and a registered secret that starts a credential name such as `token` no longer hides the value after it.
-- `aetherctl`: `--served-url` and the served-VTT readout redact origin URLs (loopback URLs still print in full), the readout resolves rendition and segment URIs against the playlist that lists them, and `smb-test`'s sequential pass no longer scans every probe for every chunk inside its timed window.
+- `aetherctl`: `--served-url` and the served-VTT readout redact origin URLs, a localhost origin included (the engine's own loopback URLs still print in full), the readout resolves rendition and segment URIs against the playlist that lists them, and `smb-test`'s sequential pass no longer scans every probe for every chunk inside its timed window.
 - `Scripts/hls-burst-origin.py` rejects a `--prefill` or `--freeze-at` that the folder's segments cannot satisfy instead of failing with an `IndexError`.
 - `reloadAtCurrentPosition(applying:)` refuses a `sharedOutputRole` change with `loadIdentityNotCorrectable`. The role was listed as load identity but never compared, so a correction rebuilt a multiview engine under the other role.
 - Seven upstream tests no longer turn a timeout into a hang, rely on main-executor ordering after `Task.yield()`, race a closed socket, or write a fake's state from another queue without a lock.
