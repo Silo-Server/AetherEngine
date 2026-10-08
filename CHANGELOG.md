@@ -29,6 +29,8 @@ the public-API contract.
 
 ### Fixed
 
+- Software video now presents the selected frame when seeking while paused. It decodes through preroll without starting the clock or audio, displays the winning seek's frame, and stays paused instead of retaining the previous picture until Play.
+
 - The software video decoder no longer runs more than 16 frame threads. It used one per core, and each frame thread holds back one decoded frame, so a 32-core Mac waited for 31 frames before showing the first one after a load or seek (about 3 s at 10 fps). FFmpeg also warns above 16 threads. Hosts with 16 or fewer cores keep their current thread count.
 - TrueHD Atmos rendered to APAC (`LoadOptions.objectAudioRendering`) no longer plays 42.7 ms ahead of the video. The bridge dropped the encoder's 2048 frames of priming and stamped the first content packet on the source position, but AVFoundation presents an APAC packet's audio 2048 frames before its timestamp, so every session ran early, at load and after every seek. The priming packets now stay in the stream and take the source position's timestamp.
 - Authorized native HLS uses the engine relay from the initial load, without forwarding origin credentials to the loopback asset. Optional subtitle playlist preparation shares the authorizer and has a bounded deadline across redirects and refreshes.
