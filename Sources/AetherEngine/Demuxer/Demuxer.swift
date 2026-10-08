@@ -2323,6 +2323,11 @@ public final class Demuxer: @unchecked Sendable {
         guard let timestamp = Self.ticks(forSeconds: seconds, timeBase: timeBase) else { return false }
         // #409: the read position moves, so the repair drops its picture-order anchor and
         // re-anchors on the next keyframe (a seek always lands on one).
+        // A first seek's head sample runs outside `timeout` on purpose. Cut short, it either settles
+        // the verdict on a partial sample, and the session plays in decode order (#699), or leaves
+        // the seek unpositioned, and a resume that ignores the outcome then reads from the head. The
+        // sample has its own bounds instead: `sampleByteBudget`, `heldPacketCeiling` and the per-read
+        // stall timeout.
         noteCompositionRepairSeekLocked()
         // #268: a time-seekable source repositions itself instead of paying libavformat's byte-space
         // binary search, which on an index-less MPEG-TS is either wedged or broken (round 10 below) and
