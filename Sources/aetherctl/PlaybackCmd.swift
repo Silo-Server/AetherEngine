@@ -950,7 +950,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
             servedURLItem = ObjectIdentifier(item)
             // The engine's loopback URL stays raw; on the remote route with no stand-in this is the
             // origin URL itself, which is redacted like the banner.
-            FileHandle.standardOutput.write(Data("  SERVED \(printableURL(asset.url))\n".utf8))
+            FileHandle.standardOutput.write(Data("  SERVED \(printableURL(asset.url, source: url))\n".utf8))
         }
         // AE#441: the live rewind surfaces a host actually scales its strip on. Sampling them needed a
         // patched copy of this CLI before, which is how an over-promising lower bound stayed unseen.
@@ -1307,7 +1307,8 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         }
         if let t = nativeRenderTick, tick == t + 2 {
             await reportLegibleSelection(engine, "after render on")
-            await reportServedVTT(engine, "after render on", around: engine.currentTime, sessionStart: startPosition ?? 0)
+            await reportServedVTT(engine, "after render on", around: engine.currentTime, sessionStart: startPosition ?? 0,
+                                  source: url)
         }
         if let subsOffTick, tick == subsOffTick {
             print("  HOSTCALL subtitles off")
@@ -1328,7 +1329,8 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         if let t = subsOffTick, tick == t + 1 { await reportLegibleSelection(engine, "after off") }
         if let t = subsOnTick, tick == t + 4 {
             await reportLegibleSelection(engine, "after on")
-            await reportServedVTT(engine, "after on", around: engine.currentTime, sessionStart: startPosition ?? 0)
+            await reportServedVTT(engine, "after on", around: engine.currentTime, sessionStart: startPosition ?? 0,
+                                  source: url)
         }
     }
 
@@ -1594,18 +1596,30 @@ extension AetherEngine {
     }
 }
 
-/// `url` for stdout. The engine's loopback address prints raw, because its path token is the only way
-/// in and this is a local harness; anything else is an origin that can carry a credential, so it is
-/// redacted the way the banner is.
-private func printableURL(_ url: URL) -> String {
-    let host = url.host?.lowercased()
-    let loopback = host == "127.0.0.1" || host == "localhost" || host == "::1"
-    return loopback ? url.absoluteString : EngineLog.redacted(url.absoluteString)
+/// `url` for stdout. The engine's own loopback servers print raw, because their path token is the only
+/// way in and this is a local harness; anything else, an origin on localhost included, can carry a
+/// credential, so it is redacted the way the banner is. An engine server is a loopback address on a
+/// port the source does not use.
+private func printableURL(_ url: URL, source: URL) -> String {
+    func isLoopback(_ u: URL) -> Bool {
+        let host = u.host?.lowercased()
+        return host == "127.0.0.1" || host == "localhost" || host == "::1"
+    }
+    func port(_ u: URL) -> Int? {
+        if let port = u.port { return port }
+        switch u.scheme {
+        case "https": return 443
+        case "http": return 80
+        default: return nil
+        }
+    }
+    let engineServed = isLoopback(url) && !(isLoopback(source) && port(url) == port(source))
+    return engineServed ? url.absoluteString : EngineLog.redacted(url.absoluteString)
 }
 
 @MainActor
 private func reportServedVTT(_ engine: AetherEngine, _ label: String, around playhead: Double,
-                             sessionStart: Double) async {
+                             sessionStart: Double, source: URL) async {
     guard let item = engine.currentAVPlayerItem,
           let asset = item.asset as? AVURLAsset else {
         print("  VTT \(label): no item")
@@ -1617,7 +1631,7 @@ private func reportServedVTT(_ engine: AetherEngine, _ label: String, around pla
         return String(data: data, encoding: .utf8)
     }
     guard let masterBody = await get(master) else {
-        print("  VTT \(label): master unreachable at \(printableURL(master))")
+        print("  VTT \(label): master unreachable at \(printableURL(master, source: source))")
         return
     }
     // The rendition AVPlayer is on, named by the legible selection so the harness follows the same
@@ -1647,7 +1661,7 @@ private func reportServedVTT(_ engine: AetherEngine, _ label: String, around pla
     // nativeRemoteHLS bypass is absolute, and its segments sit next to it rather than the master.
     let mediaURL = URL(string: pick.uri, relativeTo: master)?.absoluteURL
     guard let mediaURL, let media = await get(mediaURL) else {
-        print("  VTT \(label): \(mediaURL.map(printableURL) ?? EngineLog.redacted(pick.uri)) unreachable")
+        print("  VTT \(label): \(mediaURL.map { printableURL($0, source: source) } ?? EngineLog.redacted(pick.uri)) unreachable")
         return
     }
     // Walk EXTINF rather than assuming a uniform grid. A source with irregular keyframes (scene cuts,
