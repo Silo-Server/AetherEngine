@@ -88,10 +88,17 @@ struct RemoteHLSCueClock {
     /// text went through `MovTextSampleBuilder.sanitize`, and AVPlayer drops the WebVTT markup and may
     /// re-break lines.
     static func normalize(_ text: String) -> String {
-        var s = MovTextSampleBuilder.sanitize(text)
-        while let open = s.firstIndex(of: "<"), let close = s[open...].firstIndex(of: ">") {
-            s.removeSubrange(open...close)
+        let sanitized = MovTextSampleBuilder.sanitize(text)
+        // One forward pass: removing a tag at a time and searching again from the start cost tags x
+        // length, seconds for a crafted 64 KiB cue. Once a `<` finds no `>`, no later one can either.
+        // Scanned by Character, as before, so a `<` carrying a combining mark is still text.
+        var s = ""
+        var rest = sanitized[...]
+        while let open = rest.firstIndex(of: "<"), let close = rest[open...].firstIndex(of: ">") {
+            s.append(contentsOf: rest[..<open])
+            rest = rest[rest.index(after: close)...]
         }
+        s.append(contentsOf: rest)
         s = s.replacingOccurrences(of: "&lt;", with: "<")
             .replacingOccurrences(of: "&gt;", with: ">")
             .replacingOccurrences(of: "&nbsp;", with: " ")
