@@ -948,8 +948,9 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         if servedURL, let item = engine.currentAVPlayerItem, ObjectIdentifier(item) != servedURLItem,
            let asset = item.asset as? AVURLAsset {
             servedURLItem = ObjectIdentifier(item)
-            // Deliberately unredacted: the path token is the only way in, and this is a local harness.
-            FileHandle.standardOutput.write(Data("  SERVED \(asset.url.absoluteString)\n".utf8))
+            // The engine's loopback URL stays raw; on the remote route with no stand-in this is the
+            // origin URL itself, which is redacted like the banner.
+            FileHandle.standardOutput.write(Data("  SERVED \(printableURL(asset.url))\n".utf8))
         }
         // AE#441: the live rewind surfaces a host actually scales its strip on. Sampling them needed a
         // patched copy of this CLI before, which is how an over-promising lower bound stayed unseen.
@@ -1593,6 +1594,15 @@ extension AetherEngine {
     }
 }
 
+/// `url` for stdout. The engine's loopback address prints raw, because its path token is the only way
+/// in and this is a local harness; anything else is an origin that can carry a credential, so it is
+/// redacted the way the banner is.
+private func printableURL(_ url: URL) -> String {
+    let host = url.host?.lowercased()
+    let loopback = host == "127.0.0.1" || host == "localhost" || host == "::1"
+    return loopback ? url.absoluteString : EngineLog.redacted(url.absoluteString)
+}
+
 @MainActor
 private func reportServedVTT(_ engine: AetherEngine, _ label: String, around playhead: Double,
                              sessionStart: Double) async {
@@ -1607,7 +1617,7 @@ private func reportServedVTT(_ engine: AetherEngine, _ label: String, around pla
         return String(data: data, encoding: .utf8)
     }
     guard let masterBody = await get(master) else {
-        print("  VTT \(label): master unreachable at \(master.absoluteString)")
+        print("  VTT \(label): master unreachable at \(printableURL(master))")
         return
     }
     // The rendition AVPlayer is on, named by the legible selection so the harness follows the same
@@ -1633,22 +1643,29 @@ private func reportServedVTT(_ engine: AetherEngine, _ label: String, around pla
         print("  VTT \(label): no SUBTITLES rendition in the master")
         return
     }
-    guard let media = await get(master.deletingLastPathComponent().appendingPathComponent(pick.uri)) else {
-        print("  VTT \(label): \(pick.uri) unreachable")
+    // Each URI resolves against the playlist that names it: an origin rendition kept on the
+    // nativeRemoteHLS bypass is absolute, and its segments sit next to it rather than the master.
+    let mediaURL = URL(string: pick.uri, relativeTo: master)?.absoluteURL
+    guard let mediaURL, let media = await get(mediaURL) else {
+        print("  VTT \(label): \(mediaURL.map(printableURL) ?? EngineLog.redacted(pick.uri)) unreachable")
         return
     }
     // Walk EXTINF rather than assuming a uniform grid. A source with irregular keyframes (scene cuts,
     // which is most real content) has segments of unequal length, and the reporter's log shows exactly
     // that: `planSource` and `sourceStart` 1.96 s apart on every segment. Dividing the playhead by a
     // nominal 4 s picked nothing there, and a harness that checks zero segments reports a clean run.
-    var offsets: [(name: String, start: Double)] = []
+    var offsets: [(name: String, url: URL, start: Double)] = []
     var acc = 0.0
     var pending: Double?
     for line in media.split(separator: "\n", omittingEmptySubsequences: false) {
         if line.hasPrefix("#EXTINF:") {
             pending = Double(line.dropFirst(8).split(separator: ",").first ?? "") ?? 0
-        } else if line.hasSuffix(".vtt") {
-            offsets.append((String(line), acc))
+        } else if !line.isEmpty, !line.hasPrefix("#"),
+                  let url = URL(string: String(line), relativeTo: mediaURL)?.absoluteURL,
+                  url.pathExtension == "vtt" {
+            // The extension is read off the path so a query string does not hide it, and the name
+            // printed is the file name alone, so that query (which can carry a token) stays out.
+            offsets.append((url.lastPathComponent, url, acc))
             acc += pending ?? 0
             pending = nil
         }
@@ -1661,9 +1678,9 @@ private func reportServedVTT(_ engine: AetherEngine, _ label: String, around pla
     let startIndex = offsets.lastIndex(where: { $0.start <= relative }) ?? 0
     var checked = 0, nonEmpty = 0, cues = 0, misplaced = 0
     var firstMismatch: String?
-    for (name, start) in offsets[startIndex...] where checked < 8 {
+    for (name, url, start) in offsets[startIndex...] where checked < 8 {
         checked += 1
-        guard let body = await get(master.deletingLastPathComponent().appendingPathComponent(name)) else { continue }
+        guard let body = await get(url) else { continue }
         // A cue is a timestamp line plus text under it; counting "-->" counts cues without parsing.
         let c = body.components(separatedBy: "-->").count - 1
         cues += c

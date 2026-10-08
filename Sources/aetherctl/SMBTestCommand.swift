@@ -37,6 +37,12 @@ private func smbTestRun(_ args: [String]) async -> Int32 {
             }
         }
 
+        // Probe indices by offset, walked with a cursor, so the timed pass below visits only the probes
+        // near each chunk instead of every probe per chunk. `probes` keeps its random order for the
+        // seek pass.
+        let byOffset = probes.indices.sorted { probes[$0].offset < probes[$1].offset }
+        var cursor = 0
+
         let chunk = 1 << 20 // 1 MiB sequential read
         var buf = [UInt8](repeating: 0, count: chunk)
         var readBytes: Int64 = 0
@@ -46,7 +52,14 @@ private func smbTestRun(_ args: [String]) async -> Int32 {
             let n = buf.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: Int32(chunk)) }
             if n <= 0 { break }
             let chunkEnd = readBytes + Int64(n)
-            for i in probes.indices {
+            // Skip probes that ended before this chunk; one that crosses into it stays for its tail.
+            while cursor < byOffset.count {
+                let probe = probes[byOffset[cursor]]
+                guard probe.offset + Int64(probe.length) <= readBytes else { break }
+                cursor += 1
+            }
+            for i in byOffset[cursor...] {
+                if probes[i].offset >= chunkEnd { break }
                 let lo = max(probes[i].offset, readBytes)
                 let hi = min(probes[i].offset + Int64(probes[i].length), chunkEnd)
                 guard lo < hi else { continue }

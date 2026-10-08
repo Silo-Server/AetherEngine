@@ -47,6 +47,11 @@ args = ap.parse_args()
 
 delays = [float(x) for x in args.delays.split(",")]
 count = len([f for f in os.listdir(args.dir) if f.startswith("seg") and f.endswith(".ts")])
+# Both index the segment list below, so a short folder would otherwise end in an IndexError.
+if not 0 <= args.prefill <= count:
+    ap.error("--prefill must be 0 to %d, the segments in %s (got %d)" % (count, args.dir, args.prefill))
+if args.freeze_at >= count:
+    ap.error("--freeze-at must be below %d, the segments in %s (got %d)" % (count, args.dir, args.freeze_at))
 durs = [float(x) for x in args.durs.split(",")] if args.durs else [args.dur]
 seg_dur = [durs[k % len(durs)] for k in range(count)]
 ends = []
