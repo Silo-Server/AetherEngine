@@ -41,7 +41,9 @@ final class IFramePayloadCache: @unchecked Sendable {
     }
 
     func store(_ data: Data, for index: Int) {
-        guard !data.isEmpty else { return }
+        // Eviction never takes the entry it makes room for, so one larger than the cap would stay
+        // over it. The caller serves such a payload uncached.
+        guard !data.isEmpty, data.count <= byteLimit else { return }
         lock.lock(); defer { lock.unlock() }
         forgetLocked(index)
         do {

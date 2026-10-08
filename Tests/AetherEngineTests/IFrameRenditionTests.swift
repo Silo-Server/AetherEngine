@@ -28,7 +28,7 @@ private final class Recorder: @unchecked Sendable {
 }
 
 struct IFrameRenditionTests {
-    private func make(_ rec: Recorder, count: Int = 5) -> (IFrameRendition, URL) {
+    private func make(_ rec: Recorder, count: Int = 5, cacheLimit: Int = 1 << 20) -> (IFrameRendition, URL) {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("iframe-rendition-\(UUID().uuidString)", isDirectory: true)
         let entries = (0..<count).map {
@@ -36,7 +36,7 @@ struct IFrameRenditionTests {
         }
         let rendition = IFrameRendition(
             entries: entries,
-            cache: IFramePayloadCache(directory: dir, byteLimit: 1 << 20),
+            cache: IFramePayloadCache(directory: dir, byteLimit: cacheLimit),
             readPayload: rec.read,
             buildFragment: { payload, index, entry in
                 // The fragment names the payload it was built from and the time it was stamped with.
@@ -84,6 +84,16 @@ struct IFrameRenditionTests {
         _ = r.fragment(at: 1)
         rec.failing = [3000]
         #expect(r.fragment(at: 3) == Data("key1000@3:12.0".utf8))
+    }
+
+    @Test("a keyframe larger than the cache's cap is served from the read and read again next time")
+    func oversizedPayloadIsServedUncached() {
+        let rec = Recorder()
+        // "key2000" is 7 bytes.
+        let (r, dir) = make(rec, cacheLimit: 4); defer { r.shutdown(); try? FileManager.default.removeItem(at: dir) }
+        #expect(r.fragment(at: 2) == Data("key2000@2:8.0".utf8))
+        #expect(r.fragment(at: 2) == Data("key2000@2:8.0".utf8))
+        #expect(rec.reads == [2000, 2000])
     }
 
     @Test("a failed read with nothing cached is nil")

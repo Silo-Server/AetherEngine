@@ -153,6 +153,13 @@ final class PacketRingBuffer: @unchecked Sendable {
         markerFD = -1
         lock.unlock()
 
+        // The writer's chunk would otherwise stay open, blocks and all, until the next append. An
+        // append in flight is waited out here, after the index is cleared, so readers never wait on it.
+        writeLock.lock()
+        tail = nil
+        tailOffset = 0
+        writeLock.unlock()
+
         DispatchQueue.global(qos: .userInitiated).async { [scratch] in
             try? FileManager.default.removeItem(at: scratch)
             // Released after the removal, so the directory reads live until it is gone.

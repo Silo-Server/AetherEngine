@@ -32,13 +32,20 @@ struct IFramePayloadCacheTests {
         #expect(cache.payload(for: 2) != nil)
     }
 
-    @Test("a payload larger than the cap is kept alone rather than evicted into a miss")
-    func oversizedPayloadIsKeptAlone() throws {
+    @Test("a payload larger than the cap is not kept and evicts nothing; one exactly at the cap is kept")
+    func oversizedPayloadIsNotKept() throws {
         let (cache, dir) = try makeCache(limit: 100)
         defer { try? FileManager.default.removeItem(at: dir) }
         cache.store(Data(count: 60), for: 0)
         cache.store(Data(count: 500), for: 1)
-        #expect(cache.payload(for: 1)?.count == 500)
+        #expect(cache.payload(for: 1) == nil)
+        #expect(cache.payload(for: 0)?.count == 60)
+        #expect(cache.nearestIndex(to: 1) == 0)
+        let files = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+        #expect(files == ["payload-0.bin"], "the oversized payload left a file over the cap")
+
+        cache.store(Data(count: 100), for: 2)
+        #expect(cache.payload(for: 2)?.count == 100)
         #expect(cache.payload(for: 0) == nil)
     }
 

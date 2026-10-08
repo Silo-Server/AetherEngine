@@ -424,6 +424,97 @@ struct PacketRingBufferChunkSpoolTests {
         #expect(ring.packet(atSeq: 0) == nil)
         #expect(ring.packet(atSeq: 59)?.bytes.count == 30 << 10)
     }
+
+    // MARK: - Teardown
+
+    /// Which file a descriptor refers to, or nil once it is closed. A closed number that something
+    /// else reopened reads as a different file, so this cannot mistake reuse for the chunk.
+    private struct OpenFile: Equatable {
+        let device: dev_t
+        let inode: ino_t
+        init?(_ fd: Int32) {
+            var info = stat()
+            guard fstat(fd, &info) == 0 else { return nil }
+            device = info.st_dev
+            inode = info.st_ino
+        }
+    }
+
+    /// Records the descriptor the writer writes through, and can park one write until released.
+    private final class WriteSpy: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _fd: Int32?
+        private var parkWith: Int32?
+        private var _parked = false
+        private let gate = DispatchSemaphore(value: 0)
+        var fd: Int32? { lock.lock(); defer { lock.unlock() }; return _fd }
+        var parked: Bool { lock.lock(); defer { lock.unlock() }; return _parked }
+        /// The next write waits for `release()`, then fails with `code`.
+        func parkNextWrite(failingWith code: Int32) { lock.lock(); parkWith = code; lock.unlock() }
+        func release() { gate.signal() }
+
+        var writer: PacketRingBuffer.WriteAll {
+            { [self] fd, bytes, offset in
+                lock.lock()
+                _fd = fd
+                let code = parkWith
+                parkWith = nil
+                if code != nil { _parked = true }
+                lock.unlock()
+                if let code {
+                    gate.wait()
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(code))
+                }
+                try PacketRingBuffer.pwriteAll(fd, bytes, offset)
+            }
+        }
+    }
+
+    @Test("close() releases the chunk the writer appends to rather than leaving it to the next append")
+    func closeReleasesWriterChunk() throws {
+        let dirs = ScratchDirs()
+        let spy = WriteSpy()
+        let ring = try PacketRingBuffer(windowSeconds: .infinity, scratch: makeScratch(dirs), writeAll: spy.writer)
+        try ring.append(pts: 0, isKeyframe: true, isVideo: true, bytes: Data([1, 2, 3]))
+        let fd = try #require(spy.fd)
+        let chunk = try #require(OpenFile(fd))
+
+        ring.close()
+        #expect(OpenFile(fd) != chunk, "the closed ring still holds its tail chunk open")
+        withExtendedLifetime(ring) {}
+    }
+
+    @Test("close() during an append clears the index at once, then releases the chunk once the append ends",
+          .timeLimit(.minutes(1)))
+    func closeDuringAppendReleasesWriterChunk() async throws {
+        let dirs = ScratchDirs()
+        let spy = WriteSpy()
+        let ring = try PacketRingBuffer(windowSeconds: .infinity, scratch: makeScratch(dirs), writeAll: spy.writer)
+        try ring.append(pts: 0, isKeyframe: true, isVideo: true, bytes: Data([1]))
+        let fd = try #require(spy.fd)
+        let chunk = try #require(OpenFile(fd))
+
+        // An append that fails after close() has begun leaves the tail behind if close() does not
+        // wait it out.
+        spy.parkNextWrite(failingWith: EIO)
+        let appended = Counter()
+        let closed = Counter()
+        Thread {
+            try? ring.append(pts: 1, isKeyframe: false, isVideo: true, bytes: Data([2]))
+            appended.add(1)
+        }.start()
+        try await waitFor { spy.parked }
+        Thread {
+            ring.close()
+            closed.add(1)
+        }.start()
+        try await waitFor { ring.oldestPts == nil }
+        spy.release()
+        try await waitFor { appended.value == 1 && closed.value == 1 }
+
+        #expect(OpenFile(fd) != chunk, "the closed ring still holds its tail chunk open")
+        withExtendedLifetime(ring) {}
+    }
 }
 
 private final class Counter: @unchecked Sendable {
