@@ -47,6 +47,7 @@ the public-API contract.
 - Log redaction covers an Xtream password containing `,` `'` or `)`, which used to end the path segment early, and a registered secret that starts a credential name such as `token` no longer hides the value after it.
 - `aetherctl`: `--served-url` and the served-VTT readout redact origin URLs (loopback URLs still print in full), the readout resolves rendition and segment URIs against the playlist that lists them, and `smb-test`'s sequential pass no longer scans every probe for every chunk inside its timed window.
 - `Scripts/hls-burst-origin.py` rejects a `--prefill` or `--freeze-at` that the folder's segments cannot satisfy instead of failing with an `IndexError`.
+- `reloadAtCurrentPosition(applying:)` refuses a `sharedOutputRole` change with `loadIdentityNotCorrectable`. The role was listed as load identity but never compared, so a correction rebuilt a multiview engine under the other role.
 - Seven upstream tests no longer turn a timeout into a hang, rely on main-executor ordering after `Task.yield()`, race a closed socket, or write a fake's state from another queue without a lock.
 - Native subtitle renditions wait for complete extraction instead of caching a partial whole-track response. While extraction is pending, the local server returns a retryable HTTP 503.
 - External subtitles can declare `nativeTimelineOffsetSeconds` for media reanchored upstream. Native HLS/PiP/AirPlay renditions use the adjusted timeline while host overlay cues retain source timestamps.
