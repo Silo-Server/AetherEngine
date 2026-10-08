@@ -950,7 +950,8 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
             servedURLItem = ObjectIdentifier(item)
             // The engine's loopback URL stays raw; on the remote route with no stand-in this is the
             // origin URL itself, which is redacted like the banner.
-            FileHandle.standardOutput.write(Data("  SERVED \(printableURL(asset.url, source: url))\n".utf8))
+            let engine = engineEndpoint(mounted: asset.url, source: url)
+            FileHandle.standardOutput.write(Data("  SERVED \(printableURL(asset.url, engine: engine))\n".utf8))
         }
         // AE#441: the live rewind surfaces a host actually scales its strip on. Sampling them needed a
         // patched copy of this CLI before, which is how an over-promising lower bound stayed unseen.
@@ -1596,25 +1597,21 @@ extension AetherEngine {
     }
 }
 
-/// `url` for stdout. The engine's own loopback servers print raw, because their path token is the only
+/// The engine server behind a mounted item, or nil. An item's URL is either the source itself (the
+/// remote route with no stand-in) or the engine's loopback stand-in, so a loopback URL that is not
+/// the source is the engine's.
+private func engineEndpoint(mounted: URL, source: URL) -> URL? {
+    let host = mounted.host?.lowercased()
+    guard mounted != source, host == "127.0.0.1" || host == "localhost" || host == "::1" else { return nil }
+    return mounted
+}
+
+/// `url` for stdout. A URL on the engine's own server prints raw, because its path token is the only
 /// way in and this is a local harness; anything else, an origin on localhost included, can carry a
-/// credential, so it is redacted the way the banner is. An engine server is a loopback address on a
-/// port the source does not use.
-private func printableURL(_ url: URL, source: URL) -> String {
-    func isLoopback(_ u: URL) -> Bool {
-        let host = u.host?.lowercased()
-        return host == "127.0.0.1" || host == "localhost" || host == "::1"
-    }
-    func port(_ u: URL) -> Int? {
-        if let port = u.port { return port }
-        switch u.scheme {
-        case "https": return 443
-        case "http": return 80
-        default: return nil
-        }
-    }
-    let engineServed = isLoopback(url) && !(isLoopback(source) && port(url) == port(source))
-    return engineServed ? url.absoluteString : EngineLog.redacted(url.absoluteString)
+/// credential, so it is redacted the way the banner is.
+private func printableURL(_ url: URL, engine: URL?) -> String {
+    let onEngine = engine.map { url.scheme == $0.scheme && url.host == $0.host && url.port == $0.port } ?? false
+    return onEngine ? url.absoluteString : EngineLog.redacted(url.absoluteString)
 }
 
 @MainActor
@@ -1626,12 +1623,13 @@ private func reportServedVTT(_ engine: AetherEngine, _ label: String, around pla
         return
     }
     let master = asset.url
+    let engine = engineEndpoint(mounted: master, source: source)
     func get(_ url: URL) async -> String? {
         guard let (data, _) = try? await URLSession.shared.data(from: url) else { return nil }
         return String(data: data, encoding: .utf8)
     }
     guard let masterBody = await get(master) else {
-        print("  VTT \(label): master unreachable at \(printableURL(master, source: source))")
+        print("  VTT \(label): master unreachable at \(printableURL(master, engine: engine))")
         return
     }
     // The rendition AVPlayer is on, named by the legible selection so the harness follows the same
@@ -1661,7 +1659,7 @@ private func reportServedVTT(_ engine: AetherEngine, _ label: String, around pla
     // nativeRemoteHLS bypass is absolute, and its segments sit next to it rather than the master.
     let mediaURL = URL(string: pick.uri, relativeTo: master)?.absoluteURL
     guard let mediaURL, let media = await get(mediaURL) else {
-        print("  VTT \(label): \(mediaURL.map { printableURL($0, source: source) } ?? EngineLog.redacted(pick.uri)) unreachable")
+        print("  VTT \(label): \(mediaURL.map { printableURL($0, engine: engine) } ?? EngineLog.redacted(pick.uri)) unreachable")
         return
     }
     // Walk EXTINF rather than assuming a uniform grid. A source with irregular keyframes (scene cuts,
