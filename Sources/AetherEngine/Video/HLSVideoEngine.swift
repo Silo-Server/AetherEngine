@@ -4039,7 +4039,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
         restartLock.unlock()
     }
 
-    func requestRestart(at idx: Int, authoritative: Bool = false) {
+    /// `reviving` names the dead producer and session a delayed revive was scheduled for (audit
+    /// HLS-104). They are checked again in the same `restartLock` hold as the admission: a seek
+    /// restart that began after the caller's own check would otherwise get the stale target queued
+    /// behind it. A restart already in flight is about to replace the dead producer, so it counts.
+    func requestRestart(at idx: Int, authoritative: Bool = false,
+                        reviving revive: (deadProducer: HLSSegmentProducer?, sessionEpoch: UInt64)? = nil) {
         // A sequential origin has no restart. performRestart's demuxer seek has nowhere to land
         // on a non-seekable pb, and it ignores that failure: the new producer would keep reading
         // wherever the stream stands (or from byte 0 after a fresh reopen) and label those bytes
@@ -4056,6 +4061,17 @@ public final class HLSVideoEngine: @unchecked Sendable {
             return
         }
         restartLock.lock()
+        if let revive, !Self.meteredReviveStillOwed(
+            sessionUnchanged: sessionEpoch == revive.sessionEpoch,
+            deadProducerInstalled: producer === revive.deadProducer && !restartCoalescer.isInFlight) {
+            restartLock.unlock()
+            EngineLog.emit(
+                "[HLSVideoEngine] revive at idx=\(idx) dropped at admission: a restart began or the "
+                + "dead producer was replaced after it was scheduled",
+                category: .session
+            )
+            return
+        }
         let shouldRun = restartCoalescer.begin(idx, authoritative: authoritative)
         let seekTime = segmentStartSecondsLocked(idx) // under lock; segmentPlan guarded by restartLock (#38)
         restartLock.unlock()

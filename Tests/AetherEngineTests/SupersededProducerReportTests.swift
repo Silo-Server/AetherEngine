@@ -177,4 +177,41 @@ struct SupersededProducerReportTests {
         engine.fireMeteredRevive(at: 2, deadProducer: dead, sessionEpoch: epoch)
         #expect(restarts.began == 1)
     }
+
+    @Test("a revive that wakes as a seek restart starts does not queue its stale target behind it",
+          .timeLimit(.minutes(1)))
+    func meteredReviveYieldsToAStartingRestart() async throws {
+        let session = try Session()
+        let engine = session.engine
+        let restarts = Restarts()
+        let dead = try engine.makeProducer(baseIndex: 2)
+        engine.producer = dead
+        dead.start()
+        try await waitFor { dead.didFinish }
+        let epoch = engine.sessionEpochSnapshot()
+
+        // The seek restart is admitted and held before it takes the dead producer out, so the
+        // revive's own producer and session checks still pass.
+        let admitted = DispatchSemaphore(value: 0)
+        let proceed = DispatchSemaphore(value: 0)
+        engine.onSeekStateChanged = { began, _ in
+            restarts.note(began)
+            if began, restarts.began == 1 {
+                admitted.signal()
+                proceed.wait()
+            }
+        }
+        let began: Int = await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                let seek = DispatchGroup()
+                DispatchQueue.global().async(group: seek) { engine.requestRestart(at: 6) }
+                admitted.wait()
+                engine.fireMeteredRevive(at: 2, deadProducer: dead, sessionEpoch: epoch)
+                proceed.signal()
+                seek.wait()
+                continuation.resume(returning: restarts.began)
+            }
+        }
+        #expect(began == 1, "the revive's stale target ran after the seek restart")
+    }
 }

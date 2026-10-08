@@ -543,7 +543,7 @@ extension HLSVideoEngine {
                 category: .session)
             return
         }
-        requestRestart(at: idx, authoritative: true)
+        requestRestart(at: idx, authoritative: true, reviving: (deadProducer, sessionEpoch))
     }
 
     /// #377: how long a refusal keeps classifying a read error as metering. The reader's give-up
