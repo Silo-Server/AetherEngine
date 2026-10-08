@@ -620,16 +620,27 @@ final class AudioPlaybackHost {
         guard !didParkClockAtEnd else { return }
         didParkClockAtEnd = true
         guard clockArmed, let aOut = audioOutput else { return }
+        let clock = aOut.currentTimeSeconds
         let tail = SoftwareEndOfMediaClock.tailPlayoutSeconds(
-            clockSeconds: aOut.currentTimeSeconds,
+            clockSeconds: clock,
             lastAudioPts: lastEnqueuedEnd
         )
         guard tail > 0 else { return parkClockNow(notAfter: lastEnqueuedEnd) }
+        // The tail is source time: below 1x, or across a pause, it outlasts as many wall seconds, so
+        // the park waits for the clock to get there. `target` keeps the clamp on a broken PTS.
+        let target = clock + tail
         let generation = seekGeneration
         Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(tail * 1_000_000_000))
-            guard let self, self.seekGeneration == generation, self.didParkClockAtEnd else { return }
-            self.parkClockNow(notAfter: lastEnqueuedEnd)
+            var wait = tail
+            while true {
+                try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+                guard let self, self.seekGeneration == generation, self.didParkClockAtEnd,
+                      let aOut = self.audioOutput else { return }
+                guard let next = SoftwareEndOfMediaClock.parkWaitSeconds(
+                    clockSeconds: aOut.currentTimeSeconds, rate: aOut.rate, target: target
+                ) else { return self.parkClockNow(notAfter: lastEnqueuedEnd) }
+                wait = next
+            }
         }
     }
 

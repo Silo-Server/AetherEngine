@@ -33,4 +33,16 @@ enum SoftwareEndOfMediaClock {
         guard clockSeconds.isFinite, latest.isFinite, clockSeconds > latest else { return nil }
         return latest
     }
+
+    /// How often a deferred park re-reads a clock that is not running (paused during the tail).
+    static let stoppedClockPollSeconds: TimeInterval = 0.1
+
+    /// Wall seconds before a deferred park looks again, nil once the clock has reached `target` or
+    /// either value is unusable. The tail is source time, so it plays out over `remaining / rate`
+    /// wall seconds; a stopped clock is polled, since parking it where it stands cuts the tail.
+    static func parkWaitSeconds(clockSeconds: Double, rate: Float, target: Double) -> TimeInterval? {
+        guard clockSeconds.isFinite, target.isFinite, clockSeconds < target else { return nil }
+        guard rate > 0 else { return stoppedClockPollSeconds }
+        return (target - clockSeconds) / Double(rate)
+    }
 }
