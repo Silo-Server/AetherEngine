@@ -497,6 +497,9 @@ struct PacketRingBufferChunkSpoolTests {
         // An append that fails after close() has begun leaves the tail behind if close() does not
         // wait it out.
         spy.parkNextWrite(failingWith: EIO)
+        // A wait the time limit cancels skips the release below; the parked writer, and a close()
+        // waiting on it, must not outlive the test. A second signal is harmless: nothing parks again.
+        defer { spy.release() }
         let appended = Counter()
         let closed = Counter()
         Thread {
