@@ -80,28 +80,36 @@ struct Issue694AudioHostEndOfMediaParkTests {
     @MainActor
     @Test("a pause during the tail holds the park until the clock reaches the last sample")
     func pauseDuringTheTailDefersThePark() async throws {
-        let host = AudioPlaybackHost()
-        let demuxer = Demuxer()
-        try demuxer.open(reader: DataIOReader(data: makeWAV(seconds: 1)))
-        try await host.load(demuxer: demuxer, startPosition: nil, audioSourceStreamIndex: nil)
-        defer { host.stop() }
-        host.play()
+        // The playthrough wait releases up to 0.25 s of source before the end, and the pause has to
+        // land in that tail, before the park. At 0.25x the tail lasts about a second of wall time;
+        // a run a loaded machine still delays past it (the clock already parked on the last
+        // sample, which a resume would carry on from) starts over.
+        for _ in 0..<4 {
+            let host = AudioPlaybackHost()
+            let demuxer = Demuxer()
+            try demuxer.open(reader: DataIOReader(data: makeWAV(seconds: 1)))
+            try await host.load(demuxer: demuxer, startPosition: nil, audioSourceStreamIndex: nil)
+            defer { host.stop() }
+            host.setResumeRate(0.25)
+            host.play()
 
-        let deadline = Date().addingTimeInterval(8)
-        while !host.didReachEnd, Date() < deadline {
-            try await Task.sleep(nanoseconds: 10_000_000)
+            let deadline = Date().addingTimeInterval(16)
+            while !host.didReachEnd, Date() < deadline {
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            try #require(host.didReachEnd)
+            host.pause()
+            guard try #require(host.clockSecondsForTesting) < 0.99 else { continue }
+            try await Task.sleep(nanoseconds: 600_000_000)
+            host.play()
+
+            // A park that fired during the pause left nothing to stop the resumed clock.
+            try await waitForParkedClock(host, within: 4)
+            let first = try #require(host.clockSecondsForTesting)
+            #expect(abs(first - 1.0) < 0.02)
+            return
         }
-        #expect(host.didReachEnd)
-        // The playthrough wait releases up to 0.25 s before the end; pause inside that tail and
-        // hold the pause past it.
-        host.pause()
-        try await Task.sleep(nanoseconds: 400_000_000)
-        host.play()
-
-        // A park that fired during the pause left nothing to stop the resumed clock.
-        try await waitForParkedClock(host, within: 2)
-        let first = try #require(host.clockSecondsForTesting)
-        #expect(abs(first - 1.0) < 0.02)
+        Issue.record("the pause never landed inside the tail in four runs")
     }
 
     @MainActor
