@@ -194,6 +194,21 @@ struct LogRedactionTests {
         #expect(LogRedaction.redact("[x] url=\(url) ok") == "[x] url=\(url) ok")
     }
 
+    /// `'` `,` and `)` are legal raw in a URL path, so a password holding one read as too few segments
+    /// for the layout and went out whole. The same mark after the URL is prose and still ends it.
+    @Test("an Xtream password holding ' , or ) goes whole, and the mark after the URL stays prose",
+          arguments: ["'", ",", ")"])
+    func xtreamPasswordWithPathPunctuation(mark: String) {
+        #expect(LogRedaction.redact("[x] url=http://h:8080/live/john/pa\(mark)ss/12345.ts ok")
+                == "[x] url=http://h:8080/live/john/<redacted>/12345.ts ok")
+        #expect(LogRedaction.redact("[x] url=http://h:8080/hlsr/a1b2\(mark)c3/john/pa\(mark)ss/12345/1/7.ts ok")
+                == "[x] url=http://h:8080/hlsr/<redacted>/12345/1/7.ts ok")
+        #expect(LogRedaction.redact("[x] (http://h:8080/live/john/S3cretPass/12345.ts\(mark)) retrying")
+                == "[x] (http://h:8080/live/john/<redacted>/12345.ts\(mark)) retrying")
+        let ordinary = "[x] (see https://origin.example/live/channel1/index.m3u8\(mark)), ok"
+        #expect(LogRedaction.redact(ordinary) == ordinary)
+    }
+
     @Test("a URL logged percent-encoded inside another URL's query loses its token (audit NET-1)")
     func percentEncodedNestedURL() {
         // The exact shape the pre-NET-1 origin relay logged on every request.
@@ -266,6 +281,24 @@ struct LogRedactionTests {
         #expect(LogRedaction.redact("[x] pw=\(secret)x") == "[x] pw=<redacted>x")
         EngineLog.unregisterSecret(secret)
         #expect(LogRedaction.redact("[x] v=\(secret)x") == "[x] v=\(secret)x")
+    }
+
+    /// A registered literal that is also a credential name hid the value behind it, because the scan
+    /// resumed past the literal; the value's span must not hide a registered literal either.
+    /// `passwd` rather than `token`: the registry is process-global and parallel suites log `token`.
+    @Test("a registered secret and a named credential value both go where they meet")
+    func registeredSecretMeetsACredentialName() {
+        #expect(EngineLog.registerSecret("passwd"))
+        #expect(EngineLog.registerSecret("w0rd tail"))
+        defer {
+            EngineLog.unregisterSecret("passwd")
+            EngineLog.unregisterSecret("w0rd tail")
+        }
+        #expect(LogRedaction.redact("[x] passwd=abcdef123456&keep=1") == "[x] <redacted>&keep=1")
+        #expect(LogRedaction.redact("[x] password=w0rd tail ok") == "[x] password=<redacted> ok")
+        // An escape anywhere in the line takes the decoded-view pass instead of the streaming one.
+        #expect(LogRedaction.redact("[x] %20 passwd=abcdef123456&keep=1") == "[x] %20 <redacted>&keep=1")
+        #expect(LogRedaction.redact("[x] passwd alone") == "[x] <redacted> alone")
     }
 
     // MARK: - Nameless shapes inside a percent-encoded URL (audit SUB-104)

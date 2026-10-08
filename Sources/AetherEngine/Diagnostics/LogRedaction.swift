@@ -140,15 +140,26 @@ enum LogRedaction {
     private static func match(in bytes: [UInt8], at index: Int, secrets: [[UInt8]], keys: Bool)
         -> Range<Int>?
     {
-        if let secret = registeredSecretRange(in: bytes, at: index, secrets: secrets) { return secret }
-        if keys, let value = matchedKeyLength(in: bytes, at: index)
-            .flatMap({ valueRange(in: bytes, keyStart: index, keyEnd: index + $0) }) {
-            return value
-        }
-        return authorizationSchemeRange(in: bytes, at: index)
+        let keyed = keys ? matchedKeyLength(in: bytes, at: index)
+            .flatMap({ valueRange(in: bytes, keyStart: index, keyEnd: index + $0) }) : nil
+        guard var span = keyed
+            ?? authorizationSchemeRange(in: bytes, at: index)
             ?? encodedPayloadRange(in: bytes, at: index)
             ?? userInfoSecretRange(in: bytes, at: index)
-            ?? xtreamPathSecretRange(in: bytes, at: index)
+            ?? xtreamPathSecretRange(in: bytes, at: index) else {
+            return registeredSecretRange(in: bytes, at: index, secrets: secrets)
+        }
+        // The scan resumes past the span, so a registered secret starting before its end goes unseen
+        // unless it is folded in, and returning that secret alone hides the value instead (`token`
+        // registered, `token=abc` logged). One span covers both.
+        var k = index
+        while !secrets.isEmpty, k < span.upperBound {
+            if let secret = registeredSecretRange(in: bytes, at: k, secrets: secrets) {
+                span = min(span.lowerBound, k) ..< max(span.upperBound, secret.upperBound)
+            }
+            k += 1
+        }
+        return span
     }
 
     /// Every logical character of a line once, escapes followed through `%25` layers by
@@ -497,10 +508,15 @@ enum LogRedaction {
     }
 
     /// Ends a URL path: the query, the fragment, or whatever the log line puts after the URL.
+    ///
+    /// `'` `,` and `)` are absent: they are legal raw in a path segment and a password holds them, so
+    /// `/live/u/pa,ss/1.ts` read as too few segments and kept its password. Where prose puts one after
+    /// the URL it lands in the last segment, which the layout never redacts, and the blank after it
+    /// still ends the path.
     private static func isPathTerminator(_ b: UInt8) -> Bool {
         switch b {
-        case UInt8(ascii: "?"), UInt8(ascii: "#"), UInt8(ascii: "\""), UInt8(ascii: "'"),
-             UInt8(ascii: ","), UInt8(ascii: ")"), UInt8(ascii: ">"), UInt8(ascii: " "), 0x09, 0x0A, 0x0D:
+        case UInt8(ascii: "?"), UInt8(ascii: "#"), UInt8(ascii: "\""), UInt8(ascii: ">"),
+             UInt8(ascii: " "), 0x09, 0x0A, 0x0D:
             return true
         default:
             return false
