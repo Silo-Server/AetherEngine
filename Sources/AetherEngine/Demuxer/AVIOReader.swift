@@ -3004,12 +3004,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// Audit DMX-8: a suffix is the END of the source, so the span has to end on the byte before a
     /// numeric total. Without that, `bytes <2^63-65536>-<Int64.max>/*` installed a span whose `end`
     /// overflows on the first read that reaches it.
+    ///
+    /// The total has to be positive before `total - 1` is taken: `Int64` parses a signed string, so
+    /// `bytes 0-0/-9223372036854775808` reached the subtraction with `Int64.min` and trapped.
     static func suffixRangeStart(_ http: HTTPURLResponse, expectedLength: Int) -> Int64? {
         guard let value = http.value(forHTTPHeaderField: "Content-Range") else { return nil }
         let scanner = value.replacingOccurrences(of: "bytes ", with: "")
         let parts = scanner.split(separator: "/", maxSplits: 1)
         guard parts.count == 2,
-              let total = Int64(parts[1].trimmingCharacters(in: .whitespaces)) else { return nil }
+              let total = Int64(parts[1].trimmingCharacters(in: .whitespaces)),
+              total > 0 else { return nil }
         let bounds = parts[0].split(separator: "-", maxSplits: 1)
         guard bounds.count == 2,
               let start = Int64(bounds[0].trimmingCharacters(in: .whitespaces)),

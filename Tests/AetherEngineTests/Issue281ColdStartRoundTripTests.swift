@@ -403,6 +403,26 @@ struct Issue281ColdStartRoundTripTests {
             expectedLength: 100) == nil)
     }
 
+    /// `Int64` parses a sign, so a total of `Int64.min` reached `total - 1` and trapped the process
+    /// from a single response header.
+    @Test("a suffix 206 with a total that is not positive is refused, not trapped on")
+    func suffixStartRefusesANonPositiveTotal() {
+        let url = URL(string: "http://example.invalid/movie.bin")!
+        func response(_ contentRange: String) -> HTTPURLResponse {
+            HTTPURLResponse(url: url, statusCode: 206, httpVersion: "HTTP/1.1",
+                            headerFields: ["Content-Range": contentRange])!
+        }
+
+        #expect(AVIOReader.suffixRangeStart(response("bytes 0-0/-9223372036854775808"),
+                                            expectedLength: 1) == nil)
+        #expect(AVIOReader.suffixRangeStart(response("bytes 0-0/-1"), expectedLength: 1) == nil)
+        #expect(AVIOReader.suffixRangeStart(response("bytes 0-0/0"), expectedLength: 1) == nil)
+        #expect(AVIOReader.suffixRangeStart(response("bytes 0-0/1"), expectedLength: 1) == 0)
+        #expect(AVIOReader.suffixRangeStart(
+            response("bytes 9223372036854775707-9223372036854775806/9223372036854775807"),
+            expectedLength: 100) == 9223372036854775707)
+    }
+
     /// The calibration the in-flight test above no longer carries, checked where it costs no socket
     /// and no wall clock: two measured round trips, floored so a cache-warm first connection still
     /// buys a wait, capped so a hung fetch cannot own the open.
