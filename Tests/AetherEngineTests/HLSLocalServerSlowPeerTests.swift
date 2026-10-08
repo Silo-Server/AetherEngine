@@ -219,17 +219,19 @@ private final class Trickle: @unchecked Sendable {
         Thread.detachNewThread { [self] in
             let head = Array("GET / HTTP/1.1\r\nHost: x\r\nX-Pad: \(String(repeating: "a", count: 400))\r\n\r\n".utf8)
             for byte in head {
-                if isStopped { return }
-                var one = byte
-                if send(fd, &one, 1, 0) != 1 { return }
+                if !sendUnlessStopped(byte, fd: fd) { return }
                 Thread.sleep(forTimeInterval: 0.2)
             }
         }
     }
 
-    private var isStopped: Bool {
+    /// The check and the send hold the lock together, so once `stop()` returns no send is in flight
+    /// and the caller's `close(fd)` cannot let a reused descriptor receive a stray byte.
+    private func sendUnlessStopped(_ byte: UInt8, fd: Int32) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        return stopped
+        if stopped { return false }
+        var one = byte
+        return send(fd, &one, 1, 0) == 1
     }
 
     func stop() {

@@ -85,6 +85,9 @@ struct StoppedPumpInFlightReadTests {
         let demuxer = Demuxer()
         try demuxer.open(reader: reader, formatHint: "matroska")
         defer { demuxer.close() }
+        // Runs before the close: a wait the time limit cancels must not leave the parked read
+        // holding the access lock that close() waits on.
+        defer { reader.release() }
         reader.arm(blockAt: Self.parkOffset)
 
         let videoIndex = demuxer.videoStreamIndex

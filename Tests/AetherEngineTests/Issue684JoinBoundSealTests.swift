@@ -14,10 +14,24 @@
 import XCTest
 @testable import AetherEngine
 
+/// Locked because a test flips `joinSpent` from another queue while the provider reads it.
 private final class JoinedUpstream: @unchecked Sendable {
-    var segmentDuration: Double?
-    var joinBacklog: Double?
-    var joinSpent: Bool?
+    private let lock = NSLock()
+    private var _segmentDuration: Double?
+    private var _joinBacklog: Double?
+    private var _joinSpent: Bool?
+    var segmentDuration: Double? {
+        get { lock.withLock { _segmentDuration } }
+        set { lock.withLock { _segmentDuration = newValue } }
+    }
+    var joinBacklog: Double? {
+        get { lock.withLock { _joinBacklog } }
+        set { lock.withLock { _joinBacklog = newValue } }
+    }
+    var joinSpent: Bool? {
+        get { lock.withLock { _joinSpent } }
+        set { lock.withLock { _joinSpent = newValue } }
+    }
 }
 
 final class Issue684JoinBoundSealTests: XCTestCase {

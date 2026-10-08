@@ -53,6 +53,8 @@ struct LiveRecordingTeardownTests {
         try engine._testStartRecordingWithStubHost(to: url, host: host, ceilingBytes: 4096)
         let writer = try #require(engine.activeRecording)
         let gate = Latch()
+        // A cancelled wait below skips the open; the held writer must not outlive the test.
+        defer { gate.open() }
         writer.beforeWriteForTesting = { gate.wait() }
 
         // The first packet enters the held drain, the second breaks the ceiling: the demux thread's
@@ -96,6 +98,23 @@ struct LiveRecordingTeardownTests {
         return release
     }
 
+    @MainActor private final class Reached { var value = false }
+
+    /// Starts a recording and returns once the start is parked in its `recordingFinish` wait.
+    /// `startRecording` takes its snapshots and reaches that wait without suspending, so a task that
+    /// has entered it, seen from the main actor, is already waiting. `Task.yield()` would leave the
+    /// order to the executor.
+    private func startParkedInTheWait(_ engine: AetherEngine, to url: URL) async throws
+        -> Task<Void, any Error> {
+        let entered = Reached()
+        let starter = Task { @MainActor in
+            entered.value = true
+            try await engine.startRecording(to: url)
+        }
+        try await waitFor { entered.value }
+        return starter
+    }
+
     @Test("a start that a stop overtook while it waited does not begin recording")
     func stopDuringTheStartsWaitCancelsIt() async throws {
         let engine = try AetherEngine()
@@ -103,10 +122,11 @@ struct LiveRecordingTeardownTests {
         let release = holdPreviousFinish(engine)
 
         let url = tempURL()
-        let starter = Task { @MainActor in try await engine.startRecording(to: url) }
-        await Task.yield()
+        let starter = try await startParkedInTheWait(engine, to: url)
+        let serial = engine.recordingStopSerial
         let stopper = Task { @MainActor in await engine.stopRecording() }
-        await Task.yield()
+        // The stop has to be counted before the release lets the start look again.
+        try await waitFor { engine.recordingStopSerial != serial }
 
         release.yield(())
         release.finish()
@@ -126,8 +146,7 @@ struct LiveRecordingTeardownTests {
         let release = holdPreviousFinish(engine)
 
         let url = tempURL()
-        let starter = Task { @MainActor in try await engine.startRecording(to: url) }
-        await Task.yield()
+        let starter = try await startParkedInTheWait(engine, to: url)
         engine.loadGeneration &+= 1
 
         release.yield(())

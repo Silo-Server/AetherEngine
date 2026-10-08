@@ -49,6 +49,9 @@ struct DemuxerStreamLifetimeTests {
         let closed = Flag()
         let seenInsideTheBody = Seen()
         let release = DispatchSemaphore(value: 0)
+        // A wait the time limit cancels skips the signal below; this one lets the caller and the
+        // close behind it finish anyway. An extra signal is harmless: nothing waits twice.
+        defer { release.signal() }
         Thread.detachNewThread {
             _ = demuxer.withStream(at: MultiSubtitleContainerFixture.videoStreamIndex) { stream in
                 entered.set()
@@ -103,6 +106,9 @@ struct DemuxerStreamLifetimeTests {
         // parked on a slow origin leaves the lock in.
         let holding = Flag()
         let readReleased = DispatchSemaphore(value: 0)
+        // Runs before the close: a wait the time limit cancels must not leave the read holding the
+        // access lock that close() waits on.
+        defer { readReleased.signal() }
         let readFinished = Flag()
         Thread.detachNewThread {
             _ = try? demuxer.readPacket(isCurrent: {
