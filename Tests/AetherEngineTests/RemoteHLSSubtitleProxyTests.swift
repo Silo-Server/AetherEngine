@@ -296,6 +296,46 @@ struct RemoteHLSSubtitleProxyTests {
         #expect(body.hasPrefix("WEBVTT\n\n"))
         #expect(!body.contains("X-TIMESTAMP-MAP"))
     }
+
+    /// A Jellyfin-style origin restarts its transcode at the keyframe before the requested slot
+    /// (`-noaccurate_seek -copyts`): the segment at 12 s starts at media 10.5 s, and media time stays
+    /// source time. The probe reads -1.5 s, but that is the keyframe gap, not an offset of the media
+    /// timestamps. The rendition must keep cue time on media time, so the line lands on its frame and
+    /// AE#616 measures the 1.5 s by which AVPlayer's item time leads the picture.
+    @Test("A keyframe-restart origin keeps the plain body and leaves the lead to AE#616", .timeLimit(.minutes(2)))
+    func keyframeRestartLeavesLeadToCueClock() async throws {
+        let slot = 12.0
+        let keyframe = 10.5
+        let body = try await Self.servedVTT(segments: [2: Self.tsSegment(videoPTS90k: Int64(keyframe * 90_000))])
+        #expect(body.hasPrefix("WEBVTT\n\n"))
+        #expect(!body.contains("X-TIMESTAMP-MAP"))
+
+        // AVPlayer places the first loaded segment at its slot, so item time = media time + lead, and it
+        // shows a cue at media time cue + (MPEGTS - LOCAL) of the served map.
+        let lead = slot - keyframe
+        let cue = (start: 20.0, text: "Anchored line")
+        let shownAtItem = cue.start + Self.cueToMediaShift(body) + lead
+        var clock = RemoteHLSCueClock()
+        clock.setCues([cue])
+        let landing = clock.observe(strings: [], itemTime: slot)
+        #expect(landing == nil) // the landing delivery teaches nothing
+        let measured = clock.observe(strings: [cue.text], itemTime: shownAtItem)
+        let offset = try #require(measured)
+        // The line shows on its own frame: the frame on screen at item t is source time t - lead.
+        #expect(abs((shownAtItem - lead) - cue.start) < 0.001)
+        // AE#616 measures that lead, so sourceTime (item less the offset) is the presented frame's.
+        #expect(abs(offset - lead) < 0.001)
+    }
+
+    /// Seconds a served rendition's `X-TIMESTAMP-MAP` adds to cue time to reach media time; 0 without one.
+    private static func cueToMediaShift(_ body: String) -> Double {
+        guard let line = body.split(separator: "\n").first(where: { $0.hasPrefix("X-TIMESTAMP-MAP=") }),
+              let mpegts = line.firstRange(of: "MPEGTS:"), let local = line.firstRange(of: "LOCAL:") else { return 0 }
+        let ticks = Double(line[mpegts.upperBound...].prefix(while: \.isNumber)) ?? 0
+        let parts = line[local.upperBound...].split(separator: ":").compactMap { Double($0) }
+        let localSeconds = parts.count == 3 ? parts[0] * 3600 + parts[1] * 60 + parts[2] : 0
+        return ticks / 90_000 - localSeconds
+    }
     #endif
 
     @Test("The probe reads the segment the load opens on, with EXT-X-DEFINE variables substituted")

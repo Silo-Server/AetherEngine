@@ -23,10 +23,21 @@ enum RemoteHLSTimestampAnchor {
         let segmentStart: Double
     }
 
-    /// Anchors closer to zero than this keep the plain body. Well under what a viewer can see on a
-    /// subtitle, and it absorbs a first frame's composition offset in an fMP4 origin that already
-    /// carries source time.
+    /// Anchors below this, negative ones included, keep the plain body. Well under what a viewer can
+    /// see on a subtitle, and it absorbs a first frame's composition offset in an fMP4 origin that
+    /// already carries source time.
     static let negligibleSeconds = 0.1
+
+    /// The anchor the renditions are served with, given what the probe measured. Only a positive offset
+    /// is one of the media timestamps: a muxer delay (ffmpeg MPEG-TS adds 1.4 s by default, 10 s with
+    /// `-max_delay 5000000`) only ever moves them later. A segment whose media starts before its playlist
+    /// slot is an origin that restarted its transcode at the keyframe before the slot (Jellyfin:
+    /// `-noaccurate_seek -copyts`); its media timestamps are still source time, so the plain body
+    /// already lands on the frames, and AE#616 measures the lead of item time off it. Mapping that gap
+    /// would show every cue early by it and hide the lead from AE#616.
+    static func renditionAnchor(measured: Double) -> Double? {
+        measured < negligibleSeconds ? nil : measured
+    }
 
     /// Whole-probe budget: one deadline across every request the probe makes (the segment head and,
     /// for fMP4, its init segment), on both the relay and the plain session path. Started when the
@@ -119,7 +130,7 @@ enum RemoteHLSTimestampAnchor {
     // MARK: - Probe
 
     /// Reads the target's head (and its init segment for fMP4) and returns the anchor, or nil when it
-    /// is negligible or cannot be read. Nil means the plain WebVTT body, which is what the renditions
+    /// is negligible, negative (`renditionAnchor(measured:)`) or cannot be read. Nil means the plain WebVTT body, which is what the renditions
     /// served before the anchor existed. A refreshable authorizer goes through a relay of its own, with
     /// the same redirect and credential policy as the playlist preflight; anything else uses a session
     /// on `EngineTLS`'s delegate, like the playlist reads. `budget` bounds the whole probe, not each
@@ -165,7 +176,7 @@ enum RemoteHLSTimestampAnchor {
                 "[AetherEngine] #316: origin media sits \(String(format: "%.3f", anchor)) s from its playlist "
                 + "timeline (\(target.segmentURL.lastPathComponent) at \(String(format: "%.3f", target.segmentStart)) s)",
                 category: .engine)
-            return abs(anchor) < negligibleSeconds ? nil : anchor
+            return renditionAnchor(measured: anchor)
         } catch {
             if !Task.isCancelled {
                 EngineLog.emit(
