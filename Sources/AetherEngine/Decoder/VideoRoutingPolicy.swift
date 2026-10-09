@@ -14,6 +14,7 @@ enum VideoRoutingPolicy {
 
     /// True when a video codec must use the software decode path (SoftwarePlaybackHost) instead of
     /// native AVPlayer. `av1Available` is `VTCapabilityProbe.av1Available` (HW AV1 decode support).
+    /// Evaluated only for AV1; registering its decoder must not delay unrelated formats.
     /// #150: `spsIndicatesInterlaced` (SPS frame_mbs_only_flag == 0) breaks the tie when the demuxer's
     /// field_order probe stays UNKNOWN; a concrete PROGRESSIVE probe analyzed actual frames and wins.
     /// A false positive costs an unnecessary SW decode (deint=interlaced passes progressive frames
@@ -30,7 +31,7 @@ enum VideoRoutingPolicy {
     static func requiresSoftwarePath(
         codecID: AVCodecID,
         fieldOrder: AVFieldOrder,
-        av1Available: Bool,
+        av1Available: @autoclosure () -> Bool,
         spsIndicatesInterlaced: Bool = false,
         stereo3DType: AVStereo3DType? = nil
     ) -> Bool {
@@ -38,7 +39,7 @@ enum VideoRoutingPolicy {
         case AV_CODEC_ID_NONE, AV_CODEC_ID_HEVC:
             return false
         case AV_CODEC_ID_AV1:
-            return !av1Available
+            return !av1Available()
         case AV_CODEC_ID_H264:
             if routesSoftwareForMultiviewCarriage(codecID: codecID, stereo3DType: stereo3DType) {
                 return true
@@ -101,8 +102,8 @@ enum VideoRoutingPolicy {
     /// AVPlayer path reaches readyToPlay and then renders nothing (H.264 High 4:2:2/4:4:4/High-10, HEVC Rext
     /// on Intel Macs / older Apple TV). Pure so it is unit-testable; the impure VT probe
     /// (`VTCapabilityProbe.canHardwareDecode`) is injected as the `canHardwareDecode` closure and only runs
-    /// when the gate actually consults it. Only H.264 / HEVC consult this gate; AV1 / VP9 / etc. already
-    /// have their own routing above and must not be reclassified here.
+    /// when the gate actually consults it. H.264 / HEVC and HW-routed AV1 consult this gate (AV1 by
+    /// profile, see `av1FitsHardwareDecoder`); VP9 / etc. have their own routing above.
     ///
     /// #176: HEVC DV Profile 5 bypasses the gate entirely. The probe builds a plain-HEVC format description
     /// from the raw hvcC, which is not what the native path plays (dvh1 + dvcC, decoded by Apple's DV
@@ -118,11 +119,33 @@ enum VideoRoutingPolicy {
         switch codecID {
         case AV_CODEC_ID_HEVC where dvProfile == 5:
             return false
-        case AV_CODEC_ID_H264, AV_CODEC_ID_HEVC:
+        case AV_CODEC_ID_H264, AV_CODEC_ID_HEVC, AV_CODEC_ID_AV1:
             return !canHardwareDecode()
         default:
             return false
         }
+    }
+
+    /// Whether a load consults `forcesSoftwareForUndecodableFormat` at all. H.264 / HEVC keep it VOD-only:
+    /// broadcast live is hardware-decodable and forced-native live keeps its verified path. AV1 is
+    /// consulted on live too (audit HLS-5 follow-up): a live AV1 High / Professional stream on a
+    /// hardware-AV1 device has no native picture, and live AV1 already goes to the software host
+    /// wherever hardware AV1 is missing entirely.
+    static func consultsUndecodableFormatGate(codecID: AVCodecID, isLive: Bool) -> Bool {
+        !isLive || codecID == AV_CODEC_ID_AV1
+    }
+
+    /// Audit HLS-5: Apple's hardware AV1 decoders (A17 Pro, M3 and later) decode Main profile only,
+    /// 8/10-bit 4:2:0. `av1Available` is a codec-level answer, so High (4:4:4) and Professional
+    /// (4:2:2, 12-bit) reached AVPlayer and rendered nothing while dav1d would have played them.
+    /// The av1C states `seq_profile` in the top 3 bits of its second byte; the codecpar profile is the
+    /// fallback. Unknown on both counts keeps the native route, like the H.264 / HEVC probe gap.
+    static func av1FitsHardwareDecoder(av1C: [UInt8]?, codecparProfile: Int32) -> Bool {
+        if let av1C, av1C.count >= 4, av1C[0] & 0x80 != 0 {
+            return av1C[1] >> 5 == 0
+        }
+        guard codecparProfile >= 0 else { return true }
+        return codecparProfile == 0
     }
 
     /// AE#461: the decode path a session ends up on, given what the routing concluded and what the
@@ -144,6 +167,32 @@ enum VideoRoutingPolicy {
         case .automatic: return routedSoftware
         case .software: return true
         }
+    }
+
+    /// A URL source that turned out forward-only (the origin ignores `Range` and names no length, so
+    /// the reader could only stream it front to back) is served the way a declared sequential origin
+    /// is, when its container states a duration: native path, one linear pass, seeks unavailable.
+    /// The software path it used to take cannot seek on such a source either, so the promotion costs
+    /// nothing it had, and it buys what only the native path has: hardware decode, AVPlayer's
+    /// buffering, and a picture on an AirPlay receiver (the software host renders on the device,
+    /// only its audio follows the route).
+    ///
+    /// Only when the routing had already chosen native and the host did not ask for software, so
+    /// the promotion never moves a session between hosts on its own. A custom reader is the host's
+    /// to describe. Without a duration the segment plan has nothing to stride over, so that source
+    /// keeps the software path.
+    static func promotesForwardOnlySourceToSequential(
+        isSourceSeekable: Bool,
+        isLive: Bool,
+        declaredSequential: Bool,
+        isCustomSource: Bool,
+        routedSoftware: Bool,
+        preferred: DecodePath,
+        containerDurationSeconds: Double
+    ) -> Bool {
+        !isSourceSeekable && !isLive && !declaredSequential && !isCustomSource
+            && !routedSoftware && preferred == .automatic
+            && containerDurationSeconds.isFinite && containerDurationSeconds > 0
     }
 
     /// #176 follow-up: DV variants whose only signal is IPT-PQ-c2 (no compatible base layer) cannot be

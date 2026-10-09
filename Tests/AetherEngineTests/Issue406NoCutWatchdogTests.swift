@@ -200,6 +200,22 @@ struct Issue406NoCutWatchdogTests {
         #expect(abs(window.videoPtsAdvanceSeconds - 0.36) < 0.001)  // 9 * 3600 ticks at 90 kHz
     }
 
+    @Test("a PTS advance across opposite ends of Int64 saturates instead of trapping (audit SEG-101)")
+    func ptsAdvanceSaturates() {
+        let w = makeWatchdog()
+        w.noteFinalize(at: t0)
+        w.notePacketRead()
+        w.noteVideoPacket(pts: Int64.min + 1, isKeyframe: true)
+        w.notePacketRead()
+        w.noteVideoPacket(pts: Int64.max, isKeyframe: false)
+        guard case .exitForRetune(let window)? = w.evaluate(now: t0.addingTimeInterval(36)) else {
+            Issue.record("expected an exit")
+            return
+        }
+        #expect(window.videoPtsAdvanceSeconds > 0)
+        #expect(window.videoPtsAdvanceSeconds.isFinite)
+    }
+
     @Test("a video packet without a PTS does not open the advance window")
     func noptsVideoIsNotAnAdvance() {
         let w = makeWatchdog()

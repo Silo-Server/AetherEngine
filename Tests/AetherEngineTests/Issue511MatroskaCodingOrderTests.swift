@@ -134,6 +134,22 @@ struct Issue511MatroskaCodingOrderTests {
         #expect(result.sequence.slots == [Self.reportedSlots[60]])
     }
 
+    /// Audit BIT-3: `I0 P(poc6) B(poc2)` then an IDR. P waits for rank 3, which this sequence never
+    /// states; the slot it can own is the one rank 2 would have taken, not rank 3 of the next GOP.
+    @Test("a picture left waiting when an IDR closes its sequence takes that sequence's free slot")
+    func waitingPictureKeepsItsOwnSequence() throws {
+        var sequence = Permutation.Sequence(pocStep: 2, videoDelay: 1)
+        #expect(sequence.admit(slot: 0, pictureOrderCount: 0, isKeyframe: true) == 0)
+        let admitted = sequence.admit(slot: 33, pictureOrderCount: 6, isKeyframe: false)
+        let waiting = try #require(admitted)
+        #expect(sequence.admit(slot: 67, pictureOrderCount: 2, isKeyframe: false) == 1)
+        #expect(sequence.slot(forRank: waiting) == nil)
+        #expect(sequence.unclaimedSlots() == [67])
+
+        _ = sequence.admit(slot: 100, pictureOrderCount: 0, isKeyframe: true)
+        #expect(sequence.unclaimedSlots().isEmpty)
+    }
+
     @Test("a healthy reordered MKV is out on the packet that steps back, not after the window")
     func healthyLadderExits() {
         // The same pictures with their slots where the format says they belong: in display order,

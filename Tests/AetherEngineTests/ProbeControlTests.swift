@@ -571,7 +571,7 @@ struct ProbeControlTests {
     func filePrecancelled(_ entry: EntryPoint) {
         let token = ProbeCancellation()
         token.cancel()
-        let missing = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let missing = FileManager.default.temporaryDirectory
             .appendingPathComponent(".missing-probe-\(UUID().uuidString).mp4")
         #expect(throws: CancellationError.self) { try entry.probe(missing, cancellation: token) }
     }
@@ -1117,8 +1117,11 @@ struct ProbeControlTests {
             try reader.open()
             try control.check()
         }
-        try await waitFor { reader.isDrainingProbeRequestForTesting || job.isFinished || origin.failure != nil }
+        // Park first, drain second: in the body stage the size probe ahead of the parked request
+        // drains too when its callbacks run late, and that drain is not the one under test.
+        try await waitFor { origin.blocked.entered || job.isFinished || origin.failure != nil }
         try #require(origin.blocked.entered)
+        try await waitFor { reader.isDrainingProbeRequestForTesting || job.isFinished }
         #expect(reader.isDrainingProbeRequestForTesting)
         #expect(!job.isFinished, "Cancellation is not completion while the task callback is still queued")
         #expect(OriginRequestBudget.shared.snapshot(for: url)?.inflight == 1)

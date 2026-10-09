@@ -26,7 +26,7 @@ Interlaced sources (DVD-rip MPEG-2, SD / HD broadcast H.264) are deinterlaced th
 
 ### MP4 without composition offsets
 
-Some writers emit a sample table with no `ctts` while the H.264 bitstream still reorders pictures.
+Some writers emit a sample table with no `ctts` while the H.264 or HEVC bitstream still reorders pictures.
 Every sample then reports `PTS == DTS`, and since the native route stream-copies those timestamps
 into fMP4, AVPlayer is handed decode order as presentation order: each future reference picture is
 shown before the B pictures that precede it. Measured through AVFoundation's own decoder on a twin
@@ -34,8 +34,8 @@ pair (one encode muxed twice, composition offsets removed from one), 45 of 66 pi
 time belonging to a different picture, with the content order stepping backwards 30 times (#409).
 
 The container lost the information, but the bitstream did not: every slice header carries a picture
-order count, which is display order, and libavcodec's H.264 parser reads it without decoding a pixel
-and takes MP4's length-prefixed payload directly. `H264CompositionOffsetRepair` samples the head
+order count, which is display order, and libavcodec's H.264 and HEVC parsers read it without decoding
+a pixel and take MP4's length-prefixed payload directly. `H264CompositionOffsetRepair` samples the head
 (twelve pictures at most, held rather than re-read, so no rewind and no second fetch) and repairs a
 confirmed source at the demuxer boundary:
 
@@ -54,10 +54,12 @@ built from index entries and then filled with these packets.
 Detection is fail-closed and costs a healthy file almost nothing: the first real PTS-DTS offset ends
 the sample (usually on the first packet, since a reordered file's head sample sits one delay below
 zero). A source is only repaired when every sampled pair is equal, the decode ladder is uniform, the
-picture order regresses, and the ranks it produces are distinct and fill the sampled window. Anything
+picture order regresses, and the ranks it produces are distinct and fill the sampled window (or a
+decode-order prefix of at least nine pictures fills its own range exactly, which covers a
+hierarchical mini-GOP longer than the reorder delay, #699). Anything
 short of that (variable frame timing, a picture order that does not advance one rank per picture, a
 sample that starts nowhere it can be anchored) is delivered exactly as the container wrote it.
-Reported by @orut34iop.
+Reported by @orut34iop; the HEVC case (#699) by @ijuniorfu.
 
 ### Matroska with presentation slots in coding order
 
@@ -214,6 +216,22 @@ sets `SourceProbe.carriesHDR10PlusMetadata` independently of the primary format,
 See [whole-probe limits and cancellation](api.md#whole-probe-limits-and-cancellation) for bounded source
 reads; absence of confirmation is not proof of absence or a statement about the connected display.
 
+### HDR Vivid (CUVA) dynamic metadata
+
+HDR Vivid (CUVA T/UWA 005.1) is built to be backward compatible: the base layer is plain HLG or PQ in
+BT.2020, and its dynamic metadata is an optional registered T.35 SEI on top (country 0x26, provider
+0x0004, oriented code 0x0005). The engine plays that base exactly like any HLG or HDR10 source and the
+SEI is stream-copied with the rest of the bitstream; no Apple platform applies it, and a display
+without Vivid support shows the static base, which is the format's intended fallback. There is no
+host-side tone mapping: the native route has no pixel stage, tvOS gives an app no EDR or panel-peak
+reading to map against, and the TV maps the HDR signal itself (#699).
+
+`probe(url:detecting: .hdrVivid)` reports carriage as `SourceProbe.carriesHDRVividMetadata`, in the
+same packet pass and budget as `.hdr10Plus`. libavcodec's CUVA parser is internal, so
+`HDRVividMetadataScan` walks the body with the same field widths and only counts a message whose
+`system_start_code` is one of the defined 1 to 7, whose fields are all present, and whose bits after
+the last field are zero. HEVC only, as in libavcodec. `videoFormat` stays `.hlg` / `.hdr10`.
+
 The label can also be taken back from the item itself, where the platform has no capability table to clamp it against (AE#515). A Dolby Vision source on macOS resolves to `.hdr10`, because `supportsDolbyVision` is unclaimable there without a host assertion, while AVFoundation goes on playing the `dvh1` sample entry the engine served. Measured with the assertion off on a 16" XDR, a Profile 5 and a Profile 8.1 grade of Dolby's reference content both strobe, so the RPU reaches the pixels with no claim set anywhere and the clamp was moving nothing but the label. When the item's sample entry reads `dvh1` / `dvhe` and the probe agrees the source is Dolby Vision, the label is upgraded from `.hdr10` to `.dolbyVision` at `readyToPlay`. It is an upgrade and not a mirror of what AVFoundation parsed, for two reasons that both matter: an `.sdr` label is the clamp being right about a display presenting no HDR at all, and on tvOS and iOS the per-mode table answers the capability question, so the label follows it rather than a sample entry that a Profile 5 master carries on every panel. Profile 8.1 keeps `.hdr10` on macOS: it reports `hvc1` with the DV configuration alongside it, it composes on that display all the same, and nothing in the stack reports that.
 
 ## Audio
@@ -296,6 +314,8 @@ Matroska CodecPrivate doesn't usually carry the pre-parsed `dec3` / `dac3` box c
 Off by default. With `LoadOptions.objectAudioRendering = .apac(layout)`, a TrueHD track FFmpeg marks as Atmos (`AV_PROFILE_TRUEHD_ATMOS`, 48 kHz) skips the channel bridges: `SpatialAudioBridge` decodes the object presentation (beds, objects and their positions), renders it into the host's speaker bed (5.1.2, 5.1.4, 7.1.2, 7.1.4 or 9.1.6) with a constant-power allocentric panner, and encodes that bed as Apple Positional Audio (APAC, 320 kbps per bed channel) through `AVAudioConverter`. tvOS decodes APAC and sends it to an Atmos receiver as Dolby MAT, heights included. The trade is a lossy encode in place of the lossless 7.1 presentation, which is why the host opts in. Requires OS 26 (the APAC encoder API); on anything older, or if the bridge cannot start, the session falls back to `audioBridgeMode` with its audio intact.
 
 libavformat cannot write APAC (its `apac` codec id is an unrelated legacy codec), so the muxer is given an ALAC stand-in and the init segment's sound sample entry is replaced with an `apac` entry carrying the encoder's magic cookie, which is the complete `dapa` box (`APACSampleEntry`). The master playlist advertises `apac.31.LL`: profile 31 (multichannel) and the channel-count level, `02` for 8 channels (5.1.2), `03` for 9 to 12 channels and `04` for 13 to 24; AVPlayer rejects a bare `apac`. Every APAC packet the encoder produces is independently decodable, so every segment starts on an Audio Sync Packet. The encoder runs with dynamic range control off: its DRC analysis otherwise holds 1.56 s (`.capture`) or more than 5 s (`.movie`) of audio before the first packet, which would leave the first segment after a seek without sound. The encoder's 2048 frames of priming stay in the stream: AVFoundation presents an APAC packet's audio 2048 frames before its timestamp, so the priming packets take the source position's timestamp and the first content frame plays on it.
+
+What the session log shows, for a report that the heights or the LFE are missing. `[SpatialAudioBridge] bed levels` gives every bed channel's RMS and peak level in what the encoder was fed, named with CoreAudio's channel labels, after the first 5 s of audio (and again after every seek), then every 30 s, plus a partial window at a seek, at the end of the stream and when playback stops. Each line carries the window's position on the timeline and the most objects the metadata had playing during it, with how many of those sat above ear level with elevation allowed. Level on a height channel means the encoder was given height sound, so heights heard from the floor speakers were lost after that point, in the system's rendering or the receiver. A silent height next to elevated objects is a lead rather than a verdict, because the counts come from the metadata and an elevated object can be silent or snap to a floor speaker. The line ends with the LFE element's input level and its metadata gain, which split a silent LFE channel into a silent source, a zero gain or no LFE element; `[SpatialAudioBridge] object configuration` names the decoder's elements once per configuration (`LFE + 15 objects` on Dolby's Unfold demo). An object decoder that returns nothing for 1200 packets in a row, a second of TrueHD, is reported as `.audioBridgeProducedNoOutput`; the threshold is that long because after a start or resume mid-stream the decoder waits for the next major sync, up to 102 access units on Unfold. `[HLSVideoEngine] master audio:` is the master's `CODECS` and its audio rendition's `CHANNELS` (`channels=none` when the rendition declares none, which is every master this engine writes today), or `not served` when the session routes media-direct and AVPlayer reads only the init segment. The `audioRoute` line, written at ready-to-play, once playback has settled, and on every route, rendering-mode, rendering-capability or spatial-capability change, is the system's side: `rendering` is `AVAudioSession.renderingMode` (`dolbyAtmos` against `surround` or `spatialAudio`), and each port, named by type rather than by the user's name for the device, lists the channel labels it reports with a `heights=` count. Read the two together, because a Dolby MAT carrier can report fewer channels than it carries. A TrueHD Atmos track loaded with `objectAudioRendering` off logs that too, since the channel bridge then carries the 7.1 presentation with the objects mixed into the floor channels.
 
 ## Subtitles
 
@@ -472,11 +492,15 @@ Decrypted disc images play through the normal decode path via a synthetic seekab
 
 Both: no decryption (CSS / AACS retail discs must be ripped decrypted first), no GPL nav libraries, no menus, BD-J, or multi-angle.
 
+A remote `.iso` / `.img` / `.udf` needs an origin that honours HTTP `Range`, because a disc image is a filesystem that only random access can walk. The range probe is judged at the response head: an origin that answers it with a 200 fails the load with an error naming the cause (the body is never downloaded), and a range answered wider than asked is cut where the range ends.
+
 **Title selection.** `engine.discTitles` (`@Published [TitleInfo]`) lists the disc's titles (id, name, duration, chapter count) and `engine.selectedDiscTitle` is the active one; `engine.selectTitle(id:)` switches title, rebuilding the pipeline from the new title's head. The selection survives audio-track switches and background-resume reloads, and a fresh `load` defaults to the main title (an out-of-range id clamps to it). Blu-ray enumerates all playlists; a DVD enumerates its title sets (the VMGI TT_SRPT title list, resolved whole-VTS, with the duration read from each VTS's main program chain; per-cell / episodic splitting is deferred).
 
 **Chapters.** `engine.discChapters` (`@Published [ChapterInfo]`) carries the selected title's chapters; `engine.selectChapter(id:)` seeks to one (a thin `seek` wrapper, no pipeline rebuild). For Blu-ray they come from the playlist's PlayListMark entries (entry marks only; link points dropped), each mark's timestamp on its clip's STC offset by the clip's in_time and the cumulative duration of preceding play items. For DVD they come from the main program chain's program map plus the cumulative cell playback times. Chapter starts are title-relative (0-based); `selectChapter` adds the title's content-start base (the native playlist shift, or the software path's container start PTS) so the seek lands on the source-PTS playback axis.
 
 **Track languages.** Neither disc format carries a track language in the stream, so a title demuxed on its own reports every audio and subtitle track as undetermined and `preferredAudioLanguages` / `preferredSubtitleLanguages` have nothing to match on. The languages are read out of the disc's own navigation data instead and backfilled onto the tracks by stream id: on Blu-ray from every PlayItem's STN table (the ISO 639-2 codes beside each stream's PID, first declaration winning), on DVD from the VTS IFO audio and subpicture attribute tables, with the title's main program chain naming the substream each attribute is actually carried as (a stream the chain marks absent is dropped, and without a readable chain the attribute's position is used, which is how the great majority of discs are authored). Only an undetermined track is filled in: a language the container really declares stays authoritative. `aetherctl disc-inspect` prints what a disc declares per title, so a disc whose tracks stay undetermined can be told apart from a disc that declares nothing (#527).
+
+**Subpicture streams and the probe.** An MPEG-PS demuxer can meet a new stream at any packet, so libavformat never lets `find_stream_info` stop early on a DVD. With the playback budget that meant 50 MB read on every open, and a subtitle whose first packet comes after it was not a track at all. For a title whose VTS IFO is readable, the engine creates every subpicture stream the IFO declares before the probe. `mpegps` routes packets to an existing stream by id, and the engine joins each subpicture's PES fragments itself, because libavformat's `dvdsub` parser only attaches to streams the demuxer created. Such a title then probes 8 MB / 5 s (#651). Stream indices on such a title start with those subpicture streams. A disc without a readable VTS IFO keeps the full budget.
 
 **Container chapters.** `engine.mediaChapters` (`@Published [ChapterInfo]`) carries the chapters a Matroska or MP4 container declares, read off the probe demuxer at load. It is empty for disc sources, which publish `discChapters` instead, so exactly one of the two is populated. Unlike disc chapters these need no base: a non-disc source plays on the container's own PTS axis on both backends, so `startSeconds` is a timestamp a host hands straight to `seek(to:)`. `selectChapter(id:)` resolves against `discChapters` only and no-ops for a container chapter id. Ids are assigned sequentially in start order, so they stay usable as list indices, and untitled entries are numbered "Chapter N". A chapter's duration runs to the next chapter's start rather than to its declared end, because muxers routinely write `end == start`; the last entry falls back to its declared end, then to the container duration.
 

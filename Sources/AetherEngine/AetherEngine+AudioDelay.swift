@@ -180,7 +180,12 @@ extension AetherEngine {
     /// offset from there when they rebuild, so a re-anchor that has not reached its rebuild yet
     /// already carries the newest value. Only a press that lands after the rebuild has read it needs
     /// anything more, and that is one catch-up pass: the loop ends as soon as what was delivered is
-    /// what is in force, so a stepper held down converges instead of queueing a rebuild per press.
+    /// what is in force. Round 5 (cmcpherson274, measured): the pass is reached only by a press that
+    /// lands INSIDE a re-anchor, a band as wide as the re-anchor itself (54-65 ms on the simulator,
+    /// 87-88 ms on an Apple TV). Presses at a human cadence arrive after it and are each their own
+    /// complete re-anchor; a burst in one runloop turn arrives before the Task reads the value and
+    /// costs one. The pass starts the moment the first re-anchor returns, which on `.loopback` is
+    /// before the rebuilt host has published a position; `rebuildPosition` covers that window.
     private func reanchorForAudioDelay(_ reanchor: @escaping (_ position: Double, _ delay: Double) async -> Void) {
         guard Self.audioDelayRecutIsPossible(state: state, isLive: isLive, liveWindow: liveWindow) else {
             EngineLog.emit(

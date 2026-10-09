@@ -57,4 +57,57 @@ struct SWDemuxReadGateTests {
             parkedCount: 4, parkedCap: cap, clockArmed: true,
             lastAudioPts: 104, clockSeconds: .nan) == false)
     }
+
+    // MARK: - Parked wait (audit PERF-110)
+
+    @Test("a lead just over the target wakes when the gate opens, not before the floor")
+    func waitFollowsTheGateOpening() {
+        let clock = 100.0
+        let target = AudioLookaheadPolicy.targetLeadSeconds
+        #expect(abs(SoftwarePlaybackHost.parkedRendererWaitSeconds(
+            clockArmed: true, lastAudioPts: clock + target + 0.012, clockSeconds: clock, rate: 1) - 0.012) < 1e-9)
+        #expect(SoftwarePlaybackHost.parkedRendererWaitSeconds(
+            clockArmed: true, lastAudioPts: clock + target + 0.001, clockSeconds: clock, rate: 1) == 0.005)
+    }
+
+    @Test("a lead far over the target is capped at 20 ms so parked video keeps reaching the decoder")
+    func waitIsCapped() {
+        #expect(SoftwarePlaybackHost.parkedRendererWaitSeconds(
+            clockArmed: true, lastAudioPts: 110, clockSeconds: 100, rate: 1) == 0.020)
+    }
+
+    @Test("a gate that is already open, an unarmed clock and unreadable inputs poll at the 5 ms floor")
+    func waitFloor() {
+        #expect(SoftwarePlaybackHost.parkedRendererWaitSeconds(
+            clockArmed: true, lastAudioPts: 101, clockSeconds: 100, rate: 1) == 0.005)
+        #expect(SoftwarePlaybackHost.parkedRendererWaitSeconds(
+            clockArmed: false, lastAudioPts: 110, clockSeconds: 100, rate: 1) == 0.005)
+        #expect(SoftwarePlaybackHost.parkedRendererWaitSeconds(
+            clockArmed: true, lastAudioPts: .nan, clockSeconds: 100, rate: 1) == 0.005)
+        #expect(SoftwarePlaybackHost.parkedRendererWaitSeconds(
+            clockArmed: true, lastAudioPts: 110, clockSeconds: .nan, rate: 1) == 0.005)
+        #expect(SoftwarePlaybackHost.parkedRendererWaitSeconds(
+            clockArmed: true, lastAudioPts: 110, clockSeconds: 100, rate: 0) == 0.005)
+        #expect(SoftwarePlaybackHost.parkedRendererWaitSeconds(
+            clockArmed: true, lastAudioPts: .infinity, clockSeconds: 100, rate: 1) == 0.005)
+    }
+
+    @Test("the rate shortens the wait the same way it shortens the time to the gate")
+    func waitScalesWithRate() {
+        let target = AudioLookaheadPolicy.targetLeadSeconds
+        let excess = 0.016
+        #expect(abs(SoftwarePlaybackHost.parkedRendererWaitSeconds(
+            clockArmed: true, lastAudioPts: 100 + target + excess, clockSeconds: 100, rate: 2) - 0.008) < 1e-9)
+    }
+
+    @Test("whatever the inputs, the wait stays between 5 and 20 ms")
+    func waitIsAlwaysBounded() {
+        for lead in stride(from: -2.0, through: 12.0, by: 0.37) {
+            for rate: Float in [0.25, 0.5, 1, 1.5, 2, 4, 8] {
+                let w = SoftwarePlaybackHost.parkedRendererWaitSeconds(
+                    clockArmed: true, lastAudioPts: 100 + lead, clockSeconds: 100, rate: rate)
+                #expect(w >= 0.005 && w <= 0.020)
+            }
+        }
+    }
 }

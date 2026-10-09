@@ -43,6 +43,38 @@ func takeDoubleFlag(_ name: String, from rest: inout [String]) -> Double? {
     return value
 }
 
+/// Longest run a duration flag accepts: a week. `isFinite` alone let `--seconds 1e30` through to the
+/// run loop's `Int(_:)`, which trapped after the session was up (audit OPS-110).
+let maxRunSeconds: Double = 7 * 24 * 3600
+
+/// `takeDoubleFlag`, and the value must lie in `range`. Exits 64 otherwise.
+func takeDoubleFlag(_ name: String, in range: ClosedRange<Double>, from rest: inout [String]) -> Double? {
+    guard let value = takeDoubleFlag(name, from: &rest) else { return nil }
+    guard range.contains(value) else {
+        print("ERROR: \(name) expects a value in \(range.lowerBound)...\(range.upperBound), got \(value)")
+        exit(64)
+    }
+    return value
+}
+
+/// `takeIntFlag`, and the value must lie in `range`. Exits 64 otherwise: a negative count reached
+/// `0..<n` and trapped (audit OPS-110).
+func takeIntFlag(_ name: String, in range: ClosedRange<Int>, from rest: inout [String]) -> Int? {
+    guard let value = takeIntFlag(name, from: &rest) else { return nil }
+    guard range.contains(value) else {
+        print("ERROR: \(name) expects an integer in \(range.lowerBound)...\(range.upperBound), got \(value)")
+        exit(64)
+    }
+    return value
+}
+
+/// A host-call delay in milliseconds as a sleep, saturating: `UInt64(ms) * 1_000_000` overflowed past
+/// about 1.8e13 ms (audit OPS-110).
+func sleepNanoseconds(milliseconds: Int) -> UInt64 {
+    let (nanoseconds, overflow) = UInt64(max(0, milliseconds)).multipliedReportingOverflow(by: 1_000_000)
+    return overflow ? .max : nanoseconds
+}
+
 /// Exit 64 with an error message if any `--flag` remains in `rest` after plucking known flags (typos would silently become the URL positional otherwise).
 func rejectStrayFlags(_ rest: [String], subcommand: String) {
     if let stray = rest.first(where: { $0.hasPrefix("--") }) {

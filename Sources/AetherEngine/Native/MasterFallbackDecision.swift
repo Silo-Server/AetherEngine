@@ -29,6 +29,24 @@ enum MasterFallbackDecision {
         code == -11868 || code == -11848
     }
 
+    /// AE#535: whether a refusal teaches the process something about the panel.
+    ///
+    /// A display rejection answers "does this output configuration accept an HDR master" only while
+    /// the display is eligible for HDR at all. Measured on an Apple TV 4K on tvOS 26.6: an audio route
+    /// death right after a display mode switch opens a window in which the criteria readout reads
+    /// `matching=off hdrEligible=no`, a session-preserving reload lands in it, and AVPlayer fails the
+    /// master with -11868 because nothing HDR is compatible WITH AN INELIGIBLE DISPLAY. That refusal is
+    /// fully explained by the window, so it earns this item its media fallback and nothing more.
+    /// Latching it cost the rest of the viewing session its master, and in a process that never
+    /// backgrounds the AE#588 clear never came.
+    ///
+    /// AE#667: nor while a display mode switch is in progress. AVPlayer answers for the mode the panel is
+    /// in at that moment, which mid-switch is the one it is leaving, so the refusal is about the moment.
+    static func shouldLatchPanelRefusal(code: Int, displayEligibleForHDRNow: Bool,
+                                        displaySwitchInProgress: Bool) -> Bool {
+        isDisplayRejectionCode(code) && displayEligibleForHDRNow && !displaySwitchInProgress
+    }
+
     /// Any code that means "AVPlayer rejected the served master itself": the display-rejection pair
     /// plus NSURLErrorDomain -1002 "unsupported URL", which AVPlayer surfaces when it filters EVERY
     /// EXT-X-STREAM-INF out of the master at parse time and is left with no variant URL to load

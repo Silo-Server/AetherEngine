@@ -21,6 +21,10 @@ final class ProbeHTTPTestOrigin: @unchecked Sendable {
 
     let port: UInt16
     let blocked = ProbeTestGate()
+    /// Every request that arrives after `holdLaterRequests()` waits here, before its response head,
+    /// until the test opens the gate (or `stop()` does).
+    let held = ProbeTestGate()
+    private let holding = ProbeTestBox(false)
     private let listener: Int32
     private let wakeRead: Int32
     private let wakeWrite: Int32
@@ -74,6 +78,8 @@ final class ProbeHTTPTestOrigin: @unchecked Sendable {
     }
 
     var requests: [Request] { state.value.requests }
+
+    func holdLaterRequests() { holding.update { $0 = true } }
     var failure: String? { state.value.failure }
     var isStopped: Bool {
         let snapshot = state.value
@@ -96,6 +102,7 @@ final class ProbeHTTPTestOrigin: @unchecked Sendable {
             for fd in state.connections { shutdown(fd, SHUT_RDWR) }
         }
         blocked.open()
+        held.open()
     }
 
     private func acceptLoop() {
@@ -167,6 +174,7 @@ final class ProbeHTTPTestOrigin: @unchecked Sendable {
             $0.requests.append(request)
         }
         if stage == .headers, index == 0 { park() }
+        if holding.value { held.wait() }
         guard !state.value.stopping else { return }
 
         var start = 0

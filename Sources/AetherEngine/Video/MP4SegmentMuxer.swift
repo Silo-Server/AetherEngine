@@ -72,6 +72,12 @@ final class MP4SegmentMuxer {
         /// has numOfArrays=0 (in-band parameter sets) and the engine rebuilt a proper hvcC with
         /// VPS/SPS/PPS arrays; the mp4 muxer writes extradata directly into the hvcC/avcC box.
         let extradataOverride: [UInt8]?
+        /// The video samples are Annex B while `extradataOverride` is a length-prefixed record: the
+        /// muxer converts each sample itself and keeps its in-band parameter sets, which movenc's own
+        /// `hvc1` conversion would drop. See `AnnexBSampleConverter`.
+        let convertsAnnexBSamples: Bool
+        /// The session's framing verdict for this track (audit BIT-104); nil gives the muxer its own.
+        let nalFramingLatch: NALFramingLatch?
 
         init(
             codecpar: UnsafePointer<AVCodecParameters>,
@@ -79,7 +85,9 @@ final class MP4SegmentMuxer {
             codecTagOverride: String?,
             doviConfig: DoviConfigPolicy = .keep,
             colorOverride: ColorOverride? = nil,
-            extradataOverride: [UInt8]? = nil
+            extradataOverride: [UInt8]? = nil,
+            convertsAnnexBSamples: Bool = false,
+            nalFramingLatch: NALFramingLatch? = nil
         ) {
             self.codecpar = codecpar
             self.timeBase = timeBase
@@ -87,6 +95,8 @@ final class MP4SegmentMuxer {
             self.doviConfig = doviConfig
             self.colorOverride = colorOverride
             self.extradataOverride = extradataOverride
+            self.convertsAnnexBSamples = convertsAnnexBSamples
+            self.nalFramingLatch = nalFramingLatch
         }
     }
 
@@ -173,13 +183,30 @@ final class MP4SegmentMuxer {
     /// length-prefixed at all. Latched at init: it is a property of the configuration record that
     /// lands in the sample entry, and the AE#561 sanitizer walks every video sample with it.
     private let videoNALLengthPrefixSize: Int?
+    /// Latched from `VideoConfig.convertsAnnexBSamples`.
+    private let convertsAnnexBVideoSamples: Bool
     /// AE#561 harness switch: the sanitizer removes the only shape that reproduces a segment Apple's
     /// parser refuses, so the rung underneath it (the software-path escalation) would have nothing to
     /// be measured against. Read once from the environment, never set in a shipped configuration.
     static let nalChainSanitizerDisabled =
         ProcessInfo.processInfo.environment["AETHER_DISABLE_NAL_SANITIZER"] != nil
     /// How many video samples the AE#561 sanitizer has had to cut, over this muxer's life.
-    private var truncatedVideoSamples: Int = 0
+    private(set) var truncatedVideoSamples: Int = 0
+    /// Audit BIT-1: a video sample of this track walked exactly as a length-prefixed chain, so a
+    /// `00 00 01` head is a 256-511 byte length from here on, not an Annex B start code. The
+    /// session's latch when it passed one (audit BIT-104), so a rebuilt muxer keeps the verdict.
+    private let videoNALFraming: NALFramingLatch
+
+    private func sanitizerCut(_ bytes: UnsafeRawBufferPointer, lengthPrefixSize: Int) -> Int? {
+        let confirmed = videoNALFraming.isConfirmed
+        let cut = NALUnitChain.completeRunLength(
+            bytes, lengthPrefixSize: lengthPrefixSize, framingConfirmed: confirmed)
+        if cut == nil, !confirmed,
+           NALUnitChain.walksExactly(bytes, lengthPrefixSize: lengthPrefixSize) {
+            videoNALFraming.confirm()
+        }
+        return cut
+    }
 
     /// Only AC-3 / E-AC-3 / TrueHD build their mp4 sample entry from a parsed packet (dac3/dec3/dmlp),
     /// so only they can hit the "moov before audio parsed" wedge and need the #64-flush guard. Shared with
@@ -230,6 +257,20 @@ final class MP4SegmentMuxer {
     /// Output-TB DTS of the first video packet since the last flush; Int64.min = no window open yet.
     private var fragmentWindowFirstVideoDts: Int64 = Int64.min
 
+    /// AE#684: the sound handed to the segment being cut, first and last packet, in
+    /// `muxerAudioTimeBase`. A segment opens on a video keyframe and carries whatever audio the
+    /// source interleaved up to there, so where its sound begins against its picture is a property
+    /// of the source's mux, and it is what an item placed in that segment starts its audio from.
+    private var segmentSoundFirstPts: Int64 = Int64.min
+    private var segmentSoundLastPts: Int64 = Int64.min
+
+    /// The span since the last call, nil when the segment carried no audio packet. Consumes it.
+    func takeSegmentSoundSpan() -> (first: Int64, last: Int64)? {
+        defer { segmentSoundFirstPts = Int64.min; segmentSoundLastPts = Int64.min }
+        guard segmentSoundFirstPts != Int64.min else { return nil }
+        return (segmentSoundFirstPts, segmentSoundLastPts)
+    }
+
     let videoOutputStreamIndex: Int32 = 0
     let audioOutputStreamIndex: Int32 = 1
 
@@ -256,6 +297,8 @@ final class MP4SegmentMuxer {
         self.audioDelaySeconds = audioDelaySeconds
         self.audioNeedsParsedPacketForMoov =
             audio.map { Self.audioNeedsParsedPacketForMoov($0.codecpar.pointee.codec_id) } ?? false
+        self.videoNALFraming = video.nalFramingLatch ?? NALFramingLatch()
+        self.convertsAnnexBVideoSamples = video.convertsAnnexBSamples
         // AE#561: the override, when there is one, is the record that reaches the sample entry. Both
         // carry the same width (the #19 rebuild keeps the source header's first 22 bytes), so this
         // only matters for a source whose own extradata is missing or Annex B.
@@ -427,7 +470,8 @@ final class MP4SegmentMuxer {
     /// (a DTS reset) never triggers; boundTicks <= 0 disables the bound.
     static func bufferedTicksExceedsBound(firstDts: Int64, currentDts: Int64, boundTicks: Int64) -> Bool {
         guard boundTicks > 0, firstDts != Int64.min, currentDts >= firstDts else { return false }
-        return (currentDts - firstDts) >= boundTicks
+        let (span, overflow) = currentDts.subtractingReportingOverflow(firstDts)
+        return overflow || span >= boundTicks
     }
 
     // MARK: - Diagnostic probes
@@ -604,15 +648,24 @@ final class MP4SegmentMuxer {
             if packet.pointee.dts != Int64.min { packet.pointee.dts &+= audioDelayTicks }
         }
 
-        let clean = timestampSanitizer.sanitize(
+        guard let clean = timestampSanitizer.sanitize(
             streamIndex: packet.pointee.stream_index,
             pts: packet.pointee.pts,
             dts: packet.pointee.dts
-        )
+        ) else {
+            av_packet_unref(packet)
+            return (0, .none)
+        }
         packet.pointee.pts = clean.pts
         packet.pointee.dts = clean.dts
 
         let streamIndex = packet.pointee.stream_index
+
+        // Before the AE#561 sanitizer, which walks the sample as the length-prefixed chain the
+        // record declares. A packet with no start code is written as it came.
+        if convertsAnnexBVideoSamples, streamIndex == videoOutputStreamIndex {
+            _ = AnnexBSampleConverter.convertToLengthPrefixed(packet)
+        }
 
         // #64 mid-segment flush bound: cap libavformat's interleaver RAM on a very long segment
         // (degenerate sparse-keyframe plan, or an audio stream that decodes to nothing) by emitting a
@@ -644,7 +697,7 @@ final class MP4SegmentMuxer {
            let lengthPrefixSize = videoNALLengthPrefixSize,
            let data = packet.pointee.data,
            packet.pointee.size > 0,
-           let complete = NALUnitChain.completeRunLength(
+           let complete = sanitizerCut(
                UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size)),
                lengthPrefixSize: lengthPrefixSize
            ) {
@@ -689,6 +742,10 @@ final class MP4SegmentMuxer {
         // must keep the exact stock code path, no extra early fragment flush, so nothing perturbs its audio.
         if streamIndex == audioOutputStreamIndex {
             audioPacketWritten = true
+            if rc >= 0, clean.pts != Int64.min {
+                if segmentSoundFirstPts == Int64.min { segmentSoundFirstPts = clean.pts }
+                segmentSoundLastPts = clean.pts
+            }
             if audioNeedsParsedPacketForMoov, !moovFlushed, fragmentWindowFirstVideoDts != Int64.min {
                 flushPendingFragment()
             }

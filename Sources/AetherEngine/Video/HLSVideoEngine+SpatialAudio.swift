@@ -42,12 +42,23 @@ extension HLSVideoEngine {
             rendering: objectAudioRendering, codecID: par.codec_id,
             profile: par.profile, sampleRate: par.sample_rate)
         else {
-            if objectAudioRendering != .off, par.codec_id == AV_CODEC_ID_TRUEHD {
-                EngineLog.emit(
-                    "[HLSVideoEngine] object rendering requested but TrueHD is not Atmos "
-                    + "(profile=\(par.profile) rate=\(par.sample_rate)); keeping the channel bridge",
-                    category: .session
-                )
+            if par.codec_id == AV_CODEC_ID_TRUEHD {
+                if objectAudioRendering != .off {
+                    EngineLog.emit(
+                        "[HLSVideoEngine] object rendering requested but TrueHD is not 48 kHz Atmos "
+                        + "(profile=\(par.profile) rate=\(par.sample_rate)); keeping the channel bridge",
+                        category: .session
+                    )
+                } else if par.profile == AV_PROFILE_TRUEHD_ATMOS {
+                    // The host's choice, not a failure, but the one a missing-heights report turns on:
+                    // the channel bridge plays the 7.1 presentation, where the objects are mixed into
+                    // the floor channels.
+                    EngineLog.emit(
+                        "[HLSVideoEngine] TrueHD Atmos with objectAudioRendering off; the channel bridge "
+                        + "carries the 7.1 presentation, with the objects mixed into the floor channels",
+                        category: .session
+                    )
+                }
             }
             return nil
         }
@@ -86,6 +97,13 @@ extension HLSVideoEngine {
         )
         savedAudioConfig = cfg
         audioBridge = bridge
+        // Same surfacing as the channel bridge: a decoder that never answers is a failure, not silence.
+        if sideAudioDemuxer == nil {
+            let streamIndex = sourceAudioStreamIndex
+            bridge.onDecoderProducedNothing = { [weak self] stats in
+                self?.handleBridgeDecodedNothing(streamIndex: streamIndex, summary: stats.summary)
+            }
+        }
         do {
             let producer = try makeProducer(baseIndex: initialProducerBaseIndex)
             audioHLSCodecs = bridge.hlsCodecs

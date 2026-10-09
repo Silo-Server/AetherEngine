@@ -30,6 +30,8 @@ enum RemoteHLSSubtitleProxy {
         let server: HLSLocalServer
         let provider: RemoteHLSSubtitleProvider?
         let masterURL: URL
+        /// The NAME the served master declares for each injected track, in track order (audit NAT-2).
+        var renditionNames: [String] = []
 
         /// False when the relay stands alone and nothing was injected.
         var servesSubtitleRenditions: Bool { provider != nil }
@@ -92,7 +94,7 @@ enum RemoteHLSSubtitleProxy {
     private static func relayOnly(originURL: URL, httpHeaders: [String: String],
                                   httpRequestAuthorization: HTTPRequestAuthorization?) -> Prepared? {
         let relay = HLSOriginRelay(authorization: httpRequestAuthorization)
-        relay.admit(originURL, httpHeaders: httpHeaders)
+        relay.grantCredentials(to: originURL, httpHeaders: httpHeaders)
         let server = HLSLocalServer(relay: relay)
         do {
             try server.start()
@@ -140,24 +142,33 @@ enum RemoteHLSSubtitleProxy {
                            deadline: Date().addingTimeInterval(budgetSeconds))
         }
         defer { preflightRelay?.stop() }
+        // Audit NAT-105: the variant is whatever the master names, on any host or scheme, so the
+        // host's credentials go only where the host sent them.
+        let credentials = CredentialScope(headers: httpHeaders, anchor: originURL)
 
         let (body, finalURL) = try await fetchPlaylist(originURL, session: session, headers: httpHeaders, relay: preflightRelay)
         let parsed = try parse(body, at: finalURL)
         let variant = try await mediaPlaylist(of: parsed, body: body, at: finalURL,
-                                              session: session, headers: httpHeaders, relay: preflightRelay)
-        let duration = variant.media.segments.reduce(0) { $0 + $1.duration }
+                                              session: session, credentials: credentials,
+                                              relay: preflightRelay)
+        let duration = try sumSegmentDurations(variant.media.segments)
 
         try Task.checkCancellation()
-        let master = try RemoteHLSMasterRewrite.rewrite(
+        let rewritten = try RemoteHLSMasterRewrite.rewriteDeclaringNames(
             originPlaylist: body,
             originURL: finalURL,
             renditions: RemoteHLSSubtitleProvider.renditions(for: tracks))
+        let master = rewritten.master
 
         let provider = RemoteHLSSubtitleProvider(tracks: tracks, masterBody: master,
                                                  programDuration: duration,
                                                  defaultHeaders: httpHeaders)
         let relay: HLSOriginRelay? = needsRelay ? HLSOriginRelay(authorization: httpRequestAuthorization) : nil
-        relay?.admit(finalURL, httpHeaders: httpHeaders)
+        // Audit NET-109: the grant belongs to the URL the host handed over. A redirect target is
+        // only allowed, or a cross-host redirect would move the token to the edge and leave the
+        // host's own origin without it.
+        relay?.grantCredentials(to: originURL, httpHeaders: httpHeaders)
+        relay?.allow(finalURL)
         let server = HLSLocalServer(provider: provider, relay: relay)
         do {
             try server.start()
@@ -188,11 +199,12 @@ enum RemoteHLSSubtitleProxy {
         if let target = RemoteHLSTimestampAnchor.target(mediaPlaylistBody: variant.body, media: variant.media,
                                                         at: variant.url, startPosition: startPosition) {
             provider.startTimestampAnchorProbe {
-                await RemoteHLSTimestampAnchor.probe(target, headers: httpHeaders,
+                await RemoteHLSTimestampAnchor.probe(target, credentials: credentials,
                                                      authorization: httpRequestAuthorization)
             }
         }
-        return Prepared(server: server, provider: provider, masterURL: masterURL)
+        return Prepared(server: server, provider: provider, masterURL: masterURL,
+                        renditionNames: rewritten.renditionNames)
     }
 
     // MARK: - Playlist reads
@@ -206,21 +218,30 @@ enum RemoteHLSSubtitleProxy {
             configuration: config, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
     }
 
+    /// Matches the sibling HLS fetchers (`HLSCarriageProbe`, `HLSVODIngestReader`). This proxy fetches
+    /// an origin master and one variant before AVPlayer ever opens the source, so an origin that
+    /// answers with a fast, unbounded stream under the m3u8 URL could otherwise buffer until jetsam
+    /// (audit NAT-5).
+    private static let maximumPlaylistBytes = 2 * 1024 * 1024
+
     /// Returns the body and the URL it finally came from; every relative URI in the playlist resolves
     /// against the latter, so a redirecting origin (Plex's transcode handoff) still rewrites correctly.
     private static func fetchPlaylist(_ url: URL,
                                       session: URLSession,
                                       headers: [String: String],
                                       relay: HLSOriginRelay?) async throws -> (String, URL) {
-        if let relay { return try await relay.fetchPlaylist(url, headers: headers) }
+        if let relay {
+            return try await relay.fetchPlaylist(url, headers: headers, maximumBytes: maximumPlaylistBytes)
+        }
         var request = URLRequest(url: url)
         for (field, value) in headers { request.setValue(value, forHTTPHeaderField: field) }
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(for: request)
+            (data, response) = try await BoundedPlaylistFetch.data(
+                for: request, session: session, limit: maximumPlaylistBytes)
         } catch {
-            throw Refusal.fetchFailed("\(error.localizedDescription)")
+            throw Refusal.fetchFailed("\(error)")
         }
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             throw Refusal.fetchFailed("HTTP \(http.statusCode)")
@@ -246,7 +267,7 @@ enum RemoteHLSSubtitleProxy {
                                       body: String,
                                       at url: URL,
                                       session: URLSession,
-                                      headers: [String: String],
+                                      credentials: CredentialScope,
                                       relay: HLSOriginRelay?) async throws -> (media: HLSMediaPlaylist, body: String, url: URL) {
         switch playlist {
         case .media(let media):
@@ -257,12 +278,33 @@ enum RemoteHLSSubtitleProxy {
                   let variantURL = HLSPlaylistParser.resolve(uri: variant.uri, against: url) else {
                 throw Refusal.unusablePlaylist("master declares no resolvable variant")
             }
-            let (body, finalURL) = try await fetchPlaylist(variantURL, session: session, headers: headers, relay: relay)
+            let (body, finalURL) = try await fetchPlaylist(
+                variantURL, session: session, headers: credentials.headers(for: variantURL), relay: relay)
             guard case .media(let media) = try parse(body, at: finalURL) else {
                 throw Refusal.unusablePlaylist("variant is not a media playlist")
             }
             guard media.hasEndList else { throw Refusal.notVOD }
             return (media, body, finalURL)
         }
+    }
+
+    /// Longest program this proxy will serve as a whole-program WebVTT rendition.
+    static let maxProgramDurationSeconds: Double = MediaDurationCeiling.seconds
+
+    /// A hostile or malformed EXTINF (`inf`, negative, or a huge total) reaches `Int(Double)` in
+    /// `wholeSecondsCovering` downstream and traps (audit NAT-1); refuse it here instead. Internal
+    /// rather than private so the parsing rule is testable without a network fixture.
+    static func sumSegmentDurations(_ segments: [HLSMediaSegment]) throws -> Double {
+        var total = 0.0
+        for segment in segments {
+            guard segment.duration.isFinite, segment.duration >= 0 else {
+                throw Refusal.unusablePlaylist("EXTINF is not a finite, non-negative duration")
+            }
+            total += segment.duration
+        }
+        guard total.isFinite, total <= maxProgramDurationSeconds else {
+            throw Refusal.unusablePlaylist("program duration exceeds \(maxProgramDurationSeconds)s")
+        }
+        return total
     }
 }

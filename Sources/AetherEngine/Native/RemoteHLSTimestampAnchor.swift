@@ -125,7 +125,7 @@ enum RemoteHLSTimestampAnchor {
     /// on `EngineTLS`'s delegate, like the playlist reads. `budget` bounds the whole probe, not each
     /// request: a URL session's timeouts apply per task, so two sequential reads against a stalled
     /// origin would otherwise take twice as long.
-    static func probe(_ target: Target, headers: [String: String],
+    static func probe(_ target: Target, credentials: CredentialScope,
                       authorization: HTTPRequestAuthorization?,
                       budget: TimeInterval = probeBudgetSeconds) async -> Double? {
         let deadline = Date().addingTimeInterval(budget)
@@ -138,6 +138,9 @@ enum RemoteHLSTimestampAnchor {
         defer { session?.invalidateAndCancel() }
 
         @Sendable func head(_ url: URL, _ maximumBytes: Int) async throws -> Data {
+            // Audit NAT-105: the segment and its init can sit on any host the playlist names, so the
+            // host's credentials go only where the host sent them.
+            let headers = credentials.headers(for: url)
             if let relay { return try await relay.fetchHead(url, headers: headers, maximumBytes: maximumBytes) }
             guard let session else { throw URLError(.cancelled) }
             return try await fetchHead(url, headers: headers, maximumBytes: maximumBytes, session: session)

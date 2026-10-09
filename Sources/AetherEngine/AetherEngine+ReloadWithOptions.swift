@@ -275,6 +275,7 @@ enum SessionOptionCorrection {
         "nativeRemoteHLS",
         "sequentialOrigin",
         "heldSourceConnection",
+        "sharedOutputRole",
     ]
 
     /// The fields a running SESSION owns, which a correction may name and the rebuild then decides
@@ -314,6 +315,8 @@ enum SessionOptionCorrection {
         if proposed.heldSourceConnection != current.heldSourceConnection {
             refused.append("heldSourceConnection")
         }
+        // The role decides which engine drives the panel and owns Now Playing, joined once at load.
+        if proposed.sharedOutputRole != current.sharedOutputRole { refused.append("sharedOutputRole") }
         return refused
     }
 
@@ -406,11 +409,11 @@ enum SessionOptionCorrection {
         "dvrWindowSeconds",
         "liveBlockingReload", "liveJoinProfile", "liveJoinStartsImmediately",
         "clampsLiveResumeToWindow", "nativeRemoteHLS", "nativeRemoteHLSIngestFallback",
-        "preserveASSMarkup", "prepareNativeSubtitles", "eagerNativeSubtitleReaders", "confirmAtmos",
+        "preserveASSMarkup", "prepareNativeSubtitles", "eagerNativeSubtitleReaders", "serveIFramePlaylist", "confirmAtmos",
         "nativeSubtitlePreferredLanguages", "sequentialOrigin", "maxConcurrentSourceRequests", "heldSourceConnection",
         "declaredDurationSeconds", "probesize", "maxAnalyzeDuration", "preferredAudioLanguages",
         "preferredSubtitleLanguages", "externalSubtitles", "forwardBufferSegments", "autoplay",
         "audioDelaySeconds", "teletextPage", "deinterlaceMode", "deinterlaceFieldRate", "preferredDecodePath",
-        "isLiveRejoin", "subtitleSessionCarryover",
+        "escalatesToSoftwarePath", "sharedOutputRole", "isLiveRejoin", "subtitleSessionCarryover",
     ]
 }

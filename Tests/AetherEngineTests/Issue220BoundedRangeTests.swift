@@ -75,7 +75,7 @@ struct Issue220BoundedRangeTests {
     /// the window legitimately opens the next range AT the frontier. A count cannot tell that
     /// apart from a re-fetch: this asserted two requests and saw three on a loaded CI runner,
     /// where the third was `bytes=524288-34078719`, the refill doing its job.
-    @Test("a completed range is read out of the window, not fetched again")
+    @Test("a completed range is read out of the window, not fetched again", .timeLimit(.minutes(1)))
     func completedRangeIsNotRefetched() async throws {
         let server = try #require(ThrottledOriginServer(totalSize: 512 * 1024 * 1024))
         defer { server.stop() }
@@ -91,9 +91,7 @@ struct Issue220BoundedRangeTests {
         defer { buf.deallocate() }
         _ = reader.read(into: buf, size: 64 * 1024)
         // Let the bounded range finish and its completion callback clear activeTask.
-        for _ in 0..<100 where reader.hasLiveConnectionForTesting {
-            try? await Task.sleep(nanoseconds: 10_000_000)
-        }
+        try await waitFor { !reader.hasLiveConnectionForTesting }
 
         // Still inside the delivered range, so the bytes come out of the window.
         #expect(reader.read(into: buf, size: 64 * 1024) == 64 * 1024)

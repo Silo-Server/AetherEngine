@@ -96,4 +96,28 @@ public enum SpatialSpeaker: String, Sendable, CaseIterable {
 
     var isLFE: Bool { self == .lfe }
     var isHeight: Bool { position.z > 0 }
+
+    /// The CoreAudio label for this position, so the bed's log line names channels the way the
+    /// route line and CoreAudioBaseTypes.h do. 5.1-style surrounds and 7.1 sides share
+    /// `LeftSurround`/`RightSurround`, as CoreAudio's own Atmos tags do; no layout has both.
+    var channelLabel: AudioChannelLabel {
+        switch self {
+        case .left: return kAudioChannelLabel_Left
+        case .right: return kAudioChannelLabel_Right
+        case .center: return kAudioChannelLabel_Center
+        case .lfe: return kAudioChannelLabel_LFEScreen
+        case .surroundLeft, .sideLeft: return kAudioChannelLabel_LeftSurround
+        case .surroundRight, .sideRight: return kAudioChannelLabel_RightSurround
+        case .rearLeft: return kAudioChannelLabel_RearSurroundLeft
+        case .rearRight: return kAudioChannelLabel_RearSurroundRight
+        case .wideLeft: return kAudioChannelLabel_LeftWide
+        case .wideRight: return kAudioChannelLabel_RightWide
+        case .topFrontLeft: return kAudioChannelLabel_VerticalHeightLeft
+        case .topFrontRight: return kAudioChannelLabel_VerticalHeightRight
+        case .topMiddleLeft: return kAudioChannelLabel_LeftTopMiddle
+        case .topMiddleRight: return kAudioChannelLabel_RightTopMiddle
+        case .topRearLeft: return kAudioChannelLabel_LeftTopRear
+        case .topRearRight: return kAudioChannelLabel_RightTopRear
+        }
+    }
 }

@@ -191,7 +191,14 @@ public enum DolbyVisionRecordAudit {
         } catch {
             return nil
         }
+        return rpuProfile(walking: demuxer, packetBudget: packetBudget)
+    }
 
+    /// The walk over an opened demuxer, split out so a test can hand it a counting reader.
+    static func rpuProfile(
+        walking demuxer: Demuxer, packetBudget: Int = auditPacketBudget,
+        byteBudget: Int64 = Int64(walkByteBudget)
+    ) -> Int? {
         let videoIdx = demuxer.videoStreamIndex
         guard videoIdx >= 0, let stream = demuxer.stream(at: videoIdx) else { return nil }
         let codecpar = stream.pointee.codecpar
@@ -199,18 +206,41 @@ public enum DolbyVisionRecordAudit {
             codec: .hevc, extradata: codecpar?.pointee.extradata,
             size: Int(codecpar?.pointee.extradata_size ?? 0))
 
+        // Audit BIT-103: Matroska resyncs byte by byte through junk inside one av_read_frame, where
+        // neither the packet fuse nor the packet byte count below can see the bytes go by.
+        demuxer.beginInputByteBudget(byteBudget)
+        defer { demuxer.endInputByteBudget() }
+
         var walked = 0
+        var packetsRead = 0
+        var bytesRead = 0
         while walked < packetBudget {
+            guard !walkExhausted(packetsRead: packetsRead, bytesRead: bytesRead, packetBudget: packetBudget)
+            else { return nil }
             guard let packet = (try? demuxer.readPacket()) ?? nil else { return nil }
             defer {
                 av_packet_unref(packet)
                 av_packet_free_safe(packet)
             }
+            packetsRead += 1
+            bytesRead += Int(max(packet.pointee.size, 0))
             guard packet.pointee.stream_index == videoIdx else { continue }
             walked += 1
             if let profile = rpuProfile(packet, framing: framing) { return profile }
         }
         return nil
+    }
+
+    /// Audit BIT-2: the walk counted only video packets, so a source that stops delivering video after
+    /// its head made every open read the rest of the file. Every packet counts against these instead.
+    /// No AVDISCARD_ALL on the other streams: the demuxer would then skip them inside one read, where
+    /// neither ceiling can see the bytes go by.
+    static let foreignPacketFuseMultiplier = 16
+    static let walkByteBudget = 64 * 1024 * 1024
+
+    static func walkExhausted(packetsRead: Int, bytesRead: Int, packetBudget: Int) -> Bool {
+        let (fuse, overflow) = packetBudget.multipliedReportingOverflow(by: foreignPacketFuseMultiplier)
+        return packetsRead >= (overflow ? Int.max : fuse) || bytesRead >= walkByteBudget
     }
 
     /// The verdict for a source in one call, gate included: opens it, reads the record and the VUI, and

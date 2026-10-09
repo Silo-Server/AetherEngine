@@ -85,7 +85,9 @@ struct SoftwareStoredPacketTests {
             )
             precondition(stored == expected)
             let encoded = try stored.encoded()
-            precondition(encoded.starts(with: Data("bplist00".utf8)))
+            precondition(encoded.first == SoftwareStoredPacket.version)
+            precondition(encoded.count == SoftwareStoredPacket.headerBytes + bytes.count
+                + sideData.reduce(0) { $0 + SoftwareStoredPacket.sideDataHeaderBytes + $1.1.count })
             let decoded = try SoftwareStoredPacket.decode(encoded)
             precondition(decoded == expected)
             let restored = try decoded.makeAVPacket()

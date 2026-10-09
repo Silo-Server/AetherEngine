@@ -216,8 +216,11 @@ struct RemoteHLSSubtitleProxyTests {
                     + pesPacket(pts90k: videoPTS90k))
     }
 
+    #if os(macOS)
     /// A finished origin on disk: a master, a variant of five 6 s segments, and only the segment files
-    /// passed in, so a probe that reads any other segment fails. The sidecar has a cue at 20 s.
+    /// passed in, so a probe that reads any other segment fails. The sidecar has a cue at 20 s. The
+    /// playlists are served over HTTP by `servedVTT`, because the bounded playlist fetch only accepts an
+    /// HTTP answer.
     private static func diskOrigin(segments: [Int: Data]) throws -> (dir: URL, master: URL, srt: URL) {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("ae-anchor-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir.appendingPathComponent("v"), withIntermediateDirectories: true)
@@ -238,8 +241,25 @@ struct RemoteHLSSubtitleProxyTests {
     private static func servedVTT(segments: [Int: Data]) async throws -> String {
         let origin = try diskOrigin(segments: segments)
         defer { try? FileManager.default.removeItem(at: origin.dir) }
+        let script = """
+        import http.server
+
+        class Handler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, directory=r"\(origin.dir.path)", **kwargs)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        print("READY", server.server_address[1], flush=True)
+        server.serve_forever()
+        """
+        let launched = try #require(await PythonOrigin.launch(prefix: "aether-anchor-origin", script: script))
+        defer { launched.stop() }
+        let master = try #require(URL(string: "http://127.0.0.1:\(launched.port)/master.m3u8"))
         let prepared = try #require(await RemoteHLSSubtitleProxy.prepare(
-            originURL: origin.master, tracks: [Self.track(100_000, url: origin.srt)], httpHeaders: [:],
+            originURL: master, tracks: [Self.track(100_000, url: origin.srt)], httpHeaders: [:],
             needsRelay: false, startPosition: 13))
         defer { prepared.tearDown() }
         let provider = try #require(prepared.provider)
@@ -276,6 +296,7 @@ struct RemoteHLSSubtitleProxyTests {
         #expect(body.hasPrefix("WEBVTT\n\n"))
         #expect(!body.contains("X-TIMESTAMP-MAP"))
     }
+    #endif
 
     @Test("The probe reads the segment the load opens on, with EXT-X-DEFINE variables substituted")
     func probeTargetsTheStartSegment() throws {
@@ -387,8 +408,9 @@ struct RemoteHLSSubtitleProxyTests {
             initURL: try #require(URL(string: "\(base)/init.mp4")), segmentStart: 0)
 
         let started = Date()
-        let anchor = await RemoteHLSTimestampAnchor.probe(target, headers: [:], authorization: nil,
-                                                          budget: budget)
+        let anchor = await RemoteHLSTimestampAnchor.probe(target,
+                                                          credentials: CredentialScope(headers: [:], anchors: []),
+                                                          authorization: nil, budget: budget)
         let elapsed = Date().timeIntervalSince(started)
 
         #expect(anchor == nil)
@@ -513,6 +535,50 @@ struct RemoteHLSSubtitleProxyTests {
             existing: [], legible: [localized], injectedNames: ["DE"])
 
         #expect(merged.isEmpty)
+    }
+
+    // MARK: - NAT-1: a hostile EXTINF never reaches Int(Double)
+
+    private static func seg(_ duration: Double) -> HLSMediaSegment {
+        HLSMediaSegment(uri: "s.ts", duration: duration, discontinuityBefore: false)
+    }
+
+    @Test("An infinite, negative or absurd EXTINF is refused before it becomes a program duration")
+    func rejectsHostileSegmentDurations() {
+        #expect(throws: RemoteHLSSubtitleProxy.Refusal.self) {
+            _ = try RemoteHLSSubtitleProxy.sumSegmentDurations([Self.seg(.infinity)])
+        }
+        #expect(throws: RemoteHLSSubtitleProxy.Refusal.self) {
+            _ = try RemoteHLSSubtitleProxy.sumSegmentDurations([Self.seg(.nan)])
+        }
+        #expect(throws: RemoteHLSSubtitleProxy.Refusal.self) {
+            _ = try RemoteHLSSubtitleProxy.sumSegmentDurations([Self.seg(-1)])
+        }
+        #expect(throws: RemoteHLSSubtitleProxy.Refusal.self) {
+            // Finite, but a sum this large is still out of range (audit NAT-1's "finite but huge" case).
+            _ = try RemoteHLSSubtitleProxy.sumSegmentDurations([Self.seg(5e18), Self.seg(5e18)])
+        }
+    }
+
+    @Test("An ordinary EXTINF sum is unaffected")
+    func sumsOrdinaryDurations() throws {
+        let total = try RemoteHLSSubtitleProxy.sumSegmentDurations([Self.seg(5), Self.seg(6.5)])
+        #expect(total == 11.5)
+    }
+
+    @Test("A non-finite or absurd program duration is clamped before it reaches the provider's segment")
+    func providerClampsAHostileProgramDuration() {
+        let providerInf = RemoteHLSSubtitleProvider(
+            tracks: [], masterBody: Self.master, programDuration: .infinity, defaultHeaders: [:])
+        #expect(providerInf.segmentDuration(at: 0).isFinite)
+
+        let providerHuge = RemoteHLSSubtitleProvider(
+            tracks: [], masterBody: Self.master, programDuration: 5e18, defaultHeaders: [:])
+        #expect(providerHuge.segmentDuration(at: 0) <= RemoteHLSSubtitleProxy.maxProgramDurationSeconds)
+
+        let providerNaN = RemoteHLSSubtitleProvider(
+            tracks: [], masterBody: Self.master, programDuration: .nan, defaultHeaders: [:])
+        #expect(providerNaN.segmentDuration(at: 0) == 1)
     }
 
     @Test("Without an m3u8/NAME the display name is still the key")

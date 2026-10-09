@@ -46,6 +46,8 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     private let encoder: APACEncoder
     private var renderer: ObjectAudioRenderer?
     private var rendererGeneration = -1
+    /// What the encoder is fed, per bed channel, for the session log (see `BedLevelMeter`).
+    private var levelMeter: BedLevelMeter
 
     /// Rendered bed awaiting the encoder. TrueHD decodes one 40-frame access unit per block, 1200
     /// a second; feeding the converter that often costs more in call overhead than the encode, so
@@ -72,7 +74,23 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     private var stats = AudioBridge.FeedStats()
     private(set) var outputBytesLifetime: Int64 = 0
 
+    /// AE#641: called once, on the pump thread, when the object decoder has been fed
+    /// `silentFeedPacketThreshold` packets in a row without returning a block. The APAC
+    /// sample entry is written up front, like FLAC's, so nothing downstream fails on its own and the
+    /// session would otherwise play the picture over silence. Set before the producer starts feeding.
+    var onDecoderProducedNothing: (@Sendable (AudioBridge.FeedStats) -> Void)?
+    private var decodedNothingReported = false
+
     private static let avNoPTS: Int64 = -0x7FFFFFFFFFFFFFFF - 1
+
+    /// Packets the object decoder may take without a block before it counts as producing nothing.
+    /// Not the channel bridge's 64: a TrueHD packet is one 40-frame access unit, and after a start or
+    /// resume mid-stream the decoder waits for the next major sync before its first block. Measured
+    /// on Dolby's Unfold demo, that wait was up to 102 access units; at 64 every resume past the
+    /// opening seconds was reported as a dead decoder and the session went to `.error` while it
+    /// played, ignoring every seek after it. 1200 is a second of TrueHD, still a fraction of a second
+    /// of the producer's time.
+    static let silentFeedPacketThreshold = 1200
 
     init(
         srcTimeBase: AVRational,
@@ -83,6 +101,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         self.srcTimeBase = srcTimeBase
         self.layout = layout
         self.decoder = decoder
+        levelMeter = BedLevelMeter(layout: layout, sampleRate: Self.sampleRate)
         let rate = bitRate ?? layout.channelCount * Self.bitRatePerChannel
         encoder = try APACEncoder(layout: layout, sampleRate: Double(Self.sampleRate), bitRate: rate)
         soundSampleEntryOverride = APACSampleEntry.sampleEntry(
@@ -140,6 +159,8 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         defer { opLock.unlock() }
         stats.packetsFed += 1
         stats.packetsFedSinceLastEnqueue += 1
+        // Every exit: a decoder that rejects each packet has decoded nothing too.
+        defer { noteDecodedNothingIfNeeded() }
 
         if originFrame == nil, packet.pointee.pts != Self.avNoPTS {
             originFrame = av_rescale_q(packet.pointee.pts, srcTimeBase, encoderTimeBase)
@@ -166,6 +187,17 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         return results
     }
 
+    /// Caller holds `opLock`.
+    private func noteDecodedNothingIfNeeded() {
+        guard !decodedNothingReported, stats.decodedNothing,
+              stats.packetsFedSinceLastEnqueue >= Self.silentFeedPacketThreshold else { return }
+        decodedNothingReported = true
+        EngineLog.emit(
+            "[SpatialAudioBridge] ERROR: AE#641 the TrueHD object decoder has produced nothing: "
+            + "\(stats.summary)", category: .session)
+        onDecoderProducedNothing?(stats)
+    }
+
     func flush() -> [UnsafeMutablePointer<AVPacket>] {
         opLock.lock()
         defer { opLock.unlock() }
@@ -173,6 +205,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         drainedAtEOF = true
         var results: [UnsafeMutablePointer<AVPacket>] = []
         try? encodePending(into: &results)
+        logLevels(levelMeter.restart())
         if let packets = try? encoder.flush() { emit(packets, into: &results) }
         if !results.isEmpty {
             EngineLog.emit("[SpatialAudioBridge] EOF flush emitted \(results.count) tail packet(s)", category: .session)
@@ -186,6 +219,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         decoder.reset()
         renderer?.reset()
         encoder.reset()
+        logLevels(levelMeter.restart())
         pendingFrames = 0
         originFrame = nil
         encoderStartFrame = nil
@@ -205,6 +239,8 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     func close() {
         opLock.lock()
         defer { opLock.unlock() }
+        // A viewer who hears no heights stops playback: the window they stopped in is the one to log.
+        logLevels(levelMeter.restart())
         cleanup()
     }
 
@@ -221,18 +257,22 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         guard block.sampleRate == Self.sampleRate else { throw BridgeError.unsupportedSampleRate(block.sampleRate) }
         guard block.frameCount > 0 else { return }
 
-        if renderer == nil || block.configurationGeneration != rendererGeneration {
-            if renderer != nil {
-                EngineLog.emit(
-                    "[SpatialAudioBridge] object configuration changed (\(block.roles.count) elements), renderer rebuilt",
-                    category: .session
-                )
-            }
+        let rebuilt = renderer == nil || block.configurationGeneration != rendererGeneration
+        if rebuilt {
+            // Whether the presentation has an LFE element at all is the first question a missing-LFE
+            // report asks.
+            EngineLog.emit(
+                "[SpatialAudioBridge] object configuration\(renderer == nil ? "" : " changed, renderer rebuilt"): "
+                    + BedLevelMeter.configurationSummary(block.roles),
+                category: .session
+            )
             renderer = ObjectAudioRenderer(layout: layout, roles: block.roles)
             rendererGeneration = block.configurationGeneration
         } else if block.isDiscontinuity {
             renderer?.markDiscontinuity()
         }
+        levelMeter.observe(roles: block.roles, updates: block.updates, configurationChanged: rebuilt)
+        levelMeter.measureInput(roles: block.roles, planes: block.planes, frameCount: block.frameCount)
         // Anchor the encoder on the first block after a reset, and keep the encoder's input
         // contiguous with the source afterwards: a gap the decoder skipped (corrupt access units) is
         // filled with silence so everything after it stays on its timestamp.
@@ -266,9 +306,12 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         guard pendingFrames > 0 else { return }
         let frames = pendingFrames
         pendingFrames = 0
+        let planes = outputPlanes.map { UnsafePointer($0) }
+        // Where this chunk plays, for the level line: the anchor is a source PTS in 48 kHz frames.
+        let chunkStart = encoderStartFrame.map { Double($0 + encoderFramesIn) / Double(Self.sampleRate) }
         let packets: [APACEncoder.Packet]
         do {
-            packets = try encoder.encode(planes: outputPlanes.map { UnsafePointer($0) }, frameCount: frames)
+            packets = try encoder.encode(planes: planes, frameCount: frames)
         } catch {
             // Packet timestamps count packets since the encoder started, so a failed call that
             // swallowed packets would leave every later one stamped early. Start the encoder over
@@ -284,7 +327,12 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
             throw error
         }
         encoderFramesIn += Int64(frames)
+        logLevels(levelMeter.add(planes, frameCount: frames, startSeconds: chunkStart))
         emit(packets, into: &results)
+    }
+
+    private func logLevels(_ line: String?) {
+        if let line { EngineLog.emit("[SpatialAudioBridge] \(line)", category: .session) }
     }
 
     /// Stamp encoder packets onto the output timeline and wrap them for the muxer. Packet k is

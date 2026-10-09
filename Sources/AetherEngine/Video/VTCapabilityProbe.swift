@@ -53,7 +53,19 @@ enum VTCapabilityProbe {
     /// wrongly forces the software path. Not the question `SoftwarePlaybackHost` asks, see
     /// `HardwareDecodeVerdict`.
     static func canHardwareDecode(codecpar: UnsafePointer<AVCodecParameters>) -> Bool {
-        hardwareDecodeVerdict(codecpar: codecpar).keepsNativeRoute
+        if codecpar.pointee.codec_id == AV_CODEC_ID_AV1 {
+            let av1C = codecpar.pointee.extradata.map {
+                Array(UnsafeBufferPointer(start: $0, count: Int(max(0, codecpar.pointee.extradata_size))))
+            }
+            let fits = VideoRoutingPolicy.av1FitsHardwareDecoder(
+                av1C: av1C, codecparProfile: codecpar.pointee.profile)
+            EngineLog.emit(
+                "[VTProbe] canHardwareDecode codec=av01 profile=\(codecpar.pointee.profile) -> \(fits)",
+                category: .engine
+            )
+            return fits
+        }
+        return hardwareDecodeVerdict(codecpar: codecpar).keepsNativeRoute
     }
 
     /// The throwaway session is invalidated immediately; the whole probe costs well under a millisecond and

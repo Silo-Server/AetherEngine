@@ -8,7 +8,7 @@ import AetherEngine
 /// does detection bail?". Exit 0 when the image is recognized as playable, else 1.
 func runDiscInspect(url: URL, dump: Bool = false) -> Int32 {
     EngineLog.handler = { print($0) }
-    print("aetherctl disc-inspect: \(url.absoluteString)")
+    print(EngineLog.redacted("aetherctl disc-inspect: \(url.absoluteString)"))
     print("")
 
     let d = AetherEngine.inspectDisc(url: url, verbose: dump)

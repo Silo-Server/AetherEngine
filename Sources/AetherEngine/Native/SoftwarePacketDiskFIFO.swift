@@ -142,10 +142,7 @@ final class SoftwarePacketDiskFIFO: @unchecked Sendable {
             guard let writer else { throw Failure.corruptRecord }
             let cursor = Cursor(chunkID: tailID, generation: generation, offset: tailBytes,
                                 recordIndex: writtenRecordCount, payloadPrefix: writtenPayloadBytes)
-            var length = UInt64(data.count).bigEndian
-            let header = withUnsafeBytes(of: &length) { Data($0) }
-            try writer.write(contentsOf: header)
-            try writer.write(contentsOf: data)
+            try Self.writeRecord(data, to: writer.fileDescriptor)
             tailBytes += UInt64(recordBytes)
             recordCount = nextCount
             payloadBytes = nextPayloadBytes
@@ -174,8 +171,7 @@ final class SoftwarePacketDiskFIFO: @unchecked Sendable {
             }
             guard let reader else { throw Failure.corruptRecord }
             guard headOffset <= limit, limit - headOffset >= 8 else { throw Failure.corruptRecord }
-            let header = try readExactly(8, from: reader)
-            let length = header.reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+            let length = try Self.readRecordLength(from: reader)
             guard length <= UInt64(payloadBytes), length <= limit - headOffset - 8 else {
                 throw Failure.corruptRecord
             }
@@ -221,8 +217,7 @@ final class SoftwarePacketDiskFIFO: @unchecked Sendable {
             let size = try replacement.seekToEnd()
             guard cursor.offset <= size, size - cursor.offset >= 8 else { throw Failure.corruptRecord }
             try replacement.seek(toOffset: cursor.offset)
-            let header = try readExactly(8, from: replacement)
-            let length = header.reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+            let length = try Self.readRecordLength(from: replacement)
             guard length <= size - cursor.offset - 8,
                   length <= UInt64(writtenPayloadBytes - cursor.payloadPrefix) else {
                 throw Failure.corruptRecord
@@ -240,6 +235,59 @@ final class SoftwarePacketDiskFIFO: @unchecked Sendable {
             failure = error
             throw error
         }
+    }
+
+    /// AE#605: walks retained records from `cursor` on without touching the consumer's reader, so a
+    /// scrub still can decode out of history while playback keeps reading its own position.
+    ///
+    /// The lock is held only to validate the cursor and to snapshot the tail. The disk reads run
+    /// outside it on handles of their own, because a GOP is megabytes and the producer and the
+    /// consumer both serialize on this lock. That is safe for two reasons: an unlinked chunk stays
+    /// readable through a handle opened before the unlink, and the tail is read only up to the
+    /// length snapshotted here, never into a record still being written. What it cannot see is a
+    /// reset recreating the same chunk names underneath it, so the generation is checked again
+    /// once the walk ends, and a walk that raced a reset throws `invalidCursor` AFTER visiting: the
+    /// caller discards whatever it collected. `visit` returns false to stop early. Failures never
+    /// poison the store: a still is optional, playback is not.
+    func readHistory(from cursor: Cursor, visit: (Data) throws -> Bool) throws {
+        lock.lock()
+        do { try requireUsable() } catch { lock.unlock(); throw error }
+        guard retainConsumed else { lock.unlock(); throw Failure.retentionDisabled }
+        guard cursor.generation == generation, chunks > 0,
+              cursor.chunkID >= oldestChunkID, cursor.chunkID <= tailID,
+              cursor.recordIndex >= 0, cursor.recordIndex < writtenRecordCount else {
+            lock.unlock()
+            throw Failure.invalidCursor
+        }
+        let lastChunk = tailID
+        let lastChunkBytes = tailBytes
+        lock.unlock()
+
+        var chunkID = cursor.chunkID
+        var offset = cursor.offset
+        walk: while chunkID <= lastChunk {
+            guard let handle = try? FileHandle(forReadingFrom: chunkURL(chunkID)) else {
+                throw Failure.invalidCursor
+            }
+            defer { try? handle.close() }
+            let limit = chunkID == lastChunk ? lastChunkBytes : try handle.seekToEnd()
+            try handle.seek(toOffset: offset)
+            while offset < limit {
+                guard limit - offset >= 8 else { throw Failure.corruptRecord }
+                let length = try Self.readRecordLength(from: handle)
+                guard length <= limit - offset - 8 else { throw Failure.corruptRecord }
+                let record = try readExactly(Int(length), from: handle)
+                offset += 8 + length
+                if try !visit(record) { break walk }
+            }
+            chunkID += 1
+            offset = 0
+        }
+
+        lock.lock()
+        let stillValid = cursor.generation == generation && !isClosed
+        lock.unlock()
+        guard stillValid else { throw Failure.invalidCursor }
     }
 
     /// Evict only complete history chunks strictly before the reader, oldest first. A budget is
@@ -359,16 +407,71 @@ final class SoftwarePacketDiskFIFO: @unchecked Sendable {
         chunks += 1
     }
 
+    /// Audit PERF-109: one allocation and no copy. `read(upToCount:)` allocated a `Data` per call and
+    /// `append` copied it again into a second one, per payload.
     private func readExactly(_ length: Int, from handle: FileHandle) throws -> Data {
-        var result = Data()
-        result.reserveCapacity(length)
-        while result.count < length {
-            guard let part = try handle.read(upToCount: length - result.count), !part.isEmpty else {
-                throw Failure.corruptRecord
-            }
-            result.append(part)
+        guard length > 0 else { return Data() }
+        var result = Data(count: length)
+        try result.withUnsafeMutableBytes { raw in
+            try Self.readFully(into: raw, from: handle.fileDescriptor)
         }
         return result
+    }
+
+    private static func readRecordLength(from handle: FileHandle) throws -> UInt64 {
+        var big: UInt64 = 0
+        try withUnsafeMutableBytes(of: &big) { try readFully(into: $0, from: handle.fileDescriptor) }
+        return UInt64(bigEndian: big)
+    }
+
+    /// EOF before the buffer fills is a record the file does not hold.
+    private static func readFully(into buffer: UnsafeMutableRawBufferPointer, from fd: Int32) throws {
+        guard let base = buffer.baseAddress else { return }
+        var done = 0
+        while done < buffer.count {
+            let n = Darwin.read(fd, base + done, buffer.count - done)
+            if n > 0 { done += n; continue }
+            if n < 0, errno == EINTR { continue }
+            if n < 0 { throw posixError() }
+            throw Failure.corruptRecord
+        }
+    }
+
+    /// Audit PERF-109: the length and the payload leave in one `writev`, not two writes with a
+    /// header `Data` allocated between them. A short count (full volume, quota) finishes with plain
+    /// writes, and any failure throws into the caller's latch, so a half-written record is never
+    /// appended to.
+    private static func writeRecord(_ payload: Data, to fd: Int32) throws {
+        var header = UInt64(payload.count).bigEndian
+        try withUnsafeBytes(of: &header) { head in
+            try payload.withUnsafeBytes { body in
+                let total = head.count + body.count
+                var sent = 0
+                if body.count > 0 {
+                    sent = try withUnsafeTemporaryAllocation(of: iovec.self, capacity: 2) { vec in
+                        vec[0] = iovec(iov_base: UnsafeMutableRawPointer(mutating: head.baseAddress),
+                                       iov_len: head.count)
+                        vec[1] = iovec(iov_base: UnsafeMutableRawPointer(mutating: body.baseAddress),
+                                       iov_len: body.count)
+                        while true {
+                            let n = Darwin.writev(fd, vec.baseAddress, 2)
+                            if n >= 0 { return n }
+                            if errno != EINTR { throw posixError() }
+                        }
+                    }
+                }
+                while sent < total {
+                    let (base, offset) = sent < head.count
+                        ? (head.baseAddress!, sent) : (body.baseAddress!, sent - head.count)
+                    let limit = sent < head.count ? head.count : body.count
+                    let n = Darwin.write(fd, base + offset, limit - offset)
+                    if n > 0 { sent += n; continue }
+                    if n < 0, errno == EINTR { continue }
+                    if n < 0 { throw posixError() }
+                    throw Failure.capacityExceeded
+                }
+            }
+        }
     }
 
     private func currentReadLimit() throws -> UInt64 {
