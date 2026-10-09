@@ -39,6 +39,12 @@ struct BedLevelMeter {
     private var maxActiveObjects = 0
     private var maxElevatedObjects = 0
 
+    /// The decoder's LFE input, before the renderer applies its metadata gain. With the bed's LFE level
+    /// it splits a silent LFE into a silent source, a zero gain, or no LFE element at all.
+    private var lfeIndex: Int?
+    private var lfeInputSquares: Double = 0
+    private var lfeInputFrames = 0
+
     init(layout: SpatialSpeakerLayout, sampleRate: Int) {
         self.layout = layout
         self.sampleRate = sampleRate
@@ -53,6 +59,7 @@ struct BedLevelMeter {
                           configurationChanged: Bool = false) {
         if configurationChanged || elementStates.count != roles.count {
             elementStates = Array(repeating: nil, count: roles.count)
+            lfeIndex = roles.firstIndex(of: .lfe)
         }
         for update in updates {
             for (index, state) in update.states.enumerated() where index < elementStates.count {
@@ -68,6 +75,15 @@ struct BedLevelMeter {
             maxActiveObjects = max(maxActiveObjects, activeObjects)
             maxElevatedObjects = max(maxElevatedObjects, elevatedObjects)
         }
+    }
+
+    /// Measure the LFE element's input for one decoded block (one plane per role).
+    mutating func measureInput(roles: [ObjectAudioRole], planes: [UnsafePointer<Float>], frameCount: Int) {
+        guard frameCount > 0, let index = roles.firstIndex(of: .lfe), index < planes.count else { return }
+        var squares: Float = 0
+        vDSP_svesq(planes[index], 1, &squares, vDSP_Length(frameCount))
+        lfeInputSquares += Double(squares)
+        lfeInputFrames += frameCount
     }
 
     /// Measure `frameCount` frames of the bed (one plane per layout channel) starting at `startSeconds`
@@ -94,6 +110,7 @@ struct BedLevelMeter {
     mutating func restart() -> String? {
         let line = frames >= sampleRate ? closeWindow() : nil
         elementStates = []
+        lfeIndex = nil
         activeObjects = 0
         elevatedObjects = 0
         clearWindow()
@@ -102,7 +119,7 @@ struct BedLevelMeter {
     }
 
     /// `bed levels 7.1.4 at 3725.4 s over 30.0 s, rms/peak dBFS: L -22.4/-3.1, …; objects: up to 12
-    /// active, 5 elevated`
+    /// active, 5 elevated; LFE input -18.2 dBFS, metadata gain 0.0 dB`
     private mutating func closeWindow() -> String {
         let channels = layout.speakers.enumerated().map { c, speaker in
             let rms = (sumSquares[c] / Double(max(frames, 1))).squareRoot()
@@ -114,13 +131,40 @@ struct BedLevelMeter {
         let line = "bed levels \(layout.rawValue)\(at) over \(seconds) s, rms/peak dBFS: "
             + channels.joined(separator: ", ")
             + "; objects: up to \(maxActiveObjects) active, \(maxElevatedObjects) elevated"
+            + "; " + lfeSummary()
         windowsClosed += 1
         clearWindow()
         return line
     }
 
+    private func lfeSummary() -> String {
+        guard let lfeIndex else { return "no LFE element" }
+        let input = Self.dBFS((lfeInputSquares / Double(max(lfeInputFrames, 1))).squareRoot())
+        let gain = elementStates.indices.contains(lfeIndex) ? elementStates[lfeIndex]?.gain : nil
+        let gainText = gain.map { "metadata gain " + ($0 > 0 ? String(format: "%.1f dB", 20 * log10($0)) : "-inf dB") }
+            ?? "no metadata yet"
+        return "LFE input \(input) dBFS, \(gainText)"
+    }
+
+    /// The decoder's elements, for the configuration line: `LFE + 15 objects`, or the bed channels it
+    /// names first.
+    static func configurationSummary(_ roles: [ObjectAudioRole]) -> String {
+        var parts: [String] = []
+        let beds = roles.compactMap { role -> String? in
+            if case .bed(let speaker) = role { return AudioRouteDescription.labelName(speaker.channelLabel) }
+            return nil
+        }
+        if !beds.isEmpty { parts.append("beds " + beds.joined(separator: " ")) }
+        let lfe = roles.filter { $0 == .lfe }.count
+        parts.append(lfe == 0 ? "no LFE" : (lfe == 1 ? "LFE" : "\(lfe) LFE"))
+        parts.append("\(roles.filter { $0 == .object }.count) objects")
+        return parts.joined(separator: " + ")
+    }
+
     private mutating func clearWindow() {
         for c in sumSquares.indices { sumSquares[c] = 0; peaks[c] = 0 }
+        lfeInputSquares = 0
+        lfeInputFrames = 0
         frames = 0
         windowStart = nil
         maxActiveObjects = activeObjects

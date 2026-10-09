@@ -75,13 +75,22 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     private(set) var outputBytesLifetime: Int64 = 0
 
     /// AE#641: called once, on the pump thread, when the object decoder has been fed
-    /// `AudioBridge.silentFeedPacketThreshold` packets in a row without returning a block. The APAC
+    /// `silentFeedPacketThreshold` packets in a row without returning a block. The APAC
     /// sample entry is written up front, like FLAC's, so nothing downstream fails on its own and the
     /// session would otherwise play the picture over silence. Set before the producer starts feeding.
     var onDecoderProducedNothing: (@Sendable (AudioBridge.FeedStats) -> Void)?
     private var decodedNothingReported = false
 
     private static let avNoPTS: Int64 = -0x7FFFFFFFFFFFFFFF - 1
+
+    /// Packets the object decoder may take without a block before it counts as producing nothing.
+    /// Not the channel bridge's 64: a TrueHD packet is one 40-frame access unit, and after a start or
+    /// resume mid-stream the decoder waits for the next major sync before its first block. Measured
+    /// on Dolby's Unfold demo, that wait was up to 102 access units; at 64 every resume past the
+    /// opening seconds was reported as a dead decoder and the session went to `.error` while it
+    /// played, ignoring every seek after it. 1200 is a second of TrueHD, still a fraction of a second
+    /// of the producer's time.
+    static let silentFeedPacketThreshold = 1200
 
     init(
         srcTimeBase: AVRational,
@@ -181,7 +190,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     /// Caller holds `opLock`.
     private func noteDecodedNothingIfNeeded() {
         guard !decodedNothingReported, stats.decodedNothing,
-              stats.packetsFedSinceLastEnqueue >= AudioBridge.silentFeedPacketThreshold else { return }
+              stats.packetsFedSinceLastEnqueue >= Self.silentFeedPacketThreshold else { return }
         decodedNothingReported = true
         EngineLog.emit(
             "[SpatialAudioBridge] ERROR: AE#641 the TrueHD object decoder has produced nothing: "
@@ -250,18 +259,20 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
 
         let rebuilt = renderer == nil || block.configurationGeneration != rendererGeneration
         if rebuilt {
-            if renderer != nil {
-                EngineLog.emit(
-                    "[SpatialAudioBridge] object configuration changed (\(block.roles.count) elements), renderer rebuilt",
-                    category: .session
-                )
-            }
+            // Whether the presentation has an LFE element at all is the first question a missing-LFE
+            // report asks.
+            EngineLog.emit(
+                "[SpatialAudioBridge] object configuration\(renderer == nil ? "" : " changed, renderer rebuilt"): "
+                    + BedLevelMeter.configurationSummary(block.roles),
+                category: .session
+            )
             renderer = ObjectAudioRenderer(layout: layout, roles: block.roles)
             rendererGeneration = block.configurationGeneration
         } else if block.isDiscontinuity {
             renderer?.markDiscontinuity()
         }
         levelMeter.observe(roles: block.roles, updates: block.updates, configurationChanged: rebuilt)
+        levelMeter.measureInput(roles: block.roles, planes: block.planes, frameCount: block.frameCount)
         // Anchor the encoder on the first block after a reset, and keep the encoder's input
         // contiguous with the source afterwards: a gap the decoder skipped (corrupt access units) is
         // filled with silence so everything after it stays on its timestamp.
