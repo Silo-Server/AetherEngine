@@ -3489,6 +3489,9 @@ public final class AetherEngine: ObservableObject {
         audioSelectionTask?.cancel()
         audioSelectionTask = nil
         pendingAudioSelection = nil
+        // The cancelled switch is no longer anyone's intent: a reload that snapshots the selection
+        // before the cancelled task unwinds must not restore it.
+        audioSwitchInFlight = nil
     }
 
     /// AE#464 round 3: true while a re-anchor raised by `setAudioDelay` is running, so the presses

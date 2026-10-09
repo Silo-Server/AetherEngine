@@ -135,6 +135,18 @@ struct Issue357BackgroundTeardownSelectionTests {
         #expect(engine.consumeReloadSelection().audioTrackIndex == 3)
     }
 
+    /// A `stop()` or `load()` cancels the switch; its track is then nobody's intent.
+    @Test("a cancelled audio switch is not restored by a later reload")
+    func cancelledSwitchIsForgotten() throws {
+        let engine = try AetherEngine()
+        engine.pendingAudioSelection = 2
+        engine.audioSwitchInFlight = 1
+        engine.stop()
+        #expect(engine.pendingAudioSelection == nil)
+        #expect(engine.audioSwitchInFlight == nil)
+        #expect(engine.consumeReloadSelection().audioTrackIndex == nil)
+    }
+
     @Test("a pick made after the teardown is newer intent and wins over the snapshot")
     func newerIntentWins() throws {
         let engine = try AetherEngine()
