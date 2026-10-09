@@ -239,6 +239,22 @@ final class DocumentedConstantsTests: XCTestCase {
                        "docs/formats.md and cli.md quote apac.31.04 for 16 channels")
     }
 
+    /// formats.md "TrueHD Atmos (object rendering)" and the CHANGELOG quote the bed level windows.
+    func testBedLevelWindowsAreWhatTheDocsSay() throws {
+        let docs = try documentation()
+        XCTAssertEqual(BedLevelMeter.firstWindowSeconds, 5)
+        XCTAssertEqual(BedLevelMeter.windowSeconds, 30)
+        assertDocumented("after the first 5 s of audio (and again after every seek), then every 30 s", docs)
+    }
+
+    /// formats.md "TrueHD Atmos (object rendering)" and the CHANGELOG quote the APAC silence threshold.
+    func testAPACSilenceThresholdIsWhatTheDocsSay() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let docs = try documentation()
+        XCTAssertEqual(SpatialAudioBridge.silentFeedPacketThreshold, 1200)
+        assertDocumented("returns nothing for 1200 packets in a row, a second of TrueHD", docs)
+    }
+
     func testExternalSubtitleTrackIDBaseIsDocumented() throws {
         let docs = try documentation()
         XCTAssertEqual(AetherEngine.externalSubtitleTrackIDBase, 100_000)

@@ -117,6 +117,36 @@ struct Issue357BackgroundTeardownSelectionTests {
         #expect(selection.discTitleID == 7)
     }
 
+    /// A host picked TrueHD on a file whose auto pick is E-AC-3 Atmos, then rebuilt the session while
+    /// the switch was running: the rebuild read the active track the switch's teardown had cleared
+    /// and came back on E-AC-3, superseding the switch.
+    @Test("a reload taken while an audio switch is pending or running restores the switch's track")
+    func reloadKeepsAudioSwitch() throws {
+        let engine = try AetherEngine()
+        engine.activeAudioTrackIndex = 3
+        engine.pendingAudioSelection = 1
+        #expect(engine.consumeReloadSelection().audioTrackIndex == 1)
+        engine.pendingAudioSelection = nil
+        engine.activeAudioTrackIndex = nil
+        engine.audioSwitchInFlight = 1
+        #expect(engine.consumeReloadSelection().audioTrackIndex == 1)
+        engine.audioSwitchInFlight = nil
+        engine.activeAudioTrackIndex = 3
+        #expect(engine.consumeReloadSelection().audioTrackIndex == 3)
+    }
+
+    /// A `stop()` or `load()` cancels the switch; its track is then nobody's intent.
+    @Test("a cancelled audio switch is not restored by a later reload")
+    func cancelledSwitchIsForgotten() throws {
+        let engine = try AetherEngine()
+        engine.pendingAudioSelection = 2
+        engine.audioSwitchInFlight = 1
+        engine.stop()
+        #expect(engine.pendingAudioSelection == nil)
+        #expect(engine.audioSwitchInFlight == nil)
+        #expect(engine.consumeReloadSelection().audioTrackIndex == nil)
+    }
+
     @Test("a pick made after the teardown is newer intent and wins over the snapshot")
     func newerIntentWins() throws {
         let engine = try AetherEngine()

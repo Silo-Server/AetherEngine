@@ -1635,6 +1635,22 @@ final class HLSLocalServer: @unchecked Sendable {
         return nil
     }
 
+    /// What a master tells AVPlayer about the audio, read back from the text itself so the log line cannot
+    /// drift from what is served: the variant's `CODECS`, whether an `EXT-X-MEDIA` audio rendition is
+    /// declared, and its `CHANNELS`, which is where HLS states a channel count and spatial or object
+    /// audio. `codecs="avc1.640029,apac.31.03" audioRendition=yes channels=none`.
+    static func masterAudioSummary(_ master: String) -> String {
+        func quoted(_ value: String?) -> String { value.map { "\"\($0)\"" } ?? "none" }
+        let lines = master.split(whereSeparator: \.isNewline).map(String.init)
+        let codecs = lines.first { $0.hasPrefix("#EXT-X-STREAM-INF:") }
+            .flatMap { HLSPlaylistParser.attribute("CODECS", in: $0) }
+        let rendition = lines.first {
+            $0.hasPrefix("#EXT-X-MEDIA:") && HLSPlaylistParser.attribute("TYPE", in: $0) == "AUDIO"
+        }
+        let channels = rendition.flatMap { HLSPlaylistParser.attribute("CHANNELS", in: $0) }
+        return "codecs=\(quoted(codecs)) audioRendition=\(rendition == nil ? "no" : "yes") channels=\(quoted(channels))"
+    }
+
     /// Pure playlist builders callable without a live server instance. subResourceBaseURL emits absolute URIs for AVAssetResourceLoader; nil emits relative URIs for the HTTP workflow.
     static func buildMasterPlaylistText(provider: HLSSegmentProvider,
                                          subResourceBaseURL: URL? = nil,

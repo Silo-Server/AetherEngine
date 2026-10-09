@@ -181,24 +181,26 @@ struct SpatialAudioBridgeTests {
 
     /// The APAC sample entry is written before any audio, so a decoder that never finds a major sync
     /// plays the picture over silence unless the bridge says so itself (AE#641).
+    final class Reports: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        func add() { lock.lock(); count += 1; lock.unlock() }
+        var value: Int { lock.lock(); defer { lock.unlock() }; return count }
+    }
+
     @Test("a decoder that returns or accepts nothing is reported once, at the threshold, and a healthy one never")
     func decodedNothingIsReportedOnce() throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
-        final class Reports: @unchecked Sendable {
-            private let lock = NSLock()
-            private var count = 0
-            func add() { lock.lock(); count += 1; lock.unlock() }
-            var value: Int { lock.lock(); defer { lock.unlock() }; return count }
-        }
         let silent = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
             decoder: SyntheticDecoder(skipAfterReset: .max))
         defer { silent.close() }
         let reports = Reports()
         silent.onDecoderProducedNothing = { _ in reports.add() }
-        _ = try feed(silent, startMs: 0, count: AudioBridge.silentFeedPacketThreshold - 1)
+        let threshold = SpatialAudioBridge.silentFeedPacketThreshold
+        _ = try feed(silent, startMs: 0, count: threshold - 1)
         #expect(reports.value == 0)
-        _ = try feed(silent, startMs: 1260, count: 40)
+        _ = try feed(silent, startMs: Int64(threshold - 1) * 20, count: 40)
         #expect(reports.value == 1)
 
         let rejecting = try SpatialAudioBridge(
@@ -206,7 +208,7 @@ struct SpatialAudioBridgeTests {
         defer { rejecting.close() }
         let rejected = Reports()
         rejecting.onDecoderProducedNothing = { _ in rejected.add() }
-        _ = try feed(rejecting, startMs: 0, count: AudioBridge.silentFeedPacketThreshold + 10)
+        _ = try feed(rejecting, startMs: 0, count: SpatialAudioBridge.silentFeedPacketThreshold + 10)
         #expect(rejected.value == 1)
 
         let healthy = try SpatialAudioBridge(
@@ -217,6 +219,35 @@ struct SpatialAudioBridgeTests {
         healthy.onDecoderProducedNothing = { _ in quiet.add() }
         _ = try feed(healthy, startMs: 0, count: 100)
         #expect(quiet.value == 0)
+    }
+
+    /// The resume that put a tvOS session into `.error`: TrueHD in Matroska or M2TS is one 40-frame
+    /// access unit per packet, and after a mid-stream start the decoder skips to the next major sync,
+    /// 102 access units on Dolby's Unfold demo. That wait is not a dead decoder.
+    @Test("a mid-stream start that waits 102 access units for a major sync is not reported as silence")
+    func majorSyncWaitIsNotSilence() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let bridge = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 48_000), layout: .l714,
+            decoder: SyntheticDecoder(skipAfterReset: 102))
+        defer { bridge.close() }
+        let reports = Reports()
+        bridge.onDecoderProducedNothing = { _ in reports.add() }
+        var emitted = 0
+        for i in 0..<300 {
+            guard let pkt = av_packet_alloc() else { continue }
+            defer { var p: UnsafeMutablePointer<AVPacket>? = pkt; av_packet_free(&p) }
+            _ = av_new_packet(pkt, 1)
+            pkt.pointee.pts = Int64(i) * 40
+            pkt.pointee.dts = pkt.pointee.pts
+            for fp in try bridge.feed(packet: pkt) {
+                emitted += 1
+                var p: UnsafeMutablePointer<AVPacket>? = fp
+                trackedPacketFree(&p)
+            }
+        }
+        #expect(reports.value == 0)
+        #expect(emitted > 0, "the decoder found its sync and the bridge encoded")
     }
 
     @Test("a producer restart re-anchors on the new position")
@@ -398,5 +429,135 @@ struct SpatialAudioBridgeTests {
             }
         }
         return nil
+    }
+}
+
+/// The bed level line is the engine's half of a missing-heights report: it says which channels of the
+/// rendered bed carried sound in what AVPlayer was handed, so a silent height here and a silent height
+/// at the receiver are told apart.
+@Suite("TrueHD Atmos bed level meter")
+struct BedLevelMeterTests {
+
+    /// `chunks` encode chunks (2048 frames, as the bridge feeds it) of a half-scale sine on one channel
+    /// of a 7.1.4 bed, the rest silent. At 48 kHz the 5 s first window closes on chunk 118 and a 30 s
+    /// window on chunk 704.
+    private func feed(_ meter: inout BedLevelMeter, chunks: Int, channel: Int = 0,
+                      startSeconds: Double? = nil) -> [String] {
+        let layout = SpatialSpeakerLayout.l714
+        let chunk = 2048
+        let planes = (0..<layout.channelCount).map { _ in UnsafeMutablePointer<Float>.allocate(capacity: chunk) }
+        defer { planes.forEach { $0.deallocate() } }
+        for c in planes.indices { planes[c].update(repeating: 0, count: chunk) }
+        for i in 0..<chunk { planes[channel][i] = 0.5 * sinf(2 * .pi * Float(i) / 64) }
+        var lines: [String] = []
+        for i in 0..<chunks {
+            let at = startSeconds.map { $0 + Double(i * chunk) / 48_000 }
+            if let line = meter.add(planes.map { UnsafePointer($0) }, frameCount: chunk, startSeconds: at) {
+                lines.append(line)
+            }
+        }
+        return lines
+    }
+
+    @Test("the first window closes after 5 s, later ones every 30 s, and a seek starts a short one again")
+    func windows() {
+        var meter = BedLevelMeter(layout: .l714, sampleRate: 48_000)
+        #expect(feed(&meter, chunks: 117).isEmpty)
+        #expect(feed(&meter, chunks: 1).count == 1)
+        #expect(feed(&meter, chunks: 703).isEmpty)
+        #expect(feed(&meter, chunks: 1).count == 1)
+        // Under a second is not worth a line; two seconds is, and the next window is a first one.
+        _ = feed(&meter, chunks: 23)
+        #expect(meter.restart() == nil)
+        _ = feed(&meter, chunks: 47)
+        #expect(meter.restart()?.contains("over 2.0 s") == true)
+        #expect(feed(&meter, chunks: 118).count == 1)
+    }
+
+    @Test("each channel carries its CoreAudio name in layout order with RMS and peak, a silent one -inf")
+    func levels() throws {
+        var meter = BedLevelMeter(layout: .l714, sampleRate: 48_000)
+        let line = try #require(feed(&meter, chunks: 118, channel: 9, startSeconds: 3725.4).first)
+        // A half-scale sine: RMS 0.354 is -9.0 dBFS, peak 0.5 is -6.0. The names are the ones
+        // CoreAudioBaseTypes.h gives kAudioChannelLayoutTag_Atmos_7_1_4, as on the route line.
+        #expect(line.hasPrefix("bed levels 7.1.4 at 3725.4 s over 5.0 s, rms/peak dBFS: L -inf/-inf, "
+                               + "R -inf/-inf, C -inf/-inf, LFE -inf/-inf, Ls -inf/-inf, Rs -inf/-inf, "
+                               + "Rls -inf/-inf, Rrs -inf/-inf, Vhl -inf/-inf, Vhr -9.0/-6.0, Ltr -inf/-inf, "
+                               + "Rtr -inf/-inf;"))
+    }
+
+    @Test("objects count as active with gain and as elevated only above ear level with elevation allowed")
+    func objectCounts() throws {
+        var meter = BedLevelMeter(layout: .l714, sampleRate: 48_000)
+        let roles: [ObjectAudioRole] = [.lfe, .object, .object, .object]
+        let heights = Set(SpatialSpeaker.allCases.filter(\.isHeight))
+        let first = ObjectAudioMetadataUpdate(frameOffset: 0, rampFrames: 0, states: [
+            .init(),
+            .init(position: SIMD3(0.5, 0.5, 1)),                       // overhead
+            .init(position: SIMD3(0.5, 0.5, 1), excluded: heights),     // elevation not allowed
+            .init(position: SIMD3(0.5, 0.5, 1), gain: 0),               // muted
+        ])
+        // A later update restates only the muted object; the others keep their last state.
+        let second = ObjectAudioMetadataUpdate(frameOffset: 0, rampFrames: 0, states: [
+            nil, nil, nil, .init(position: SIMD3(0, 0, 0)),
+        ])
+        meter.observe(roles: roles, updates: [first, second])
+        let line = try #require(feed(&meter, chunks: 118).first)
+        #expect(line.contains("; objects: up to 3 active, 1 elevated;"))
+        // Metadata that holds still sends no update; the next window still reports what plays.
+        let held = try #require(feed(&meter, chunks: 704).first)
+        #expect(held.contains("; objects: up to 3 active, 1 elevated;"))
+        // A seek forgets the objects until the decoder restates them.
+        _ = meter.restart()
+        let afterSeek = try #require(feed(&meter, chunks: 118).first)
+        #expect(afterSeek.contains("; objects: up to 0 active, 0 elevated;"))
+    }
+
+    @Test("a configuration without objects does not keep reporting the previous configuration's objects")
+    func countsResetOnConfigurationChange() throws {
+        var meter = BedLevelMeter(layout: .l714, sampleRate: 48_000)
+        meter.observe(roles: [.object], updates: [ObjectAudioMetadataUpdate(
+            frameOffset: 0, rampFrames: 0, states: [.init(position: SIMD3(0.5, 0.5, 1))])])
+        let first = try #require(feed(&meter, chunks: 118).first)
+        #expect(first.contains("; objects: up to 1 active, 1 elevated;"))
+        meter.observe(roles: [.bed(.left)], updates: [], configurationChanged: true)
+        // The window open at the change saw the object play; the one after it must not.
+        let during = try #require(feed(&meter, chunks: 704).first)
+        #expect(during.contains("; objects: up to 1 active, 1 elevated;"))
+        let after = try #require(feed(&meter, chunks: 704).first)
+        #expect(after.contains("; objects: up to 0 active, 0 elevated;"))
+    }
+
+    @Test("the line ends with the LFE element's input level and metadata gain, or says there is none")
+    func lfeInputAndGain() throws {
+        var meter = BedLevelMeter(layout: .l714, sampleRate: 48_000)
+        let roles: [ObjectAudioRole] = [.lfe, .object]
+        meter.observe(roles: roles, updates: [ObjectAudioMetadataUpdate(
+            frameOffset: 0, rampFrames: 0, states: [.init(gain: 0.5), .init(position: SIMD3(0.5, 0.5, 0))])])
+        let frames = 48_000
+        let lfe = UnsafeMutablePointer<Float>.allocate(capacity: frames)
+        let object = UnsafeMutablePointer<Float>.allocate(capacity: frames)
+        defer { lfe.deallocate(); object.deallocate() }
+        for i in 0..<frames { lfe[i] = 0.5 * sinf(2 * .pi * Float(i) / 64); object[i] = 0 }
+        meter.measureInput(roles: roles, planes: [UnsafePointer(lfe), UnsafePointer(object)], frameCount: frames)
+        let line = try #require(feed(&meter, chunks: 118).first)
+        #expect(line.hasSuffix("; LFE input -9.0 dBFS, metadata gain -6.0 dB"))
+
+        // TrueHD can carry LFE2 beside LFE; the renderer sums both, so the meter does too, and names
+        // each element's gain.
+        var twoLFE = BedLevelMeter(layout: .l714, sampleRate: 48_000)
+        let twoRoles: [ObjectAudioRole] = [.lfe, .lfe]
+        twoLFE.observe(roles: twoRoles, updates: [ObjectAudioMetadataUpdate(
+            frameOffset: 0, rampFrames: 0, states: [.init(), .init(gain: 0.5)])])
+        twoLFE.measureInput(roles: twoRoles, planes: [UnsafePointer(object), UnsafePointer(lfe)], frameCount: frames)
+        let both = try #require(feed(&twoLFE, chunks: 118).first)
+        #expect(both.hasSuffix("; LFE input -9.0 dBFS, metadata gain 0.0 dB/-6.0 dB"))
+
+        var noLFE = BedLevelMeter(layout: .l714, sampleRate: 48_000)
+        noLFE.observe(roles: [.object], updates: [])
+        let without = try #require(feed(&noLFE, chunks: 118).first)
+        #expect(without.hasSuffix("; no LFE element"))
+        #expect(BedLevelMeter.configurationSummary([.lfe] + Array(repeating: .object, count: 15)) == "LFE + 15 objects")
+        #expect(BedLevelMeter.configurationSummary([.bed(.left), .bed(.right), .object]) == "beds L R + no LFE + 1 objects")
     }
 }

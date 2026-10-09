@@ -3477,7 +3477,11 @@ public final class AetherEngine: ObservableObject {
     /// `sessionRebuildResumesPlaying`. See `rebuildResumesPlaying`.
     var transportIntentUnderReconstruction: Bool?
     private(set) var audioSelectionTask: Task<Void, Never>?
-    private var pendingAudioSelection: Int?
+    /// A `selectAudioTrack` pick not yet started, and the one whose rebuild is running. A reload that
+    /// lands meanwhile restores these before `activeAudioTrackIndex`, which the switch's own
+    /// `stopInternal` has just cleared (see `liveSelection`).
+    var pendingAudioSelection: Int?
+    var audioSwitchInFlight: Int?
     private var audioSelectionEpoch = UUID()
 
     private func cancelPendingAudioSelection() {
@@ -3485,6 +3489,9 @@ public final class AetherEngine: ObservableObject {
         audioSelectionTask?.cancel()
         audioSelectionTask = nil
         pendingAudioSelection = nil
+        // The cancelled switch is no longer anyone's intent: a reload that snapshots the selection
+        // before the cancelled task unwinds must not restore it.
+        audioSwitchInFlight = nil
     }
 
     /// AE#464 round 3: true while a re-anchor raised by `setAudioDelay` is running, so the presses
@@ -6988,8 +6995,13 @@ public final class AetherEngine: ObservableObject {
                 guard !Task.isCancelled, self.audioSelectionEpoch == epoch else { return }
                 if self.activeAudioTrackIndex == selected { continue }
                 let beforeReload = self.loadGeneration
+                self.audioSwitchInFlight = selected
                 let failure = await self.reloadWithAudioOverride(
                     url: url, audioStreamIndex: Int32(selected), expectedGeneration: beforeReload)
+                // A cancelled task returns late: the marker may now belong to a newer switch.
+                if self.audioSelectionEpoch == epoch, self.audioSwitchInFlight == selected {
+                    self.audioSwitchInFlight = nil
+                }
                 // This rebuild owns one stopInternal generation. Background teardown or
                 // another SDK recovery cannot lend its successor to queued audio work.
                 guard !Task.isCancelled, self.audioSelectionEpoch == epoch, failure == nil,
