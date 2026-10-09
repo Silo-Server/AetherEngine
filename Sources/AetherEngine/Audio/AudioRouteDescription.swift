@@ -64,8 +64,9 @@ enum AudioRouteDescription {
     /// A change mid-session leaves the session's start line describing a route that is gone, and a user
     /// switching output to test a theory is exactly that case. Installed on first touch, never removed.
     ///
-    /// A rendering-mode or spatial-capability change gets the same line: an HDMI sink can switch between
-    /// multichannel PCM and Dolby Atmos without the route itself changing.
+    /// A rendering-mode, rendering-capability or spatial-playback change gets the same line: an output
+    /// can switch between multichannel PCM and Dolby Atmos, or change the layouts it supports, without
+    /// the route itself changing.
     static let changeLogger: Void = {
         let session = AVAudioSession.sharedInstance()
         _ = NotificationCenter.default.addObserver(
@@ -76,6 +77,7 @@ enum AudioRouteDescription {
             EngineLog.emit("[AetherEngine] audioRoute changed reason=\(reason) \(route)", category: .engine)
         }
         for (name, what) in [(AVAudioSession.renderingModeChangeNotification, "rendering mode"),
+                             (AVAudioSession.renderingCapabilitiesChangeNotification, "rendering capabilities"),
                              (AVAudioSession.spatialPlaybackCapabilitiesChangedNotification, "spatial playback")] {
             _ = NotificationCenter.default.addObserver(forName: name, object: session, queue: nil) { _ in
                 guard let route = current() else { return }
