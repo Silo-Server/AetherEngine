@@ -2128,6 +2128,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.servedSourceIsHDR = videoRange != .sdr
         self.servedDolbyVisionConversion = convertP7ToProfile81 ? .profile7ToProfile81 : nil
         EngineLog.emit("[HLSVideoEngine] serving on \(url.absoluteString) (dvModeAvailable=\(dvModeAvailable) effectiveDvMode=\(effectiveDvMode) panelIsHDR=\(panelIsInHDRMode) displaySupportsHDR=\(displaySupportsHDR) matchContent=\(matchContentEnabled) sourceIsHDR=\(videoRange != .sdr || effectiveDvMode) useMaster=\(useMasterPlaylist) videoRange=\(videoRange) dvVariant=\(dvVariant) audioLang=\(servedAudioLanguage ?? "none"))")
+        // Everything the playlist says about the audio, and a media-direct session says nothing: AVPlayer
+        // then reads only the init segment.
+        let masterAudio = useMasterPlaylist
+            ? HLSLocalServer.masterAudioSummary(HLSLocalServer.buildMasterPlaylistText(provider: prov))
+            : "not served (media playlist only)"
+        EngineLog.emit("[HLSVideoEngine] master audio: \(masterAudio)", category: .session)
         return url
     }
 

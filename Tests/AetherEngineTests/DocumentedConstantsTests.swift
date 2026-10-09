@@ -239,6 +239,14 @@ final class DocumentedConstantsTests: XCTestCase {
                        "docs/formats.md and cli.md quote apac.31.04 for 16 channels")
     }
 
+    /// formats.md "TrueHD Atmos (object rendering)" and the CHANGELOG quote the bed level windows.
+    func testBedLevelWindowsAreWhatTheDocsSay() throws {
+        let docs = try documentation()
+        XCTAssertEqual(BedLevelMeter.firstWindowSeconds, 5)
+        XCTAssertEqual(BedLevelMeter.windowSeconds, 30)
+        assertDocumented("after the first 5 s of audio (and again after every seek), then every 30 s", docs)
+    }
+
     func testExternalSubtitleTrackIDBaseIsDocumented() throws {
         let docs = try documentation()
         XCTAssertEqual(AetherEngine.externalSubtitleTrackIDBase, 100_000)

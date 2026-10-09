@@ -400,3 +400,85 @@ struct SpatialAudioBridgeTests {
         return nil
     }
 }
+
+/// The bed level line is the engine's half of a missing-heights report: it says which channels of the
+/// rendered bed carried sound in what AVPlayer was handed, so a silent height here and a silent height
+/// at the receiver are told apart.
+@Suite("TrueHD Atmos bed level meter")
+struct BedLevelMeterTests {
+
+    /// `chunks` encode chunks (2048 frames, as the bridge feeds it) of a half-scale sine on one channel
+    /// of a 7.1.4 bed, the rest silent. At 48 kHz the 5 s first window closes on chunk 118 and a 30 s
+    /// window on chunk 704.
+    private func feed(_ meter: inout BedLevelMeter, chunks: Int, channel: Int = 0,
+                      startSeconds: Double? = nil) -> [String] {
+        let layout = SpatialSpeakerLayout.l714
+        let chunk = 2048
+        let planes = (0..<layout.channelCount).map { _ in UnsafeMutablePointer<Float>.allocate(capacity: chunk) }
+        defer { planes.forEach { $0.deallocate() } }
+        for c in planes.indices { planes[c].update(repeating: 0, count: chunk) }
+        for i in 0..<chunk { planes[channel][i] = 0.5 * sinf(2 * .pi * Float(i) / 64) }
+        var lines: [String] = []
+        for i in 0..<chunks {
+            let at = startSeconds.map { $0 + Double(i * chunk) / 48_000 }
+            if let line = meter.add(planes.map { UnsafePointer($0) }, frameCount: chunk, startSeconds: at) {
+                lines.append(line)
+            }
+        }
+        return lines
+    }
+
+    @Test("the first window closes after 5 s, later ones every 30 s, and a seek starts a short one again")
+    func windows() {
+        var meter = BedLevelMeter(layout: .l714, sampleRate: 48_000)
+        #expect(feed(&meter, chunks: 117).isEmpty)
+        #expect(feed(&meter, chunks: 1).count == 1)
+        #expect(feed(&meter, chunks: 703).isEmpty)
+        #expect(feed(&meter, chunks: 1).count == 1)
+        // Under a second is not worth a line; two seconds is, and the next window is a first one.
+        _ = feed(&meter, chunks: 23)
+        #expect(meter.restart() == nil)
+        _ = feed(&meter, chunks: 47)
+        #expect(meter.restart()?.contains("over 2.0 s") == true)
+        #expect(feed(&meter, chunks: 118).count == 1)
+    }
+
+    @Test("each channel carries its CoreAudio name in layout order with RMS and peak, a silent one -inf")
+    func levels() throws {
+        var meter = BedLevelMeter(layout: .l714, sampleRate: 48_000)
+        let line = try #require(feed(&meter, chunks: 118, channel: 9, startSeconds: 3725.4).first)
+        // A half-scale sine: RMS 0.354 is -9.0 dBFS, peak 0.5 is -6.0. The names are the ones
+        // CoreAudioBaseTypes.h gives kAudioChannelLayoutTag_Atmos_7_1_4, as on the route line.
+        #expect(line.hasPrefix("bed levels 7.1.4 at 3725.4 s over 5.0 s, rms/peak dBFS: L -inf/-inf, "
+                               + "R -inf/-inf, C -inf/-inf, LFE -inf/-inf, Ls -inf/-inf, Rs -inf/-inf, "
+                               + "Rls -inf/-inf, Rrs -inf/-inf, Vhl -inf/-inf, Vhr -9.0/-6.0, Ltr -inf/-inf, "
+                               + "Rtr -inf/-inf;"))
+    }
+
+    @Test("objects count as active with gain and as elevated only above ear level with elevation allowed")
+    func objectCounts() throws {
+        var meter = BedLevelMeter(layout: .l714, sampleRate: 48_000)
+        let roles: [ObjectAudioRole] = [.lfe, .object, .object, .object]
+        let heights = Set(SpatialSpeaker.allCases.filter(\.isHeight))
+        let first = ObjectAudioMetadataUpdate(frameOffset: 0, rampFrames: 0, states: [
+            .init(),
+            .init(position: SIMD3(0.5, 0.5, 1)),                       // overhead
+            .init(position: SIMD3(0.5, 0.5, 1), excluded: heights),     // elevation not allowed
+            .init(position: SIMD3(0.5, 0.5, 1), gain: 0),               // muted
+        ])
+        // A later update restates only the muted object; the others keep their last state.
+        let second = ObjectAudioMetadataUpdate(frameOffset: 0, rampFrames: 0, states: [
+            nil, nil, nil, .init(position: SIMD3(0, 0, 0)),
+        ])
+        meter.observe(roles: roles, updates: [first, second])
+        let line = try #require(feed(&meter, chunks: 118).first)
+        #expect(line.hasSuffix("; objects: up to 3 active, 1 elevated"))
+        // Metadata that holds still sends no update; the next window still reports what plays.
+        let held = try #require(feed(&meter, chunks: 704).first)
+        #expect(held.hasSuffix("; objects: up to 3 active, 1 elevated"))
+        // A seek forgets the objects until the decoder restates them.
+        _ = meter.restart()
+        let afterSeek = try #require(feed(&meter, chunks: 118).first)
+        #expect(afterSeek.hasSuffix("; objects: up to 0 active, 0 elevated"))
+    }
+}

@@ -2282,6 +2282,13 @@ final class NativeAVPlayerHost {
 
     /// Dump item.tracks at readyToPlay (HLS: asset.tracks is empty; item.tracks has the resolved list after playlist+init.mp4 parse). Channel layout tag diagnoses multichannel-routing path.
     private static func dumpPlayerItemTracks(_ item: AVPlayerItem, sid: Int) async {
+        // Whether AVPlayer may spatialize (virtualize) multichannel audio on this item: one of the
+        // candidates when a bed's heights come out of the floor speakers.
+        EngineLog.emit(
+            "[NativeAVPlayerHost] #\(sid) item.allowedAudioSpatializationFormats="
+            + "\(spatializationFormatsName(item.allowedAudioSpatializationFormats)) (readyToPlay)",
+            category: .engine
+        )
         let tracks = item.tracks
         if tracks.isEmpty {
             EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.tracks empty (readyToPlay)", category: .engine)
@@ -2754,6 +2761,16 @@ final class NativeAVPlayerHost {
         // AE#684: the route's own latency rides on the line, per item, beside the item's start.
         guard let route = AudioRouteDescription.current() else { return }
         EngineLog.emit("[NativeAVPlayerHost] #\(sid) audioRoute \(route) (\(phase))", category: .engine)
+    }
+
+    nonisolated static func spatializationFormatsName(_ formats: AVAudioSpatializationFormats) -> String {
+        switch formats {
+        case []: return "none"
+        case .monoAndStereo: return "monoAndStereo"
+        case .multichannel: return "multichannel"
+        case .monoStereoAndMultichannel: return "monoStereoAndMultichannel"
+        default: return "raw\(formats.rawValue)"
+        }
     }
 
     /// Read sr/ch/bits/layoutTag from CMAudioFormatDescription. Layout tag diagnoses where downmix occurs: unknown/stereo tag = AVPlayer parse layer; correct 7.1 tag = route/soundbar layer.

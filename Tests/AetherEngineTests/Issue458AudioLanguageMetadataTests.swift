@@ -207,6 +207,20 @@ struct Issue458AudioRenditionPlaylistTests {
         #expect(!master.contains("AUDIO=\"aud\""))
     }
 
+    /// The session log's `master audio:` line, read back from the served text so it cannot drift from it.
+    @Test("the master audio summary reads codecs, the rendition and its CHANNELS off the master text")
+    func masterAudioSummary() {
+        let labelled = HLSLocalServer.buildMasterPlaylistText(
+            provider: AudioRenditionMockProvider(audio: (language: "eng", name: "English")))
+        #expect(HLSLocalServer.masterAudioSummary(labelled)
+                == "codecs=\"hvc1.1.6.L120.90,mp4a.40.2\" audioRendition=yes channels=none")
+        let unlabelled = HLSLocalServer.buildMasterPlaylistText(provider: AudioRenditionMockProvider(audio: nil))
+        #expect(HLSLocalServer.masterAudioSummary(unlabelled)
+                == "codecs=\"hvc1.1.6.L120.90,mp4a.40.2\" audioRendition=no channels=none")
+        let declared = labelled.replacingOccurrences(of: "AUTOSELECT=YES", with: "AUTOSELECT=YES,CHANNELS=\"12/-/BED-12\"")
+        #expect(HLSLocalServer.masterAudioSummary(declared).hasSuffix("channels=\"12/-/BED-12\""))
+    }
+
     /// A group referenced by a variant has to exist, or AVPlayer fails the master outright.
     @Test("the variant's AUDIO attribute and the group it names appear together or not at all")
     func groupReferenceIsConsistent() {
