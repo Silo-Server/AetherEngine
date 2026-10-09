@@ -96,7 +96,7 @@ struct Issue378SourceRefusedTests {
 
     /// The regression guard for #281: an origin that answers the suffix form itself — here with a
     /// 416 — is still remembered after one occurrence.
-    @Test("a 416 to the suffix form still latches")
+    @Test("a 416 to the suffix form still latches", .timeLimit(.minutes(1)))
     func rangeNotSatisfiableStillLatches() async throws {
         let declared: Int64 = 4 * 1024 * 1024 * 1024
         let server = try #require(ScriptedOriginServer { recorded in
@@ -114,9 +114,7 @@ struct Issue378SourceRefusedTests {
         let reader = AVIOReader(url: url)
         defer { reader.markClosed(); reader.close() }
         try reader.open()
-        for _ in 0..<100 where SuffixRangeSupport.shared.denialReason(for: url) == nil {
-            try? await Task.sleep(nanoseconds: 20_000_000)
-        }
+        try await waitFor { SuffixRangeSupport.shared.denialReason(for: url) != nil }
         let reason = try #require(SuffixRangeSupport.shared.denialReason(for: url))
         #expect(reason.contains("416"))
     }

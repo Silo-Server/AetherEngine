@@ -62,17 +62,19 @@ final class LiveRecordingQueue: @unchecked Sendable {
     }
 
     /// Drains what is queued and stops accepting. Blocks the CALLER, never the demux thread: only
-    /// `stopRecording` and teardown call it.
+    /// the writer's teardown calls it, and never from the main actor.
     func finish() {
         lock.lock()
         finished = true
         lock.unlock()
-        // Let an in-flight pump finish, then drain whatever it left behind, then let that finish.
-        queue.sync { }
-        pump()
-        queue.sync { }
+        // The queue is serial, so an in-flight pump finishes first and this one drains what it left.
+        queue.sync { pump() }
     }
 
+    /// Audit REC-1: takes the backlog a batch at a time. `removeFirst()` per item shifted the whole
+    /// array each time, quadratic on the tens of thousands of small packets the ceiling admits. The
+    /// bytes still leave `pendingBytes` one write at a time, so the ceiling keeps counting a batch
+    /// that is taken but not yet on disk.
     private func pump() {
         while true {
             lock.lock()
@@ -81,10 +83,15 @@ final class LiveRecordingQueue: @unchecked Sendable {
                 lock.unlock()
                 return
             }
-            let item = pending.removeFirst()
-            pendingBytes -= item.bytes.count
+            var batch: [QueuedPacket] = []
+            swap(&batch, &pending)
             lock.unlock()
-            drain(item)
+            for item in batch {
+                drain(item)
+                lock.lock()
+                pendingBytes -= item.bytes.count
+                lock.unlock()
+            }
         }
     }
 }

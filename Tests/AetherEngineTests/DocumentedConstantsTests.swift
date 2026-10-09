@@ -303,6 +303,22 @@ final class DocumentedConstantsTests: XCTestCase {
             """)
     }
 
+    /// The README's Swift and Xcode rows are the toolchain CI builds and tests with, not a taste
+    /// (audit OPS-103): every macOS job runs on the `xcode-27` image and none selects another Xcode.
+    /// Moving CI to another image without the rows, or the rows without CI, fails here.
+    func testToolchainRowsAreTheOnesCITestsWith() throws {
+        let ci = try sourceFile(".github/workflows/ci.yml")
+        let macOSJobs = ci.components(separatedBy: "runs-on: ").dropFirst()
+            .map { entry in entry.prefix { !$0.isNewline } }
+            .filter { !$0.hasPrefix("ubuntu") }
+        XCTAssertFalse(macOSJobs.isEmpty, "ci.yml has no macOS job")
+        XCTAssertTrue(macOSJobs.allSatisfy { $0 == "xcode-27" }, "macOS jobs run on \(macOSJobs)")
+        XCTAssertFalse(ci.contains("xcode-version:"), "a job selects its own Xcode instead of the image's")
+        let docs = try documentation()
+        assertDocumented("| Xcode | 27.0 |", docs)
+        assertDocumented("| Swift | 6.4 |", docs)
+    }
+
     /// The docs corpus is README + docs/; a claim living in a source docstring is read straight.
     private func sourceFile(_ relativePath: String) throws -> String {
         guard let text = try? String(contentsOf: Self.repoRoot.appendingPathComponent(relativePath),

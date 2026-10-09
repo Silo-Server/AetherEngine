@@ -65,8 +65,8 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
     /// limit in force on material the coverage model cannot describe.
     private var storedVideoSeconds: Double?
     private var consumedVideoSeconds: Double?
-    private var videoCoverage = SoftwarePacketCoverage()
-    private var audioCoverage = SoftwarePacketCoverage()
+    private var videoCoverage: SoftwarePacketCoverage
+    private var audioCoverage: SoftwarePacketCoverage
     private var presentationCoverage: SoftwareVideoPacketCoverage?
     private struct Keyframe {
         let seconds: Double
@@ -79,6 +79,7 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
     init(video: Stream, audio: Stream?, byteBudget: Int, forwardSeconds: Double,
          initialSourceClock: Double, fifo: SoftwarePacketDiskFIFO,
          videoReorderDepth: Int? = nil,
+         coverageRangeCap: Int = 4096,
          beforeConsumerOperation: (@Sendable () -> Void)? = nil,
          readSource: @escaping @Sendable (@Sendable () -> Bool) throws -> SoftwareStoredPacket?) {
         self.video = video
@@ -87,9 +88,12 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         self.forwardSeconds = max(1, forwardSeconds)
         self.sourceClock = initialSourceClock
         self.fifo = fifo
+        self.videoCoverage = SoftwarePacketCoverage(maximumRangeCount: coverageRangeCap)
+        self.audioCoverage = SoftwarePacketCoverage(maximumRangeCount: coverageRangeCap)
         self.presentationCoverage = videoReorderDepth.map {
             SoftwareVideoPacketCoverage(timeBaseNumerator: video.numerator,
-                timeBaseDenominator: video.denominator, reorderDepth: $0)
+                timeBaseDenominator: video.denominator, reorderDepth: $0,
+                maximumRangeCount: coverageRangeCap)
         }
         self.beforeConsumerOperation = beforeConsumerOperation
         self.readSource = readSource
@@ -216,6 +220,54 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         return false
     }
 
+    /// AE#605: the retained video packets a scrub still at `seconds` needs, keyframe first, or nil
+    /// when the store cannot answer it. Any thread except main: it reads the disk.
+    ///
+    /// Eligibility is the cached seek's own rule, coverage past the target plus a retained keyframe
+    /// at or before it, so a still is offered exactly where a commit to that position would be a
+    /// cache hit, and the card never shows a picture the seek then has to fetch. Unlike the live
+    /// ring there is no clamp at the end: a VOD target past the frontier has a real frame the store
+    /// does not hold yet, and the frame before it is the wrong answer. The consumer cursor is not
+    /// touched, so playback reads on from where it stood.
+    func stillRun(atSeconds seconds: Double, maxPackets: Int, maxSpanSeconds: Double,
+                  reorderTail: Int) -> [SoftwareStoredPacket]? {
+        guard seconds.isFinite, maxPackets > 0 else { return nil }
+        condition.lock()
+        let eligible = !closed && !sourceRepositioning && !resetPending && failure == nil
+            && (frontierLocked(at: seconds).map { $0 > seconds } ?? false)
+        let anchor = eligible
+            ? keyframes.filter { $0.seconds <= seconds }.max { $0.seconds < $1.seconds } : nil
+        condition.unlock()
+        guard let anchor, seconds - anchor.seconds <= maxSpanSeconds else { return nil }
+
+        var run: [SoftwareStoredPacket] = []
+        var reached = false
+        var tail = reorderTail
+        var overflow = false
+        do {
+            try fifo.readHistory(from: anchor.cursor) { data in
+                let packet = try SoftwareStoredPacket.decode(data)
+                guard packet.streamIndex == video.index else { return true }
+                if run.isEmpty, packet.flags & 1 == 0 { overflow = true; return false }
+                run.append(packet)
+                if run.count > maxPackets { overflow = true; return false }
+                if reached {
+                    tail -= 1
+                    return tail > 0
+                }
+                if let pts = videoSeconds(pts: packet.pts), pts >= seconds {
+                    reached = true
+                    return tail > 0
+                }
+                return true
+            }
+        } catch {
+            return nil
+        }
+        guard reached, !overflow else { return nil }
+        return run
+    }
+
     func endSeek(_ token: UInt64, sourceClock: Double) {
         condition.lock(); defer { condition.unlock() }
         guard token == generation, !closed else { return }
@@ -320,6 +372,21 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
             video: videoEnd, audio: audioEnd, requiresAudio: audio != nil)
     }
 
+    /// The playhead in a stream's ticks, rounded down so a prune never reaches past it.
+    ///
+    /// #613: coverage keeps its history behind the playhead for backward cached seeks, so a long
+    /// session fills the range cap. A full coverage used to stop describing new packets (duration
+    /// model) or invalidate itself (successor model), which left every frontier after the cap nil.
+    /// Forgetting what lies wholly behind the playhead instead costs a backward cached seek into that
+    /// history, which then goes cold.
+    private func playheadTick(_ stream: Stream) -> Int64? {
+        guard stream.numerator > 0, stream.denominator > 0 else { return nil }
+        let ticks = (sourceClock * Double(stream.denominator) / Double(stream.numerator))
+            .rounded(.down)
+        guard ticks.isFinite, ticks > -9.0e18, ticks < 9.0e18 else { return nil }
+        return Int64(ticks)
+    }
+
     private func clearSourceMetadataLocked() {
         count = 0; bytes = 0; residentBytes = 0
         ended = false; failure = nil
@@ -418,8 +485,14 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
                         copyDiskStateLocked(state)
                         if packet.streamIndex == video.index {
                             if presentationCoverage != nil {
+                                if presentationCoverage?.isFull == true, let tick = playheadTick(video) {
+                                    presentationCoverage?.prune(before: tick)
+                                }
                                 presentationCoverage?.insert(pts: packet.pts)
                             } else {
+                                if videoCoverage.isFull, let tick = playheadTick(video) {
+                                    videoCoverage.prune(before: tick)
+                                }
                                 videoCoverage.insert(pts: packet.pts, duration: packet.duration)
                             }
                             if let seconds = videoSeconds(pts: packet.pts) { storedVideoSeconds = seconds }
@@ -429,7 +502,10 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
                                     keyframes.removeFirst(min(1024, keyframes.count))
                                 }
                             }
-                        } else if packet.streamIndex == audio?.index {
+                        } else if let audio, packet.streamIndex == audio.index {
+                            if audioCoverage.isFull, let tick = playheadTick(audio) {
+                                audioCoverage.prune(before: tick)
+                            }
                             audioCoverage.insert(pts: packet.pts, duration: packet.duration)
                         }
                     }

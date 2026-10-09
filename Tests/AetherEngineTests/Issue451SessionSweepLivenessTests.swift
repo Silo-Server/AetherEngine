@@ -111,7 +111,7 @@ struct Issue451SessionSweepLivenessTests {
         #expect(c.totalBytes == 512)
 
         // Whatever removed it (a sibling's sweep, the OS reclaiming tmp) is outside this class.
-        try? FileManager.default.removeItem(at: c.sessionDir.appendingPathComponent("seg-4.m4s"))
+        if let url = c.peekURL(index: 4) { try? FileManager.default.removeItem(at: url) }
 
         #expect(c.peekURL(index: 4) == nil,
                 "a URL handed to a response must name a file that exists")
@@ -127,7 +127,7 @@ struct Issue451SessionSweepLivenessTests {
         let c = SegmentCache(baseDirectory: base)
         defer { c.close() }
         c.store(index: 2, data: Data(repeating: 0xDD, count: 64))
-        try? FileManager.default.removeItem(at: c.sessionDir.appendingPathComponent("seg-2.m4s"))
+        if let url = c.peekURL(index: 2) { try? FileManager.default.removeItem(at: url) }
 
         // The serve that finds nothing answers a retriable 503; without dropping the entry, the
         // next fetch takes the same branch and the producer is never asked to make it again.

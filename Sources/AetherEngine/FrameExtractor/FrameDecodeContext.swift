@@ -1,6 +1,7 @@
 import Foundation
 import CoreGraphics
 import CoreMedia
+import CoreVideo
 import AetherLibavformat
 import AetherLibavcodec
 import AetherLibavutil
@@ -79,6 +80,14 @@ final class FrameDecodeContext: @unchecked Sendable {
             return false
         }
         return false
+    }
+
+    /// Whether this open may ask VideoToolbox. A no-base-layer Dolby Vision title stays on software
+    /// (audit BIT-102): VideoToolbox hands 10-bit 4:2:0 over as P010, `DolbyVisionStillConverter` accepts
+    /// only `yuv420p10le`, and the IPT-PQ-C2 planes then went through the BT.2020 tone map, which is the
+    /// green / magenta cast #103 fixed.
+    static func stillUsesHardware(allows: Bool, disabled: Bool, dvNoBaseLayer: Bool) -> Bool {
+        allows && !disabled && !dvNoBaseLayer
     }
 
     /// Thread budget for the disposable still/thumbnail decoder. Capped well below the
@@ -214,7 +223,8 @@ final class FrameDecodeContext: @unchecked Sendable {
             throw FrameDecodeError.unsupportedCodec
         }
         var openedWithHardware = false
-        if allowsHardwareDecode, !hardwareDecodeDisabled {
+        if Self.stillUsesHardware(allows: allowsHardwareDecode, disabled: hardwareDecodeDisabled,
+                                  dvNoBaseLayer: isDolbyVisionNoBaseLayer) {
             let deviceResult = av_hwdevice_ctx_create(
                 &hardwareDeviceContext, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, nil, nil, 0)
             if deviceResult >= 0, hardwareDeviceContext != nil {
@@ -404,8 +414,8 @@ final class FrameDecodeContext: @unchecked Sendable {
 
         demuxer.seek(to: seekSeconds)
 
-        guard timeBase.num > 0 else { return nil }
-        let targetPTS = Int64((seekSeconds * Double(timeBase.den)) / Double(timeBase.num))
+        // A target the stream's own time base cannot hold is no position in it (audit BIT-105).
+        guard let targetPTS = Demuxer.ticks(forSeconds: seekSeconds, timeBase: timeBase) else { return nil }
 
         var frame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
         guard frame != nil else { return nil }
@@ -615,6 +625,29 @@ final class FrameDecodeContext: @unchecked Sendable {
         return AVRational(num: 1, den: 1)
     }
 
+    /// The sws coefficient table for the matrix `ColorAttachments.presented` resolves, so a gap is
+    /// filled here exactly as it is on the buffer playback shows.
+    static func swsColorspace(for description: ColorDescription) -> Int32 {
+        switch ColorAttachments.presented(description).matrix {
+        case kCVImageBufferYCbCrMatrix_ITU_R_601_4:     SWS_CS_ITU601
+        case kCVImageBufferYCbCrMatrix_ITU_R_2020:      SWS_CS_BT2020
+        case kCVImageBufferYCbCrMatrix_SMPTE_240M_1995: SWS_CS_SMPTE240M
+        default:                                        SWS_CS_ITU709
+        }
+    }
+
+    /// Full range when the frame says so, or when its pixel format is one of the JPEG variants that
+    /// carry the range in the format rather than in `color_range`.
+    static func isFullRange(_ frame: UnsafePointer<AVFrame>) -> Bool {
+        if frame.pointee.color_range == AVCOL_RANGE_JPEG { return true }
+        switch AVPixelFormat(rawValue: frame.pointee.format) {
+        case AV_PIX_FMT_YUVJ420P, AV_PIX_FMT_YUVJ422P, AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_YUVJ440P, AV_PIX_FMT_YUVJ411P:
+            return true
+        default:
+            return false
+        }
+    }
+
     /// sws_scale the frame to RGBA at `targetWidth` (height from source aspect) into an
     /// owned-buffer CGImage. Mirrors the sws tuple-pointer dance in SoftwareVideoDecoder.
     private func convertToCGImage(frame: UnsafeMutablePointer<AVFrame>, targetWidth: Int) -> CGImage? {
@@ -637,6 +670,14 @@ final class FrameDecodeContext: @unchecked Sendable {
             Int32(SWS_BILINEAR.rawValue), nil, nil, nil
         )
         guard swsContext != nil else { return nil }
+        // Without this sws converts every picture with its BT.601 default, which put a 1080p
+        // BT.709 colour bar up to 33 levels off in the still while playback showed it right.
+        // The matrix comes from the rule the displayed buffer is tagged by, so both agree.
+        let description = ColorDescription(frame: frame)
+        let coefficients = sws_getCoefficients(Self.swsColorspace(for: description))
+        sws_setColorspaceDetails(
+            swsContext, coefficients, Self.isFullRange(frame) ? 1 : 0,
+            coefficients, 1, 0, 1 << 16, 1 << 16)
 
         let bytesPerRow = dstW * 4
         var rgba = [UInt8](repeating: 0, count: bytesPerRow * dstH)
@@ -674,7 +715,8 @@ final class FrameDecodeContext: @unchecked Sendable {
 
         let data = Data(rgba)
         guard let provider = CGDataProvider(data: data as CFData),
-              let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
+              let colorSpace = ColorAttachments.colorSpace(for: ColorAttachments.presented(description))
+                ?? CGColorSpace(name: CGColorSpace.sRGB) else {
             return nil
         }
         // sws_scale RGBA yields opaque pixels (alpha 0xFF), so alpha is ignorable not premultiplied.

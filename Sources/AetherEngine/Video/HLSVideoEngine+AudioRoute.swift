@@ -131,6 +131,26 @@ extension HLSVideoEngine {
         hadSourceAudioStream ? .droppedNoPipeline : .noAudioInSource
     }
 
+    /// AE#641: the bridge decoded not one frame of the selected stream. A FLAC sample entry is built from
+    /// the encoder's extradata, so no muxer death follows on that route: a live session serves an
+    /// audio track that is never filled and AVPlayer waits on it, a VOD session plays silently while
+    /// reporting `.bridged`. Live hands it to the engine, which rebuilds video-only; VOD surfaces
+    /// the same verdict the E-AC-3 route reaches through its failed cut, so a host can hand the
+    /// position to a player that decodes the track itself.
+    func handleBridgeDecodedNothing(streamIndex: Int32, summary: String) {
+        if isLiveSession {
+            onLiveAudioDecodesNothing?(streamIndex, summary)
+            return
+        }
+        EngineLog.emit(
+            "[HLSVideoEngine] AE#641 the VOD audio bridge decoded nothing from stream \(streamIndex) "
+            + "(\(summary)); surfacing it instead of playing silently",
+            category: .session
+        )
+        surfaceVODSourceFailure(FFmpegErr.einval, "Audio track could not be decoded",
+                                kind: .audioBridgeProducedNoOutput)
+    }
+
     /// Guards `audioSourceStreamIndexOverride` against stale picker selections from a previous title.
     static func isAudioStream(demuxer: Demuxer, index: Int32) -> Bool {
         guard index >= 0, let stream = demuxer.stream(at: index) else {
@@ -147,6 +167,7 @@ extension HLSVideoEngine {
         streamCopyAudio: HLSSegmentProducer.AudioConfig?,
         sourceAudioStreamIndex: Int32,
         sourceAudioStream: UnsafeMutablePointer<AVStream>?,
+        sourceCarriesAudio: Bool,
         audioHLSCodecs: inout String?,
         audioLanguage: String? = nil
     ) throws -> HLSSegmentProducer {
@@ -160,13 +181,25 @@ extension HLSVideoEngine {
         // AE#462 harness (TEST-ONLY): both attempts are skipped so the video-only tail is reachable
         // without a source this build has no decoder for. Loud, because a run that read as a real
         // classification would be worse than no harness at all.
-        let forcedDrop = AetherEngine.forceAudioPipelineFailureForTesting
-        if forcedDrop {
+        let forcedForTesting = AetherEngine.forceAudioPipelineFailureForTesting
+        if forcedForTesting {
             EngineLog.emit(
                 "[HLSVideoEngine] TEST-ONLY: audio pipeline forced to fail, skipping stream-copy and bridge",
                 category: .session
             )
         }
+        // AE#641: this session's bridge already decoded nothing from this stream, and a second
+        // bridge would be handed the same bytes.
+        let knownUndecodable = Self.isKnownUndecodable(
+            undecodableAudioStreamIndices, sourceAudioStreamIndex: sourceAudioStreamIndex)
+        if knownUndecodable {
+            EngineLog.emit(
+                "[HLSVideoEngine] AE#641 audio stream \(sourceAudioStreamIndex) decoded nothing earlier "
+                + "in this session; skipping stream-copy and bridge",
+                category: .session
+            )
+        }
+        let forcedDrop = forcedForTesting || knownUndecodable
 
         let sourceCodecLabel: String = {  // falls back to "audio" for codecs with no libavcodec name entry
             if let stream = sourceAudioStream,
@@ -186,7 +219,8 @@ extension HLSVideoEngine {
                 codecTagOverride: vcfg.codecTagOverride,
                 doviConfig: vcfg.doviConfig,
                 colorOverride: vcfg.colorOverride,
-                extradataOverride: vcfg.extradataOverride
+                extradataOverride: vcfg.extradataOverride,
+                convertsAnnexBSamples: vcfg.convertsAnnexBSamples
             )
             let probeAudio = MP4SegmentMuxer.AudioConfig(
                 codecpar: cfg.codecpar,
@@ -313,6 +347,12 @@ extension HLSVideoEngine {
                 )
                 self.savedAudioConfig = cfg
                 self.audioBridge = bridge
+                if sideAudioDemuxer == nil {
+                    let streamIndex = sourceAudioStreamIndex
+                    bridge.onDecoderProducedNothing = { [weak self] stats in
+                        self?.handleBridgeDecodedNothing(streamIndex: streamIndex, summary: stats.summary)
+                    }
+                }
                 do {
                     let prod = try makeProducer(baseIndex: initialProducerBaseIndex)
                     // The label and the CODECS attribute come from the encoder the bridge ACTUALLY opened,
@@ -359,8 +399,12 @@ extension HLSVideoEngine {
         // AE#462: the drop becomes a fact the host can read, and a line that says which of the two
         // silences this is. The ERROR lines above name a failure; this one names the outcome, which
         // is what a reader of the log is actually looking for.
+        // AE#641: whether the SOURCE has audio, not whether a stream was picked. `av_find_best_stream`
+        // passes over an audio stream whose parameters the probe left empty, and on VOD nothing falls
+        // back to it, so a source with an undecodable track used to read as one without audio.
         self.audioDelivery = Self.videoOnlyAudioDelivery(
-            hadSourceAudioStream: sourceAudioStream != nil && sourceAudioStreamIndex >= 0)
+            hadSourceAudioStream: sourceCarriesAudio
+                || (sourceAudioStream != nil && sourceAudioStreamIndex >= 0))
         EngineLog.emit(
             "[HLSVideoEngine] audio delivery = \(audioDelivery.rawValue)"
             + (audioDelivery == .droppedNoPipeline

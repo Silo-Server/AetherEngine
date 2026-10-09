@@ -266,6 +266,50 @@ struct RemoteHLSSubtitleProxyTests {
         #expect(merged.isEmpty)
     }
 
+    // MARK: - NAT-1: a hostile EXTINF never reaches Int(Double)
+
+    private static func seg(_ duration: Double) -> HLSMediaSegment {
+        HLSMediaSegment(uri: "s.ts", duration: duration, discontinuityBefore: false)
+    }
+
+    @Test("An infinite, negative or absurd EXTINF is refused before it becomes a program duration")
+    func rejectsHostileSegmentDurations() {
+        #expect(throws: RemoteHLSSubtitleProxy.Refusal.self) {
+            _ = try RemoteHLSSubtitleProxy.sumSegmentDurations([Self.seg(.infinity)])
+        }
+        #expect(throws: RemoteHLSSubtitleProxy.Refusal.self) {
+            _ = try RemoteHLSSubtitleProxy.sumSegmentDurations([Self.seg(.nan)])
+        }
+        #expect(throws: RemoteHLSSubtitleProxy.Refusal.self) {
+            _ = try RemoteHLSSubtitleProxy.sumSegmentDurations([Self.seg(-1)])
+        }
+        #expect(throws: RemoteHLSSubtitleProxy.Refusal.self) {
+            // Finite, but a sum this large is still out of range (audit NAT-1's "finite but huge" case).
+            _ = try RemoteHLSSubtitleProxy.sumSegmentDurations([Self.seg(5e18), Self.seg(5e18)])
+        }
+    }
+
+    @Test("An ordinary EXTINF sum is unaffected")
+    func sumsOrdinaryDurations() throws {
+        let total = try RemoteHLSSubtitleProxy.sumSegmentDurations([Self.seg(5), Self.seg(6.5)])
+        #expect(total == 11.5)
+    }
+
+    @Test("A non-finite or absurd program duration is clamped before it reaches the provider's segment")
+    func providerClampsAHostileProgramDuration() {
+        let providerInf = RemoteHLSSubtitleProvider(
+            tracks: [], masterBody: Self.master, programDuration: .infinity, defaultHeaders: [:])
+        #expect(providerInf.segmentDuration(at: 0).isFinite)
+
+        let providerHuge = RemoteHLSSubtitleProvider(
+            tracks: [], masterBody: Self.master, programDuration: 5e18, defaultHeaders: [:])
+        #expect(providerHuge.segmentDuration(at: 0) <= RemoteHLSSubtitleProxy.maxProgramDurationSeconds)
+
+        let providerNaN = RemoteHLSSubtitleProvider(
+            tracks: [], masterBody: Self.master, programDuration: .nan, defaultHeaders: [:])
+        #expect(providerNaN.segmentDuration(at: 0) == 1)
+    }
+
     @Test("Without an m3u8/NAME the display name is still the key")
     func injectionKeyFallsBackToDisplayName() {
         let bare = RemoteHLSMediaSelection.LegibleOption(

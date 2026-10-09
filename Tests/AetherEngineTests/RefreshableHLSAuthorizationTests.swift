@@ -149,7 +149,7 @@ struct RefreshableHLSAuthorizationTests {
         let server = HLSLocalServer(relay: relay)
         try server.start()
         defer { server.stop(); relay.stop() }
-        relay.admit(origin.url("/media.m3u8"))
+        relay.grantCredentials(to: origin.url("/media.m3u8"))
         let playlist = relay.rewritePlaylist("#EXTM3U\nhttp://localhost:\(origin.port)/foreign.ts\n",
             relativeTo: origin.url("/media.m3u8"), port: server.port, token: server.pathToken)
         let entry = try #require(URL(string: String(playlist.split(separator: "\n")[1])))
@@ -201,7 +201,7 @@ struct RefreshableHLSAuthorizationTests {
         let server = HLSLocalServer(relay: relay)
         try server.start()
         defer { server.stop(); relay.stop() }
-        relay.admit(origin.url("/media"), httpHeaders: ["X-Static-Secret": "never-forward"])
+        relay.grantCredentials(to: origin.url("/media"), httpHeaders: ["X-Static-Secret": "never-forward"])
         let entry = try #require(server.relayURL(for: origin.url("/media")))
         _ = try await URLSession.shared.data(from: entry)
         await state.setToken("fresh")
@@ -277,7 +277,7 @@ struct RefreshableHLSAuthorizationTests {
                        "X-Emby-Authorization": "private", "X-MediaBrowser-Token": "private",
                        "User-Agent": "SyntheticPlayer", "X-Transport": "preserved"]
         let relay = HLSOriginRelay()
-        relay.admit(origin.url(path), httpHeaders: headers)
+        relay.grantCredentials(to: origin.url(path), httpHeaders: headers)
         let server = HLSLocalServer(relay: relay)
         try server.start()
         defer { server.stop(); relay.stop() }
@@ -306,7 +306,7 @@ struct RefreshableHLSAuthorizationTests {
         let (data, _) = try await URLSession.shared.data(from: entry)
         #expect(origin.requests.map { $0["authorization"] } == ["Bearer /redirect", "Bearer /final/media.m3u8"])
         let line = try #require(String(decoding: data, as: UTF8.self).split(separator: "\n").first { !$0.hasPrefix("#") })
-        #expect(HLSOriginRelay.originURL(fromQuery: URL(string: String(line))!.query!) == origin.url("/final/segment.ts"))
+        #expect(relay.originURL(fromQuery: URL(string: String(line))!.query!) == origin.url("/final/segment.ts"))
     }
 
     @Test("Stopping wakes a pending resolver and prevents its late result from sending")
@@ -381,7 +381,7 @@ struct RefreshableHLSAuthorizationTests {
         let text = String(decoding: data, as: UTF8.self)
         let line = try #require(text.split(separator: "\n").first { !$0.hasPrefix("#") })
         let segment = try #require(URL(string: String(line)))
-        #expect(HLSOriginRelay.originURL(fromQuery: segment.query ?? "") == origin.url("/final/segment.ts"))
+        #expect(relay.originURL(fromQuery: segment.query ?? "") == origin.url("/final/segment.ts"))
     }
 }
 

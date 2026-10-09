@@ -74,7 +74,7 @@ struct AVFoundationOffMainTests {
     /// concurrent queue has to fail here rather than pass on an unrelated carrier test.
     @Test("the diagnostics pool reads on two lanes, each on its own thread", .timeLimit(.minutes(3)))
     func poolAdmitsTwoLanesOffThePool() async throws {
-        let pool = ItemDiagnosticReadPool()
+        let pool = ItemDiagnosticReadPool.withoutReadTimeout()
         let counter = LaneCounter()
         let release = DispatchSemaphore(value: 0)
         defer { release.signal() }

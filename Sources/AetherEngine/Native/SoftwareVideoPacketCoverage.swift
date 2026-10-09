@@ -1,24 +1,27 @@
 import Foundation
 
-/// H.264 compressed-packet presentation coverage matching the renderer's successor-PTS duration.
+/// H.264 and HEVC compressed-packet presentation coverage matching the renderer's successor-PTS
+/// duration.
 ///
 /// AVPacket.duration may describe decode cadence rather than how long a variable-rate picture is
 /// displayed. The renderer holds a picture until its presentation-order successor (positive gaps
 /// up to one second). This model publishes only those successor intervals, without rewriting any
 /// packet timestamp or duration. A larger gap remains a discontinuity, not a tolerance to bridge.
 ///
-/// H.264-only caller contract: complete selected-stream packets, with valid presentation timestamps,
+/// H.264/HEVC caller contract: complete selected-stream packets, with valid presentation timestamps,
 /// enter in demux/decode order after they are retained in the packet store. FFmpeg n8.1.2 h264_ps.c
-/// rejects num_reorder_frames > 16; the default holds 32 distinct timestamps as a conservative
-/// field-picture margin. That codec picture bound does NOT prove arbitrary container PTS obey the
-/// bound. A timestamp behind the emitted watermark therefore invalidates all coverage until reset.
-/// Source: https://github.com/FFmpeg/FFmpeg/blob/n8.1.2/libavcodec/h264_ps.c#L174-L180
+/// rejects num_reorder_frames > 16 and hevc/ps.c rejects sps_max_num_reorder_pics > 15; the default
+/// holds 32 distinct timestamps as a conservative field-picture margin. That codec picture bound
+/// does NOT prove arbitrary container PTS obey the bound. A timestamp behind the emitted watermark
+/// therefore invalidates all coverage until reset.
+/// Sources: https://github.com/FFmpeg/FFmpeg/blob/n8.1.2/libavcodec/h264_ps.c#L174-L180
+/// https://github.com/FFmpeg/FFmpeg/blob/n8.1.2/libavcodec/hevc/ps.c#L1397-L1403
 ///
 /// This metadata-only value neither owns packets nor synchronizes access. The owner must reset it
 /// together with its packet store on seek/flush/discard. Other codecs must keep their strict packet
 /// duration coverage unless their presentation reordering has a separately established bound.
 struct SoftwareVideoPacketCoverage: Sendable {
-    private var coverage = SoftwarePacketCoverage()
+    private var coverage: SoftwarePacketCoverage
     private var pending: [Int64] = []
     private var emittedPTS: Int64?
     private let timeBaseNumerator: Int32
@@ -30,7 +33,9 @@ struct SoftwareVideoPacketCoverage: Sendable {
     private(set) var lateTimestampCount = 0
     private(set) var isFinished = false
 
-    init(timeBaseNumerator: Int32, timeBaseDenominator: Int32, reorderDepth: Int = 32) {
+    init(timeBaseNumerator: Int32, timeBaseDenominator: Int32, reorderDepth: Int = 32,
+         maximumRangeCount: Int = 4096) {
+        coverage = SoftwarePacketCoverage(maximumRangeCount: maximumRangeCount)
         self.timeBaseNumerator = timeBaseNumerator
         self.timeBaseDenominator = timeBaseDenominator
         self.reorderDepth = min(32, max(1, reorderDepth))
@@ -41,6 +46,7 @@ struct SoftwareVideoPacketCoverage: Sendable {
 
     var pendingCount: Int { pending.count }
     var rangeCount: Int { coverage.rangeCount }
+    var isFull: Bool { coverage.isFull }
 
     /// Duration/DTS are deliberately not inputs. Duplicate pending PTS do not advance the reorder
     /// watermark. At most depth + 1 timestamps are held transiently, then the minimum is emitted.

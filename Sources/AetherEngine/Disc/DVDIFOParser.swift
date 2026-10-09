@@ -216,6 +216,34 @@ enum DVDIFOParser {
         return languages
     }
 
+    /// Every subpicture substream id the title's IFO declares, with or without a language, ascending.
+    ///
+    /// The same control-table reading as `parseStreamLanguages`: an entry the main PGC marks
+    /// unavailable is not in the VOBs, and each display-mode number an entry names is its own
+    /// MPEG-PS substream. Without a readable PGC the attribute position is the number (#651). nil when
+    /// the bytes are no VTS IFO, which is not the same answer as a title with no subpictures.
+    static func parseSubpictureStreamIDs(_ data: [UInt8]) -> [Int]? {
+        guard data.count >= 12, Array(data[0..<12]) == vtsMagic,
+              data.count > vtsSubpictureCountOffset else { return nil }
+        let pgc = mainPGCOffset(data)
+        let count = min(Int(data[vtsSubpictureCountOffset]), vtsMaxSubpictureStreams)
+        var ids = Set<Int>()
+        for n in 0..<count {
+            guard let pgc, pgc + pgcSubpictureControlOffset + n * 4 + 4 <= data.count else {
+                ids.insert(subpictureSubstreamBase + n)
+                continue
+            }
+            let control = be32(data, pgc + pgcSubpictureControlOffset + n * 4)
+            guard control & 0x8000_0000 != 0 else { continue }
+            ids.insert(subpictureSubstreamBase + ((control >> 24) & 0x1F))
+            for shift in [16, 8, 0] {
+                let number = (control >> shift) & 0x1F
+                if number != 0 { ids.insert(subpictureSubstreamBase + number) }
+            }
+        }
+        return ids.sorted()
+    }
+
     /// Base substream id for a DVD audio coding mode; a stream's id is this plus its substream number.
     /// AC-3, DTS and LPCM ride in private_stream_1, where FFmpeg reports the substream byte; MPEG audio
     /// has its own PES stream id, where FFmpeg reports the full start code. nil for the reserved coding

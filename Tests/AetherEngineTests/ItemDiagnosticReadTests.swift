@@ -56,7 +56,7 @@ struct ItemDiagnosticReadTests {
 
     @Test("blocking getters leave the main actor free and notification bursts coalesce")
     func coalescesWhileBlocked() async throws {
-        let pool = ItemDiagnosticReadPool()
+        let pool = ItemDiagnosticReadPool.withoutReadTimeout()
         let probe = DiagnosticReadProbe()
         defer { probe.unblock() }
         let reader = AVPlayerItemDiagnostics(item: item(), pool: pool, read: probe.read)
@@ -84,7 +84,7 @@ struct ItemDiagnosticReadTests {
 
     @Test("cancellation does not release a blocked lane; a new item can use the other lane")
     func cancellationDoesNotPretendToDrain() async throws {
-        let pool = ItemDiagnosticReadPool()
+        let pool = ItemDiagnosticReadPool.withoutReadTimeout()
         let probe = DiagnosticReadProbe()
         defer { probe.unblock() }
         let old = AVPlayerItemDiagnostics(item: item(), pool: pool, read: probe.read)
@@ -111,7 +111,7 @@ struct ItemDiagnosticReadTests {
 
     @Test("two blocked lanes bound swap bursts, retain observed counters, and prioritize current errors")
     func saturationBoundsRetirement() async throws {
-        let pool = ItemDiagnosticReadPool()
+        let pool = ItemDiagnosticReadPool.withoutReadTimeout()
         let probe = DiagnosticReadProbe()
         defer { probe.unblock() }
         let blocked = (0..<2).map { _ in
@@ -158,7 +158,7 @@ struct ItemDiagnosticReadTests {
 
     @Test("retirement reconciles a post-detach final sample without losing a newer observed baseline")
     func retirementReconcilesCounters() async throws {
-        let pool = ItemDiagnosticReadPool()
+        let pool = ItemDiagnosticReadPool.withoutReadTimeout()
         let probe = DiagnosticReadProbe(snapshot: .init(access: [access(150, 7), access(-1, -1)]))
         defer { probe.unblock() }
         let reader = AVPlayerItemDiagnostics(item: item(), pool: pool, read: probe.read)
@@ -203,7 +203,7 @@ struct ItemDiagnosticReadTests {
 
     @Test("native notification reads are item-bound and a late old poison cannot affect a fresh load")
     func nativeNotificationWiring() async throws {
-        let pool = ItemDiagnosticReadPool()
+        let pool = ItemDiagnosticReadPool.withoutReadTimeout()
         let oldProbe = DiagnosticReadProbe(snapshot: .init(
             errors: [.init(code: -15628, domain: "CoreMediaErrorDomain")]), onlyFirstItem: true)
         defer { oldProbe.unblock() }
@@ -230,7 +230,7 @@ struct ItemDiagnosticReadTests {
 
     @Test("native swaps fold cached counters immediately, reconcile once, and reset on a new session")
     func nativeCounterHandover() async throws {
-        let pool = ItemDiagnosticReadPool()
+        let pool = ItemDiagnosticReadPool.withoutReadTimeout()
         let probe = DiagnosticReadProbe(snapshot: .init(access: [access(150, 7)]))
         defer { probe.unblock() }
         let host = NativeAVPlayerHost(diagnosticPool: pool, diagnosticRead: probe.read)
@@ -252,7 +252,7 @@ struct ItemDiagnosticReadTests {
 
     @Test("a blocked retirement cannot reconcile counters into an unrelated new load")
     func lateCounterReconciliationIsDiscarded() async throws {
-        let pool = ItemDiagnosticReadPool()
+        let pool = ItemDiagnosticReadPool.withoutReadTimeout()
         let probe = DiagnosticReadProbe(snapshot: .init(access: [access(999, 99)]))
         defer { probe.unblock() }
         let host = NativeAVPlayerHost(diagnosticPool: pool, diagnosticRead: probe.read)
@@ -275,7 +275,7 @@ struct ItemDiagnosticReadTests {
 
     @Test("native coalesced error notifications still publish startup loader poison once")
     func nativeLoaderPoison() async throws {
-        let pool = ItemDiagnosticReadPool()
+        let pool = ItemDiagnosticReadPool.withoutReadTimeout()
         let probe = DiagnosticReadProbe(snapshot: .init(
             errors: [.init(code: -15628, domain: "CoreMediaErrorDomain"),
                      .init(code: 404, domain: "HTTP")]))
@@ -299,7 +299,7 @@ struct ItemDiagnosticReadTests {
     @Test("a synchronous stall subscriber replacing the item rejects the rest of the old batch",
           arguments: [false, true])
     func replacementDuringDelivery(inPlace: Bool) async throws {
-        let pool = ItemDiagnosticReadPool()
+        let pool = ItemDiagnosticReadPool.withoutReadTimeout()
         let probe = DiagnosticReadProbe(snapshot: .init(
             errors: [.init(code: -15628, domain: "CoreMediaErrorDomain"),
                      .init(code: -15628, domain: "CoreMediaErrorDomain")]), onlyFirstItem: true)
@@ -334,7 +334,7 @@ struct ItemDiagnosticReadTests {
 
     @Test("audio error notifications leave the callback free and stop rejects the late snapshot")
     func audioNotificationWiring() async throws {
-        let pool = ItemDiagnosticReadPool()
+        let pool = ItemDiagnosticReadPool.withoutReadTimeout()
         let probe = DiagnosticReadProbe()
         defer { probe.unblock() }
         let host = AudioAVPlayerHost(diagnosticPool: pool, diagnosticRead: probe.read)
@@ -358,7 +358,7 @@ struct ItemDiagnosticReadTests {
 
     @Test("real idle AVFoundation log getters produce missing rather than fabricated counters")
     func idleNativeRead() async throws {
-        let pool = ItemDiagnosticReadPool()
+        let pool = ItemDiagnosticReadPool.withoutReadTimeout()
         let reader = AVPlayerItemDiagnostics(item: item(), pool: pool)
         defer { reader.cancel() }
         var result: ItemDiagnosticSnapshot?

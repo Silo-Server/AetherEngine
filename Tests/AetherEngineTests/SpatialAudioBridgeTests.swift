@@ -13,7 +13,7 @@ import AetherLibavutil
 /// with the encoder's 2048 frames of priming counted in, so the first packet takes the anchor and
 /// the first content frame plays there. These drive the bridge with a synthetic decoder that
 /// behaves like the real one on exactly those points.
-@Suite("TrueHD Atmos spatial bridge")
+@Suite("TrueHD Atmos spatial bridge", .timeLimit(.minutes(2)))
 struct SpatialAudioBridgeTests {
 
     /// Stand-in object decoder: one pushed byte is one 40-frame access unit (TrueHD's 1/1200 s),
@@ -73,6 +73,14 @@ struct SpatialAudioBridgeTests {
         }
 
         func reset() { skipped = 0; inputFrames = 0; blocks = []; pushes = 0 }
+    }
+
+    /// Stand-in decoder that refuses every access unit, as a corrupt or foreign stream would.
+    final class RejectingDecoder: ObjectAudioDecoding {
+        struct Refused: Error {}
+        func push(_ bytes: UnsafeRawBufferPointer) throws { throw Refused() }
+        func nextBlock() throws -> ObjectAudioDecodedBlock? { nil }
+        func reset() {}
     }
 
     /// Stand-in decoder with something to find: one pushed byte is one 40-frame access unit,
@@ -169,6 +177,46 @@ struct SpatialAudioBridgeTests {
         // last partial packet.
         #expect(packets.count == 2 + Int((Double(96_000 - 200) / 1024).rounded(.up)))
         #expect(bridge.feedStats.packetsEmitted == packets.count)
+    }
+
+    /// The APAC sample entry is written before any audio, so a decoder that never finds a major sync
+    /// plays the picture over silence unless the bridge says so itself (AE#641).
+    @Test("a decoder that returns or accepts nothing is reported once, at the threshold, and a healthy one never")
+    func decodedNothingIsReportedOnce() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        final class Reports: @unchecked Sendable {
+            private let lock = NSLock()
+            private var count = 0
+            func add() { lock.lock(); count += 1; lock.unlock() }
+            var value: Int { lock.lock(); defer { lock.unlock() }; return count }
+        }
+        let silent = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
+            decoder: SyntheticDecoder(skipAfterReset: .max))
+        defer { silent.close() }
+        let reports = Reports()
+        silent.onDecoderProducedNothing = { _ in reports.add() }
+        _ = try feed(silent, startMs: 0, count: AudioBridge.silentFeedPacketThreshold - 1)
+        #expect(reports.value == 0)
+        _ = try feed(silent, startMs: 1260, count: 40)
+        #expect(reports.value == 1)
+
+        let rejecting = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: RejectingDecoder())
+        defer { rejecting.close() }
+        let rejected = Reports()
+        rejecting.onDecoderProducedNothing = { _ in rejected.add() }
+        _ = try feed(rejecting, startMs: 0, count: AudioBridge.silentFeedPacketThreshold + 10)
+        #expect(rejected.value == 1)
+
+        let healthy = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
+            decoder: SyntheticDecoder(skipAfterReset: 5))
+        defer { healthy.close() }
+        let quiet = Reports()
+        healthy.onDecoderProducedNothing = { _ in quiet.add() }
+        _ = try feed(healthy, startMs: 0, count: 100)
+        #expect(quiet.value == 0)
     }
 
     @Test("a producer restart re-anchors on the new position")
@@ -309,15 +357,30 @@ struct SpatialAudioBridgeTests {
 
         let asset = AVURLAsset(url: file)
         let track = try #require(try await asset.loadTracks(withMediaType: .audio).first)
+        // copyNextSampleBuffer blocks until AVFoundation has decoded the next buffer. Called from the
+        // cooperative pool it held one of a three-core CI runner's threads while that decode waited
+        // for one, and the whole test process stalled. A thread of its own cannot starve the pool.
+        let decoded = await withCheckedContinuation {
+            (continuation: CheckedContinuation<Result<Double?, Error>, Never>) in
+            Thread.detachNewThread {
+                continuation.resume(returning: Result { try Self.clickOnset(asset: asset, track: track) })
+            }
+        }
+        let heard = try #require(try decoded.get(), "the click reaches the left channel")
+        #expect(abs(heard - 0.25) < 0.001, "the click decodes at \(heard) s, not at its source position 0.25 s")
+    }
+
+    /// Decodes the track to PCM and returns when the left channel first rises above the click
+    /// threshold, or nil when it never does. Blocks until AVFoundation has decoded that far.
+    private static func clickOnset(asset: AVURLAsset, track: AVAssetTrack) throws -> Double? {
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
             AVFormatIDKey: kAudioFormatLinearPCM, AVLinearPCMBitDepthKey: 32,
             AVLinearPCMIsFloatKey: true, AVLinearPCMIsNonInterleaved: false,
         ])
         reader.add(output)
-        #expect(reader.startReading())
-        var onset: Double?
-        while onset == nil, let buffer = output.copyNextSampleBuffer() {
+        guard reader.startReading() else { throw reader.error ?? CocoaError(.fileReadUnknown) }
+        while let buffer = output.copyNextSampleBuffer() {
             guard let format = CMSampleBufferGetFormatDescription(buffer),
                   let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee else { continue }
             let channels = Int(asbd.mChannelsPerFrame)
@@ -331,10 +394,9 @@ struct SpatialAudioBridgeTests {
                 blockBufferMemoryAllocator: nil, flags: 0, blockBufferOut: &block)
             guard let samples = list.mBuffers.mData?.assumingMemoryBound(to: Float.self) else { continue }
             if let i = (0..<frames).first(where: { abs(samples[$0 * channels]) > 0.2 }) {
-                onset = start + Double(i) / 48_000
+                return start + Double(i) / 48_000
             }
         }
-        let heard = try #require(onset, "the click reaches the left channel")
-        #expect(abs(heard - 0.25) < 0.001, "the click decodes at \(heard) s, not at its source position 0.25 s")
+        return nil
     }
 }

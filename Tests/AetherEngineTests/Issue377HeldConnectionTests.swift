@@ -81,7 +81,7 @@ struct Issue377HeldConnectionTests {
     @Test("the request carries the range, the host and the path with its query")
     func requestFraming() throws {
         let url = try #require(URL(string: "https://cdn.example.com/media/file.mkv?token=abc&x=1"))
-        let bytes = HeldSourceConnection.requestBytes(
+        let bytes = try HeldSourceConnection.requestBytes(
             target: url, host: "cdn.example.com", port: 443, secure: true,
             offset: 14_652_209_616, extraHeaders: [:], userAgent: "AetherEngine/test")
         let text = String(decoding: bytes, as: UTF8.self)
@@ -96,7 +96,7 @@ struct Issue377HeldConnectionTests {
     @Test("a non-default port rides in Host, because an origin may route on it")
     func hostCarriesNonDefaultPort() throws {
         let url = try #require(URL(string: "http://192.168.1.10:8096/Videos/1/stream"))
-        let text = String(decoding: HeldSourceConnection.requestBytes(
+        let text = String(decoding: try HeldSourceConnection.requestBytes(
             target: url, host: "192.168.1.10", port: 8096, secure: false,
             offset: 0, extraHeaders: [:], userAgent: nil), as: UTF8.self)
         #expect(text.contains("\r\nHost: 192.168.1.10:8096\r\n"))
@@ -106,7 +106,7 @@ struct Issue377HeldConnectionTests {
     @Test("a source header set wins without duplicating a header the request already sends")
     func extraHeadersDoNotDuplicate() throws {
         let url = try #require(URL(string: "https://jellyfin.example.com/Items/1/Download"))
-        let text = String(decoding: HeldSourceConnection.requestBytes(
+        let text = String(decoding: try HeldSourceConnection.requestBytes(
             target: url, host: "jellyfin.example.com", port: 443, secure: true, offset: 0,
             extraHeaders: ["X-Emby-Token": "secret", "User-Agent": "Sodalite/1.0", "Range": "bytes=99-"],
             userAgent: "AetherEngine/test"), as: UTF8.self)
@@ -118,6 +118,38 @@ struct Issue377HeldConnectionTests {
         // A caller cannot smuggle a second Range in: the offset is the reader's to decide.
         #expect(text.components(separatedBy: "Range: ").count == 2)
         #expect(text.contains("\r\nRange: bytes=0-\r\n"))
+    }
+
+    @Test("the path and query go on the wire percent-encoded, as the URL spells them")
+    func requestKeepsThePercentEncoding() throws {
+        let url = try #require(URL(string: "http://h.example/My%20Movie%3F.mkv/?a=%20b&c=%0D%0A"))
+        let text = String(decoding: try HeldSourceConnection.requestBytes(
+            target: url, host: "h.example", port: 80, secure: false,
+            offset: 0, extraHeaders: [:], userAgent: nil), as: UTF8.self)
+        #expect(text.hasPrefix("GET /My%20Movie%3F.mkv/?a=%20b&c=%0D%0A HTTP/1.1\r\n"))
+        #expect(text.components(separatedBy: "\r\n").allSatisfy { !$0.contains("\r") && !$0.contains("\n") })
+    }
+
+    @Test("an IPv6 literal is bracketed in Host")
+    func ipv6HostIsBracketed() throws {
+        let url = try #require(URL(string: "http://[::1]:8096/Videos/1/stream"))
+        let host = try #require(url.host)
+        let text = String(decoding: try HeldSourceConnection.requestBytes(
+            target: url, host: host, port: 8096, secure: false,
+            offset: 0, extraHeaders: [:], userAgent: nil), as: UTF8.self)
+        #expect(text.contains("\r\nHost: [::1]:8096\r\n"))
+    }
+
+    @Test("a header value carrying a line break is refused rather than written")
+    func lineBreakInAHeaderIsRefused() throws {
+        let url = try #require(URL(string: "http://h.example/a.mkv"))
+        for value in ["a\r\nX-Injected: 1", "a\nX-Injected: 1", "a\rb"] {
+            #expect(throws: (any Error).self) {
+                try HeldSourceConnection.requestBytes(
+                    target: url, host: "h.example", port: 80, secure: false, offset: 0,
+                    extraHeaders: ["X-Custom": value], userAgent: nil)
+            }
+        }
     }
 
     // MARK: - Chunked framing
@@ -262,6 +294,37 @@ struct Issue377HeldConnectionTests {
         #expect(Int64(delegate.body.count) == total)
         #expect(connection.respondedBy.path == "/pinned.mkv")
         #expect(origin.requestLog.map(\.path) == ["/source.mkv", "/pinned.mkv"])
+    }
+
+    @Test("a cross-origin redirect drops the credential headers and keeps the rest")
+    func crossOriginRedirectDropsCredentials() async throws {
+        let total: Int64 = 64 * 1024
+        final class PortBox: @unchecked Sendable { var port: UInt16 = 0 }
+        let box = PortBox()
+        let respond: @Sendable (Int, Int64, String) -> ThrottledOriginServer.Directive = { _, _, path in
+            path == "/pinned.mkv" ? .serve206 : .redirect(to: "http://localhost:\(box.port)/pinned.mkv")
+        }
+        let redirecting = ThrottledOriginServer(totalSize: total, throttleUs: 0, respond: respond)
+        let origin = try #require(redirecting)
+        defer { origin.stop() }
+        box.port = origin.port
+        let url = try #require(URL(string: "http://127.0.0.1:\(origin.port)/source.mkv"))
+
+        let delegate = RecordingHeldDelegate(defaultBudget: 64 * 1024)
+        let connection = HeldSourceConnection(
+            url: url, offset: 0,
+            extraHeaders: ["X-Emby-Token": "secret", "Authorization": "MediaBrowser Token=\"secret\"",
+                           "X-Custom": "kept"],
+            userAgent: nil, label: "test", delegate: delegate)
+        connection.start()
+        #expect(delegate.waitForEnd())
+
+        let headers = origin.requestHeaders
+        try #require(headers.count == 2)
+        #expect(headers[0]["x-emby-token"] == "secret")
+        #expect(headers[1]["x-emby-token"] == nil)
+        #expect(headers[1]["authorization"] == nil)
+        #expect(headers[1]["x-custom"] == "kept")
     }
 
     @Test("a mid-body offset asks for exactly that offset")

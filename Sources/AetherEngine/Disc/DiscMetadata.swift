@@ -72,12 +72,19 @@ struct DiscTitle: Sendable, Equatable {
     /// every track as undetermined without this; `Demuxer.trackInfo` backfills from it. Empty when the
     /// disc declares none (#527).
     let streamLanguages: [Int: String]
+    /// DVD: every subpicture substream id (`0x20` + number) the VTS IFO declares for this title,
+    /// language or not, ascending. `Demuxer` creates these streams before the probe, so a subtitle
+    /// whose first packet comes late is a track from the start rather than whenever the probe
+    /// happens to reach it (#651). Empty when the IFO declares none, nil when it is unreadable: only a
+    /// title whose IFO was read gets the short probe, since only then is nothing left to discover.
+    let dvdSubpictureStreamIDs: [Int]?
 
     init(id: Int, durationTicks: UInt64, chapters: [DiscChapter] = [],
          bdClipIDs: [String]? = nil, bdClipSubtractTicks: [Int64]? = nil,
          bdClipCumulativeBeforeTicks: [UInt64]? = nil,
          dvdVTSN: Int? = nil, dvdTitleNumber: Int? = nil,
-         streamLanguages: [Int: String] = [:]) {
+         streamLanguages: [Int: String] = [:],
+         dvdSubpictureStreamIDs: [Int]? = nil) {
         self.id = id
         self.durationTicks = durationTicks
         self.chapters = chapters
@@ -87,6 +94,7 @@ struct DiscTitle: Sendable, Equatable {
         self.dvdVTSN = dvdVTSN
         self.dvdTitleNumber = dvdTitleNumber
         self.streamLanguages = streamLanguages
+        self.dvdSubpictureStreamIDs = dvdSubpictureStreamIDs
     }
 }
 

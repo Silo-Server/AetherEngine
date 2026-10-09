@@ -18,8 +18,14 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
 
     private let playlistURL: URL
     private let httpHeaders: [String: String]
+    /// The URL the host gave `httpHeaders` for. A companion inherits its parent's, since its own
+    /// playlist URL is one the master named (audit NET-7).
+    let credentialOrigin: URL
     private let role: Role
     private let fifo = ByteFIFO(capacity: 16 * 1024 * 1024)
+    /// Wider than the VOD reader's 2 MB: a live window with hours of DVR at short segments is a
+    /// legitimately long playlist, and this one is refetched every few seconds rather than once.
+    static let maximumPlaylistBytes = 8 * 1024 * 1024
     private let session: URLSession
     private var ingestTask: Task<Void, Never>?
     private let startLock = NSLock()
@@ -35,6 +41,11 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     /// AE#447: longest EXTINF the upstream has actually served, the measured counterpart to
     /// `_upstreamTargetDuration`. Monotonic; read via `upstreamSegmentDurationSeconds`.
     private var _upstreamSegmentDurationSeconds: Double?
+    /// AE#684: summed EXTINF of the join batch. Written with the join line, before its bytes flow.
+    private var _joinBacklogSeconds: Double?
+    /// AE#684: the join batch has been committed to the FIFO in full / has been seen consumed.
+    private var _joinBatchCommitted = false
+    private var _joinSpent = false
     /// Installed by the resolver before the first FIFO byte; nil = muxed audio.
     private var _companionAudioReader: HLSLiveIngestReader?
     /// AE#359: SUBTITLES renditions of the picked variant, resolved to absolute URLs. Metadata only.
@@ -59,6 +70,17 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     /// fetches saturate the link while bounding in-memory segment bytes to the window size.
     static let maxConcurrentSegmentFetches = 4
 
+    /// AE#678: the prefetch window narrowed to the origin's request budget. A host that declares
+    /// `maxConcurrentSourceRequests = 1` for a single-connection provider meant every request this
+    /// reader makes, and four parallel segment fetches were four connections to it.
+    static func segmentFetchConcurrency(budgetLimit: Int?) -> Int {
+        guard let budgetLimit else { return maxConcurrentSegmentFetches }
+        return max(1, min(maxConcurrentSegmentFetches, budgetLimit))
+    }
+
+    /// The URL the host loaded, which is what `OriginRequestBudget` keys the declared ceiling on.
+    var budgetOriginURL: URL { playlistURL }
+
     /// First-segment classification latch; touched only from the ingest task's ordered commit path.
     private var sniffedFirstSegment = false
 
@@ -77,6 +99,47 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
 
     public var upstreamSegmentDurationSeconds: Double? {
         startLock.withLock { _upstreamSegmentDurationSeconds }
+    }
+
+    var joinBacklogSeconds: Double? {
+        startLock.withLock { _joinBacklogSeconds }
+    }
+
+    var joinIsSpent: Bool {
+        let (spent, committed, companion) = startLock.withLock {
+            (_joinSpent, _joinBatchCommitted, _companionAudioReader)
+        }
+        if spent { return true }
+        guard Self.pumpJoinIsSpent(
+            main: (committed, fifo.isEmptyWithReaderParked),
+            companion: companion?.pumpJoinState
+        ) else { return false }
+        startLock.withLock { _joinSpent = true }
+        return true
+    }
+
+    /// One reader's half of `joinIsSpent`: whether its ingest ever started, whether its join batch
+    /// is committed, and whether it is empty with its consumer parked on it.
+    var pumpJoinState: (started: Bool, committed: Bool, parked: Bool) {
+        let (isStarted, committed) = startLock.withLock { (started, _joinBatchCommitted) }
+        return (isStarted, committed, fifo.isEmptyWithReaderParked)
+    }
+
+    /// AE#684: the fact is the PUMP's, not one reader's. With a demuxed audio rendition the cutter
+    /// merges two readers on one thread and parks on whichever runs dry first, and a rendition whose
+    /// segments end a little before the video's runs dry first every time: the video reader is then
+    /// never parked, and a fact read off it alone never becomes true (measured: the full seal over a
+    /// window that cannot hold it, 2.2 s to first picture under `.fastZap` and 10.4 s under
+    /// `.standard`, where 7.25.1 took 0.18 s). So both join batches have to be committed, and the
+    /// cutter has to be parked on EITHER empty reader: it holds a packet of the other one it cannot
+    /// place until the dry one delivers, so nothing more is cut either way. A companion that was
+    /// never started is not being read at all and does not count.
+    static func pumpJoinIsSpent(main: (committed: Bool, parked: Bool),
+                                companion: (started: Bool, committed: Bool, parked: Bool)?) -> Bool {
+        guard main.committed else { return false }
+        guard let companion, companion.started else { return main.parked }
+        guard companion.committed else { return false }
+        return main.parked || companion.parked
     }
 
     public var closedLiveCadenceSeconds: Double? {
@@ -134,7 +197,8 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
 
     /// `httpHeaders` ride on every fetch (playlist, segment, AES key) and inherit to the companion audio
     /// reader, so header-enforcing IPTV origins (Referer / User-Agent / Authorization, #119) accept the
-    /// ingest the same way they accept the AVPlayer bypass (AetherEngine#168).
+    /// ingest the same way they accept the AVPlayer bypass (AetherEngine#168). Credential headers go
+    /// only to `playlistURL`'s origin with no TLS downgrade (audit NET-7).
     public convenience init(playlistURL: URL, httpHeaders: [String: String]) {
         self.init(playlistURL: playlistURL, httpHeaders: httpHeaders, role: .mainVideo)
     }
@@ -148,9 +212,11 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         return HLSLiveIngestReader(playlistURL: playlistURL, httpHeaders: httpHeaders, role: .mainVideo)
     }
 
-    init(playlistURL: URL, httpHeaders: [String: String] = [:], role: Role) {
+    init(playlistURL: URL, httpHeaders: [String: String] = [:], role: Role,
+         credentialOrigin: URL? = nil) {
         self.playlistURL = playlistURL
         self.httpHeaders = httpHeaders
+        self.credentialOrigin = credentialOrigin ?? playlistURL
         self.role = role
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 10
@@ -281,8 +347,9 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                         startLock.withLock { _joinWallClock = joinDate }
                     }
                     let backlog = fresh.reduce(0.0) { $0 + $1.duration }
+                    startLock.withLock { _joinBacklogSeconds = backlog }
                     EngineLog.emit(
-                        "[HLSIngest] joined \(fresh.count) segment(s), ~\(Int(backlog))s behind the live edge"
+                        "[HLSIngest] joined \(fresh.count) segment(s), ~\(String(format: "%.0f", backlog))s behind the live edge"
                         + " pdt=\(fresh.first?.programDateTime.map { "\($0)" } ?? "nil")",
                         category: .engine
                     )
@@ -292,6 +359,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                     guard try await ingestSegmentBatch(fresh, mediaURL: mediaURL) else {
                         return // FIFO closed underneath us
                     }
+                    if isJoin { startLock.withLock { _joinBatchCommitted = true } }
                 }
 
                 if media.hasEndList {
@@ -333,13 +401,15 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
             }
             return (segment, url)
         }
+        let window = Self.segmentFetchConcurrency(
+            budgetLimit: OriginRequestBudget.shared.limit(for: mediaURL))
         return try await withThrowingTaskGroup(of: (Int, Data).self) { group -> Bool in
             var nextToSpawn = 0
             var nextToCommit = 0
             var ready: [Int: Data] = [:]
 
             while nextToSpawn < resolved.count,
-                  nextToSpawn < nextToCommit + Self.maxConcurrentSegmentFetches {
+                  nextToSpawn < nextToCommit + window {
                 spawnFetch(into: &group, index: nextToSpawn, item: resolved[nextToSpawn], mediaURL: mediaURL)
                 nextToSpawn += 1
             }
@@ -366,7 +436,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                     }
                 }
                 while nextToSpawn < resolved.count,
-                      nextToSpawn < nextToCommit + Self.maxConcurrentSegmentFetches {
+                      nextToSpawn < nextToCommit + window {
                     spawnFetch(into: &group, index: nextToSpawn, item: resolved[nextToSpawn], mediaURL: mediaURL)
                     nextToSpawn += 1
                 }
@@ -385,7 +455,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         mediaURL: URL
     ) {
         group.addTask {
-            let fetched = try await self.fetchSegment(item.url)
+            let fetched = try await self.fetchSegment(item.url, duration: item.segment.duration)
             guard !fetched.isEmpty, let crypt = item.segment.crypt else { return (index, fetched) }
             return (index, try await self.decryptSegment(fetched, crypt: crypt, against: mediaURL))
         }
@@ -479,7 +549,9 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                     + "starting companion reader on \(audioURL.lastPathComponent)",
                     category: .engine
                 )
-                installCompanion(HLSLiveIngestReader(playlistURL: audioURL, httpHeaders: httpHeaders, role: .companionAudio))
+                installCompanion(HLSLiveIngestReader(
+                    playlistURL: audioURL, httpHeaders: httpHeaders, role: .companionAudio,
+                    credentialOrigin: credentialOrigin))
             }
             // AE#359: the variant's SUBTITLES group, resolved to absolute playlist URLs and published as
             // metadata. Nothing is fetched here; the host decides whether a subtitle track is ever wanted.
@@ -545,10 +617,46 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
     }
 
-    /// Applies the configured origin headers to every ingest fetch. Internal for the header-contract tests.
+    /// AE#678: every ingest request is charged to `OriginRequestBudget` like the reader's and the relay's,
+    /// so the host's declared ceiling and a ceiling learned from a refusal bind this path too. The slot
+    /// wait blocks, so it runs off the cooperative pool; no ticket is ever held across another acquire.
+    private func budgeted(
+        _ url: URL, label: String, _ fetch: () async throws -> (Data, URLResponse)
+    ) async throws -> (Data, URLResponse) {
+        let ticket: OriginRequestBudget.Ticket? = await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                continuation.resume(returning: OriginRequestBudget.shared.acquire(
+                    for: url, label: label, timeout: Self.budgetSlotWaitSeconds,
+                    shouldAbort: { self?.isClosed ?? true }))
+            }
+        }
+        defer { OriginRequestBudget.shared.release(ticket) }
+        try Task.checkCancellation()
+        let (data, response) = try await fetch()
+        if let http = response as? HTTPURLResponse {
+            if let finalURL = http.url, finalURL != url {
+                OriginRequestBudget.shared.noteRedirect(from: url, to: finalURL)
+            }
+            if Self.refusalStatuses.contains(http.statusCode) {
+                OriginRequestBudget.shared.noteRefusal(
+                    for: http.url ?? url, status: http.statusCode,
+                    retryAfter: http.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init))
+            }
+        }
+        return (data, response)
+    }
+
+    static let budgetSlotWaitSeconds: TimeInterval = 10
+    static let refusalStatuses: Set<Int> = [429, 503, 509]
+
+    private var isClosed: Bool { startLock.withLock { closed } }
+
+    /// Applies the configured origin headers to every ingest fetch, credentials only where the host's
+    /// origin is (audit NET-7). Internal for the header-contract tests.
     func makeRequest(_ url: URL) -> URLRequest {
         var request = URLRequest(url: url)
-        for (field, value) in httpHeaders {
+        for (field, value) in RedirectHeaderPolicy.scoped(
+            httpHeaders, grantedFor: credentialOrigin, sentTo: url) {
             request.setValue(value, forHTTPHeaderField: field)
         }
         return request
@@ -556,7 +664,10 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
 
     /// Fetch + parse a playlist. Returns parsed playlist and final URL after redirects (relative segment URIs resolve against it).
     private func fetchPlaylist(_ url: URL) async throws -> (HLSPlaylist, URL) {
-        let (data, response) = try await session.data(for: makeRequest(url))
+        let (data, response) = try await budgeted(url, label: "ingest-playlist") {
+            try await BoundedPlaylistFetch.data(
+                for: self.makeRequest(url), session: self.session, limit: Self.maximumPlaylistBytes)
+        }
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard (200..<300).contains(status) else {
             throw HLSIngestError.playlistUnreachable(status: status)
@@ -567,12 +678,21 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         return (try HLSPlaylistParser.parse(text), response.url ?? url)
     }
 
-    private func fetchSegment(_ url: URL) async throws -> Data {
+    private func fetchSegment(_ url: URL, duration: Double) async throws -> Data {
         var lastStatus = -1
+        let limit = BoundedFetch.segmentLimit(forDuration: duration)
         for attempt in 0..<3 {
             if Task.isCancelled { throw CancellationError() }
             do {
-                let (data, response) = try await session.data(for: makeRequest(url))
+                let (data, response): (Data, URLResponse)
+                do {
+                    (data, response) = try await budgeted(url, label: "ingest-segment") {
+                        try await BoundedFetch.data(for: self.makeRequest(url), session: self.session, limit: limit)
+                    }
+                } catch is BoundedFetch.Exceeded {
+                    // Audit NET-112: an endless body is the origin's answer, not a blip to retry.
+                    throw HLSIngestError.playlistInvalid(reason: "segment exceeds \(limit) bytes")
+                }
                 lastStatus = (response as? HTTPURLResponse)?.statusCode ?? -1
                 if (200..<300).contains(lastStatus) { return data }
                 if lastStatus == 404 { return Data() } // slid out of provider window; tracker advances regardless
@@ -605,7 +725,16 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         let cacheKey = url.absoluteString
         if let cached = keyCacheLock.withLock({ keyCache[cacheKey] }) { return cached }
 
-        let (data, response) = try await session.data(for: makeRequest(url))
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await budgeted(url, label: "ingest-key") {
+                try await BoundedFetch.data(
+                    for: self.makeRequest(url), session: self.session, limit: BoundedFetch.keyLimit)
+            }
+        } catch is BoundedFetch.Exceeded {
+            throw HLSIngestError.segmentDecryptFailed(reason: "key exceeds \(BoundedFetch.keyLimit) bytes")
+        }
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard (200..<300).contains(status) else {
             throw HLSIngestError.segmentDecryptFailed(reason: "key fetch HTTP \(status)")

@@ -78,59 +78,6 @@ struct Issue93ItemDeathReviveTests {
             consumerIsPaused: false, allowPausedConsumer: false))
     }
 
-    // MARK: - Viewer pause before the death
-
-    private static let second: UInt64 = 1_000_000_000
-
-    @Test("an item that died under a viewer's pause is reloaded paused")
-    func deathUnderViewerPause() {
-        // The field report: paused on an Apple TV, the item died minutes later and the reload
-        // started playback with nobody touching the remote.
-        #expect(NativeAVPlayerHost.transportPausedBeforeFailure(
-            pausedSinceUptime: 10 * Self.second, failureUptime: 460 * Self.second))
-    }
-
-    @Test("an item that died while rolling is reloaded playing")
-    func deathWhileRolling() {
-        #expect(!NativeAVPlayerHost.transportPausedBeforeFailure(
-            pausedSinceUptime: nil, failureUptime: 460 * Self.second))
-    }
-
-    @Test("the dead item's own pause, landing just before the notification, is not the viewer's")
-    func deathParksItsOwnPause() {
-        #expect(!NativeAVPlayerHost.transportPausedBeforeFailure(
-            pausedSinceUptime: 460 * Self.second - Self.second / 20,
-            failureUptime: 460 * Self.second))
-    }
-
-    @Test("a pause stamped after the notification is not the viewer's")
-    func pauseAfterNotification() {
-        #expect(!NativeAVPlayerHost.transportPausedBeforeFailure(
-            pausedSinceUptime: 461 * Self.second, failureUptime: 460 * Self.second))
-    }
-
-    @Test("with no press since the death, the transport it died in decides")
-    func reloadFollowsTransportAtDeath() {
-        #expect(!NativeAVPlayerHost.itemDeathReloadResumesPlaying(
-            diedUnderPause: true, commandSinceFailure: nil, transportRolling: false))
-        #expect(NativeAVPlayerHost.itemDeathReloadResumesPlaying(
-            diedUnderPause: false, commandSinceFailure: nil, transportRolling: false))
-    }
-
-    @Test("a Play or Pause pressed while the death is confirmed outranks the transport it died in")
-    func pressDuringConfirmationDecides() {
-        #expect(NativeAVPlayerHost.itemDeathReloadResumesPlaying(
-            diedUnderPause: true, commandSinceFailure: true, transportRolling: false))
-        #expect(!NativeAVPlayerHost.itemDeathReloadResumesPlaying(
-            diedUnderPause: false, commandSinceFailure: false, transportRolling: true))
-    }
-
-    @Test("a Play from outside the engine after a paused death resumes the reload")
-    func externalPlayAfterPausedDeath() {
-        #expect(NativeAVPlayerHost.itemDeathReloadResumesPlaying(
-            diedUnderPause: true, commandSinceFailure: nil, transportRolling: true))
-    }
-
     // MARK: - Host-side counting decision
 
     @Test("loopback path counts an end failure after playback was established")
@@ -151,3 +98,68 @@ struct Issue93ItemDeathReviveTests {
             surfaceEndFailures: false, hasEverPlayed: false))
     }
 }
+
+/// #93: item death parks AVPlayer at `.paused` whatever the viewer wanted, so the stage-2 reload runs
+/// for a paused consumer too. Whether the fresh item then PLAYS is the viewer's call, read from the
+/// host's durable intent (#122), which the in-place swap keeps.
+///
+/// Field log, Apple TV 4K 3rd gen, tvOS 27.0, HDR10+ HEVC Matroska: paused at 2605.23 s, the item died
+/// with -11868 two minutes later as the tvOS screensaver took the display, and the recovery called
+/// `play()` on the fresh item. The title started itself and the screensaver was dismissed.
+@Suite("#93: the stage-2 reload resumes only a viewer who was playing")
+@MainActor
+struct ItemDeathRecoveryTransportTests {
+
+    private let url = URL(fileURLWithPath: "/nonexistent-item-death-recovery-transport-test.m3u8")
+
+    /// An engine holding a native host with one mounted item, the state the recovery reloads from.
+    private func engineWithMountedItem() throws -> (AetherEngine, NativeAVPlayerHost) {
+        let engine = try AetherEngine()
+        let host = NativeAVPlayerHost()
+        engine.nativeHost = host
+        engine.currentAVPlayer = host.avPlayer
+        host.load(url: url, startPosition: 2605.23, contract: .init())
+        return (engine, host)
+    }
+
+    @Test("A paused viewer stays paused through the reload")
+    func pausedViewerStaysPaused() throws {
+        let (engine, host) = try engineWithMountedItem()
+        defer { host.tearDown() }
+        host.pause()
+
+        engine.forceStalledConsumerReloadForTesting()
+
+        #expect(!host.transportIntentIsPlaying)
+        #expect(host.avPlayer.rate == 0)
+    }
+
+    @Test("A playing viewer is resumed on the fresh item, as before")
+    func playingViewerResumes() throws {
+        let (engine, host) = try engineWithMountedItem()
+        defer { host.tearDown() }
+        host.play()
+
+        engine.forceStalledConsumerReloadForTesting()
+
+        #expect(host.transportIntentIsPlaying)
+    }
+
+    /// The #98 media fallback needs a live loopback session to run, so this reads its call site, as
+    /// the #535 latch test does.
+    @Test("The media fallback asks the same intent before it plays")
+    func fallbackAsksTheIntent() throws {
+        let source = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/AetherEngine/AetherEngine.swift")
+        let text = try #require(try? String(contentsOf: source, encoding: .utf8))
+        let fn = try #require(text.range(of: "func fallBackToMediaPlaylist("))
+        let end = try #require(text[fn.upperBound...].range(of: "\n    }\n"))
+        let body = String(text[fn.lowerBound..<end.upperBound])
+        #expect(body.contains("if host.transportIntentIsPlaying { host.play() }"))
+        #expect(!body.contains("\n        host.play()\n"))
+    }
+}
+

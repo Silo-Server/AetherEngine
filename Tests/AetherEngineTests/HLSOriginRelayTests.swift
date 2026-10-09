@@ -14,22 +14,71 @@ struct HLSOriginRelayAddressingTests {
 
     @Test("An origin survives the round trip through a relay URL")
     func roundTrip() throws {
+        let relay = HLSOriginRelay()
         let origin = URL(
             string: "https://media.example.com:8920/videos/1/master.m3u8"
                 + "?ApiKey=abc123&PlaySessionId=x%20y&tag=a+b")!
-        let local = try #require(HLSOriginRelay.localURL(for: origin, port: 51234, token: token))
+        let local = try #require(relay.localURL(for: origin, port: 51234, token: token))
 
         #expect(local.host == "127.0.0.1")
         #expect(local.port == 51234)
         #expect(local.path == "/\(token)\(HLSOriginRelay.route)")
-        let recovered = try #require(HLSOriginRelay.originURL(fromQuery: local.query ?? ""))
+        let recovered = try #require(relay.originURL(fromQuery: local.query ?? ""))
         #expect(recovered == origin, "recovered \(recovered) from \(origin)")
+    }
+
+    @Test("A relay URL names the origin by reference, never by its host, path or token (audit NET-1)")
+    func localURLCarriesNoOriginText() throws {
+        // The local URL is logged on every request, handed to AirPlay receivers and written into
+        // every rewritten playlist, so nothing of the origin may be readable in it, in any encoding.
+        let relay = HLSOriginRelay()
+        let secret = "0123456789abcdef0123456789abcdef"
+        let origin = URL(
+            string: "https://jf.example.com/Videos/abc/master.m3u8?MediaSourceId=x&api_key=\(secret)")!
+        let local = try #require(relay.localURL(for: origin, port: 51234, token: token))
+        let text = local.absoluteString
+        // Fragments long enough to mean something: the reference is random base64, and a two-letter
+        // fragment ("jf") turns up in it by chance on about one run in twenty (CI, 2026-09-28).
+        for fragment in [secret, "jf.example", "example", "Videos", "master.m3u8", "api_key", "MediaSourceId"] {
+            #expect(!text.contains(fragment), "\(fragment) is readable in \(text)")
+        }
+        #expect(!text.contains("%"), "the reference should need no escaping: \(text)")
+    }
+
+    @Test("One origin always seals to the same local URL, so a refreshed playlist names a segment the same way")
+    func sealingIsStable() throws {
+        let relay = HLSOriginRelay()
+        let segment = URL(string: "https://media.example.com/hls/seg42.ts?api_key=k")!
+        let first = try #require(relay.localURL(for: segment, port: 51234, token: token))
+        let again = try #require(relay.localURL(for: segment, port: 51234, token: token))
+        let other = try #require(relay.localURL(
+            for: URL(string: "https://media.example.com/hls/seg43.ts?api_key=k")!, port: 51234, token: token))
+        #expect(first == again)
+        #expect(first != other)
+    }
+
+    @Test("A reference from another session, or one that was altered, opens to nothing")
+    func foreignOrTamperedReferenceIsRefused() throws {
+        let origin = URL(string: "https://media.example.com/hls/media.m3u8?ApiKey=k")!
+        let previousSession = HLSOriginRelay()
+        let stale = try #require(previousSession.localURL(for: origin, port: 51234, token: token))
+        let relay = HLSOriginRelay()
+        #expect(relay.originURL(fromQuery: stale.query ?? "") == nil)
+
+        let own = try #require(relay.localURL(for: origin, port: 51234, token: token))
+        var query = Array(own.query ?? "")
+        let flipAt = query.count - 3
+        query[flipAt] = query[flipAt] == "A" ? "B" : "A"
+        #expect(relay.originURL(fromQuery: String(query)) == nil)
     }
 
     @Test("A query that names no origin yields none")
     func rejectsForeignQuery() {
-        #expect(HLSOriginRelay.originURL(fromQuery: "") == nil)
-        #expect(HLSOriginRelay.originURL(fromQuery: "other=https%3A%2F%2Fa.b") == nil)
+        let relay = HLSOriginRelay()
+        #expect(relay.originURL(fromQuery: "") == nil)
+        #expect(relay.originURL(fromQuery: "other=https%3A%2F%2Fa.b") == nil)
+        #expect(relay.originURL(fromQuery: "origin=https%3A%2F%2Fa.b") == nil,
+                "the pre-NET-1 plain origin form must not be honoured")
     }
 
     @Test("The origin key keeps scheme, host and port apart")
@@ -56,7 +105,7 @@ struct HLSOriginRelayAddressingTests {
     func rewritesMediaPlaylist() throws {
         let relay = HLSOriginRelay()
         let origin = URL(string: "https://media.example.com/hls/media.m3u8?ApiKey=k")!
-        relay.admit(origin)
+        relay.grantCredentials(to: origin)
 
         let playlist = """
             #EXTM3U
@@ -90,8 +139,10 @@ struct HLSOriginRelayAddressingTests {
         // A relative segment resolves against the playlist it came from.
         let segLine = try #require(lines.first { !$0.hasPrefix("#") && !$0.isEmpty })
         let query = try #require(URL(string: segLine)?.query)
-        let recovered = try #require(HLSOriginRelay.originURL(fromQuery: query))
+        let recovered = try #require(relay.originURL(fromQuery: query))
         #expect(recovered.absoluteString == "https://media.example.com/hls/seg0.ts")
+        #expect(!rewritten.contains("ApiKey"), "the origin's query leaked into the rewritten playlist")
+        #expect(!rewritten.contains("example.com"), "an origin host leaked into the rewritten playlist")
     }
 
     @Test("An injected rendition stays with the server that owns it")
@@ -102,7 +153,7 @@ struct HLSOriginRelayAddressingTests {
         // engine has.
         let relay = HLSOriginRelay()
         let origin = URL(string: "https://media.example.com/hls/master.m3u8")!
-        relay.admit(origin)
+        relay.grantCredentials(to: origin)
 
         let master = """
             #EXTM3U
@@ -130,14 +181,14 @@ struct HLSOriginRelayAddressingTests {
         // fetch to time out. Nothing here waits on a name resolving, and the three
         // differ only by port, which the allow list treats as part of the origin.
         let origin = URL(string: "https://127.0.0.1:9/hls/media.m3u8")!
-        relay.admit(origin)
+        relay.grantCredentials(to: origin)
 
         _ = relay.rewritePlaylist(
             "#EXTM3U\n#EXTINF:6.0,\nhttps://127.0.0.1:10/seg1.ts\n", relativeTo: origin,
             port: server.port, token: server.pathToken)
 
         let named = try #require(server.relayURL(for: URL(string: "https://127.0.0.1:10/seg1.ts")!))
-        let stranger = try #require(HLSOriginRelay.localURL(
+        let stranger = try #require(relay.localURL(
             for: URL(string: "https://127.0.0.1:11/x.ts")!, port: server.port,
             token: server.pathToken))
 
@@ -152,9 +203,9 @@ struct HLSOriginRelayAddressingTests {
         try server.start()
         defer { server.stop(); relay.stop() }
         let origin = URL(string: "https://127.0.0.1:9/hls/media.m3u8")!
-        relay.admit(origin)
+        relay.grantCredentials(to: origin)
 
-        let stranger = try #require(HLSOriginRelay.localURL(
+        let stranger = try #require(relay.localURL(
             for: origin, port: server.port, token: String(repeating: "cd", count: 16)))
         #expect(try await status(of: stranger) == 404, "a stale or scanned token was answered")
     }
@@ -162,13 +213,14 @@ struct HLSOriginRelayAddressingTests {
     @Test("A blocking-reload request keeps the parameters that make it block")
     func blockingReloadParametersReachTheOrigin() throws {
         // AVPlayer appends _HLS_msn / _HLS_part to a playlist URL that advertises CAN-BLOCK-RELOAD
-        // (#441). The relay URL already carries a query, so they arrive alongside `origin`; dropped,
-        // the reload answers at once and the player asks again immediately.
+        // (#441). The relay URL already carries a query, so they arrive alongside the reference;
+        // dropped, the reload answers at once and the player asks again immediately.
+        let relay = HLSOriginRelay()
         let origin = URL(string: "https://media.example.com/hls/media.m3u8?ApiKey=k")!
-        let local = try #require(HLSOriginRelay.localURL(for: origin, port: 51234, token: token))
+        let local = try #require(relay.localURL(for: origin, port: 51234, token: token))
         let asAVPlayerAsks = "\(local.query ?? "")&_HLS_msn=42&_HLS_part=3"
 
-        let upstream = try #require(HLSOriginRelay.originURL(fromQuery: asAVPlayerAsks))
+        let upstream = try #require(relay.originURL(fromQuery: asAVPlayerAsks))
         #expect(upstream.path == "/hls/media.m3u8")
         let query = try #require(upstream.query)
         #expect(query.contains("ApiKey=k"), "the origin's own query was dropped: \(query)")
@@ -181,6 +233,41 @@ struct HLSOriginRelayAddressingTests {
     // cannot be built. Without the gate the whole test target fails to COMPILE for iOS and tvOS,
     // which a macOS `swift build` never shows.
     #if os(macOS)
+
+    @Test("A held body that outgrows its cap is refused instead of buffered whole (audit NET-10)")
+    func heldBodyIsBounded() async throws {
+        // No length stated, so the relay has to hold it; eight 64 KB slices against a 256 KB cap.
+        let upstream = try #require(await TricklingOrigin(slices: 8, pauseSeconds: 0, declaresLength: false))
+        defer { upstream.stop() }
+        let relay = HLSOriginRelay(maximumHeldBodyBytes: 256 * 1024)
+        let server = HLSLocalServer(relay: relay)
+        try server.start()
+        defer { server.stop(); relay.stop() }
+
+        let entry = try #require(server.relayURL(for: URL(string: "http://127.0.0.1:\(upstream.port)/seg.ts")!))
+        var request = URLRequest(url: entry)
+        request.timeoutInterval = 30
+        let (body, response) = try await URLSession.shared.data(for: request)
+        let http = try #require(response as? HTTPURLResponse)
+        #expect(http.statusCode == 502, "an over-cap held body was relayed (\(body.count) bytes)")
+    }
+
+    @Test("A held body under its cap still arrives whole")
+    func heldBodyUnderCapArrives() async throws {
+        let upstream = try #require(await TricklingOrigin(slices: 2, pauseSeconds: 0, declaresLength: false))
+        defer { upstream.stop() }
+        let relay = HLSOriginRelay(maximumHeldBodyBytes: 256 * 1024)
+        let server = HLSLocalServer(relay: relay)
+        try server.start()
+        defer { server.stop(); relay.stop() }
+
+        let entry = try #require(server.relayURL(for: URL(string: "http://127.0.0.1:\(upstream.port)/seg.ts")!))
+        var request = URLRequest(url: entry)
+        request.timeoutInterval = 30
+        let (body, response) = try await URLSession.shared.data(for: request)
+        #expect((response as? HTTPURLResponse)?.statusCode == 200)
+        #expect(body.count == TricklingOrigin.totalBytes(slices: 2))
+    }
 
     @Test("A range is forwarded verbatim and its framing comes back")
     func rangesPassThroughUntouched() async throws {

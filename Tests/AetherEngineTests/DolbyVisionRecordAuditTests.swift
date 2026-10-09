@@ -286,6 +286,15 @@ struct DolbyVisionRecordAuditTests {
         #expect(r.convertP7ToProfile81 == false)
     }
 
+    @Test("the RPU walk ends on foreign packets and bytes, not only on video packets")
+    func walkIsBoundedByEveryPacket() {
+        #expect(!DolbyVisionRecordAudit.walkExhausted(packetsRead: 63, bytesRead: 0, packetBudget: 4))
+        #expect(DolbyVisionRecordAudit.walkExhausted(packetsRead: 64, bytesRead: 0, packetBudget: 4))
+        #expect(DolbyVisionRecordAudit.walkExhausted(
+            packetsRead: 1, bytesRead: DolbyVisionRecordAudit.walkByteBudget, packetBudget: 4))
+        #expect(!DolbyVisionRecordAudit.walkExhausted(packetsRead: 1, bytesRead: 0, packetBudget: Int.max))
+    }
+
     // MARK: - Against real media
 
     @Test("the relabelled fixture's RPU reports the profile its record hides",

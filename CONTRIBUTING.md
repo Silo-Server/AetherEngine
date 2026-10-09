@@ -33,7 +33,7 @@ swift test --skip "$AUTHORIZATION_TEST_SUITES"
 swift test --skip-build --filter "$AUTHORIZATION_TEST_SUITES"
 ```
 
-For iterative work, open `Package.swift` in Xcode 26+ and pick the `AetherEngine` scheme. `FFmpegBuild` is a transitive dependency that supplies the bundled FFmpeg / dav1d binaries; you do not build it yourself.
+For iterative work, open `Package.swift` in Xcode 27+ and pick the `AetherEngine` scheme. `FFmpegBuild` is a transitive dependency that supplies the bundled FFmpeg / dav1d binaries; you do not build it yourself.
 
 The `aetherctl` command-line target is macOS-only (it uses `Foundation.Process`) and is excluded from the iOS / tvOS library build.
 

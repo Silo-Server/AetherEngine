@@ -9,7 +9,7 @@ import AetherEngine
 /// restartReopen confirms the skipped find_stream_info pass as the judder source.
 func runPktDump(url: URL, at seconds: Double, count: Int, profileName: String) -> Int32 {
     EngineLog.handler = { print($0) }
-    print("aetherctl pktdump: \(url.absoluteString)")
+    print(EngineLog.redacted("aetherctl pktdump: \(url.absoluteString)"))
     print("  profile=\(profileName) at=\(seconds)s count=\(count)")
     print("")
     do {

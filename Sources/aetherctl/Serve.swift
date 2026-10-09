@@ -7,7 +7,7 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
               dolbyVisionHandling: DolbyVisionHandling = .automatic,
               nativeSubsIndex: Int? = nil, startPosition: Double? = nil,
               audioDelayMs: Int = 0, objectAudioRendering: ObjectAudioRendering = .off,
-              audioStreamIndex: Int32? = nil) -> Never {
+              audioStreamIndex: Int32? = nil, iFrames: Bool = false) -> Never {
     EngineLog.handler = { line in
         let timestamp = ISO8601DateFormatter.string(
             from: Date(),
@@ -25,7 +25,8 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
     if audioDelayMs != 0 { flagSuffix += " [--audio-delay \(audioDelayMs)]" }
     if case .apac(let layout) = objectAudioRendering { flagSuffix += " [--atmos-bed \(layout.rawValue)]" }
     if let audioStreamIndex { flagSuffix += " [--audio-index \(audioStreamIndex)]" }
-    print("aetherctl serve: \(url.absoluteString)\(flagSuffix)")
+    if iFrames { flagSuffix += " [--iframes]" }
+    print(EngineLog.redacted("aetherctl serve: \(url.absoluteString)\(flagSuffix)"))
     print("")
 
     let engine = HLSVideoEngine(
@@ -47,6 +48,10 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
     // Enable native WebVTT subtitle renditions before start() so the master declares the SUBTITLES group (#55). Must precede start().
     if nativeSubsIndex != nil {
         engine.requestNativeSubtitleTrack()
+    }
+    // AE#682: the LoadOptions.serveIFramePlaylist path. Must precede start().
+    if iFrames {
+        engine.requestIFramePlaylist()
     }
     let playbackURL: URL
     do {
@@ -102,7 +107,7 @@ func runValidate(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = 
     var flagSuffix = dvModeAvailable ? "" : " [--no-dv]"
     if forceDVWithoutDisplay { flagSuffix += " [--force-dv]" }
     if dolbyVisionHandling == .baseLayerOnly { flagSuffix += " [--dv-base-layer]" }
-    print("aetherctl validate: \(url.absoluteString)\(flagSuffix)")
+    print(EngineLog.redacted("aetherctl validate: \(url.absoluteString)\(flagSuffix)"))
     print("")
 
     let engine = HLSVideoEngine(

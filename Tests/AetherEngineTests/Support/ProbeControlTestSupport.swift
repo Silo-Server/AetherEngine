@@ -224,9 +224,10 @@ enum ProbeTestFixtures {
         try decode(AtmosDetectionProbeIntegrationTests.eac3PlainBase64)
     }
 
-    /// Scratch fixtures stay under the checkout, never the system temporary directory.
+    /// Scratch fixtures live in the temporary directory: one written into the working directory is left
+    /// in the checkout when the process dies inside the body (audit OPS-109).
     static func withFile<T>(_ data: Data, _ body: (URL) throws -> T) throws -> T {
-        let url = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(".probe-control-\(UUID().uuidString).mp4")
         defer { try? FileManager.default.removeItem(at: url) }
         try data.write(to: url)

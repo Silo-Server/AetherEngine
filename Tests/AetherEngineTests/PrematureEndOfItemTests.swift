@@ -152,4 +152,25 @@ struct PrematureEndOfItemTests {
             attemptsUsed: AetherEngine.prematureEndRecoveryMaxAttempts,
             lastAttemptPlayhead: nil))
     }
+
+    /// The recovery runs inside AVPlayer's end notification against a live item, so this reads its
+    /// body, as the #93 fallback test does: a pause made through the engine while the re-seek was in
+    /// flight clears the play intent, and the recovery must not restart the player over it.
+    @Test("The recovery resumes only if the viewer still wants playback after the re-seek")
+    func recoveryKeepsAPauseMadeDuringTheReseek() throws {
+        let source = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/AetherEngine/Native/NativeAVPlayerHost.swift")
+        let text = try #require(try? String(contentsOf: source, encoding: .utf8))
+        let fn = try #require(text.range(of: "func recoverFromPrematureEnd("))
+        let end = try #require(text[fn.upperBound...].range(of: "\n    }\n"))
+        let body = text[fn.lowerBound..<end.upperBound]
+        let reseek = try #require(body.range(of: "await seek(to: playhead)"))
+        let afterReseek = body[reseek.upperBound...]
+        let guardRange = try #require(afterReseek.range(of: "guard playIntent else {"))
+        let playRange = try #require(afterReseek.range(of: "avPlayer.play()"))
+        #expect(guardRange.lowerBound < playRange.lowerBound)
+    }
 }
