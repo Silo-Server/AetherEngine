@@ -67,9 +67,8 @@ struct AudioRouteDescriptionLiveTests {
         let ports = try #require(line.range(of: " ports=["))
         #expect(rendering.lowerBound < multichannel.lowerBound && multichannel.lowerBound < ports.lowerBound)
         #expect(!line.contains("rendering=raw"), "every mode the SDK defines has a name")
-        // Hosts that strip user-chosen device names before a report leaves the device find each port
-        // by this shape, `name[type, ch=n…]`, so it is held here rather than left to chance.
-        #expect(line.range(of: #"ports=\[(\]|.*\[[A-Za-z0-9]+, ch=-?\d+)"#, options: .regularExpression) != nil)
+        // Each port is its type and its channel fields, never the device's name.
+        #expect(line.range(of: #"ports=\[(\]|[A-Za-z0-9]+\[ch=-?\d+)"#, options: .regularExpression) != nil)
     }
 }
 #endif

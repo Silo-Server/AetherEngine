@@ -7,7 +7,7 @@ import CoreAudioTypes
 /// of routes, not of formats.
 enum AudioRouteDescription {
 
-    /// `output=… preferred=… max=… rendering=… multichannelContent=… ports=[name[type, ch=n, labels=…,
+    /// `output=… preferred=… max=… rendering=… multichannelContent=… ports=[type[ch=n, labels=…,
     /// heights=n], …] latency=…ms io=…ms`, or nil where there is no `AVAudioSession`. The output latency is
     /// the field AE#395 needs: a buffered AirPlay route delays sound by seconds where HDMI delays it by
     /// milliseconds, and a feed that is fine on one is late on the other.
@@ -18,6 +18,11 @@ enum AudioRouteDescription {
     /// together: a Dolby MAT carrier can report fewer channels than it carries (AE#520), so `heights=0`
     /// next to `rendering=dolbyAtmos` proves nothing on its own, while `heights=0` next to `surround`
     /// is a route with no height channels at all.
+    ///
+    /// Ports are named by type, never by `portName`: for AirPods, Bluetooth and AirPlay that is
+    /// whatever the user called the device, and an HDMI sink's name can be a renamed CEC name. The
+    /// line reaches the host's handler and from there diagnostics reports, and no host-side scrub of
+    /// a free-text name inside it can be made reliable.
     static func current() -> String? {
         #if os(iOS) || os(tvOS)
         let session = AVAudioSession.sharedInstance()
@@ -34,13 +39,13 @@ enum AudioRouteDescription {
 
     #if os(iOS) || os(tvOS)
     private static func portDescription(_ port: AVAudioSessionPortDescription) -> String {
-        var fields = ["\(port.portType.rawValue)", "ch=\(port.channels?.count ?? -1)"]
+        var fields = ["ch=\(port.channels?.count ?? -1)"]
         if let labels = port.channels?.map(\.channelLabel), !labels.isEmpty {
             fields.append("labels=\(channelLabelSummary(labels))")
             fields.append("heights=\(heightChannelCount(labels))")
         }
         if port.isSpatialAudioEnabled { fields.append("spatial") }
-        return "\(port.portName)[\(fields.joined(separator: ", "))]"
+        return "\(port.portType.rawValue)[\(fields.joined(separator: ", "))]"
     }
 
     static func renderingModeName(_ mode: AVAudioSession.RenderingMode) -> String {

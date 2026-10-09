@@ -4,9 +4,10 @@ import Foundation
 /// Per-channel levels of the rendered bed, for the session log.
 ///
 /// A report that the heights or the LFE are missing can only be placed if the log says what the
-/// engine handed AVPlayer. Silent here means the engine never sent that channel, or the programme
-/// had nothing there at the time, which the object counts tell apart; present here means it was lost
-/// downstream, in the system's rendering or in the receiver.
+/// engine handed AVPlayer. Level here means the encoder was given that channel's sound, so a height
+/// heard from the floor speakers lost it after this point. Silence here is a lead, not a verdict: the
+/// object counts come from the metadata (gain and position), and an elevated object can still be
+/// silent or snap to a floor speaker.
 ///
 /// Measured on the planes the encoder is fed, gap-fill silence included, because that is what was
 /// sent. The first window after a start or a seek closes after `firstWindowSeconds`, so a short test
