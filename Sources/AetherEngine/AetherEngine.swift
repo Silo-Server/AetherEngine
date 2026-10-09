@@ -6998,7 +6998,10 @@ public final class AetherEngine: ObservableObject {
                 self.audioSwitchInFlight = selected
                 let failure = await self.reloadWithAudioOverride(
                     url: url, audioStreamIndex: Int32(selected), expectedGeneration: beforeReload)
-                if self.audioSwitchInFlight == selected { self.audioSwitchInFlight = nil }
+                // A cancelled task returns late: the marker may now belong to a newer switch.
+                if self.audioSelectionEpoch == epoch, self.audioSwitchInFlight == selected {
+                    self.audioSwitchInFlight = nil
+                }
                 // This rebuild owns one stopInternal generation. Background teardown or
                 // another SDK recovery cannot lend its successor to queued audio work.
                 guard !Task.isCancelled, self.audioSelectionEpoch == epoch, failure == nil,

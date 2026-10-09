@@ -513,6 +513,21 @@ struct BedLevelMeterTests {
         #expect(afterSeek.contains("; objects: up to 0 active, 0 elevated;"))
     }
 
+    @Test("a configuration without objects does not keep reporting the previous configuration's objects")
+    func countsResetOnConfigurationChange() throws {
+        var meter = BedLevelMeter(layout: .l714, sampleRate: 48_000)
+        meter.observe(roles: [.object], updates: [ObjectAudioMetadataUpdate(
+            frameOffset: 0, rampFrames: 0, states: [.init(position: SIMD3(0.5, 0.5, 1))])])
+        let first = try #require(feed(&meter, chunks: 118).first)
+        #expect(first.contains("; objects: up to 1 active, 1 elevated;"))
+        meter.observe(roles: [.bed(.left)], updates: [], configurationChanged: true)
+        // The window open at the change saw the object play; the one after it must not.
+        let during = try #require(feed(&meter, chunks: 704).first)
+        #expect(during.contains("; objects: up to 1 active, 1 elevated;"))
+        let after = try #require(feed(&meter, chunks: 704).first)
+        #expect(after.contains("; objects: up to 0 active, 0 elevated;"))
+    }
+
     @Test("the line ends with the LFE element's input level and metadata gain, or says there is none")
     func lfeInputAndGain() throws {
         var meter = BedLevelMeter(layout: .l714, sampleRate: 48_000)
@@ -527,6 +542,16 @@ struct BedLevelMeterTests {
         meter.measureInput(roles: roles, planes: [UnsafePointer(lfe), UnsafePointer(object)], frameCount: frames)
         let line = try #require(feed(&meter, chunks: 118).first)
         #expect(line.hasSuffix("; LFE input -9.0 dBFS, metadata gain -6.0 dB"))
+
+        // TrueHD can carry LFE2 beside LFE; the renderer sums both, so the meter does too, and names
+        // each element's gain.
+        var twoLFE = BedLevelMeter(layout: .l714, sampleRate: 48_000)
+        let twoRoles: [ObjectAudioRole] = [.lfe, .lfe]
+        twoLFE.observe(roles: twoRoles, updates: [ObjectAudioMetadataUpdate(
+            frameOffset: 0, rampFrames: 0, states: [.init(), .init(gain: 0.5)])])
+        twoLFE.measureInput(roles: twoRoles, planes: [UnsafePointer(object), UnsafePointer(lfe)], frameCount: frames)
+        let both = try #require(feed(&twoLFE, chunks: 118).first)
+        #expect(both.hasSuffix("; LFE input -9.0 dBFS, metadata gain 0.0 dB/-6.0 dB"))
 
         var noLFE = BedLevelMeter(layout: .l714, sampleRate: 48_000)
         noLFE.observe(roles: [.object], updates: [])

@@ -41,7 +41,8 @@ struct BedLevelMeter {
 
     /// The decoder's LFE input, before the renderer applies its metadata gain. With the bed's LFE level
     /// it splits a silent LFE into a silent source, a zero gain, or no LFE element at all.
-    private var lfeIndex: Int?
+    /// Every LFE element: TrueHD can carry LFE2 beside LFE, and the renderer sums both.
+    private var lfeIndices: [Int] = []
     private var lfeInputSquares: Double = 0
     private var lfeInputFrames = 0
 
@@ -59,7 +60,10 @@ struct BedLevelMeter {
                           configurationChanged: Bool = false) {
         if configurationChanged || elementStates.count != roles.count {
             elementStates = Array(repeating: nil, count: roles.count)
-            lfeIndex = roles.firstIndex(of: .lfe)
+            lfeIndices = roles.indices.filter { roles[$0] == .lfe }
+            // A configuration with no objects sends no object metadata; the old counts must not hold.
+            activeObjects = 0
+            elevatedObjects = 0
         }
         for update in updates {
             for (index, state) in update.states.enumerated() where index < elementStates.count {
@@ -77,12 +81,15 @@ struct BedLevelMeter {
         }
     }
 
-    /// Measure the LFE element's input for one decoded block (one plane per role).
+    /// Measure the LFE elements' combined input for one decoded block (one plane per role).
     mutating func measureInput(roles: [ObjectAudioRole], planes: [UnsafePointer<Float>], frameCount: Int) {
-        guard frameCount > 0, let index = roles.firstIndex(of: .lfe), index < planes.count else { return }
-        var squares: Float = 0
-        vDSP_svesq(planes[index], 1, &squares, vDSP_Length(frameCount))
-        lfeInputSquares += Double(squares)
+        let indices = roles.indices.filter { roles[$0] == .lfe && $0 < planes.count }
+        guard frameCount > 0, !indices.isEmpty else { return }
+        for index in indices {
+            var squares: Float = 0
+            vDSP_svesq(planes[index], 1, &squares, vDSP_Length(frameCount))
+            lfeInputSquares += Double(squares)
+        }
         lfeInputFrames += frameCount
     }
 
@@ -110,7 +117,7 @@ struct BedLevelMeter {
     mutating func restart() -> String? {
         let line = frames >= sampleRate ? closeWindow() : nil
         elementStates = []
-        lfeIndex = nil
+        lfeIndices = []
         activeObjects = 0
         elevatedObjects = 0
         clearWindow()
@@ -138,12 +145,13 @@ struct BedLevelMeter {
     }
 
     private func lfeSummary() -> String {
-        guard let lfeIndex else { return "no LFE element" }
+        guard !lfeIndices.isEmpty else { return "no LFE element" }
         let input = Self.dBFS((lfeInputSquares / Double(max(lfeInputFrames, 1))).squareRoot())
-        let gain = elementStates.indices.contains(lfeIndex) ? elementStates[lfeIndex]?.gain : nil
-        let gainText = gain.map { "metadata gain " + ($0 > 0 ? String(format: "%.1f dB", 20 * log10($0)) : "-inf dB") }
-            ?? "no metadata yet"
-        return "LFE input \(input) dBFS, \(gainText)"
+        let gains = lfeIndices.compactMap { elementStates.indices.contains($0) ? elementStates[$0]?.gain : nil }
+        guard !gains.isEmpty else { return "LFE input \(input) dBFS, no metadata yet" }
+        let gainText = gains.map { $0 > 0 ? String(format: "%.1f dB", 20 * log10($0)) : "-inf dB" }
+            .joined(separator: "/")
+        return "LFE input \(input) dBFS, metadata gain \(gainText)"
     }
 
     /// The decoder's elements, for the configuration line: `LFE + 15 objects`, or the bed channels it
