@@ -763,11 +763,18 @@ final class SoftwarePlaybackHost {
     /// software VOD session). It is bounded by the time the read gate needs to open (the lead's excess
     /// over its target at the playback rate), never below 5 ms, and never above 20 ms: a renderer queue
     /// of about ten frames cannot drain in that, so the parked video still reaches the decoder in time.
+    ///
+    /// An armed clock at rate 0 is the stopped clock a paused picture decodes under. Its lead never
+    /// shrinks and its renderer never drains, so only play, stop or a seek can open the gate, and each
+    /// broadcasts the condition: the wait is the paused loops' half second, not a 5 ms poll for as
+    /// long as the viewer stays paused.
     nonisolated static func parkedRendererWaitSeconds(
         clockArmed: Bool, lastAudioPts: Double, clockSeconds: Double, rate: Float
     ) -> TimeInterval {
-        let floor = 0.005, ceiling = 0.020
-        guard clockArmed, lastAudioPts.isFinite, clockSeconds.isFinite, rate > 0 else { return floor }
+        let floor = 0.005, ceiling = 0.020, stoppedClock = 0.5
+        guard clockArmed else { return floor }
+        guard rate > 0 else { return stoppedClock }
+        guard lastAudioPts.isFinite, clockSeconds.isFinite else { return floor }
         let untilGateOpens = (lastAudioPts - clockSeconds - AudioLookaheadPolicy.targetLeadSeconds) / Double(rate)
         guard untilGateOpens.isFinite else { return floor }
         return min(max(untilGateOpens, floor), ceiling)

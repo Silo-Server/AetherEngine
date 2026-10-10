@@ -87,9 +87,19 @@ struct SWDemuxReadGateTests {
         #expect(SoftwarePlaybackHost.parkedRendererWaitSeconds(
             clockArmed: true, lastAudioPts: 110, clockSeconds: .nan, rate: 1) == 0.005)
         #expect(SoftwarePlaybackHost.parkedRendererWaitSeconds(
-            clockArmed: true, lastAudioPts: 110, clockSeconds: 100, rate: 0) == 0.005)
-        #expect(SoftwarePlaybackHost.parkedRendererWaitSeconds(
             clockArmed: true, lastAudioPts: .infinity, clockSeconds: 100, rate: 1) == 0.005)
+    }
+
+    @Test("a stopped clock under a paused picture waits like the paused loops instead of polling")
+    func stoppedClockWaitsHalfASecond() {
+        // The lead cannot shrink at rate 0, so only play, stop or a seek (each broadcasts) opens the gate.
+        #expect(SoftwarePlaybackHost.parkedRendererWaitSeconds(
+            clockArmed: true, lastAudioPts: 110, clockSeconds: 100, rate: 0) == 0.5)
+        #expect(SoftwarePlaybackHost.parkedRendererWaitSeconds(
+            clockArmed: true, lastAudioPts: .nan, clockSeconds: 100, rate: 0) == 0.5)
+        // Unarmed, the loop still has to reach the parked-video arming exit at the floor.
+        #expect(SoftwarePlaybackHost.parkedRendererWaitSeconds(
+            clockArmed: false, lastAudioPts: 110, clockSeconds: 100, rate: 0) == 0.005)
     }
 
     @Test("the rate shortens the wait the same way it shortens the time to the gate")
