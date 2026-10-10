@@ -181,22 +181,36 @@ final class SoftwarePlaybackHost {
     nonisolated(unsafe) private var _isPlaying: Bool = false
     nonisolated(unsafe) private var _stopRequested: Bool = false
 
-    /// Sodalite#104 round 4: a pause arrived before the first frame, so the loops keep reading until one
-    /// is in (`PausedFirstFrame`). Set by `pause()`, cleared by `play()`, `stop()` and that frame.
+    /// The loops may decode one picture while paused, initially or after a seek.
+    /// Set by `pause()` or a landed paused seek; cleared by `play()`, `stop()`
+    /// and a frame from the requested generation at or after its target.
     nonisolated private var pausedBeforeFirstFrame: Bool {
-        get { flagsLock.lock(); defer { flagsLock.unlock() }; return _pausedBeforeFirstFrame }
-        set { flagsLock.lock(); _pausedBeforeFirstFrame = newValue; flagsLock.unlock() }
+        get { flagsLock.lock(); defer { flagsLock.unlock() }; return pausedFrameGate.isPending }
+        set {
+            let generation = seekGeneration
+            flagsLock.lock()
+            if newValue { pausedFrameGate.arm(generation: generation) }
+            else { pausedFrameGate.cancel() }
+            flagsLock.unlock()
+        }
     }
-    nonisolated(unsafe) private var _pausedBeforeFirstFrame = false
+    nonisolated(unsafe) private var pausedFrameGate = PausedFrameGate()
 
     /// Clears the flag and says whether it was set, in one step, so the first frame and a `play()` cannot
     /// both act on it.
-    nonisolated private func takePausedBeforeFirstFrame() -> Bool {
+    nonisolated private func takePausedBeforeFirstFrame(generation: UInt64, pts: Double) -> Bool {
         flagsLock.lock(); defer { flagsLock.unlock() }
-        let was = _pausedBeforeFirstFrame
-        _pausedBeforeFirstFrame = false
-        return was
+        return pausedFrameGate.consume(generation: generation, pts: pts)
     }
+
+    private func armPausedSeekFrame(generation: UInt64, minimumPTS: Double) {
+        flagsLock.lock(); defer { flagsLock.unlock() }
+        pausedFrameGate.arm(generation: generation, minimumPTS: minimumPTS)
+    }
+
+    /// A paused seek past the last picture reads to end of media while the viewer is still paused.
+    /// The end is held for `play()`, which met it there before the loops ran under a paused seek.
+    private var heldEndOfMedia = HeldEndOfMedia()
 
     /// Condition the demux thread waits on while paused so it doesn't
     /// busy-loop reading packets that would just stack up.
@@ -749,11 +763,18 @@ final class SoftwarePlaybackHost {
     /// software VOD session). It is bounded by the time the read gate needs to open (the lead's excess
     /// over its target at the playback rate), never below 5 ms, and never above 20 ms: a renderer queue
     /// of about ten frames cannot drain in that, so the parked video still reaches the decoder in time.
+    ///
+    /// An armed clock at rate 0 is the stopped clock a paused picture decodes under. Its lead never
+    /// shrinks and its renderer never drains, so only play, stop or a seek can open the gate, and each
+    /// broadcasts the condition: the wait is the paused loops' half second, not a 5 ms poll for as
+    /// long as the viewer stays paused.
     nonisolated static func parkedRendererWaitSeconds(
         clockArmed: Bool, lastAudioPts: Double, clockSeconds: Double, rate: Float
     ) -> TimeInterval {
-        let floor = 0.005, ceiling = 0.020
-        guard clockArmed, lastAudioPts.isFinite, clockSeconds.isFinite, rate > 0 else { return floor }
+        let floor = 0.005, ceiling = 0.020, stoppedClock = 0.5
+        guard clockArmed else { return floor }
+        guard rate > 0 else { return stoppedClock }
+        guard lastAudioPts.isFinite, clockSeconds.isFinite else { return floor }
         let untilGateOpens = (lastAudioPts - clockSeconds - AudioLookaheadPolicy.targetLeadSeconds) / Double(rate)
         guard untilGateOpens.isFinite else { return floor }
         return min(max(untilGateOpens, floor), ceiling)
@@ -887,18 +908,19 @@ final class SoftwarePlaybackHost {
         try videoDecoder.open(stream: vStream) { [weak self] pixelBuffer, pts, hdr10PlusData in
             guard let self else { return }
             // AE#491: a frame decoded from a pre-seek packet is not late, it is from somewhere else.
-            guard self.decodeGeneration == self.seekGeneration else { return }
+            let generation = self.decodeGeneration
+            guard generation == self.seekGeneration else { return }
             // Decoder callback is off-main; SampleBufferRenderer is internally locked.
             self.renderer.enqueue(pixelBuffer: pixelBuffer, pts: pts, hdr10PlusData: hdr10PlusData)
+            if self.takePausedBeforeFirstFrame(generation: generation, pts: pts.seconds) {
+                // Both initial pause and paused seek need a picture. The reorder
+                // buffer otherwise holds it after the loops park again.
+                self.renderer.drainReorderBuffer()
+                self.presentFirstFrameUnderPause(pts: pts.seconds, generation: generation)
+            }
             // First-frame milestone: demux reached a video packet + decoder produced a pixel buffer.
             if self.bumpFramesEnqueued() == 0 {
                 self.noteFirstFrameEnqueuedForDisplayFallback()
-                if self.takePausedBeforeFirstFrame() {
-                    // The reorder buffer holds frames before it hands one to the layer, and the
-                    // loops park again from here: without the drain the frame never leaves it.
-                    self.renderer.drainReorderBuffer()
-                    self.presentFirstFrameUnderPause(pts: pts.seconds, generation: self.decodeGeneration)
-                }
                 let pfType = CVPixelBufferGetPixelFormatType(pixelBuffer)
                 EngineLog.emit(
                     "[SWHost] first video frame enqueued: "
@@ -1073,6 +1095,11 @@ final class SoftwarePlaybackHost {
     // MARK: - Transport
 
     func play() {
+        if heldEndOfMedia.release(currentGeneration: seekGeneration) {
+            pausedByHost = false
+            finishAtEndOfMedia()
+            return
+        }
         // Resume after pause(): gate on clockArmed, not demuxLoopStarted. A rate change on the
         // un-anchored synchronizer (no media at its clock time yet) wedges the delayed-rate-change
         // machinery permanently frozen; the arming seekClock applies the current lastRate (#107).
@@ -1085,7 +1112,7 @@ final class SoftwarePlaybackHost {
         ) {
         case .resumeHostPause:
             pausedByHost = false
-            _ = takePausedBeforeFirstFrame()
+            pausedBeforeFirstFrame = false
             if clockArmed {
                 audioOutput?.setRate(lastRate)
             }
@@ -1218,6 +1245,13 @@ final class SoftwarePlaybackHost {
         }
     }
 
+    private func finishAtEndOfMedia() {
+        demuxDiag.markSourceExhausted()
+        parkClockAtEndOfMedia()
+        didReachEnd = true
+        isPlaying = false
+    }
+
     /// AE#374: stop the master clock on the last sample instead of letting it free-run past the end.
     ///
     /// `.ended` is terminal, so nothing will consume the clock again, but the synchronizer used to keep
@@ -1319,6 +1353,7 @@ final class SoftwarePlaybackHost {
         // reposition can tell on `seekQueue` whether a newer seek has already taken over.
         bumpSeekGeneration()
         let generation = seekGeneration
+        pausedBeforeFirstFrame = false
         didReachEnd = false
         didParkClockAtEnd = false
         didEmitParkedDiag = false
@@ -1451,6 +1486,9 @@ final class SoftwarePlaybackHost {
             // Paused seek: anchor at target with rate 0 so play() resumes from the seek position (without this, scrubs freeze or drop all samples).
             audioOutput?.seekClock(to: targetTime, rate: 0)
             pausedByHost = true
+            if outcome == .landed {
+                armPausedSeekFrame(generation: generation, minimumPTS: sourceSeconds)
+            }
         }
         // Arm now so the demux loop doesn't re-arm at stale initialClockTime (a pre-first-audio seek snapped back to session start without this).
         clockArmed = true
@@ -1759,10 +1797,16 @@ final class SoftwarePlaybackHost {
                 guard let self, self.admitsRead(generation: generation) else { return }
                 // Only current EOF may mark the diagnostic source exhausted or stop playback.
                 // A queued pre-seek EOF task must not end a freshly positioned generation.
-                self.demuxDiag.markSourceExhausted()
-                self.parkClockAtEndOfMedia()
-                self.didReachEnd = true
-                self.isPlaying = false
+                if !self.isPlaying, self.pausedBeforeFirstFrame {
+                    self.pausedBeforeFirstFrame = false
+                    self.heldEndOfMedia.hold(generation: generation)
+                    EngineLog.emit(
+                        "[SWHost] end of media under a paused seek: held until play",
+                        category: .swPlayback
+                    )
+                    return
+                }
+                self.finishAtEndOfMedia()
             }
         }
         let onError: @Sendable (String) -> Void = { [weak self] message in
