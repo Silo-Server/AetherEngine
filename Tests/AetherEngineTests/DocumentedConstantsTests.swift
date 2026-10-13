@@ -18,6 +18,11 @@ import AetherLibavcodec
 /// Adding a number to the docs? Pin it here in the same commit.
 @MainActor
 final class DocumentedConstantsTests: XCTestCase {
+    func testLiveReplayQuarantineBoundsMatchDocumentation() throws {
+        XCTAssertEqual(LivePacketReplayGuard.maximumPendingBytes, 96 * 1_024 * 1_024)
+        XCTAssertEqual(LivePacketReplayGuard.maximumPendingPackets, 10_000)
+        assertDocumented("Quarantine is bounded to 96 MiB and 10,000 packets", try documentation())
+    }
 
     func testAuthorizedResourceDeadlineMatchesDocumentation() throws {
         XCTAssertEqual(HTTPRequestAuthorization.resourceTransferTimeout, 20)
@@ -221,38 +226,43 @@ final class DocumentedConstantsTests: XCTestCase {
         assertDocumented("Two channels or fewer have no surround to carry", docs)
     }
 
+    // MARK: - The Atmos rendition's CHANNELS value
+
+    /// docs/formats.md and docs/architecture.md both print the CHANNELS value a stream-copied
+    /// E-AC-3 JOC rendition is advertised with, and the object count in it is the part a reader
+    /// checks against Dolby's delivery kit. If the engine ever sources it from the `dec3` box's
+    /// `complexity_index_type_a` instead of stating it, both sentences stop being true at once.
+    func testAtmosRenditionChannelsValueIsWhatTheDocsSay() throws {
+        let docs = try documentation()
+        XCTAssertEqual(VideoSegmentProvider.atmosChannelsAttribute, "16/JOC",
+                       "documented as the object count, a slash, then JOC")
+        assertDocumented(#"`CHANNELS="16/JOC"`"#, docs)
+    }
+
     // MARK: - External subtitle ids
 
     /// A host tells its own tracks from the engine's by this base, and docs/api.md prints the number.
-    /// formats.md "TrueHD Atmos (object rendering)" and the CHANGELOG quote the APAC rate.
-    func testAPACBedRateIsWhatTheDocsSay() throws {
+    /// docs/api.md and formats.md quote the APAC rate, the limiter and the bed log cadence (#731).
+    func testTrueHDAtmosNumbersAreWhatTheDocsSay() throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
-        XCTAssertEqual(SpatialAudioBridge.bitRatePerChannel, 320_000,
-                       "docs/formats.md quotes 320 kbps per bed channel")
-        XCTAssertEqual(APACSampleEntry.codecsString(channelCount: 8), "apac.31.02",
-                       "docs/formats.md and cli.md quote apac.31.02 for 5.1.2")
-        XCTAssertEqual(APACSampleEntry.codecsString(channelCount: 10), "apac.31.03",
-                       "docs/formats.md and cli.md quote apac.31.03 for 10 channels")
-        XCTAssertEqual(APACSampleEntry.codecsString(channelCount: 12), "apac.31.03",
-                       "docs/formats.md and cli.md quote apac.31.03 for 12 channels")
-        XCTAssertEqual(APACSampleEntry.codecsString(channelCount: 16), "apac.31.04",
-                       "docs/formats.md and cli.md quote apac.31.04 for 16 channels")
-    }
-
-    /// formats.md "TrueHD Atmos (object rendering)" and the CHANGELOG quote the bed level windows.
-    func testBedLevelWindowsAreWhatTheDocsSay() throws {
         let docs = try documentation()
+        XCTAssertEqual(SpatialAudioBridge.bitRatePerChannel, 320_000)
+        assertDocumented("320 kbps per bed channel", docs)
+        XCTAssertEqual(PeakLimiter.threshold, 0.98)
+        assertDocumented("nothing leaves above −0.18 dBFS", docs)
+        XCTAssertEqual(PeakLimiter.releaseSeconds, 0.25)
+        assertDocumented("a 250 ms release", docs)
         XCTAssertEqual(BedLevelMeter.firstWindowSeconds, 5)
         XCTAssertEqual(BedLevelMeter.windowSeconds, 30)
         assertDocumented("after the first 5 s of audio (and again after every seek), then every 30 s", docs)
-    }
-
-    /// formats.md "TrueHD Atmos (object rendering)" and the CHANGELOG quote the APAC silence threshold.
-    func testAPACSilenceThresholdIsWhatTheDocsSay() throws {
-        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
-        let docs = try documentation()
         XCTAssertEqual(SpatialAudioBridge.silentFeedPacketThreshold, 1200)
         assertDocumented("returns nothing for 1200 packets in a row, a second of TrueHD", docs)
+        XCTAssertEqual(ObjectMetadataHold.maxHeldFrames, 4_800)
+        assertDocumented("(it waits at most 100 ms)", docs)
+        XCTAssertEqual(APACSampleEntry.codecsString(channelCount: 8), "apac.31.02")
+        XCTAssertEqual(APACSampleEntry.codecsString(channelCount: 10), "apac.31.03")
+        XCTAssertEqual(APACSampleEntry.codecsString(channelCount: 12), "apac.31.03")
+        XCTAssertEqual(APACSampleEntry.codecsString(channelCount: 16), "apac.31.04")
     }
 
     func testExternalSubtitleTrackIDBaseIsDocumented() throws {

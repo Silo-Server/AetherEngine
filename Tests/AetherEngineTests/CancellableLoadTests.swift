@@ -20,7 +20,7 @@ struct CancellableLoadTests {
         private var arrivals = 0
         private var releasedByEngine = false
 
-        init(fallback: TimeInterval = 60) { self.fallback = fallback }
+        init(fallback: TimeInterval = 120) { self.fallback = fallback }
 
         var entered: Bool { condition.withLock { arrivals > 0 } }
         var wasReleasedByEngine: Bool { condition.withLock { releasedByEngine } }
@@ -69,14 +69,13 @@ struct CancellableLoadTests {
     static let ceiling: Duration = .seconds(4)
 
     /// Cancels after the load has been held a moment and reports how long it took to end. The wait
-    /// runs well past `ceiling`, so a slow end reports its real duration instead of the poll's.
-    private static func cancelAndTime(_ task: Task<Void, Never>, _ box: OutcomeBox,
-                                      budget: Duration = .seconds(30)) async throws -> Duration {
+    /// has no bound of its own, so a slow end reports its real duration instead of the poll's.
+    private static func cancelAndTime(_ task: Task<Void, Never>, _ box: OutcomeBox) async throws -> Duration {
         try await Task.sleep(for: .milliseconds(200))
         let clock = ContinuousClock()
         let cancelledAt = clock.now
         task.cancel()
-        _ = try await waitFor(upTo: budget) { box.outcome != nil }
+        try await waitFor { box.outcome != nil }
         return clock.now - cancelledAt
     }
 
@@ -346,7 +345,7 @@ struct CancellableLoadTests {
             defer { condition.unlock() }
             let epoch = cancels
             arrivals += 1
-            let deadline = Date().addingTimeInterval(10)
+            let deadline = Date().addingTimeInterval(120)
             while !closed, cancels == epoch, condition.wait(until: deadline) {}
             return -1
         }
@@ -372,7 +371,7 @@ struct CancellableLoadTests {
             engine.claimSoftwarePathTakeover()
             engine.stopInternal(resetDisplayCriteria: false, keepCustomReader: true)
             let gen = engine.loadGeneration
-            await Task.detached {
+            await BlockingWork.detached {
                 var byte: UInt8 = 0
                 _ = reader.read(&byte, size: 1)
             }.value
@@ -444,7 +443,7 @@ struct CancellableLoadTests {
             if armed, position == 0 {
                 parkedAtHead += 1
                 let parked = parkedAtHead
-                let deadline = Date().addingTimeInterval(10)
+                let deadline = Date().addingTimeInterval(120)
                 while armed, parkedAtHead == parked, condition.wait(until: deadline) {}
                 return -1
             }

@@ -95,7 +95,7 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
         cancelDecode()
         let jobs = Self.fillJobs(tracks: tracks, stores: stores, defaultHeaders: defaultHeaders)
         guard !jobs.isEmpty else { return }
-        let task = Task.detached(priority: .utility) { [jobs] in
+        let task = BlockingWork.detached(priority: .utility) { [jobs] in
             for job in jobs {
                 if Task.isCancelled { return }
                 await AetherEngine.runExternalSubtitleFill(job: job)
@@ -131,7 +131,7 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
         anchorLock.lock()
         timestampAnchor = .probing
         anchorLock.unlock()
-        let task = Task.detached(priority: .utility) { [weak self] in
+        let task = BlockingWork.detached(priority: .utility) { [weak self] in
             let anchor = await probe()
             self?.resolveTimestampAnchor(anchor)
         }

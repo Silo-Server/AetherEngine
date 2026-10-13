@@ -53,7 +53,7 @@ final class RetentionRangeURLProtocol: URLProtocol, @unchecked Sendable {
     }
 }
 
-@Suite("#243 IOReader buffers do not strand in the caller's autorelease pool", .serialized)
+@Suite("#243 IOReader buffers do not strand in the caller's autorelease pool", .serialized, .offCooperativePool)
 struct Issue243ReaderRetentionTests {
 
     private static func mallocInUseBytes() -> Int64 {
@@ -63,15 +63,25 @@ struct Issue243ReaderRetentionTests {
     }
 
     /// Bytes released when the pool the reads ran in is drained.
+    ///
+    /// The malloc figure is process-wide, so a test in another suite that frees a large buffer
+    /// while this pool drains reads as bytes this pool held. Up to three attempts, keeping the
+    /// smallest: the defect holds about a byte per byte read on every attempt, a stray free lands
+    /// on one.
     private static func bytesHeldByCallerPool(bytesRead: inout Int64, _ readLoop: () -> Int64) -> Int64 {
-        var beforeDrain: Int64 = 0
-        var moved: Int64 = 0
-        autoreleasepool {
-            moved = readLoop()
-            beforeDrain = mallocInUseBytes()
+        var smallest = Int64.max
+        for _ in 0..<3 {
+            var beforeDrain: Int64 = 0
+            var moved: Int64 = 0
+            autoreleasepool {
+                moved = readLoop()
+                beforeDrain = mallocInUseBytes()
+            }
+            bytesRead = moved
+            smallest = min(smallest, max(0, beforeDrain - mallocInUseBytes()))
+            if smallest < moved / 10 { break }
         }
-        bytesRead = moved
-        return max(0, beforeDrain - mallocInUseBytes())
+        return smallest
     }
 
     /// A tenth of the bytes moved: far above the fixed-size noise of a pool drain, far below the

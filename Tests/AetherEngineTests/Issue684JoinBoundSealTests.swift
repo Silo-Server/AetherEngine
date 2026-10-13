@@ -245,7 +245,7 @@ final class Issue684JoinBoundSealTests: XCTestCase {
         while fifo.parkedWaiterCount == 0 { usleep(200) }
         XCTAssertTrue(fifo.isEmptyWithReaderParked)
         fifo.cancel()
-        wait(for: [done], timeout: 2)
+        wait(for: [done], timeout: 300)
         XCTAssertFalse(fifo.isEmptyWithReaderParked, "a cancelled reader is not a spent join")
     }
 

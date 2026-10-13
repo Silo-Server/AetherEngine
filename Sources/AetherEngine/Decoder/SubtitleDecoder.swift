@@ -95,16 +95,12 @@ enum SubtitleDecoder {
             // The decode blocks on AVIO reads, and an authorized read waits for the host's async
             // resolver, which needs a cooperative thread. Decoding on that pool lets concurrent
             // decodes starve their own resolvers until the authorization timeout.
-            try await withCheckedThrowingContinuation { continuation in
-                DispatchQueue.global(qos: .userInitiated).async {
-                    continuation.resume(with: Result {
-                        try decodeBlocking(
-                            url: url, httpHeaders: httpHeaders,
-                            httpRequestAuthorization: httpRequestAuthorization,
-                            preserveASSMarkup: preserveASSMarkup, requested: requested, token: token)
-                    })
-                }
-            }
+            try await BlockingWork.detached(priority: .userInitiated) {
+                try decodeBlocking(
+                    url: url, httpHeaders: httpHeaders,
+                    httpRequestAuthorization: httpRequestAuthorization,
+                    preserveASSMarkup: preserveASSMarkup, requested: requested, token: token)
+            }.value
         } onCancel: {
             token.cancel()
         }

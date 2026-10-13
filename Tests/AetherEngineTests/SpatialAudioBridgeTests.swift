@@ -155,6 +155,23 @@ struct SpatialAudioBridgeTests {
         #expect(HLSVideoEngine.spatialRenderingLayout(rendering: .off, codecID: AV_CODEC_ID_TRUEHD, profile: 30, sampleRate: 48_000) == nil)
     }
 
+    @Test("every 48 kHz DTS-HD MA track is a DTS:X candidate, whatever FFmpeg's label; lossy DTS is not")
+    func dtsEligibility() {
+        let on = ObjectAudioRendering.apac(.l714)
+        // FFmpeg names only two of DTS:X's markers, so a plain DTS-HD MA label can still be DTS:X;
+        // LibDTSX decides on the track's first frames.
+        for profile in [AV_PROFILE_DTS_HD_MA, AV_PROFILE_DTS_HD_MA_X, AV_PROFILE_DTS_HD_MA_X_IMAX] {
+            #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_DTS, profile: profile, sampleRate: 48_000) == .l714)
+            #expect(HLSVideoEngine.objectAudioSource(codecID: AV_CODEC_ID_DTS, profile: profile) == .dtsHDMasterAudio)
+        }
+        for profile in [AV_PROFILE_DTS, AV_PROFILE_DTS_ES, AV_PROFILE_DTS_HD_HRA, AV_PROFILE_DTS_EXPRESS] {
+            #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_DTS, profile: profile, sampleRate: 48_000) == nil)
+        }
+        #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_DTS, profile: AV_PROFILE_DTS_HD_MA_X, sampleRate: 96_000) == nil)
+        #expect(HLSVideoEngine.spatialRenderingLayout(rendering: .off, codecID: AV_CODEC_ID_DTS, profile: AV_PROFILE_DTS_HD_MA_X, sampleRate: 48_000) == nil)
+        #expect(HLSVideoEngine.objectAudioSource(codecID: AV_CODEC_ID_TRUEHD, profile: 30) == .trueHDAtmos)
+    }
+
     @Test("the first packet sits at the source position of the first decodable frame, and steps by 1024")
     func anchorsOnSource() throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
@@ -250,6 +267,89 @@ struct SpatialAudioBridgeTests {
         #expect(emitted > 0, "the decoder found its sync and the bridge encoded")
     }
 
+    /// The encoder runs on its own queue, so a feed returns what earlier chunks encoded. Settled
+    /// before every cut, the split is the one a synchronous encode makes.
+    @Test("settled after every feed, the bridge returns a synchronous encode's packets at each point")
+    func settleRestoresTheSynchronousSplit() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let pipelined = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: ClickDecoder(clickFrame: 30_000))
+        let settledEachFeed = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: ClickDecoder(clickFrame: 30_000))
+        defer { pipelined.close(); settledEachFeed.close() }
+        func take(_ packets: [UnsafeMutablePointer<AVPacket>]) -> [(pts: Int64, data: Data)] {
+            packets.map { fp in
+                defer { var p: UnsafeMutablePointer<AVPacket>? = fp; trackedPacketFree(&p) }
+                return (fp.pointee.pts, Data(bytes: fp.pointee.data, count: Int(fp.pointee.size)))
+            }
+        }
+        func feedOne(_ bridge: SpatialAudioBridge, ms: Int64) throws -> [(pts: Int64, data: Data)] {
+            let pkt = av_packet_alloc()!
+            defer { var p: UnsafeMutablePointer<AVPacket>? = pkt; av_packet_free(&p) }
+            _ = av_new_packet(pkt, 24)
+            pkt.pointee.pts = ms
+            pkt.pointee.dts = ms
+            return take(try bridge.feed(packet: pkt))
+        }
+        var a: [(pts: Int64, data: Data)] = [], b: [(pts: Int64, data: Data)] = []
+        for round in 0..<4 {
+            for i in 0..<25 {
+                let ms = Int64(round * 25 + i) * 20
+                a += try feedOne(pipelined, ms: ms)
+                b += try feedOne(settledEachFeed, ms: ms) + take(settledEachFeed.settle())
+            }
+            a += take(pipelined.settle())
+            #expect(a.map(\.pts) == b.map(\.pts), "after a cut both hold the same packets")
+        }
+        a += take(pipelined.flush())
+        b += take(settledEachFeed.flush())
+        #expect(!a.isEmpty)
+        #expect(a.map(\.pts) == b.map(\.pts))
+        #expect(a.map(\.data) == b.map(\.data))
+    }
+
+    /// Like `ClickDecoder`, but returns nothing after a reset until the bridge asks for what it
+    /// holds, as the TrueHD decoder does while it waits for the first object metadata.
+    final class HoldingDecoder: ObjectAudioDecoding {
+        private let inner = ClickDecoder(clickFrame: 30_000)
+        private var holding = true
+        private(set) var releases = 0
+
+        func push(_ bytes: UnsafeRawBufferPointer) throws { try inner.push(bytes) }
+        func nextBlock() throws -> ObjectAudioDecodedBlock? { holding ? nil : try inner.nextBlock() }
+        func reset() { inner.reset(); holding = true }
+        func releaseHeldBlocks() { releases += 1; holding = false }
+    }
+
+    /// A cut settles the bridge, and what the decoder holds plays before that cut, so the hold moves
+    /// no audio into the next segment.
+    @Test("a cut releases what the decoder holds, so it splits as a decoder without a hold does")
+    func settleReleasesHeldBlocks() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let holding = HoldingDecoder()
+        let held = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: holding)
+        let plain = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: ClickDecoder(clickFrame: 30_000))
+        defer { held.close(); plain.close() }
+        func take(_ packets: [UnsafeMutablePointer<AVPacket>]) -> [(pts: Int64, data: Data)] {
+            packets.map { fp in
+                defer { var p: UnsafeMutablePointer<AVPacket>? = fp; trackedPacketFree(&p) }
+                return (fp.pointee.pts, Data(bytes: fp.pointee.data, count: Int(fp.pointee.size)))
+            }
+        }
+        var a = try feed(held, startMs: 0, count: 25).map(\.pts)
+        var b = try feed(plain, startMs: 0, count: 25).map(\.pts)
+        a += take(held.settle()).map(\.pts)
+        b += take(plain.settle()).map(\.pts)
+        #expect(!b.isEmpty)
+        #expect(a == b, "after the cut both carry the same packets")
+        #expect(holding.releases == 1)
+        a += try feed(held, startMs: 500, count: 25).map(\.pts) + take(held.flush()).map(\.pts)
+        b += try feed(plain, startMs: 500, count: 25).map(\.pts) + take(plain.flush()).map(\.pts)
+        #expect(a == b)
+    }
+
     @Test("a producer restart re-anchors on the new position")
     func restartReanchors() throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
@@ -340,6 +440,21 @@ struct SpatialAudioBridgeTests {
             return nil
         }
         return (try #require(initBytes), segment, sessionDir)
+    }
+
+    @Test("the Atmos output activator's bundled stream reads as E-AC-3 with the Atmos extension")
+    @MainActor
+    func silentAtmosStreamIsAtmos() async throws {
+        let asset = AVURLAsset(url: AtmosOutputActivator.silentAtmosStream)
+        let track = try #require(try await asset.loadTracks(withMediaType: .audio).first)
+        let format = try #require(try await track.load(.formatDescriptions).first)
+        // AVFoundation lists an E-AC-3 track whose dec3 box states the Atmos extension as 'ec+3'
+        // layers (objects first) over its 'ec-3' core.
+        var size = 0
+        let list = try #require(CMAudioFormatDescriptionGetFormatList(format, sizeOut: &size))
+        #expect(size >= MemoryLayout<AudioFormatListItem>.size)
+        #expect(list[0].mASBD.mFormatID == 0x6563_2B33)
+        #expect(CMFormatDescriptionGetMediaSubType(format) == kAudioFormatEnhancedAC3)
     }
 
     @Test("movenc muxes the stand-in and the init segment carries the real apac entry")
@@ -559,5 +674,120 @@ struct BedLevelMeterTests {
         #expect(without.hasSuffix("; no LFE element"))
         #expect(BedLevelMeter.configurationSummary([.lfe] + Array(repeating: .object, count: 15)) == "LFE + 15 objects")
         #expect(BedLevelMeter.configurationSummary([.bed(.left), .bed(.right), .object]) == "beds L R + no LFE + 1 objects")
+    }
+}
+
+extension SpatialAudioBridgeTests {
+    // MARK: - Review round 1 of the bridge (#731)
+
+    /// Contiguous like `ClickDecoder`, but at push `panicAt` it fails the way the real one does on a
+    /// caught panic: the push throws, the decoder resets itself, and its offsets start from zero.
+    final class SelfResettingDecoder: ObjectAudioDecoding {
+        let panicAt: Int
+        private var pushes = 0
+        private var inputFrames: Int64 = 0
+        private var blocks: [(offset: Int64, frames: Int)] = []
+        private let plane = UnsafeMutablePointer<Float>.allocate(capacity: 1 << 16)
+        private(set) var selfResetCount = 0
+        struct Panic: Error {}
+
+        init(panicAt: Int) { self.panicAt = panicAt; plane.initialize(repeating: 0.1, count: 1 << 16) }
+        deinit { plane.deallocate() }
+
+        func push(_ bytes: UnsafeRawBufferPointer) throws {
+            pushes += 1
+            if pushes == panicAt {
+                inputFrames = 0; blocks = []; selfResetCount += 1
+                throw Panic()
+            }
+            blocks.append((inputFrames, bytes.count * 40))
+            inputFrames += Int64(bytes.count * 40)
+        }
+
+        func nextBlock() throws -> ObjectAudioDecodedBlock? {
+            guard !blocks.isEmpty else { return nil }
+            let b = blocks.removeFirst()
+            return ObjectAudioDecodedBlock(
+                sampleRate: 48_000, frameCount: b.frames, inputFrameOffset: b.offset,
+                configurationGeneration: 0, roles: [.bed(.left)], planes: [UnsafePointer(plane)], updates: [])
+        }
+
+        func reset() { inputFrames = 0; blocks = [] }
+    }
+
+    /// Decodes fine at a rate the renderer refuses, so every block throws.
+    final class WrongRateDecoder: ObjectAudioDecoding {
+        private var pending = 0
+        private let plane = UnsafeMutablePointer<Float>.allocate(capacity: 4096)
+        deinit { plane.deallocate() }
+        func push(_ bytes: UnsafeRawBufferPointer) throws { pending += 1 }
+        func nextBlock() throws -> ObjectAudioDecodedBlock? {
+            guard pending > 0 else { return nil }
+            pending -= 1
+            return ObjectAudioDecodedBlock(
+                sampleRate: 44_100, frameCount: 40, inputFrameOffset: 0, configurationGeneration: 0,
+                roles: [.bed(.left)], planes: [UnsafePointer(plane)], updates: [])
+        }
+        func reset() { pending = 0 }
+    }
+
+    private func drain(_ bridge: some AudioTranscodingBridge) -> [Int64] {
+        bridge.flush().map { fp in
+            defer { var p: UnsafeMutablePointer<AVPacket>? = fp; trackedPacketFree(&p) }
+            return fp.pointee.pts
+        }
+    }
+
+    @Test("after the decoder resets itself mid-stream, later audio keeps its source position")
+    func selfResetReanchors() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let bridge = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: SelfResettingDecoder(panicAt: 50))
+        defer { bridge.close() }
+        // 100 packets of 20 ms from 1 s. Packet 50 is lost to the panic; its 960 frames come back as
+        // silence, so the stream is as long as an unbroken one. Appended onto the encoder instead,
+        // everything after the panic would play 20 ms early and the stream would end a packet short.
+        let packets = try feed(bridge, startMs: 1000, count: 100).map(\.pts) + drain(bridge)
+        #expect(packets.first == 48_000)
+        #expect(zip(packets, packets.dropFirst()).allSatisfy { $1 - $0 == 1024 })
+        #expect(packets.count == 2 + Int((Double(96_000) / 1024).rounded(.up)))
+    }
+
+    @Test("a seek after the end of the file anchors on the new position")
+    func seekAfterEOF() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let bridge = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: ClickDecoder(clickFrame: .max))
+        defer { bridge.close() }
+        _ = try feed(bridge, startMs: 0, count: 50)
+        _ = drain(bridge)
+        bridge.startSegment()
+        let after = try feed(bridge, startMs: 5000, count: 50)
+        #expect(after.first?.pts == 240_000, "5 s at 48 kHz")
+        #expect(!after.isEmpty)
+    }
+
+    @Test("a bridge whose every feed fails is reported once and never throws at the producer")
+    func persistentFailureReportedOnce() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let bridge = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: WrongRateDecoder())
+        defer { bridge.close() }
+        let reports = Reports()
+        bridge.onDecoderProducedNothing = { _ in reports.add() }
+        let out = try feed(bridge, startMs: 0, count: SpatialAudioBridge.silentFeedPacketThreshold * 2 + 5)
+        #expect(out.isEmpty)
+        #expect(reports.value == 1)
+    }
+
+    @Test("the master's CHANNELS counts the bed, not the 2-channel stand-in the muxer is given",
+          arguments: [SpatialSpeakerLayout.l714, .l916])
+    func servedChannelsAreTheBeds(layout: SpatialSpeakerLayout) throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let bridge = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: layout, decoder: ClickDecoder(clickFrame: .max))
+        defer { bridge.close() }
+        #expect(bridge.encoderCodecpar?.pointee.ch_layout.nb_channels == 2)
+        #expect(bridge.servedChannelCount == layout.channelCount)
     }
 }

@@ -7,7 +7,7 @@ import Foundation
 /// took the last slot and the inner acquire waited its whole four second budget for it: +4 s per
 /// block, and a third request on the books against a limit of two. A reader that already holds a
 /// ticket must never block on another, so the detour holds one.
-@Suite("Detour origin ticket", .serialized)
+@Suite("Detour origin ticket", .serialized, .offCooperativePool)
 struct DetourOriginTicketTests {
 
     @Test("a detour block behind a pump holding one of two slots takes one slot and no wait",
@@ -59,4 +59,22 @@ struct DetourOriginTicketTests {
         #expect(server.requestedRanges.contains { $0.start == 4 * 1024 * 1024 && $0.end == 8 * 1024 * 1024 - 1 },
                 "no detour block went out, so this measured nothing: \(server.requestedRanges)")
     }
+
+    #if os(macOS)
+    /// #746 moved the 429 accounting into `syncRequest`'s completion callback, so the slot is not
+    /// handed on before the refusal is on the books. The detour still charged the same answer again
+    /// afterwards, and each charge halves the origin's concurrency and doubles its quiet period.
+    @Test("a rate limited detour block is charged to the origin once", .timeLimit(.minutes(1)))
+    func rateLimitedDetourChargedOnce() async throws {
+        let origin = try #require(await RangeEchoOrigin(status: 429))
+        defer { origin.stop() }
+        let url = URL(string: "http://127.0.0.1:\(origin.port)/movie.bin")!
+        let reader = AVIOReader(url: url)
+        defer { reader.markClosed(); reader.close() }
+
+        #expect(reader.detourFetchIsRateLimitedForTesting(from: 0, size: 1024))
+        let books = try #require(OriginRequestBudget.shared.snapshot(for: url))
+        #expect(books.refusals == 1, "one 429 was charged \(books.refusals) times")
+    }
+    #endif
 }

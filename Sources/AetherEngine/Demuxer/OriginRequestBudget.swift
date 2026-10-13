@@ -92,6 +92,30 @@ final class OriginRequestBudget: @unchecked Sendable {
         let granted: Bool
     }
 
+    /// A finite request ends on the delegate queue, before its synchronous caller resumes.
+    /// Cancellation/early return may race that callback, so the ticket is returned only once.
+    final class Lease: @unchecked Sendable {
+        private let lock = NSLock()
+        private let budget: OriginRequestBudget
+        private var ticket: Ticket?
+
+        init(_ ticket: Ticket?, budget: OriginRequestBudget = .shared) {
+            self.ticket = ticket
+            self.budget = budget
+        }
+
+        deinit { release() }
+
+        func release() {
+            let held = lock.withLock {
+                let held = ticket
+                ticket = nil
+                return held
+            }
+            budget.release(held)
+        }
+    }
+
     struct Snapshot {
         var inflight: Int
         var peakInflight: Int
@@ -376,7 +400,10 @@ final class OriginRequestBudget: @unchecked Sendable {
     /// token, no slot, and its place in the FIFO given up, so it cannot take what the next session
     /// is waiting for. nil is also what an unkeyable URL returns, so a caller that passes
     /// `shouldAbort` tells the two apart by asking its own abort state.
+    /// `allowOvercommit: false` returns nil when the wait budget is spent. Metadata discovery
+    /// uses this mode so its fallback requests cannot exceed an origin's known concurrency limit.
     func acquire(for url: URL, label: String, timeout: TimeInterval,
+                 allowOvercommit: Bool = true,
                  shouldAbort: (() -> Bool)? = nil) -> Ticket? {
         guard let raw = Self.originKey(for: url) else { return nil }
 
@@ -391,6 +418,7 @@ final class OriginRequestBudget: @unchecked Sendable {
         case .passed(let milliseconds):
             pacedMs = milliseconds
         case .spent:
+            guard allowOvercommit else { return nil }
             // The pacer alone spent the caller's budget. Proceed uncounted-for, the same answer the
             // slot timeout below gives, and stay honest about being on the link.
             lock.lock()
@@ -472,7 +500,16 @@ final class OriginRequestBudget: @unchecked Sendable {
         var timedOut = origins[keyNow] ?? OriginState()
         if let i = timedOut.waiters.firstIndex(where: { $0 === semaphore }) {
             timedOut.waiters.remove(at: i)
+            if !allowOvercommit {
+                origins[keyNow] = timedOut
+                lock.unlock()
+                return nil
+            }
             timedOut.inflight += 1   // proceeding anyway; stay honest about what is on the link
+        } else if !allowOvercommit {
+            // The release raced the deadline and already granted this caller a real slot.
+            lock.unlock()
+            return Ticket(key: raw, label: label, waitedMs: waitedMs, granted: true)
         }
         // The `else` is the race where a release signalled us between the timeout firing and this
         // lock: it already removed us from the queue AND counted the slot in, so there is nothing

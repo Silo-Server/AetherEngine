@@ -55,7 +55,7 @@ final class HTTPAuthorizationWait: @unchecked Sendable {
                  rejectedHeaders: [String: String]?, timeout: TimeInterval) throws -> [String: String] {
         condition.lock()
         if result == nil {
-            task = Task.detached { [self] in
+            task = BlockingWork.detached { [self] in
                 let answer: Result<[String: String], Error>
                 do { answer = .success(try await authorization.resolver(url, rejectedHeaders)) }
                 catch { answer = .failure(error) }

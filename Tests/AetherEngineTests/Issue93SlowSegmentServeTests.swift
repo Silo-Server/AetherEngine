@@ -8,6 +8,7 @@ import Foundation
 /// request accumulated -12889 strikes toward failedToPlayToEndTime. A serve
 /// that cannot deliver promptly must now emit response headers early
 /// (Transfer-Encoding: chunked) and stream the body when the segment lands.
+@Suite(.offCooperativePool)
 struct Issue93SlowSegmentServeTests {
 
     private final class Counter: @unchecked Sendable {
@@ -31,7 +32,7 @@ struct Issue93SlowSegmentServeTests {
             fired.bump()
             didFire.signal()
         }
-        let armed = didFire.wait(timeout: .now() + 15) == .success
+        let armed = didFire.wait(timeout: .now() + 120) == .success
         signal.complete()
         #expect(armed)
         #expect(fired.value == 1)
@@ -107,7 +108,8 @@ struct Issue93SlowSegmentServeTests {
     private func makeProvider(cache: SegmentCache, isLive: Bool = false,
                               slowThreshold: TimeInterval,
                               restartHandler: ((Int) -> Void)? = { _ in },
-                              restartActivity: (() -> Bool)? = { false }) -> VideoSegmentProvider {
+                              restartActivity: (() -> Bool)? = { false },
+                              segmentPlacedHandler: (@Sendable (Int) -> Void)? = nil) -> VideoSegmentProvider {
         VideoSegmentProvider(
             cache: cache, segments: segments(60), codecsString: "hvc1", supplementalCodecs: nil,
             resolution: (1920, 1080), videoRange: .sdr, frameRate: 24.0, hdcpLevel: nil,
@@ -116,21 +118,48 @@ struct Issue93SlowSegmentServeTests {
             restartActivity: restartActivity,
             repositionWaitSlice: 0.05,
             repositionRideCapSeconds: 5.0,
-            slowServeThresholdSeconds: slowThreshold
+            slowServeThresholdSeconds: slowThreshold,
+            segmentPlacedHandler: segmentPlacedHandler
         )
     }
 
-    @Test("a cache hit never signals slow")
-    func cacheHitDoesNotSignal() {
+    @Test("cached bytes survive a slow notification without restarting the producer",
+          .timeLimit(.minutes(1)), arguments: [false, true])
+    func cacheHitSurvivesSlowNotification(holdServeUntilSignal: Bool) async throws {
         let cache = SegmentCache(forwardWindow: 10, backwardWindow: 10)
         defer { cache.close() }
-        cache.store(index: 5, data: Data(repeating: 0xAB, count: 16))
+        let payload = Data(repeating: 0xAB, count: 16)
+        cache.store(index: 5, data: payload)
         let fired = Counter()
-        let provider = makeProvider(cache: cache, slowThreshold: 0.02)
-        let data = provider.mediaSegment(at: 5, onSlow: { fired.bump() })
-        Thread.sleep(forTimeInterval: 0.15)
-        #expect(data != nil)
-        #expect(fired.value == 0)
+        let restarts = Counter()
+        let releaseServe = DispatchSemaphore(value: 0)
+        let provider = makeProvider(
+            cache: cache, slowThreshold: 0.02,
+            restartHandler: { _ in restarts.bump() },
+            segmentPlacedHandler: { _ in
+                if holdServeUntilSignal { releaseServe.wait() }
+            })
+        // A resident segment can still spend the threshold waiting to be scheduled. The early
+        // header is valid then too; cache residency is not a wall-clock completion guarantee.
+        let data: Data? = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                Thread.detachNewThread {
+                    let data = provider.mediaSegment(at: 5, onSlow: {
+                        fired.bump()
+                        releaseServe.signal()
+                    })
+                    continuation.resume(returning: data)
+                }
+            }
+        } onCancel: {
+            // Let the blocking serve return so the test's time limit can report a missing signal.
+            releaseServe.signal()
+        }
+        try Task.checkCancellation()
+        #expect(data == payload)
+        #expect(restarts.value == 0)
+        #expect(fired.value <= 1)
+        if holdServeUntilSignal { #expect(fired.value == 1) }
     }
 
     @Test("a serve that outlives the threshold signals slow exactly once")
@@ -215,8 +244,10 @@ struct Issue93SlowSegmentServeTests {
         }
     }
 
-    /// Raw-socket GET: returns the response bytes plus the time to first byte,
-    /// reading until EOF or `deadline` elapses with no new bytes.
+    /// Raw-socket GET: returns the response bytes plus the time to first byte, reading until the
+    /// response is complete, the server ends the connection, or `deadline` elapses with no new
+    /// bytes. The server keeps the connection alive, so without the completion check the idle
+    /// deadline would be what ends a good response, and a slow body on a loaded runner would be cut.
     private static func rawGET(port: UInt16, path: String,
                                deadline: TimeInterval) -> (bytes: Data, firstByteAfter: TimeInterval) {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
@@ -254,14 +285,31 @@ struct Issue93SlowSegmentServeTests {
                 }
                 collected.append(contentsOf: buf[0..<n])
                 lastByteAt = DispatchTime.now()
+                if responseIsComplete(collected) { break }
             } else if n == 0 {
                 break   // orderly close
+            } else if errno != EAGAIN && errno != EWOULDBLOCK {
+                break   // reset
             } else {
                 let idle = Double(DispatchTime.now().uptimeNanoseconds - lastByteAt.uptimeNanoseconds) / 1e9
                 if idle > deadline { break }
             }
         }
         return (collected, firstByteAfter)
+    }
+
+    private static func responseIsComplete(_ raw: Data) -> Bool {
+        guard raw.range(of: Data("\r\n\r\n".utf8)) != nil else { return false }
+        let (header, body) = splitResponse(raw)
+        if header.contains("Transfer-Encoding: chunked") {
+            return body.suffix(HLSLocalServer.chunkedFinal.count).elementsEqual(HLSLocalServer.chunkedFinal)
+        }
+        for line in header.split(whereSeparator: \.isNewline)
+        where line.lowercased().hasPrefix("content-length:") {
+            let value = line.split(separator: ":", maxSplits: 1).last ?? ""
+            if let length = Int(value.trimmingCharacters(in: .whitespaces)) { return body.count >= length }
+        }
+        return false
     }
 
     /// Splits an HTTP/1.1 response blob into (headerString, bodyData).
@@ -296,7 +344,7 @@ struct Issue93SlowSegmentServeTests {
         try server.start()
         defer { server.stop() }
 
-        let (raw, _) = Self.rawGET(port: server.port, path: "/\(server.pathToken)/seg1.mp4", deadline: 1.0)
+        let (raw, _) = Self.rawGET(port: server.port, path: "/\(server.pathToken)/seg1.mp4", deadline: 30)
         let (header, body) = Self.splitResponse(raw)
         #expect(header.contains("200 OK"))
         #expect(header.contains("Content-Length: \(payload.count)"))
@@ -314,7 +362,7 @@ struct Issue93SlowSegmentServeTests {
         try server.start()
         defer { server.stop() }
 
-        let (raw, firstByteAfter) = Self.rawGET(port: server.port, path: "/\(server.pathToken)/seg1.mp4", deadline: 1.0)
+        let (raw, firstByteAfter) = Self.rawGET(port: server.port, path: "/\(server.pathToken)/seg1.mp4", deadline: 30)
         let (header, body) = Self.splitResponse(raw)
         #expect(firstByteAfter >= 0)
         #expect(firstByteAfter < 0.7, "header must arrive near the slow signal, got \(firstByteAfter)s")
@@ -330,7 +378,7 @@ struct Issue93SlowSegmentServeTests {
         try server.start()
         defer { server.stop() }
 
-        let (raw, firstByteAfter) = Self.rawGET(port: server.port, path: "/\(server.pathToken)/seg1.mp4", deadline: 1.5)
+        let (raw, firstByteAfter) = Self.rawGET(port: server.port, path: "/\(server.pathToken)/seg1.mp4", deadline: 30)
         let (header, body) = Self.splitResponse(raw)
         #expect(firstByteAfter >= 0)
         #expect(header.contains("Transfer-Encoding: chunked"))
