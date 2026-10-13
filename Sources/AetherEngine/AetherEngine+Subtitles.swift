@@ -287,7 +287,7 @@ extension AetherEngine {
         subtitleDrainTickSerial &+= 1
         let serial = subtitleDrainTickSerial
         subtitleDrainTickInFlight = Task { [weak self] in
-            let events = await Task.detached(priority: .userInitiated) { handoff.decode() }.value
+            let events = await BlockingWork.detached(priority: .userInitiated) { handoff.decode() }.value
             guard let self, self.subtitleDrainTickSerial == serial else { return }
             self.subtitleDrainTickInFlight = nil
             self.finishSubtitleDrainTick(work, events: events)
@@ -762,7 +762,7 @@ extension AetherEngine {
         let titleID = activeDiscTitleID
         subtitleForwardPrefetchActiveLead = lead
         let link = SideReaderLinkArbiter(gate: sideReaderLinkGate)
-        subtitleForwardPrefetchTask = Task.detached(priority: .utility) { [weak self] in
+        subtitleForwardPrefetchTask = BlockingWork.detached(priority: .utility) { [weak self] in
             // #231: the loop used to end on the first failed read and only a seek or producer
             // re-anchor could bring it back, so a viewer who does not seek lost every cue beyond
             // the pump's own park for the rest of the session, silently. Restart on a read error,
@@ -1498,7 +1498,7 @@ extension AetherEngine {
             stores: session.nativeSubtitleCueStoresForSession,
             defaultHeaders: loadedOptions.httpHeaders)
         guard !jobs.isEmpty else { return }
-        externalNativeStoreFillTask = Task.detached(priority: .utility) { [jobs] in
+        externalNativeStoreFillTask = BlockingWork.detached(priority: .utility) { [jobs] in
             for job in jobs {
                 if Task.isCancelled { return }
                 await AetherEngine.runExternalSubtitleFill(job: job)
@@ -1817,7 +1817,7 @@ extension AetherEngine {
         let maxAnalyzeDuration = loadedOptions.maxAnalyzeDuration
         let titleID = activeDiscTitleID
         let link = SideReaderLinkArbiter(gate: sideReaderLinkGate)
-        nativeSubtitleReadersTask = Task.detached(priority: .utility) { [weak self] in
+        nativeSubtitleReadersTask = BlockingWork.detached(priority: .utility) { [weak self] in
             await self?.runNativeSubtitleReaders(
                 url: url, reader: reader, formatHint: formatHint, headers: headers,
                 pairs: pairs, startAt: startAt, videoWidth: w, videoHeight: h,

@@ -6,8 +6,8 @@ import AetherEngine
 func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = false,
               dolbyVisionHandling: DolbyVisionHandling = .automatic,
               nativeSubsIndex: Int? = nil, startPosition: Double? = nil,
-              audioDelayMs: Int = 0, objectAudioRendering: ObjectAudioRendering = .off,
-              audioStreamIndex: Int32? = nil, iFrames: Bool = false) -> Never {
+              audioDelayMs: Int = 0, iFrames: Bool = false,
+              objectAudioRendering: ObjectAudioRendering = .off, audioStreamIndex: Int32? = nil) -> Never {
     EngineLog.handler = { line in
         let timestamp = ISO8601DateFormatter.string(
             from: Date(),
@@ -26,6 +26,8 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
     if case .apac(let layout) = objectAudioRendering { flagSuffix += " [--atmos-bed \(layout.rawValue)]" }
     if let audioStreamIndex { flagSuffix += " [--audio-index \(audioStreamIndex)]" }
     if iFrames { flagSuffix += " [--iframes]" }
+    if case .apac(let layout) = objectAudioRendering { flagSuffix += " [--atmos-bed \(layout.rawValue)]" }
+    if let audioStreamIndex { flagSuffix += " [--audio-index \(audioStreamIndex)]" }
     print(EngineLog.redacted("aetherctl serve: \(url.absoluteString)\(flagSuffix)"))
     print("")
 

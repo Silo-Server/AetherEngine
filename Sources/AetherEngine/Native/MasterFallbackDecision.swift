@@ -42,9 +42,13 @@ enum MasterFallbackDecision {
     ///
     /// AE#667: nor while a display mode switch is in progress. AVPlayer answers for the mode the panel is
     /// in at that moment, which mid-switch is the one it is leaving, so the refusal is about the moment.
-    static func shouldLatchPanelRefusal(code: Int, displayEligibleForHDRNow: Bool,
+    ///
+    /// AE#535 (2026-10-11): nor when the refused master advertised `VIDEO-RANGE=SDR`. A refusal of an SDR
+    /// master says nothing about HDR presentation, yet it latched the HDR route for every later title
+    /// (cmcpherson274, two SDR titles' -11848 refusals at 7.15.1 and 7.17.1).
+    static func shouldLatchPanelRefusal(code: Int, servedMasterIsHDR: Bool, displayEligibleForHDRNow: Bool,
                                         displaySwitchInProgress: Bool) -> Bool {
-        isDisplayRejectionCode(code) && displayEligibleForHDRNow && !displaySwitchInProgress
+        isDisplayRejectionCode(code) && servedMasterIsHDR && displayEligibleForHDRNow && !displaySwitchInProgress
     }
 
     /// Any code that means "AVPlayer rejected the served master itself": the display-rejection pair
@@ -56,6 +60,19 @@ enum MasterFallbackDecision {
     /// GETs the server demonstrably answered, so the code cannot mean a genuinely bad host URL.
     static func isMasterRejectionCode(_ code: Int) -> Bool {
         isDisplayRejectionCode(code) || code == -1002
+    }
+
+    /// A malformed media playlist can be wrapped in the same -11848 as a display refusal.
+    /// It says nothing about HDR support and must not poison the process's display decision.
+    static func isMasterRejection(_ error: NSError, mediaErrorCodes: [Int] = []) -> Bool {
+        guard !mediaErrorCodes.contains(-12642) else { return false }
+        var current: NSError? = error
+        for _ in 0..<8 {
+            guard let value = current else { break }
+            if value.domain == "CoreMediaErrorDomain", value.code == -12642 { return false }
+            current = value.userInfo[NSUnderlyingErrorKey] as? NSError
+        }
+        return isMasterRejectionCode(error.code)
     }
 
     /// Fall back to the media playlist only when a master-rejection failed the item, the engine was

@@ -99,7 +99,7 @@ final class SharedOutputCoordinator {
     /// engines the release of one and the activation of the other had no order between them.
     func enqueueTransition(_ body: @escaping @Sendable () async -> Void) -> Task<Void, Never> {
         let previous = lastTransition
-        let transition = Task.detached(priority: .userInitiated) {
+        let transition = BlockingWork.detached(priority: .userInitiated) {
             await previous?.value
             await body()
         }

@@ -50,12 +50,6 @@ private final class CountingFileReader: IOReader, @unchecked Sendable {
     func close() { lock.withLock { _closes += 1 } }
 }
 
-private func waitUntil(_ timeout: TimeInterval = 5, _ condition: () -> Bool) -> Bool {
-    let deadline = Date().addingTimeInterval(timeout)
-    while Date() < deadline { if condition() { return true }; Thread.sleep(forTimeInterval: 0.02) }
-    return condition()
-}
-
 @Suite("I-frame rendition on a real session", .serialized)
 struct IFrameSessionTests {
     private static let fixture = "restart-witness-av.mp4"
@@ -174,7 +168,7 @@ struct IFrameSessionTests {
 
     @Test("a custom source's clone feeds the side reader and is closed exactly once at stop",
           .enabled(if: fixtureExists(fixture)), .timeLimit(.minutes(2)))
-    func customCloneIsClosedAtStop() throws {
+    func customCloneIsClosedAtStop() async throws {
         let clone = try CountingFileReader(url: fixtureURL(Self.fixture))
         let engine = HLSVideoEngine(url: fixtureURL(Self.fixture), dvModeAvailable: false)
         engine.requestIFramePlaylist()
@@ -185,21 +179,21 @@ struct IFrameSessionTests {
         #expect(IFrameTestBoxes.sampleCount(fragment: fragment) == 1)
         #expect(clone.closes == 0)
         engine.stop()
-        #expect(waitUntil { clone.closes == 1 })
-        Thread.sleep(forTimeInterval: 0.2)
+        try await waitFor { clone.closes == 1 }
+        try await Task.sleep(for: .milliseconds(200))
         #expect(clone.closes == 1)
     }
 
     @Test("a clone nobody ever read from is still closed at stop",
           .enabled(if: fixtureExists(fixture)), .timeLimit(.minutes(2)))
-    func untouchedCloneIsClosedAtStop() throws {
+    func untouchedCloneIsClosedAtStop() async throws {
         let clone = try CountingFileReader(url: fixtureURL(Self.fixture))
         let engine = HLSVideoEngine(url: fixtureURL(Self.fixture), dvModeAvailable: false)
         engine.requestIFramePlaylist()
         engine.customIFrameReader = (reader: clone, formatHint: "mp4")
         _ = try engine.start()
         engine.stop()
-        #expect(waitUntil { clone.closes == 1 })
+        try await waitFor { clone.closes == 1 }
     }
 
     @Test("a clone handed to a session that cannot serve the rendition is closed at once",

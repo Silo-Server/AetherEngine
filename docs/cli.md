@@ -73,7 +73,7 @@ open 'http://127.0.0.1:<port>/<token>/master.m3u8'   # macOS QuickTime
 
 `--start-position S` starts the session at S seconds, the resume anchor a host passes to `load(url:startPosition:)`. Also available on `play`.
 
-`--atmos-bed <layout>` is `LoadOptions.objectAudioRendering = .apac(layout)` (`5.1.2`, `5.1.4`, `7.1.2`, `7.1.4` or `9.1.6`): a TrueHD Atmos track is rendered into that bed and served as APAC, so the master reads `CODECS="…,apac.31.02"` (5.1.2, 8 channels), `apac.31.03` (10 or 12 channels) or `apac.31.04` (9.1.6, 16 channels) and the log carries `TrueHD Atmos: objects rendered into …`. `--audio-index <n>` serves source stream `n`, as a host's audio picker would; without it the engine prefers an E-AC-3 JOC track when the file has one. Dolby's Unfold demo: `serve --atmos-bed 7.1.4 --audio-index 1 dolby-unfold-lossless.m2ts`.
+`--atmos-bed <layout>` is `LoadOptions.objectAudioRendering = .apac(layout)` (`5.1.2`, `5.1.4`, `7.1.2`, `7.1.4` or `9.1.6`, #731, #744): a TrueHD Atmos or DTS:X track is rendered into that bed and served as APAC, so a master reads `CODECS="…,apac.31.02"` (5.1.2, 8 channels), `apac.31.03` (10 or 12 channels) or `apac.31.04` (9.1.6, 16 channels), and the log carries `TrueHD Atmos: objects rendered into …` (or `DTS:X: bed, heights and objects rendered into …`) and the `[SpatialAudioBridge] bed levels` lines. A DTS-HD MA track that LibDTSX does not confirm as DTS:X logs `DTS-HD MA track is not DTS:X LibDTSX renders (…); keeping the channel bridge` instead. `--audio-index <n>` serves source stream `n`, as a host's audio picker would. Dolby's Unfold demo, whose TrueHD Atmos track is stream 1: `serve --no-dv --atmos-bed 7.1.4 --audio-index 1 unfold.m2ts`.
 
 `--audio-delay <ms>` parks the server with the AE#464 audio offset already in its muxer, which is how the DELIVERED offset is measured rather than argued about: fetch the media playlist and walk its segments, then read the first audio and video packet timestamps out of `init.mp4` + a segment with `ffprobe -show_entries packet=stream_index,pts_time`. On a 30 fps H.264 + AAC fixture the source's own alignment is +21.8 ms, `--audio-delay 200` reads +221.8 ms and `--audio-delay -150` reads -128.2 ms, i.e. exactly the offset asked for, with the video timestamp unchanged in every arm.
 
@@ -273,10 +273,27 @@ asking again every drain cycle. The observable is the range count, in the origin
 point is that there is no second ask to refuse. Two shapes are worth running deliberately, because
 they are the two the flag has to survive: a long uninterrupted read, and a PAUSE, which must end the
 connection after five seconds and cost exactly one re-request at the frontier when playback resumes.
+On a finite HEVC-in-MPEG-TS HLS VOD (the AE#268 ingest) the same flag puts the playlist and every
+segment on one persistent HTTP/1.1 connection (AE#732); the observable there is the
+`[HLSVODIngest] AE#732 connection ... open` and `... closed after N requests reason=...` lines, one
+pair per connection, and a run without seeks should show exactly one.
+
+`--progressive-segments` sets `LoadOptions.progressiveSegmentDelivery`: each VOD segment is served
+while it is written. Run it against a throttled origin and compare the `FIRSTFRAME` and first
+`PHASE playing` times with and without the flag; the session log shows `serving while it is written`
+for every segment that went out that way. On a local or fast source the segments are cut before
+AVPlayer asks and the two runs look the same.
 
 `--max-concurrent-requests N` sets `LoadOptions.maxConcurrentSourceRequests` (#377): the most requests the reader may have open against the origin at once, across every path it fetches on. `1` also switches off the speculative parallel paths, which is the shape of a connection-metered CDN. Count the requests in the origin's own log, or read the `[AVIOReader]` connection lines, with and without the flag.
 
 `--assert-dv` sets `LoadOptions.panelPresentsDolbyVision` (AE#493), the host's assertion that its display presents Dolby Vision. macOS has no per-mode display capability API, so a Mac run plays a Dolby Vision source as its HDR10 base layer (`effective-format=hdr10`) until the host says otherwise; the flag moves that label and the tvOS criteria request. It does not change the packaging of a Profile 5 / 8.1 / 8.4 source (those carry their `dvcC` and `SUPPLEMENTAL-CODECS` on every display since 6.72.0 / 6.73.0), while Profile 7 and AV1 Dolby Vision are still gated on it. A wrong claim costs one in-place media-playlist fallback, not the item.
+
+`--native-video-frame-diagnostics` enables the opt-in SDR native-loopback decoded-output
+observer from `LoadOptions.nativeVideoFrameDiagnostics`. It logs progress, output gaps and
+observation delays without suppressing the player layer or claiming physical display proof.
+
+`play --native-video-frame-recovery` separately enables bounded SDR native decoded-output repair;
+it is off by default and does not follow from enabling diagnostics. See [diagnostics](api.md#diagnostics).
 
 `--picture-probe` attaches an `AVPlayerItemVideoOutput` to the running item and decodes the source
 time out of the picture itself, which is the one axis question nothing else here can answer: every
@@ -405,6 +422,17 @@ round 11 documents on both sides of that thread.
 
 `--start-position S` starts at a resume anchor, the same one `serve` takes. `--sw` forces the software path for a source that would route native, which is how a native-only fixture exercises the SW pipeline.
 
+A run with `--start-position` and nothing else that repositions (no `--seek-every`, no host calls besides `play`, no audio switch) is also judged on where the resume LANDS: a clock that reads more than a second behind the anchor in the first three ticks exits 2 with `VERDICT: resume clock fell behind its anchor`. That is AE#724, and the plain clock-advances check could not see it, because the session it broke kept advancing, only from the wrong place. A resume on a long-GOP source repositions to the keyframe before its target, so its first decoded audio sample arrives up to a GOP early, and the software host used to move its clock back onto that sample. Ten-second GOPs reproduce it, two-second ones never do:
+
+```bash
+ffmpeg -f lavfi -i testsrc2=size=320x180:rate=24 -f lavfi -i sine=frequency=440:sample_rate=48000 \
+  -t 30 -c:v libx264 -preset ultrafast -g 240 -keyint_min 240 -sc_threshold 0 -c:a aac gop240.mp4
+aetherctl play --sw --start-position 17.3 --seconds 5 file://$PWD/gop240.mp4
+aetherctl play --sw --paused --host-calls play --start-position 17.3 --seconds 5 file://$PWD/gop240.mp4
+```
+
+Before the fix both read `clock re-anchored to first sample: anchor=9.984s (load anchor 17.300s ...)` and `cur=10.8` at the first tick; after it `cur=18.2` and no re-anchor. `--paused` alone (no `play`) is not judged, but its ticks are the observable for the second half of the same report: a paused resume read `cur=0.00` until play, because the host published its still unarmed synchronizer over the anchor, and now reads `cur=17.30`.
+
 `--malloc-census` turns on the large-allocation census (`AetherEngine.setLargeAllocationCensusEnabled`) for the run, for tracing a footprint that grows where the segment budget says it should not. Besides the 30 s sample it arms a jump trigger, which exists because the 30 s memprobe cannot catch a failure that completes inside one sample (every kill on #220 was that shape): a counter polled at `--census-hz N` runs the zone walk once it climbs `--census-threshold-mb N` above its running high-water. Both flags are inert without `--malloc-census`.
 
 `--audio-stats` installs the engine audio tap and watches the decoded PCM itself: an `AGAP` line for every source-PTS discontinuity > 2 ms between consecutive buffers, and per-second `alead` (last decoded audio PTS minus the synchronizer clock) plus `abufs` (buffers delivered) appended to the telemetry. `alead` is the audio renderer's safety margin: on the SW live path the look-ahead pump holds it near `AudioLookaheadPolicy.targetLeadSeconds`; a collapse toward zero means the source or the feeder cannot keep real time (this is how the #107 audio-chopping report was diagnosed).
@@ -488,6 +516,8 @@ Brings up the loopback session headless, decodes the audio tap (#95) as fast as 
 ## bgaudio
 
 Verifies SW-path background audio (iOS keepalive) headless on macOS, where the `UIApplication` background lifecycle that normally drives it does not exist. Loads a software-routed source through the full engine, plays a foreground baseline, toggles the SW host into background-audio-only (`--fg N` foreground seconds, `--bg N` background seconds; defaults 3 / 6), then returns to foreground. Reports per-tick the audio clock, the SW video-frame count, and the process memory footprint, and a verdict. A healthy run shows the clock advancing through the background phase (audio alive), the video-frame count flat (video dropped), the footprint roughly flat (the loop paces on the audio renderer rather than buffering the rest of the file), and the video-frame count rising again on foreground return (resync at the next keyframe). The flag and counters are exposed through DEBUG-only engine hooks, so this command is unavailable in a Release build. Generate a quick software-path clip with `ffmpeg -f lavfi -i testsrc2 -f lavfi -i sine -c:v libvpx-vp9 -c:a aac -shortest clip.mkv`.
+
+`--lose-session` (AE#739) reproduces what an iOS screen lock does to the SW host's VideoToolbox session: halfway through the foreground phase, and again right after entering background-audio-only, it invalidates the session in place, so the next decode returns `kVTInvalidSessionErr` (-12903) exactly as in a field log. It forces the software path and needs an HEVC source, since only HEVC reaches the hardware decoder there (`ffmpeg -f lavfi -i testsrc2=size=1920x1080:rate=24 -f lavfi -i sine -t 30 -c:v libx265 -x265-params keyint=48 -tag:v hvc1 -c:a aac clip.mp4`), and it prints the engine log so the loss, rebuild and reposition lines are visible. It fails unless video frames rise again after the foreground loss (the host rebuilds the session and repositions to the playhead) and after the foreground return (rebuilt unconditionally, resumes at the next keyframe). Before the fix both counts stayed at +0.
 
 ## customio
 

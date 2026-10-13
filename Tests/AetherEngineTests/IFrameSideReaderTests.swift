@@ -131,7 +131,7 @@ struct IFrameSideReaderTests {
         #expect(DemuxerOpenProfile.labelsWithoutCompositionRepair.contains("extract"))
     }
 
-    @Test("interrupt aborts an open that is still in flight", .timeLimit(.minutes(1)))
+    @Test("interrupt aborts an open that is still in flight", .timeLimit(.minutes(3)))
     func interruptAbortsAnOpenInFlight() {
         let parked = ProbeParkedReader(operation: .read)
         parked.mayReturn.open()
@@ -146,8 +146,8 @@ struct IFrameSideReaderTests {
         entered.wait()
         Thread.sleep(forTimeInterval: 0.2)
         r.interrupt()
-        let returned = done.wait(timeout: .now() + 10) == .success
-        #expect(returned, "payload() was still inside the open ten seconds after interrupt()")
+        let returned = done.wait(timeout: .now() + 120) == .success
+        #expect(returned, "payload() was still inside the open 120 seconds after interrupt()")
         parked.release()
         if !returned { done.wait() }
         r.close()

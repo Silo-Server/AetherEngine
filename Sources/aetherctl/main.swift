@@ -67,7 +67,7 @@ func printUsage() {
 
     Usage:
       aetherctl probe [--detect-hdr10plus] [--detect-hdr-vivid] [--detect-atmos] <url>
-      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] [--atmos-bed 7.1.4] <url>
+      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] [--atmos-bed 7.1.4] [--audio-index N] <url>
       aetherctl validate [--no-dv] [--force-dv] [--dv-base-layer] <url>
       aetherctl swdecode [--frames N] <url>
       aetherctl play [--seconds N] [--live] [--no-sw-escalation] [--fast-zap] [--live-start-immediately] [--dvr-window N] [--subs <codec-or-lang>]
@@ -129,8 +129,10 @@ func printUsage() {
                          (#35/#37/#38: rapid-seek burst, wedge report, seek-event ledger)
       aetherctl pktdump [--at S] [--count N] [--profile playback|restartReopen|stillExtraction] <url>
                         (raw demuxer packet timing, before dts repair and muxing)
-      aetherctl bgaudio [--fg N] [--bg N] <url>
-                        (SW-path background audio headless on macOS; DEBUG builds only)
+      aetherctl bgaudio [--fg N] [--bg N] [--lose-session] <url>
+                        (SW-path background audio headless on macOS; DEBUG builds only.
+                         --lose-session invalidates the VT session mid-foreground and
+                         on entering background, as an iOS screen lock does, AE#739)
       aetherctl smbtest [--reads N] <smb-url>
                         (SMB byte source: throughput pass + random-seek consistency; macOS)
       aetherctl <url>             (alias for `serve`)
@@ -380,14 +382,16 @@ if first == "bgaudio" {
     var rest = Array(args.dropFirst(2))
     let fg = takeDoubleFlag("--fg", in: 0...maxRunSeconds, from: &rest) ?? 3.0
     let bg = takeDoubleFlag("--bg", in: 0...maxRunSeconds, from: &rest) ?? 6.0
+    let loseSession = takeFlag("--lose-session", from: &rest)
     guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
         print("ERROR: bgaudio requires a <url> argument")
-        print("Usage: aetherctl bgaudio [--fg N] [--bg N] <url>")
+        print("Usage: aetherctl bgaudio [--fg N] [--bg N] [--lose-session] <url>")
         exit(64)
     }
     rest.removeAll { $0 == urlArg }
     rejectStrayFlags(rest, subcommand: "bgaudio")
-    exit(runBackgroundAudio(url: parseSourceURL(urlArg), fgSeconds: fg, bgSeconds: bg))
+    exit(runBackgroundAudio(url: parseSourceURL(urlArg), fgSeconds: fg, bgSeconds: bg,
+                            loseSession: loseSession))
 }
 
 if first == "smbtest" {
@@ -691,6 +695,9 @@ if first == "play" {
     // drain cycle. This is the knob for an origin that refuses new requests in windows: run it
     // against one and count the ranges in its own log, or read `conn start ... held` here.
     let heldConnection = takeFlag("--held-connection", from: &rest)
+    // LoadOptions.progressiveSegmentDelivery: serve each VOD segment while it is written. Pair it
+    // with a throttled origin to see the startup difference; on a fast source nothing changes.
+    let progressiveSegments = takeFlag("--progressive-segments", from: &rest)
     let declaredDuration = takeDoubleFlag("--declared-duration", from: &rest)
     // #311: install the software frame-time observer and read the presentation timebase, so the
     // per-frame boundaries and the clock a host would pace an overlay against are both observable.
@@ -699,6 +706,8 @@ if first == "play" {
     // AE#684: print the loopback URL of every native item, so its init and segments can be fetched.
     let servedURL = takeFlag("--served-url", from: &rest)
     let pictureProbe = takeFlag("--picture-probe", from: &rest)
+    let nativeVideoFrameDiagnostics = takeFlag("--native-video-frame-diagnostics", from: &rest)
+    let nativeVideoFrameRecovery = takeFlag("--native-video-frame-recovery", from: &rest)
     // AE#534: the source axis's origin, for a container whose timeline does not start at zero.
     // The picture states a frame index, which an -output_ts_offset remux does not move.
     let pictureOrigin = takeDoubleFlag("--picture-origin", from: &rest) ?? 0
@@ -880,7 +889,7 @@ if first == "play" {
         done.wait()
     }
     exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: playFastZap, liveStartImmediately: liveStartImmediately, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: playStartPosition, mallocCensus: mallocCensus, forceSoftware: playForceSW, softwareEscalation: playSoftwareEscalation,
-                 censusThresholdMB: censusThresholdMB, censusHz: censusHz, frameTimes: frameTimes, presentTimes: presentTimes, servedURL: servedURL, pictureProbe: pictureProbe, pictureOrigin: pictureOrigin, sidecars: sidecars,
+                 censusThresholdMB: censusThresholdMB, censusHz: censusHz, frameTimes: frameTimes, presentTimes: presentTimes, servedURL: servedURL, pictureProbe: pictureProbe, pictureOrigin: pictureOrigin, nativeVideoFrameDiagnostics: nativeVideoFrameDiagnostics, nativeVideoFrameRecovery: nativeVideoFrameRecovery, sidecars: sidecars,
                  audioSwitch: audioSwitch,
                  teletextPage: teletextPage, teletextSwitch: teletextSwitch,
                  audioDelayMs: audioDelayMs, audioDelaySwitches: audioDelaySwitches,
@@ -888,6 +897,7 @@ if first == "play" {
                  optionCorrection: optionCorrection,
                  sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests,
                  heldConnection: heldConnection,
+                 progressiveSegments: progressiveSegments,
                  declaredDuration: declaredDuration,
                  httpHeaders: playHeaders,
                  deinterlaceFieldRate: playFieldRate,
@@ -987,7 +997,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     // be read straight off the segments (ffprobe the audio and video first-packet PTS) instead of
     // being judged by ear.
     let serveAudioDelayMs = takeIntFlag("--audio-delay", from: &rest) ?? 0
-    // TrueHD Atmos rendered into a speaker bed and served as APAC (LoadOptions.objectAudioRendering).
+    // #731: TrueHD Atmos or DTS:X rendered into a speaker bed and served as APAC (LoadOptions.objectAudioRendering).
     let atmosBedFlag = takeStringFlag("--atmos-bed", from: &rest)
     let serveObjectAudioRendering: ObjectAudioRendering
     if let atmosBedFlag {
@@ -1019,9 +1029,10 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
         runServe(url: url, dvModeAvailable: dvModeAvailable, forceDVWithoutDisplay: forceDV,
                  dolbyVisionHandling: dvHandling,
                  nativeSubsIndex: nativeSubsIndex, startPosition: startPosition,
-                 audioDelayMs: serveAudioDelayMs, objectAudioRendering: serveObjectAudioRendering,
+                 audioDelayMs: serveAudioDelayMs, iFrames: serveIFrames,
+                 objectAudioRendering: serveObjectAudioRendering,
                  // `--audio-index` (parsed once above, shared with customio): serve that source stream.
-                 audioStreamIndex: customAudioIndex, iFrames: serveIFrames)
+                 audioStreamIndex: customAudioIndex)
     case "validate":
         exit(runValidate(url: url, dvModeAvailable: dvModeAvailable, forceDVWithoutDisplay: forceDV,
                          dolbyVisionHandling: dvHandling))

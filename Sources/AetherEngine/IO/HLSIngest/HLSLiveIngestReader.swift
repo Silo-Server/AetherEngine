@@ -271,7 +271,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         guard !started, !closed else { return }
         started = true
         // Strong capture: the ingest loop must keep the reader and FIFO alive until close() cancels it.
-        ingestTask = Task.detached(priority: .userInitiated) { [self] in
+        ingestTask = BlockingWork.detached(priority: .userInitiated) { [self] in
             await runIngest()
         }
     }

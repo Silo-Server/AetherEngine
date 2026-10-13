@@ -36,12 +36,14 @@ final class APACEncoder {
         case formatUnavailable(SpatialSpeakerLayout)
         case converterUnavailable(SpatialSpeakerLayout)
         case convertFailed(String)
+        case encodeAfterFlush
 
         var description: String {
             switch self {
             case .formatUnavailable(let l): return "APACEncoder: no APAC output format for \(l.rawValue)"
             case .converterUnavailable(let l): return "APACEncoder: this OS has no APAC encoder for \(l.rawValue)"
             case .convertFailed(let why): return "APACEncoder: convert failed (\(why))"
+            case .encodeAfterFlush: return "APACEncoder: encode after flush (reset first)"
             }
         }
     }
@@ -56,9 +58,10 @@ final class APACEncoder {
     let leadingFrames: Int
 
     private let pcmFormat: AVAudioFormat
-    private let apacFormat: AVAudioFormat
     private let converter: AVAudioConverter
     private let inputBuffer: AVAudioPCMBuffer
+    /// Reused by every `drain`: at 16 × `maximumOutputPacketSize` it is 393 KB for 7.1.4.
+    private let outputBuffer: AVAudioCompressedBuffer
     private var ended = false
 
     /// `bitRate` is the target in bits per second. Apple's HLS table recommends 384 kbps for 7.1,
@@ -80,7 +83,6 @@ final class APACEncoder {
             AVEncoderBitRateKey: bitRate,
         ]
         guard let apac = AVAudioFormat(settings: settings) else { throw EncoderError.formatUnavailable(layout) }
-        apacFormat = apac
         guard let conv = AVAudioConverter(from: pcmFormat, to: apac) else {
             throw EncoderError.converterUnavailable(layout)
         }
@@ -92,13 +94,18 @@ final class APACEncoder {
         guard let cookie = conv.magicCookie, !cookie.isEmpty else { throw EncoderError.converterUnavailable(layout) }
         magicCookie = cookie
         leadingFrames = Int(conv.primeInfo.leadingFrames)
+        precondition(maxInputFrames > 0, "APACEncoder needs room for at least one input frame")
         inputBuffer = AVAudioPCMBuffer(pcmFormat: pcmFormat, frameCapacity: AVAudioFrameCount(maxInputFrames))!
+        outputBuffer = AVAudioCompressedBuffer(
+            format: apac, packetCapacity: 16, maximumPacketSize: max(conv.maximumOutputPacketSize, 1))
     }
 
     /// Queue `frameCount` frames (one plane per layout channel) and return every packet the encoder
     /// completes. Larger inputs are fed in `maxInputFrames` slices.
     func encode(planes: [UnsafePointer<Float>], frameCount: Int) throws -> [Packet] {
         precondition(planes.count == layout.channelCount)
+        // The converter has seen end of stream and would swallow everything fed after it.
+        guard !ended else { throw EncoderError.encodeAfterFlush }
         var packets: [Packet] = []
         var offset = 0
         let capacity = Int(inputBuffer.frameCapacity)
@@ -133,9 +140,7 @@ final class APACEncoder {
 
     private func drain(feeding input: AVAudioPCMBuffer?, endOfStream: Bool, into packets: inout [Packet]) throws {
         var supplied = input == nil
-        let output = AVAudioCompressedBuffer(
-            format: apacFormat, packetCapacity: 16,
-            maximumPacketSize: max(converter.maximumOutputPacketSize, 1))
+        let output = outputBuffer
         while true {
             output.packetCount = 0
             output.byteLength = 0
@@ -154,8 +159,9 @@ final class APACEncoder {
             }
             collect(output, into: &packets)
             // haveData: the output buffer filled and more may be waiting. Anything else means the
-            // encoder has emitted all it can from what it was given.
-            if status != .haveData { break }
+            // encoder has emitted all it can from what it was given. A haveData that produced
+            // nothing would never change, so it ends the loop too.
+            if status != .haveData || output.packetCount == 0 { break }
         }
     }
 

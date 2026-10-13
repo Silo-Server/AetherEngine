@@ -416,6 +416,22 @@ public struct LoadOptions: Sendable, Equatable {
     /// subtitle downloads. On supported requests this replaces `httpHeaders`; default nil.
     public var httpRequestAuthorization: HTTPRequestAuthorization?
 
+    /// Opt-in decoded-frame diagnostics for SDR native loopback playback. Default off.
+    /// Samples an additional AVPlayerItemVideoOutput; reports output gaps, not physical display
+    /// freezes. Disabled during seek/pause, external playback and mobile background activity.
+    public var nativeVideoFrameDiagnostics: Bool = false
+
+    /// Opt-in bounded repair of stalled SDR decoded output on native loopback playback.
+    /// Enables frame observation independently of diagnostics. Default off; short gaps,
+    /// unavailable output, PiP, background, external playback, pause and seeks never repair.
+    public var nativeVideoFrameRecovery: Bool = false
+
+    /// The host owns the retry after a verified live replay exhausts in-engine recovery: the engine
+    /// publishes `liveSourceReplayExhausted` and waits for `retryLiveSourceRecovery()`. Default off,
+    /// where that exhaustion publishes `liveSourceReset` like any other source loss, so a host that
+    /// only knows that event still retunes instead of holding the last frame.
+    public var hostRetriesExhaustedLiveReplay: Bool = false
+
     /// Diagnostic lever: force dvh1 codec tags + master playlist regardless of display capability. OFF by default: non-DV displays route DV through the media playlist (no master) so AVPlayer auto-tonemaps the HEVC base layer (only path that avoids AVFoundationErrorDomain -11868 on tvOS 26). AetherEngine#4.
     public var keepDvh1TagWithoutDV: Bool
 
@@ -431,8 +447,8 @@ public struct LoadOptions: Sendable, Equatable {
     /// the profile field means, and a tvOS build that reads the base layer's colorimetry from the profile
     /// rather than the RPU would render IPT out of YCbCr (the green/violet cast of AE#4 and AE#176).
     ///
-    /// Ignored when the display does support Dolby Vision, and applies to HEVC Profile 8.1 only. Reported by
-    /// DrHurt against a Samsung HDR10 panel.
+    /// Ignored when the display does support Dolby Vision, and applies to HEVC Profile 8.1 and to Profile 7,
+    /// which is served as the Profile 8.1 it is converted to. Reported by DrHurt against a Samsung HDR10 panel.
     public var forceDolbyVisionOnNonDVDisplay: Bool
 
     /// A `DolbyVisionHandling`. Default `.automatic`. `.baseLayerOnly` presents the HDR10 / HLG base layer
@@ -528,9 +544,10 @@ public struct LoadOptions: Sendable, Equatable {
     /// - `.lossless`: FLAC up to 7.1. Needs a sink that accepts multichannel LPCM (Denon / Marantz / NAD AVRs); stereo-only routes silently downmix.
     public var audioBridgeMode: AudioBridgeMode
 
-    /// TrueHD Atmos delivery. `.off` (default) keeps `audioBridgeMode`'s 7.1 channel decode;
-    /// `.apac(layout)` renders the Atmos objects into `layout` and delivers Apple Positional Audio,
-    /// which reaches an Atmos receiver as Dolby MAT with its heights. See `ObjectAudioRendering`.
+    /// TrueHD Atmos and DTS:X delivery (#731). `.off` (default) keeps `audioBridgeMode`'s 7.1 channel
+    /// decode; `.apac(layout)` renders the objects and heights into `layout` and delivers Apple
+    /// Positional Audio, which reaches an Atmos receiver as Dolby MAT with its heights. See
+    /// `ObjectAudioRendering`.
     public var objectAudioRendering: ObjectAudioRendering
 
     /// Treat the source as a live stream. `seek(to:)` becomes a no-op; `isLive` surface reflects this for host UIs. Set explicitly: auto-detection from `probe.durationSeconds == 0` is too noisy (VOD MKVs with broken duration headers). Default `false`.
@@ -541,6 +558,10 @@ public struct LoadOptions: Sendable, Equatable {
 
     /// DVR rewind window in seconds; nil = live-only (seek is a no-op). Engine retains roughly this much past content disk-backed, bounded by the session disk budget (a quarter of the free space, at most 2 GiB), so a long window on a high-bitrate channel or a small volume holds less than it asks for. Suggested default: 1800. Ignored when `isLive == false`. Default nil.
     public var dvrWindowSeconds: Double?
+
+    /// Opt in to strict software DVR storage bounds and runtime capacity leases.
+    /// Nil preserves the default spool behavior.
+    public var softwareDVRRetention: SoftwareDVRRetentionOptions? = nil
 
     /// LL-HLS blocking-reload (`#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD`) override for live loopback sessions.
     /// nil (default) = auto: for a `LiveIngestSourceInfo` custom reader the engine derives eligibility from
@@ -569,6 +590,27 @@ public struct LoadOptions: Sendable, Equatable {
     /// lean-back viewing. Ignored for `nativeRemoteHLS` and VOD. Default `.standard`
     /// (AetherEngine#195/#208).
     public var liveJoinProfile: LiveJoinProfile = .standard
+
+    /// HTTP VOD opening budgets. Applied to the initial playback reader and its reopens;
+    /// live, sequential-only sources and disposable frame probes retain their own policies.
+    public var sourceOpenPolicy: SourceOpenPolicy = .init()
+
+    /// Extra wait after an eligible finalized window for `.fastZap` loopback live joins.
+    /// Nil uses the observed segment duration clamped to 0.5...2 seconds. Zero serves immediately
+    /// once the minimum media exists. Invalid or negative values use the automatic policy.
+    /// A shorter grace can increase early rebuffering on irregular sources. This does not change
+    /// TARGETDURATION, HOLD-BACK, or `.standard` joins. The minimum is two segments unless
+    /// `liveStartupSingleSegmentMinimumSeconds` explicitly permits a sufficiently long first one.
+    public var liveStartupGraceSeconds: Double? = nil
+
+    /// Opt-in minimum media duration for starting a `.fastZap` loopback live session with one
+    /// finalized segment. Nil retains the two-segment minimum. A finite, positive value allows a
+    /// single segment at least that long to enter the same bounded-start grace; shorter segments
+    /// still need a second segment. This avoids waiting for another full GOP on long-GOP sources.
+    /// It does not change segment boundaries, TARGETDURATION, HOLD-BACK or `.standard` joins.
+    /// A shallow initial playlist can rebuffer if the next segment arrives late. Hosts choose
+    /// this latency/resilience tradeoff; invalid values preserve the two-segment minimum.
+    public var liveStartupSingleSegmentMinimumSeconds: Double? = nil
 
     /// Cut AVPlayer's stall-avoidance wait short at the live join, once it is holding on media it has
     /// already buffered. Live sessions on the AVPlayer-backed paths only. Default `false` (AE#440).
@@ -738,6 +780,14 @@ public struct LoadOptions: Sendable, Equatable {
     /// transport: they park deliberately for minutes, which is the one shape a held connection
     /// must not take.
     ///
+    /// AE#732: it also covers a finite HLS VOD that takes the AE#268 ingest (HEVC in MPEG-TS). Its
+    /// playlist, key and segment requests then run over one persistent HTTP/1.1 connection per
+    /// origin, reused across segment boundaries, one segment at a time instead of four in parallel,
+    /// for origins that refuse h2 or a freshly opened connection but serve consecutive requests on
+    /// one keep-alive connection. The connection is replaced only when the origin closes it, the
+    /// origin changes, or a seek abandons a body mid-transfer; each open and close is logged with
+    /// its protocol and request count. Other HLS routes keep their transport.
+    ///
     /// Names the session rather than tuning it: the transport is chosen when the source is opened,
     /// so a reload cannot change it. Default false, which is every reader shipped so far.
     public var heldSourceConnection: Bool = false
@@ -796,6 +846,16 @@ public struct LoadOptions: Sendable, Equatable {
     /// historical default of 10 (~ 40 s). Ignored for `nativeRemoteHLS`, where AVPlayer talks to the
     /// remote server directly.
     public var forwardBufferSegments: Int?
+
+    /// Serve each VOD loopback segment while it is being written instead of after its cut. The
+    /// muxer flushes a fragment about every half second and the loopback server sends each one as
+    /// it lands, so AVPlayer can show and start on the first fragments of a segment rather than
+    /// waiting for all of it. On a fast or local source a segment is cut long before AVPlayer asks
+    /// for it and nothing changes; on a slow link it is the difference between waiting for a whole
+    /// segment (seconds of a long GOP at the link's rate) and waiting for its first fragment.
+    /// Default false. VOD only: live keeps its own window and blocking-reload contracts. Ignored for
+    /// `nativeRemoteHLS` and on the software path, which serve no loopback segments.
+    public var progressiveSegmentDelivery: Bool = false
 
     /// Autostart at load completion. Default `true`: every load path ends in `host.play()` and a
     /// `.playing` state (current behavior, byte-identical). Set `false` to mount PAUSED: a host that
@@ -905,6 +965,9 @@ public struct LoadOptions: Sendable, Equatable {
         dvrWindowSeconds: Double? = nil,
         liveBlockingReload: Bool? = nil,
         liveJoinProfile: LiveJoinProfile = .standard,
+        sourceOpenPolicy: SourceOpenPolicy = .init(),
+        liveStartupGraceSeconds: Double? = nil,
+        liveStartupSingleSegmentMinimumSeconds: Double? = nil,
         liveJoinStartsImmediately: Bool = true,
         clampsLiveResumeToWindow: Bool = true,
         nativeRemoteHLS: Bool = false,
@@ -925,6 +988,7 @@ public struct LoadOptions: Sendable, Equatable {
         preferredSubtitleLanguages: [String] = [],
         externalSubtitles: [ExternalSubtitleTrack] = [],
         forwardBufferSegments: Int? = nil,
+        progressiveSegmentDelivery: Bool = false,
         autoplay: Bool = true,
         teletextPage: Int? = nil,
         audioDelaySeconds: Double = 0,
@@ -932,7 +996,10 @@ public struct LoadOptions: Sendable, Equatable {
         deinterlaceFieldRate: DeinterlaceFieldRate = .field,
         preferredDecodePath: DecodePath = .automatic,
         escalatesToSoftwarePath: Bool = true,
-        sharedOutputRole: SharedOutputRole = .primary
+        sharedOutputRole: SharedOutputRole = .primary,
+        nativeVideoFrameDiagnostics: Bool = false,
+        nativeVideoFrameRecovery: Bool = false,
+        hostRetriesExhaustedLiveReplay: Bool = false
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
@@ -952,6 +1019,9 @@ public struct LoadOptions: Sendable, Equatable {
         self.dvrWindowSeconds = dvrWindowSeconds
         self.liveBlockingReload = liveBlockingReload
         self.liveJoinProfile = liveJoinProfile
+        self.sourceOpenPolicy = sourceOpenPolicy
+        self.liveStartupGraceSeconds = liveStartupGraceSeconds
+        self.liveStartupSingleSegmentMinimumSeconds = liveStartupSingleSegmentMinimumSeconds
         self.liveJoinStartsImmediately = liveJoinStartsImmediately
         self.clampsLiveResumeToWindow = clampsLiveResumeToWindow
         self.nativeRemoteHLS = nativeRemoteHLS
@@ -972,6 +1042,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.preferredSubtitleLanguages = preferredSubtitleLanguages
         self.externalSubtitles = externalSubtitles
         self.forwardBufferSegments = forwardBufferSegments
+        self.progressiveSegmentDelivery = progressiveSegmentDelivery
         self.autoplay = autoplay
         self.teletextPage = teletextPage
         self.audioDelaySeconds = audioDelaySeconds
@@ -980,6 +1051,9 @@ public struct LoadOptions: Sendable, Equatable {
         self.preferredDecodePath = preferredDecodePath
         self.escalatesToSoftwarePath = escalatesToSoftwarePath
         self.sharedOutputRole = sharedOutputRole
+        self.nativeVideoFrameRecovery = nativeVideoFrameRecovery
+        self.nativeVideoFrameDiagnostics = nativeVideoFrameDiagnostics
+        self.hostRetriesExhaustedLiveReplay = hostRetriesExhaustedLiveReplay
     }
 }
 
@@ -994,8 +1068,9 @@ public enum VideoFormat: Sendable, Equatable {
 
 /// A Dolby Vision profile rewrite the engine applies to the served stream (`AetherEngine.dolbyVisionConversion`).
 public enum DolbyVisionConversion: Sendable, Equatable {
-    /// Dual-layer Profile 7 rewritten per packet to single-layer Profile 8.1 for a display presenting Dolby
-    /// Vision. The enhancement layer is discarded: a MEL carries next to nothing, a FEL loses its refinement.
+    /// Dual-layer Profile 7 rewritten per packet to single-layer Profile 8.1, on every display (a display
+    /// without Dolby Vision gets the RPU-driven tone map a Profile 8.1 gets). The enhancement layer is
+    /// discarded: a MEL carries next to nothing, a FEL loses its refinement.
     case profile7ToProfile81
 }
 
