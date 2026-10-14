@@ -137,6 +137,15 @@ extension AetherEngine {
     /// Packet ceiling for the AVDISCARD_ALL fuse, saturating instead of trapping: `maxPackets` is a public
     /// option and `Int.max` is a plausible "no limit" value for a host to pass (`forwardBufferSegments`
     /// takes exactly that), which would overflow a plain multiply.
+    /// Source bytes the probe may consume across every stream. With the other streams at AVDISCARD_ALL
+    /// the demuxer reads and drops a video run inside one `av_read_frame`, where neither `maxBytes` nor
+    /// the packet fuse sees it. Wider than the HDR10+ budget because the audio sits behind interleaved
+    /// UHD video here: 16 x `maxBytes`, at least 64 MiB. Saturating: `maxBytes` is public.
+    nonisolated static func atmosInputByteBudget(maxBytes: Int64) -> Int64 {
+        let (product, overflowed) = max(0, maxBytes).multipliedReportingOverflow(by: 16)
+        return overflowed ? .max : max(product, 64 * 1024 * 1024)
+    }
+
     nonisolated static func atmosForeignPacketFuse(maxPackets: Int) -> Int {
         let (product, overflowed) = maxPackets.multipliedReportingOverflow(by: foreignPacketFuseMultiplier)
         return overflowed ? Int.max : product
@@ -228,6 +237,8 @@ extension AetherEngine {
         // exhaust the 8 MiB byte cap in well under a second of container data, and the probe returns
         // .byteCap having fed the decoder nothing -- reporting "not Atmos" for genuinely Atmos media.
         demuxer.discardAllStreamsExcept([targetIndex])
+        demuxer.beginInputByteBudget(Self.atmosInputByteBudget(maxBytes: options.maxBytes))
+        defer { demuxer.endInputByteBudget() }
 
         while true {
             let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000
@@ -242,10 +253,10 @@ extension AetherEngine {
             do {
                 packet = try demuxer.readPacket()
             } catch {
-                return stopped(.demuxError)
+                return stopped(demuxer.inputByteBudgetExhausted ? .byteCap : .demuxError)
             }
             guard let pkt = packet else {
-                return stopped(.demuxEOF)
+                return stopped(demuxer.inputByteBudgetExhausted ? .byteCap : .demuxEOF)
             }
             let afterRead = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000
             if afterRead >= options.timeBudget {

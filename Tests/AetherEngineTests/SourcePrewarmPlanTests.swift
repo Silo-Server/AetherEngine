@@ -123,6 +123,15 @@ struct SourcePrewarmPlanTests {
                 == .range(start: cuesAbsolute))
     }
 
+    @Test("a SeekPosition at the top of the 64-bit range is skipped instead of overflowing")
+    func overflowingSeekPositionIsSkipped() {
+        let fixture = matroskaHead(entries: [(cuesID, -1)], padTo: 4096)
+        #expect(SourcePrewarmPlan.trailing(head: fixture.head, total: 63_708_627) == SourcePrewarmPlan.Trailing.none)
+        let dataStart = Int64(fixture.segmentDataStart)
+        let mixed = matroskaHead(entries: [(tagsID, Int64.max), (cuesID, 60_000 - dataStart)], padTo: 4096)
+        #expect(SourcePrewarmPlan.trailing(head: mixed.head, total: 63_000) == .range(start: 60_000))
+    }
+
     @Test("a Matroska whose objects all sit inside the warm head needs nothing more")
     func matroskaWithEverythingInTheHeadNeedsNothing() {
         let fixture = matroskaHead(entries: [(cuesID, 2048), (tagsID, 4096)], padTo: 64 * 1024)

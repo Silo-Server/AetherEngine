@@ -2,6 +2,21 @@ import Foundation
 import AetherLibavcodec
 import AetherLibavutil
 
+/// Audit BIT-104: whether a video sample of the session's track has walked exactly as a
+/// length-prefixed chain (BIT-1). Held by the session rather than by one muxer, because every seek,
+/// restart and reload builds a fresh muxer, and a muxer's first sample is exactly the one a restart
+/// lands on.
+final class NALFramingLatch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var confirmed: Bool
+
+    init(confirmed: Bool = false) { self.confirmed = confirmed }
+
+    var isConfirmed: Bool { lock.withLock { confirmed } }
+
+    func confirm() { lock.withLock { confirmed = true } }
+}
+
 /// The length-prefixed NAL chain (avcC / hvcC framing) as Apple's fMP4 parser walks it.
 ///
 /// A sample in an mp4 video track is a run of NAL units, each introduced by a big-endian length of
@@ -43,12 +58,20 @@ enum NALUnitChain {
     ///
     /// Zero means not one NAL unit in the payload is complete, which leaves the caller nothing to
     /// write.
-    static func completeRunLength(_ bytes: UnsafeRawBufferPointer, lengthPrefixSize: Int) -> Int? {
+    ///
+    /// `framingConfirmed` says an earlier sample of this track already walked exactly as a
+    /// length-prefixed chain. Audit BIT-1: with a 4-byte prefix, every first NAL of 256 to 511 bytes
+    /// starts `00 00 01 xx`, so the head test alone let exactly those damaged samples through. Once
+    /// the track is known to be length-prefixed that head is a length, not a start code.
+    static func completeRunLength(
+        _ bytes: UnsafeRawBufferPointer, lengthPrefixSize: Int, framingConfirmed: Bool = false
+    ) -> Int? {
         let count = bytes.count
         guard (1...4).contains(lengthPrefixSize), count >= lengthPrefixSize else { return nil }
         // An Annex B payload is not this framing at all, and reading its start code as a length would
         // cut every frame of a healthy stream down to nothing.
-        if count >= 3, bytes[0] == 0, bytes[1] == 0, bytes[2] == 1 { return nil }
+        let threeByteHeadIsLength = framingConfirmed && lengthPrefixSize == 4
+        if !threeByteHeadIsLength, count >= 3, bytes[0] == 0, bytes[1] == 0, bytes[2] == 1 { return nil }
         if count >= 4, bytes[0] == 0, bytes[1] == 0, bytes[2] == 0, bytes[3] == 1 { return nil }
 
         var offset = 0
@@ -61,5 +84,12 @@ enum NALUnitChain {
             offset += lengthPrefixSize + length
         }
         return offset == count ? nil : offset
+    }
+
+    /// Whether the payload walks as a length-prefixed chain that ends exactly on its last byte. Annex B
+    /// data cannot do that by accident, since it would have to encode its own byte offsets.
+    static func walksExactly(_ bytes: UnsafeRawBufferPointer, lengthPrefixSize: Int) -> Bool {
+        guard let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return false }
+        return VideoConfigRecord.walksAsLengthPrefixed(base, size: bytes.count, lengthSize: lengthPrefixSize)
     }
 }

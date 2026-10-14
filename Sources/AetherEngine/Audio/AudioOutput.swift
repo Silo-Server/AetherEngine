@@ -9,6 +9,11 @@ final class AudioOutput: @unchecked Sendable {
     let renderer: AVSampleBufferAudioRenderer
     let synchronizer: AVSampleBufferRenderSynchronizer
 
+    /// AE#395: the renderers' axis. Every time this object takes or returns is on the source axis;
+    /// the conversion happens here, at the renderer and synchronizer calls, and in the video renderer
+    /// that shares this timeline.
+    let timeline = RendererTimeline()
+
     private let lock = NSLock()
 
     /// AE#464: the host's audio presentation offset, applied to every buffer on its way into the
@@ -18,6 +23,16 @@ final class AudioOutput: @unchecked Sendable {
 
     /// One line per offset change, not per buffer. Reset by `setPresentationOffset`.
     private var loggedOffsetInEffect = false
+
+    /// Audit DEC-106: retired by every `flush()` and `stop()`, under `lock`. A feed loop reads it before
+    /// it reads a packet and enqueues through `enqueue(sampleBuffer:ifEpoch:)`, which compares under the
+    /// same lock, so a buffer decided on before a seek's flush can no longer land after it.
+    private var _epoch: UInt64 = 0
+    var epoch: UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return _epoch
+    }
 
     init() {
         renderer = AVSampleBufferAudioRenderer()
@@ -46,6 +61,23 @@ final class AudioOutput: @unchecked Sendable {
         synchronizer.rate
     }
 
+    /// AE#395: the renderer's own view of its queue, for the diagnostic line: `status/sufficient/error`.
+    /// A session that is silent on one route while its clock runs at 1.00 has nothing else that could
+    /// say whether the renderer is playing what it was given, and the renderer error was only ever
+    /// logged in DEBUG builds.
+    var diagRendererState: String {
+        let status: String
+        switch renderer.status {
+        case .rendering: status = "rendering"
+        case .failed: status = "failed"
+        case .unknown: status = "unknown"
+        @unknown default: status = "?"
+        }
+        let sufficient = renderer.hasSufficientMediaDataForReliablePlaybackStart ? "y" : "n"
+        let error = (renderer.error as NSError?).map { "\($0.domain)/\($0.code)" } ?? "-"
+        return "\(status)/\(sufficient)/\(error)"
+    }
+
     /// AE#549: how often this renderer has flushed itself, for the diagnostic line.
     var automaticFlushCount: Int {
         lock.lock()
@@ -55,6 +87,11 @@ final class AudioOutput: @unchecked Sendable {
 
     private var automaticFlushObserver: NSObjectProtocol?
     private var _automaticFlushCount = 0
+
+    /// Where the AE#549 flush runs. The posting thread must never wait on `lock`: `enqueue` holds it
+    /// across `renderer.enqueue` (DEC-106), and a renderer that posts from inside that call would make the
+    /// feed thread wait on a lock it already holds, with every `flush()` / `stop()` / `seekClock()` behind it.
+    private let automaticFlushQueue = DispatchQueue(label: "engine.audio.autoflush")
 
     /// AE#549: the renderer throws its queue away when the route changes under it, and posts the
     /// timestamp of the first sample it dropped. Nothing in the engine observed that, so the lead
@@ -78,20 +115,23 @@ final class AudioOutput: @unchecked Sendable {
             queue: nil
         ) { [weak self] note in
             guard let self else { return }
-            let flushedFrom = (note.userInfo?[AVSampleBufferAudioRendererFlushTimeKey] as? NSValue)?
-                .timeValue.seconds
-            lock.lock()
-            _automaticFlushCount += 1
-            let count = _automaticFlushCount
-            renderer.flush()
-            lock.unlock()
-            EngineLog.emit(
-                "[AudioOutput] AE#549 renderer flushed itself (#\(count)): "
-                + "dropped from \(flushedFrom.map { String(format: "%.3f", $0) } ?? "unknown")s, "
-                + "clock at \(String(format: "%.3f", currentTimeSeconds))s rate=\(rate); "
-                + "audio returns once the feed reaches the clock",
-                category: .swPlayback
-            )
+            let flushedFrom = (note.userInfo?[AVSampleBufferAudioRendererFlushTimeKey] as? NSValue)
+                .map { self.timeline.sourceTime(forRenderer: $0.timeValue).seconds }
+            automaticFlushQueue.async { [weak self] in
+                guard let self else { return }
+                lock.lock()
+                _automaticFlushCount += 1
+                let count = _automaticFlushCount
+                renderer.flush()
+                lock.unlock()
+                EngineLog.emit(
+                    "[AudioOutput] AE#549 renderer flushed itself (#\(count)): "
+                    + "dropped from \(flushedFrom.map { String(format: "%.3f", $0) } ?? "unknown")s, "
+                    + "clock at \(String(format: "%.3f", currentTimeSeconds))s rate=\(rate); "
+                    + "audio returns once the feed reaches the clock",
+                    category: .swPlayback
+                )
+            }
         }
     }
 
@@ -129,15 +169,26 @@ final class AudioOutput: @unchecked Sendable {
     /// Set playback speed (0.5-2.0). Hosts own rate state (lastRate/pausedByHost); this object is stateless about it.
     func setRate(_ rate: Float) {
         let at = synchronizer.currentTime()
-        EngineLog.emit("[AudioOutput] setRate \(rate) at t=\(String(format: "%.3f", at.seconds))", category: .swPlayback)
+        EngineLog.emit("[AudioOutput] setRate \(rate) at t=\(String(format: "%.3f", timeline.sourceSeconds(forRenderer: at.seconds)))", category: .swPlayback)
         synchronizer.setRate(rate, time: at)
     }
 
     /// Pause audio (and the master clock). Hosts resume via setRate (pausedByHost pattern); deliberately no resume() here.
     func pause() {
         let at = synchronizer.currentTime()
-        EngineLog.emit("[AudioOutput] pause at t=\(String(format: "%.3f", at.seconds))", category: .swPlayback)
+        EngineLog.emit("[AudioOutput] pause at t=\(String(format: "%.3f", timeline.sourceSeconds(forRenderer: at.seconds)))", category: .swPlayback)
         synchronizer.setRate(0.0, time: at)
+    }
+
+    /// Pause the master clock, at `latest` if it has already run past it. A park deferred to the last
+    /// sample runs whenever its task is scheduled, and on a starved main actor that is after the clock
+    /// has walked on (#694: 1.149 s on a 1.0 s source on a CI runner).
+    func pause(notAfter latest: Double) {
+        let now = timeline.sourceTime(forRenderer: synchronizer.currentTime())
+        let seconds = SoftwareEndOfMediaClock.parkSeconds(clockSeconds: CMTimeGetSeconds(now), notAfter: latest)
+        let at = seconds.map { CMTime(seconds: $0, preferredTimescale: 90000) } ?? now
+        EngineLog.emit("[AudioOutput] pause at t=\(String(format: "%.3f", at.seconds))", category: .swPlayback)
+        synchronizer.setRate(0.0, time: timeline.rendererTime(forSource: at))
     }
 
     /// AE#464: set the audio presentation offset. Positive presents audio later than video, which on
@@ -155,13 +206,43 @@ final class AudioOutput: @unchecked Sendable {
     /// Enqueue a decoded audio CMSampleBuffer. Always enqueues (renderer buffers internally); gating on
     /// isReadyForMoreMediaData dropped early samples before the synchronizer started, giving silence.
     ///
+    /// Audit DEC-106: with `epoch`, the buffer is enqueued only if no flush has retired that epoch, and the
+    /// comparison and the enqueue happen under the lock `flush` takes. Returns false, enqueuing nothing,
+    /// for a buffer that predates a flush.
+    ///
     /// AE#464: this is where a lip-sync offset is applied, and the position is the point. It is past
     /// the audio tap (whose `sourceTime` is documented as the SOURCE axis and feeds transcription),
     /// past the decoder's gapless clock (which would absorb a sub-100 ms offset as rounding), and
     /// past the caller's `lastEnqueuedAudioPtsSec` bookkeeping (whose lead is measured against the
     /// synchronizer clock, i.e. against the source axis too). Only the renderer sees the shift.
-    func enqueue(sampleBuffer: CMSampleBuffer) {
-        renderer.enqueue(retimed(sampleBuffer))
+    @discardableResult
+    func enqueue(sampleBuffer: CMSampleBuffer, ifEpoch epoch: UInt64? = nil) -> Bool {
+        lock.lock()
+        if let epoch, epoch != _epoch {
+            lock.unlock()
+            return false
+        }
+        let offset = presentationOffset
+        // AE#395: the lip-sync offset and the move onto the renderer axis are one retime, not two copies.
+        let shift = CMTimeSubtract(offset, timeline.offset(latchingFrom: sampleBuffer))
+        let delivered = shift == .zero ? sampleBuffer : Self.retimed(sampleBuffer, by: shift)
+        var offsetLine: String?
+        if offset != .zero, !loggedOffsetInEffect, delivered !== sampleBuffer {
+            loggedOffsetInEffect = true
+            // Release-visible, once per offset change: an offset that was set and an offset that is being
+            // DELIVERED are different claims, and without this line the difference is only measurable with
+            // a capture card. The two timestamps are the whole proof.
+            let source = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
+            offsetLine = "[AudioOutput] AE#464 audio delay in effect: "
+                + String(format: "%+.0f ms", offset.seconds * 1000)
+                + String(format: " (sample at %.3fs delivered at %.3fs)", source, source + offset.seconds)
+        }
+        renderer.enqueue(delivered)
+        #if DEBUG
+        afterRendererEnqueueForTesting?()
+        #endif
+        lock.unlock()
+        if let offsetLine { EngineLog.emit(offsetLine, category: .swPlayback) }
 
         #if DEBUG
         // Once per session: first enqueue + any renderer rejection, to distinguish "nothing enqueued" from
@@ -180,43 +261,21 @@ final class AudioOutput: @unchecked Sendable {
             EngineLog.emit("[AudioOutput] renderer error: \(err)", category: .swPlayback)
         }
         #endif
+        return true
     }
 
     #if DEBUG
+    /// Test-only: runs inside `enqueue`'s locked section, right after the renderer took the buffer, which
+    /// is where a renderer that posts its notifications from inside `enqueue` would post them.
+    var afterRendererEnqueueForTesting: (@Sendable () -> Void)?
     private var _loggedFirstEnqueue = false
     private var _loggedRendererError = false
     #endif
 
-    /// A copy of `sampleBuffer` shifted by the current offset, or the buffer itself when there is
-    /// none (the overwhelmingly common case, and one that must not cost an allocation). A copy that
-    /// cannot be made is delivered unshifted: an audible lip-sync error is a far better outcome than
-    /// a dropped buffer, which is silence.
-    private func retimed(_ sampleBuffer: CMSampleBuffer) -> CMSampleBuffer {
-        lock.lock()
-        let offset = presentationOffset
-        lock.unlock()
-        guard offset != .zero else { return sampleBuffer }
-        let shifted = Self.retimed(sampleBuffer, by: offset)
-
-        // Release-visible, once per offset change: an offset that was set and an offset that is being
-        // DELIVERED are different claims, and without this line the difference is only measurable with
-        // a capture card. The two timestamps are the whole proof.
-        if !loggedOffsetInEffect, shifted !== sampleBuffer {
-            loggedOffsetInEffect = true
-            let source = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
-            EngineLog.emit(
-                "[AudioOutput] AE#464 audio delay in effect: "
-                + String(format: "%+.0f ms", offset.seconds * 1000)
-                + String(format: " (sample at %.3fs delivered at %.3fs)", source, source + offset.seconds),
-                category: .swPlayback
-            )
-        }
-        return shifted
-    }
-
-    /// The timing half, pure so the shift can be checked without a renderer. Every timing entry moves
+    /// The shift itself, pure so it can be checked without a renderer. Every timing entry moves
     /// by `offset`, presentation and decode alike; an entry with no valid presentation stamp is left
-    /// alone rather than given one.
+    /// alone rather than given one. A copy that cannot be made is delivered unshifted: an audible
+    /// lip-sync error is a far better outcome than a dropped buffer, which is silence.
     static func retimed(_ sampleBuffer: CMSampleBuffer, by offset: CMTime) -> CMSampleBuffer {
         guard offset != .zero else { return sampleBuffer }
         var count: CMItemCount = 0
@@ -249,8 +308,31 @@ final class AudioOutput: @unchecked Sendable {
     }
 
     var currentTime: CMTime {
-        synchronizer.currentTime()
+        timeline.sourceTime(forRenderer: synchronizer.currentTime())
     }
+
+    /// AE#395: the master clock on the source axis, for an overlay paced against it (#311). The
+    /// synchronizer's own timebase until the origin latches at a non-zero value, then a child of it
+    /// shifted by that origin, which follows every rate change of its parent by construction. Read it
+    /// per use rather than holding it across a session start.
+    var sourceTimebase: CMTimebase {
+        guard let origin = timeline.origin, origin != 0 else { return synchronizer.timebase }
+        lock.lock()
+        defer { lock.unlock() }
+        if let shiftedTimebase { return shiftedTimebase }
+        var child: CMTimebase?
+        guard CMTimebaseCreateWithSourceTimebase(allocator: kCFAllocatorDefault,
+                                                 sourceTimebase: synchronizer.timebase,
+                                                 timebaseOut: &child) == noErr,
+              let child,
+              CMTimebaseSetRateAndAnchorTime(child, rate: 1, anchorTime: RendererTimeline.cmTime(origin),
+                                             immediateSourceTime: .zero) == noErr else {
+            return synchronizer.timebase
+        }
+        shiftedTimebase = child
+        return child
+    }
+    private var shiftedTimebase: CMTimebase?
 
     var currentTimeSeconds: Double {
         let t = CMTimeGetSeconds(currentTime)
@@ -268,12 +350,14 @@ final class AudioOutput: @unchecked Sendable {
     func flush() {
         lock.lock()
         defer { lock.unlock() }
+        _epoch &+= 1
         renderer.flush()
     }
 
     func stop() {
         lock.lock()
         defer { lock.unlock() }
+        _epoch &+= 1
         synchronizer.setRate(0.0, time: .zero)
         renderer.flush()
     }
@@ -285,6 +369,6 @@ final class AudioOutput: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         EngineLog.emit("[AudioOutput] seekClock to=\(String(format: "%.3f", time.seconds)) rate=\(rate)", category: .swPlayback)
-        synchronizer.setRate(rate, time: time)
+        synchronizer.setRate(rate, time: timeline.rendererTime(forSource: time))
     }
 }

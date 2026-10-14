@@ -32,6 +32,20 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
     private let fillLock = NSLock()
     private var fillTask: Task<Void, Never>?
 
+    /// Where cue time 0 sits on the origin's media timestamps (`RemoteHLSTimestampAnchor`). Unprobed
+    /// and failed probes both serve the plain body; a running probe holds the `.vtt` answer inside the
+    /// same wait as an unfinished store, because AVPlayer keeps the first answer for the session.
+    private enum TimestampAnchor {
+        case unprobed
+        case probing
+        case resolved(Double?)
+    }
+    /// Guards `timestampAnchor` and `anchorTask`: resolved on the probe's task, read on the server's
+    /// connection thread, cancelled from the engine's teardown.
+    private let anchorLock = NSLock()
+    private var timestampAnchor = TimestampAnchor.unprobed
+    private var anchorTask: Task<Void, Never>?
+
     /// How long a `.vtt` fetch waits for its store to finish. AVPlayer fetches a whole-program VOD
     /// subtitle segment ONCE and never re-fetches it, so serving early means serving truncated for the
     /// rest of the session; the fill normally completes long before the rendition is ever selected.
@@ -44,7 +58,13 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
          vttFillWaitSeconds: TimeInterval = defaultVTTFillWaitSeconds) {
         self.tracks = tracks
         self.staticMasterPlaylistBody = masterBody
-        self.programDuration = max(1, programDuration)
+        // `RemoteHLSSubtitleProxy.sumSegmentDurations` already refuses a non-finite, negative or
+        // absurd EXTINF sum before it reaches here; this is the last stop before the value leaves
+        // the provider (`segmentDuration(at:)`) for `wholeSecondsCovering`'s `Int(Double)`, which
+        // traps on `+inf` (audit NAT-1). Bounded again here so a caller that builds this provider
+        // directly, bypassing the proxy, cannot reintroduce the trap.
+        let finiteDuration = programDuration.isFinite ? programDuration : 1
+        self.programDuration = min(max(1, finiteDuration), RemoteHLSSubtitleProxy.maxProgramDurationSeconds)
         self.defaultHeaders = defaultHeaders
         self.vttFillWaitSeconds = vttFillWaitSeconds
         self.stores = tracks.map { _ in NativeSubtitleCueStore() }
@@ -72,10 +92,10 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
     /// machinery the loopback path uses (#266), so a container holding several subtitle streams is read
     /// once and a single bad stream index cannot blank its siblings.
     func startFill() {
-        cancelFill()
+        cancelDecode()
         let jobs = Self.fillJobs(tracks: tracks, stores: stores, defaultHeaders: defaultHeaders)
         guard !jobs.isEmpty else { return }
-        let task = Task.detached(priority: .utility) { [jobs] in
+        let task = BlockingWork.detached(priority: .utility) { [jobs] in
             for job in jobs {
                 if Task.isCancelled { return }
                 await AetherEngine.runExternalSubtitleFill(job: job)
@@ -86,12 +106,66 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
         fillLock.unlock()
     }
 
+    /// Teardown: stops the decode and a timestamp probe still in flight.
     func cancelFill() {
+        cancelDecode()
+        anchorLock.lock()
+        let probe = anchorTask
+        anchorTask = nil
+        anchorLock.unlock()
+        probe?.cancel()
+    }
+
+    private func cancelDecode() {
         fillLock.lock()
         let task = fillTask
         fillTask = nil
         fillLock.unlock()
         task?.cancel()
+    }
+
+    /// Runs `probe` once, off the load path, and anchors every rendition this provider serves to its
+    /// answer. The proxy starts it right after the build, so the segment it reads is the one the
+    /// origin is producing for the player's first request anyway.
+    func startTimestampAnchorProbe(_ probe: @escaping @Sendable () async -> Double?) {
+        anchorLock.lock()
+        timestampAnchor = .probing
+        anchorLock.unlock()
+        let task = BlockingWork.detached(priority: .utility) { [weak self] in
+            let anchor = await probe()
+            self?.resolveTimestampAnchor(anchor)
+        }
+        anchorLock.lock()
+        anchorTask = task
+        anchorLock.unlock()
+    }
+
+    private func resolveTimestampAnchor(_ anchor: Double?) {
+        anchorLock.lock()
+        timestampAnchor = .resolved(anchor)
+        anchorLock.unlock()
+    }
+
+    /// Wait for the started probe, the `awaitFill` of the anchor: for tests, not for the session.
+    func awaitTimestampAnchor() async {
+        await currentAnchorTask()?.value
+    }
+
+    private func currentAnchorTask() -> Task<Void, Never>? {
+        anchorLock.lock()
+        defer { anchorLock.unlock() }
+        return anchorTask
+    }
+
+    /// Nil while unprobed, still probing, or when the probe had no answer: all mean the plain body.
+    private var anchorSnapshot: (pending: Bool, seconds: Double?) {
+        anchorLock.lock()
+        defer { anchorLock.unlock() }
+        switch timestampAnchor {
+        case .unprobed: return (false, nil)
+        case .probing: return (true, nil)
+        case .resolved(let seconds): return (false, seconds)
+        }
     }
 
     /// Wait for the started fill to finish. Nothing in the session waits for it, the `.vtt` handler
@@ -100,6 +174,14 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
     /// cooperative pool, where the detached decode does not get a thread at all.
     func awaitFill() async {
         await currentFillTask()?.value
+    }
+
+    /// AE#616: every sidecar's decode has finished, so `allCueStarts()` is the whole program.
+    var isFillFinished: Bool { stores.allSatisfy(\.isFinished) }
+
+    /// AE#616: cue starts and texts across every injected rendition, on the axis the `.vtt` serves.
+    func allCueStarts() -> [(start: Double, text: String)] {
+        stores.flatMap { $0.allCues().map { (start: $0.start, text: $0.text) } }
     }
 
     /// Reading the handle stays synchronous: `NSLock` is unavailable from an async context.
@@ -164,18 +246,29 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
     /// serves a finished master instead. The EXT-X-MEDIA tags were written by `RemoteHLSMasterRewrite`.
     var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] { [] }
 
-    /// Whole-program WebVTT on the origin item's timeline. The host can declare
-    /// an upstream reanchor offset; unfinished stores must not be served because
+    /// Whole-program WebVTT for one sidecar. Cue times are the sidecar's own, moved by the track's
+    /// declared `nativeTimelineOffsetSeconds`: this bypass has no loopback producer and therefore no
+    /// playlist shift. An `X-TIMESTAMP-MAP` ties cue time 0 to where the origin's media timestamps
+    /// put it, so AVPlayer places the cues against the frames. They do NOT line up with item time
+    /// where an origin's segments start before their playlist slot; AE#616 measures that gap off them.
+    /// A probe that has not answered inside the wait serves the plain body, which is what this
+    /// returned before the anchor existed. An unfinished store is answered `.pending`, never served:
     /// AVPlayer caches this response for the rest of the session.
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> NativeSubtitleVTTResponse {
-        guard tracks.indices.contains(ordinal), segmentIndex == 0 else { return .missing }
+        guard ordinal >= 0, ordinal < stores.count, segmentIndex == 0 else { return .missing }
         let store = stores[ordinal]
         let deadline = Date().addingTimeInterval(vttFillWaitSeconds)
-        while !store.isFinished, Date() < deadline {
+        while !store.isFinished || anchorSnapshot.pending, Date() < deadline {
             usleep(100_000)
         }
         guard store.isFinished else { return .pending }
+        let anchor = anchorSnapshot
+        if anchor.pending {
+            EngineLog.emit(
+                "[AetherEngine] #316: subs_\(ordinal) served before the timestamp probe answered, "
+                + "cue time 0 stays at timestamp 0", category: .engine)
+        }
         let cues = store.allCues()
-        return .ready(WebVTTBuilder.body(cues: cues))
+        return .ready(WebVTTBuilder.body(cues: cues, timestampAnchorSeconds: anchor.seconds))
     }
 }

@@ -53,7 +53,9 @@ struct ColorDescription: Equatable {
     /// The description to act on: the bitstream wherever it committed to a value, the container for the
     /// fields it left open. Per field, because a partially filled VUI is the common case and the one
     /// that fails silently (a matrix without a transfer reads HDR to a gate and reads nothing to zimg).
-    /// Two silences stay silent: an untagged stream is not improved by inventing BT.709 for it.
+    /// Two silences stay silent: an untagged stream is not improved by inventing BT.709 for it here.
+    /// The BT.709 a display needs is chosen where the buffer meets CoreVideo, see
+    /// `ColorAttachments.presented` (AE#654), so the HDR gate and the tone mapper still see the gap.
     static func resolved(bitstream: ColorDescription, container: ColorDescription) -> ColorDescription {
         ColorDescription(
             primaries: bitstream.primaries == AVCOL_PRI_UNSPECIFIED ? container.primaries : bitstream.primaries,

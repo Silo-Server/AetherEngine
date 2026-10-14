@@ -29,7 +29,7 @@ private func writePNG(_ image: CGImage, to path: String) -> Bool {
 
 func runExtract(url: URL, at seconds: Double, mode: FrameMode, loops: Int, maxWidth: Int) -> Int32 {
     EngineLog.handler = { print($0) }
-    print("aetherctl extract: \(url.absoluteString) at=\(seconds)s mode=\(mode) loops=\(loops)")
+    print(EngineLog.redacted("aetherctl extract: \(url.absoluteString) at=\(seconds)s mode=\(mode) loops=\(loops)"))
     print("")
 
     let extractor = FrameExtractor(url: url, httpHeaders: [:])
@@ -49,7 +49,7 @@ func runExtract(url: URL, at seconds: Double, mode: FrameMode, loops: Int, maxWi
         if let image {
             produced += 1
             if i == 0 {
-                let out = "/tmp/aetherctl-extract-\(mode).png"
+                let out = debugOutputPath("aetherctl-extract-\(mode).png")
                 if writePNG(image, to: out) {
                     print("Wrote \(image.width)x\(image.height) -> \(out)")
                 } else {

@@ -149,6 +149,21 @@ struct Issue233ASSOverrideStyleTests {
         #expect(SubtitleRectText.playRes(fromASSHeader: "[Script Info]\nScriptType: v4.00+") == nil)
     }
 
+    // Audit SUB-112: `Double(_:)` accepts `nan`, `inf` and `1e999`, and a NaN position breaks the
+    // published [0, 1] placement contract (a UIKit host raises `CALayer position contains NaN`).
+    @Test("a non-finite position tag yields no position", arguments: [
+        #"{\pos(nan,nan)}x"#, #"{\pos(1e999,5)}x"#, #"{\pos(5,-inf)}x"#,
+    ])
+    func nonFinitePositionIgnored(body: String) {
+        #expect(placement("0,0,Default,,0,0,0,,\(body)")?.position == nil)
+    }
+
+    @Test("a non-finite play resolution is no play resolution")
+    func nonFinitePlayResIgnored() {
+        #expect(SubtitleRectText.playRes(fromASSHeader: "[Script Info]\nPlayResX: inf\nPlayResY: 1080") == nil)
+        #expect(SubtitleRectText.playRes(fromASSHeader: "[Script Info]\nPlayResX: 1920\nPlayResY: nan") == nil)
+    }
+
     // MARK: - The formats this actually serves
 
     /// What `ff_htmlmarkup_to_ass` emits for `<i>ciao</i> <font color="#FF0000">rosso</font>`.

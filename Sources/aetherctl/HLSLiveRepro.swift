@@ -23,8 +23,12 @@ func runHLSLiveRepro(args: [String]) -> Int32 {
         return 64
     }
     let paths = segList.split(separator: ",").map(String.init)
-    let seconds = takeIntFlag("--seconds", from: &rest) ?? 40
-    let segSeconds = takeIntFlag("--segment-seconds", from: &rest) ?? 5
+    guard !paths.isEmpty else {
+        print("ERROR: hlslive requires at least one segment in --segments")
+        return 64
+    }
+    let seconds = takeIntFlag("--seconds", in: 0...Int(maxRunSeconds), from: &rest) ?? 40
+    let segSeconds = takeIntFlag("--segment-seconds", in: 1...3600, from: &rest) ?? 5
     let discFlag = takeStringFlag("--disc", from: &rest)
 
     var slices: [[UInt8]] = []

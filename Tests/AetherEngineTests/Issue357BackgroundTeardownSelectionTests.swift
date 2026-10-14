@@ -27,6 +27,16 @@ struct Issue357BackgroundTeardownSelectionTests {
         engine.stopInternal(resetDisplayCriteria: false, keepNativeHost: true, keepCustomReader: true)
     }
 
+    @Test("foreground restore is owed only after video teardown")
+    func restoreRequiresTeardown() throws {
+        let engine = try AetherEngine()
+        #expect(!engine.needsForegroundVideoRestore)
+        backgroundTeardown(engine)
+        #expect(engine.needsForegroundVideoRestore)
+        _ = engine.consumeReloadSelection()
+        #expect(!engine.needsForegroundVideoRestore)
+    }
+
     @Test("the selection stopInternal wipes is still there for the reload that follows minutes later")
     func teardownHandsSelectionToReload() throws {
         let engine = try AetherEngine()
@@ -84,6 +94,57 @@ struct Issue357BackgroundTeardownSelectionTests {
         #expect(selection.subtitles.secondaryTrackIndex == 5)
         #expect(selection.subtitles.nativeReapplyOrdinal == 0)
         #expect(selection.subtitles.reapplyOrdinalMatchesActiveTrack)
+    }
+
+    /// Audit CORE-3: on iOS a `pause()` while backgrounded re-arms the grace window after the first
+    /// teardown, and its expiry tears down again. That second capture reads what `stopInternal`
+    /// already wiped and used to replace the good snapshot with it.
+    @Test("a second teardown before the reload keeps the selection the first one parked")
+    func secondTeardownKeepsParkedSelection() throws {
+        let engine = try AetherEngine()
+        let track = engine.addExternalSubtitleTrack(makeTrack("picked"))
+        engine.selectSubtitleTrack(index: track.id)
+        engine.activeAudioTrackIndex = 2
+        engine.activeDiscTitleID = 7
+
+        backgroundTeardown(engine)
+        backgroundTeardown(engine)
+
+        let selection = engine.consumeReloadSelection()
+        #expect(selection.subtitles.activeSubtitleTrackIndex == track.id)
+        #expect(selection.subtitles.hostExplicitSubtitleAction)
+        #expect(selection.audioTrackIndex == 2)
+        #expect(selection.discTitleID == 7)
+    }
+
+    /// A host picked TrueHD on a file whose auto pick is E-AC-3 Atmos, then rebuilt the session while
+    /// the switch was running: the rebuild read the active track the switch's teardown had cleared
+    /// and came back on E-AC-3, superseding the switch.
+    @Test("a reload taken while an audio switch is pending or running restores the switch's track")
+    func reloadKeepsAudioSwitch() throws {
+        let engine = try AetherEngine()
+        engine.activeAudioTrackIndex = 3
+        engine.pendingAudioSelection = 1
+        #expect(engine.consumeReloadSelection().audioTrackIndex == 1)
+        engine.pendingAudioSelection = nil
+        engine.activeAudioTrackIndex = nil
+        engine.audioSwitchInFlight = 1
+        #expect(engine.consumeReloadSelection().audioTrackIndex == 1)
+        engine.audioSwitchInFlight = nil
+        engine.activeAudioTrackIndex = 3
+        #expect(engine.consumeReloadSelection().audioTrackIndex == 3)
+    }
+
+    /// A `stop()` or `load()` cancels the switch; its track is then nobody's intent.
+    @Test("a cancelled audio switch is not restored by a later reload")
+    func cancelledSwitchIsForgotten() throws {
+        let engine = try AetherEngine()
+        engine.pendingAudioSelection = 2
+        engine.audioSwitchInFlight = 1
+        engine.stop()
+        #expect(engine.pendingAudioSelection == nil)
+        #expect(engine.audioSwitchInFlight == nil)
+        #expect(engine.consumeReloadSelection().audioTrackIndex == nil)
     }
 
     @Test("a pick made after the teardown is newer intent and wins over the snapshot")
@@ -147,12 +208,20 @@ struct Issue357BackgroundTeardownSelectionTests {
         let engine = try AetherEngine()
         engine.nativeHost = NativeAVPlayerHost()
         engine.playbackBackend = .native
+        let surface = AetherPlayerView(frame: .zero)
+        engine.bind(view: surface)
+        let layer = engine.nativePlayerLayer
+        #expect(layer?.superlayer != nil)
 
         backgroundTeardown(engine)
 
         // The teardown preserves the host on purpose: AVKit registers its Now-Playing client once
         // per AVPlayer instance (issue #15), so the instance has to outlive the suspension.
         #expect(engine.nativeHost != nil)
+        #expect(engine.nativePlayerLayer === layer)
+        #expect(layer?.superlayer != nil)
+        #expect(!engine.isSessionReady)
+        #expect(!engine.hasFirstFrameReadyForDisplay)
         // And it resets the backend, which is the state the foreground reload's load() reads.
         #expect(engine.playbackBackend == .none)
         // Reading the backend alone answered "nothing native here" and threw the kept host away.

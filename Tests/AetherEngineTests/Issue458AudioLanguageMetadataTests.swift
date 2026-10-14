@@ -169,8 +169,12 @@ struct Issue458AudioLanguageMetadataTests {
 /// AVFoundation reads an audio language from on an HLS asset: with the tag absent, an fMP4 whose mdhd
 /// says "deu" still reports `AVAssetTrack.languageCode == nil` and builds no audible selection group.
 private final class AudioRenditionMockProvider: HLSSegmentProvider, @unchecked Sendable {
-    let audio: (language: String, name: String)?
-    init(audio: (language: String, name: String)?) { self.audio = audio }
+    let audio: (language: String?, name: String)?
+    let channels: String?
+    init(audio: (language: String?, name: String)?, channels: String? = nil) {
+        self.audio = audio
+        self.channels = channels
+    }
     func initSegment() -> Data? { Data([0x00]) }
     func mediaSegment(at index: Int) -> Data? { Data([0x00]) }
     var segmentCount: Int { 1 }
@@ -178,7 +182,8 @@ private final class AudioRenditionMockProvider: HLSSegmentProvider, @unchecked S
     var playlistType: HLSPlaylistType { .vod }
     var masterCodecs: String? { "hvc1.1.6.L120.90,mp4a.40.2" }
     var masterVideoRange: HLSVideoRange? { .sdr }
-    var masterAudioRendition: (language: String, name: String)? { audio }
+    var masterAudioRendition: (language: String?, name: String)? { audio }
+    var masterAudioChannels: String? { channels }
 }
 
 struct Issue458AudioRenditionPlaylistTests {
@@ -205,6 +210,20 @@ struct Issue458AudioRenditionPlaylistTests {
         )
         #expect(!master.contains("TYPE=AUDIO"))
         #expect(!master.contains("AUDIO=\"aud\""))
+    }
+
+    /// The session log's `master audio:` line, read back from the served text so it cannot drift from it.
+    @Test("the master audio summary reads codecs, the rendition and its CHANNELS off the master text")
+    func masterAudioSummary() {
+        let labelled = HLSLocalServer.buildMasterPlaylistText(
+            provider: AudioRenditionMockProvider(audio: (language: "eng", name: "English")))
+        #expect(HLSLocalServer.masterAudioSummary(labelled)
+                == "codecs=\"hvc1.1.6.L120.90,mp4a.40.2\" audioRendition=yes channels=none")
+        let unlabelled = HLSLocalServer.buildMasterPlaylistText(provider: AudioRenditionMockProvider(audio: nil))
+        #expect(HLSLocalServer.masterAudioSummary(unlabelled)
+                == "codecs=\"hvc1.1.6.L120.90,mp4a.40.2\" audioRendition=no channels=none")
+        let declared = labelled.replacingOccurrences(of: "AUTOSELECT=YES", with: "AUTOSELECT=YES,CHANNELS=\"12/-/BED-12\"")
+        #expect(HLSLocalServer.masterAudioSummary(declared).hasSuffix("channels=\"12/-/BED-12\""))
     }
 
     /// A group referenced by a variant has to exist, or AVPlayer fails the master outright.

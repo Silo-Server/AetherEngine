@@ -135,6 +135,220 @@ struct Issue362HarvestHoleTests {
                 > refreshed.first(where: { $0.ptsSeconds == 280.023 })!.sequence)
     }
 
+    @Test("a seam over ground some run has read is a re-harvest, not a hole")
+    func readSeamIsNotAHole() {
+        // The forward prefetch stored 0-60 s first; the pump re-read 0-4.38 s behind it, and each of
+        // those duplicates took a fresh sequence. The order breaks at 4.38 over ground the prefetch
+        // has read, and that seam moves with the pump on every tick.
+        let pts = [4.0, 4.38, 4.40, 4.42]
+        let sequence: [UInt64] = [900, 901, 400, 401]
+        func seamCut(isRead: @escaping (Double, Double) -> Bool) -> (index: Int, at: Double, sequence: UInt64)? {
+            SubtitleOverlayDrainer.harvestGapCut(count: pts.count, ptsAt: { pts[$0] },
+                                                 sequenceAt: { sequence[$0] }, resumeFrom: nil,
+                                                 notBefore: 0, isRead: isRead)
+        }
+        #expect(seamCut { _, _ in true } == nil)
+        #expect(seamCut { _, _ in false }?.index == 2, "without proof the order rule stands")
+        #expect(cut()?.index == 2, "the reported hole is unread ground, so it still holds")
+    }
+
+    @Test("only a current run proves a span read; an empty ledger refuses no landing but proves nothing")
+    func proofNeedsOneCurrentRun() {
+        let store = SubtitlePacketStore()
+        #expect(store.hasReadSpan(from: 1, through: 2))
+        #expect(!store.provesReadSpan(streamIndex: 3, from: 1, through: 2))
+        store.notePrefetchRead(from: 0, through: 60)
+        #expect(store.provesReadSpan(streamIndex: 3, from: 4.38, through: 4.40))
+        #expect(!store.provesReadSpan(streamIndex: 3, from: 59, through: 61))
+    }
+
+    @Test("a real hole inside the seam tolerance is not proven read")
+    func seamToleranceProvesNothing() {
+        // One prefetch run read to 4.38 and stopped; the next started at 4.60. The ledger's seam
+        // tolerance joins them for `hasReadSpan`, but nobody read the 0.22 s between.
+        let store = SubtitlePacketStore()
+        store.notePrefetchRead(from: 0, through: 4.38)
+        store.notePrefetchRead(from: 4.60, through: 30)
+        #expect(store.hasReadSpan(from: 4.38, through: 4.60))
+        #expect(!store.provesReadSpan(streamIndex: 3, from: 4.38, through: 4.60))
+        #expect(store.provesReadSpan(streamIndex: 3, from: 4.60, through: 30))
+    }
+
+    @Test("the pump's reach is a claim from the playhead, not proof of reading")
+    func pumpReachProvesNothing() {
+        // During a slow seek the playhead, and with it the pump's stated reach, can move past what
+        // the pump has stored.
+        let store = SubtitlePacketStore()
+        store.noteHarvestAnchor(.pump, at: 0)
+        store.noteHarvestReach(.pump, through: 60)
+        #expect(store.hasReadSpan(from: 4.38, through: 4.40))
+        #expect(!store.provesReadSpan(streamIndex: 3, from: 4.38, through: 4.40))
+    }
+
+    @Test("ground the store has evicted is not proven read, however it was covered")
+    func evictedGroundProvesNothing() {
+        let store = SubtitlePacketStore()
+        store.notePrefetchRead(from: 0, through: 60)
+        for pts in [1.0, 2.0, 3.0, 40.0] {
+            store.append(streamIndex: 3, ptsSeconds: pts, durationSeconds: 0, payload: Data(count: 8))
+        }
+        store.prune(before: 2.5)
+        #expect(!store.provesReadSpan(streamIndex: 3, from: 1.5, through: 30))
+        #expect(store.provesReadSpan(streamIndex: 3, from: 2.5, through: 30))
+        #expect(store.provesReadSpan(streamIndex: 4, from: 1.5, through: 30), "eviction is per stream")
+        // A new prefetch run reads the ground again and stores what the prune removed.
+        store.noteHarvestAnchor(.prefetch, at: 0)
+        for pts in [1.0, 2.0] { harvest(store, at: pts) }
+        store.noteHarvestProgress(.prefetch, through: 30)
+        #expect(store.entries(streamIndex: 3, from: 0, through: 30).map(\.ptsSeconds) == [1, 2, 3])
+        #expect(store.provesReadSpan(streamIndex: 3, from: 1.5, through: 30))
+    }
+
+    @Test("a prefetch run proves reading only from the first position it read")
+    func proofStartsAtTheFirstRead() {
+        // Asked for 100 s, the seek landed at 120 s: a byte estimate that overshot, or Matroska
+        // clamping to the anchor stream's first indexed cue. Its first packet there must not prove
+        // 100-120 s read.
+        let store = SubtitlePacketStore()
+        store.noteHarvestAnchor(.prefetch, at: 100)
+        harvest(store, at: 120)
+        store.noteHarvestProgress(.prefetch, through: 130)
+        #expect(store.hasReadSpan(from: 100, through: 120), "the generous ledger still counts it")
+        #expect(!store.provesReadSpan(streamIndex: 3, from: 100, through: 120))
+        #expect(store.provesReadSpan(streamIndex: 3, from: 121, through: 129))
+
+        // Landing before the anchor proves from the anchor on.
+        store.noteHarvestAnchor(.prefetch, at: 200)
+        harvest(store, at: 198)
+        store.noteHarvestProgress(.prefetch, through: 230)
+        #expect(store.provesReadSpan(streamIndex: 3, from: 200, through: 220))
+        #expect(!store.provesReadSpan(streamIndex: 3, from: 199, through: 220), "nothing before the anchor")
+    }
+
+    @Test("a seam is judged by the proof captured with the entries it sits in")
+    func proofIsCapturedWithItsEntries() {
+        let store = SubtitlePacketStore()
+        store.notePrefetchRead(from: 0, through: 100)
+        let (_, proof) = store.entriesWithReadProof(streamIndex: 3, from: 0, through: 200)
+        // The prefetch reads on and stores 101-119 after the copy was taken.
+        for pts in [105.0, 110.0] { harvest(store, at: pts) }
+        store.noteHarvestProgress(.prefetch, through: 120)
+        #expect(store.provesReadSpan(streamIndex: 3, from: 100, through: 120))
+        #expect(!proof.proves(from: 100, through: 120), "the copy lacks what was read after it")
+        #expect(proof.proves(from: 50, through: 100))
+    }
+
+    @Test("a display set still in assembly is read but not stored, so it proves nothing")
+    func pendingDisplaySetCapsTheProof() {
+        let store = SubtitlePacketStore()
+        store.notePrefetchRead(from: 0, through: 100)
+        let pcs = Data([0x16, 0x00, 0x01, 0x00]), end = Data([0x80, 0x00, 0x00])
+        func chunk(_ payload: Data, writer: SubtitlePacketStore.Writer = .prefetch) {
+            store.harvestChunk(streamIndex: 3, ptsSeconds: 110, durationSeconds: 0, flags: 0,
+                               payload: payload, assembleSplitDisplaySets: true, writer: writer)
+        }
+        chunk(pcs)
+        chunk(pcs, writer: .pump)
+        store.noteHarvestProgress(.prefetch, through: 120)
+        #expect(store.provesReadSpan(streamIndex: 3, from: 100, through: 109))
+        #expect(!store.provesReadSpan(streamIndex: 3, from: 100, through: 120))
+        chunk(end)
+        #expect(store.provesReadSpan(streamIndex: 3, from: 100, through: 120),
+                "stored once its END arrives; the pump's own set in assembly does not matter")
+    }
+
+    @Test("a display set in assembly that memory pressure drops still bounds the proof")
+    func evictedPendingSetBoundsTheProof() {
+        let store = SubtitlePacketStore(perStreamByteCap: 10_000, aggregateByteCap: 1_000)
+        store.notePrefetchRead(from: 0, through: 100)
+        let pcs = Data([0x16, 0x02, 0x55]) + Data(count: 597)
+        store.harvestChunk(streamIndex: 3, ptsSeconds: 110, durationSeconds: 0, flags: 0,
+                           payload: pcs, assembleSplitDisplaySets: true, writer: .prefetch)
+        store.noteHarvestProgress(.prefetch, through: 120)
+        // Another stream's packet pushes the store over its budget; stream 3 is the cold one.
+        store.append(streamIndex: 4, ptsSeconds: 115, durationSeconds: 0, payload: Data(count: 600))
+        #expect(store.totalRetainedBytes <= 1_000)
+        #expect(!store.provesReadSpan(streamIndex: 3, from: 100, through: 120),
+                "the dropped set was read but never stored")
+    }
+
+    @Test("a display set dropped unfinished or oversize still bounds the proof")
+    func droppedPendingSetsBoundTheProof() {
+        let pcs = Data([0x16, 0x00, 0x01, 0x00]), end = Data([0x80, 0x00, 0x00])
+        func chunk(_ store: SubtitlePacketStore, _ payload: Data, at pts: Double) {
+            store.harvestChunk(streamIndex: 3, ptsSeconds: pts, durationSeconds: 0, flags: 0,
+                               payload: payload, assembleSplitDisplaySets: true, writer: .prefetch)
+        }
+        // The next composition opens before this one's END arrives.
+        let replaced = SubtitlePacketStore()
+        replaced.notePrefetchRead(from: 0, through: 100)
+        chunk(replaced, pcs, at: 110)
+        chunk(replaced, pcs + end, at: 120)
+        replaced.noteHarvestProgress(.prefetch, through: 130)
+        #expect(!replaced.provesReadSpan(streamIndex: 3, from: 100, through: 130))
+        #expect(replaced.provesReadSpan(streamIndex: 3, from: 111, through: 130))
+
+        // A set over the assembly budget is dropped too.
+        let oversize = SubtitlePacketStore()
+        oversize.notePrefetchRead(from: 0, through: 100)
+        chunk(oversize, Data([0x16, 0xFF, 0xFF]) + Data(count: SubtitlePacketStore.maxPendingDisplaySetBytes), at: 110)
+        oversize.noteHarvestProgress(.prefetch, through: 130)
+        #expect(!oversize.provesReadSpan(streamIndex: 3, from: 100, through: 130))
+
+        // The END that tips a set over the budget can share its packet with a whole next set.
+        let tail = SubtitlePacketStore()
+        tail.notePrefetchRead(from: 0, through: 100)
+        chunk(tail, Data([0x16, 0xFF, 0xFF]) + Data(count: SubtitlePacketStore.maxPendingDisplaySetBytes - 4), at: 110)
+        chunk(tail, end + pcs + end, at: 120)
+        tail.noteHarvestProgress(.prefetch, through: 130)
+        #expect(!tail.provesReadSpan(streamIndex: 3, from: 111, through: 130), "the set at 120 s was dropped")
+        #expect(tail.provesReadSpan(streamIndex: 3, from: 121, through: 130))
+    }
+
+    @Test("a subtitle packet the prefetch read but did not store bounds the proof")
+    func unstoredPrefetchReadsBoundTheProof() {
+        // A continuation chunk with no set open: the prefetch landed between a PCS and its END.
+        let midSet = SubtitlePacketStore()
+        midSet.notePrefetchRead(from: 0, through: 100)
+        midSet.harvestChunk(streamIndex: 3, ptsSeconds: 110, durationSeconds: 0, flags: 0,
+                            payload: Data([0x15, 0x00, 0x01, 0x00]), assembleSplitDisplaySets: true,
+                            writer: .prefetch)
+        midSet.noteHarvestProgress(.prefetch, through: 130)
+        #expect(!midSet.provesReadSpan(streamIndex: 3, from: 100, through: 130))
+        #expect(midSet.provesReadSpan(streamIndex: 3, from: 111, through: 130))
+
+        // A packet dropped for want of a time base, at a position nobody knows.
+        let noTimeBase = SubtitlePacketStore()
+        noTimeBase.notePrefetchRead(from: 0, through: 130)
+        noTimeBase.notePrefetchDroppedPacket(streamIndex: 3)
+        #expect(!noTimeBase.provesReadSpan(streamIndex: 3, from: 100, through: 130))
+        #expect(noTimeBase.provesReadSpan(streamIndex: 4, from: 100, through: 130), "only that stream")
+        noTimeBase.notePrefetchRead(from: 0, through: 130)
+        #expect(noTimeBase.provesReadSpan(streamIndex: 3, from: 100, through: 130), "a new run reads it again")
+
+        // A packet without a PTS is dropped at a position nobody knows either.
+        let noPTS = SubtitlePacketStore()
+        noPTS.notePrefetchRead(from: 0, through: 130)
+        noPTS.harvestChunk(streamIndex: 3, ptsSeconds: nil, durationSeconds: 0, flags: 0, payload: Data(count: 8),
+                           assembleSplitDisplaySets: false, writer: .prefetch)
+        #expect(!noPTS.provesReadSpan(streamIndex: 3, from: 100, through: 130))
+
+        // A landing between a PCS and its END: that composition began before the run.
+        let landing = SubtitlePacketStore()
+        landing.noteHarvestAnchor(.prefetch, at: 100)
+        landing.harvestChunk(streamIndex: 3, ptsSeconds: nil, durationSeconds: 0, flags: 0,
+                             payload: Data([0x15, 0x00, 0x01, 0x00]), assembleSplitDisplaySets: true,
+                             writer: .prefetch)
+        landing.noteHarvestProgress(.prefetch, through: 100)
+        landing.noteHarvestReach(.prefetch, through: 130)
+        #expect(landing.provesReadSpan(streamIndex: 3, from: 100, through: 130))
+    }
+
+    private func harvest(_ store: SubtitlePacketStore, at pts: Double) {
+        store.harvestChunk(streamIndex: 3, ptsSeconds: pts, durationSeconds: 0, flags: 0,
+                           payload: Data(count: 8), assembleSplitDisplaySets: false, writer: .prefetch)
+    }
+
     @Test("the store stamps harvest order, ascending, across streams")
     func sequenceIsMonotonic() {
         let store = SubtitlePacketStore()

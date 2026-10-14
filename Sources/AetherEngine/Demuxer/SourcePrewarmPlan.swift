@@ -141,8 +141,10 @@ enum SourcePrewarmPlan {
                 let end = min(head.count, start + Int(clamping: size))
                 // A SeekHead truncated by the warm head's edge still yields the entries that fit.
                 for position in seekPositions(head, from: start, to: end) {
-                    let absolute = Int64(dataStart) + position
-                    guard absolute >= headEnd else { continue }
+                    // Audit DMX-2: an 8-byte SeekPosition reaches Int64.max; such an entry names
+                    // nothing a source can hold, so it is skipped rather than added.
+                    let (absolute, overflow) = Int64(dataStart).addingReportingOverflow(position)
+                    guard !overflow, absolute >= headEnd else { continue }
                     earliest = min(earliest ?? absolute, absolute)
                 }
             }

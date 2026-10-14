@@ -192,7 +192,7 @@ enum VideoConfigRecord {
     /// Zero bytes immediately before a start code belong to the start code (a 4-byte code is a 3-byte
     /// one with a leading `trailing_zero_8bits`), so they are trimmed off the preceding NAL. A
     /// parameter set never ends in `0x00`: its last byte carries the rbsp_stop_one_bit.
-    private static func splitAnnexBNALs(_ bytes: [UInt8]) -> [[UInt8]] {
+    static func splitAnnexBNALs(_ bytes: [UInt8]) -> [[UInt8]] {
         var starts: [Int] = []
         var i = 0
         while i + 3 <= bytes.count {

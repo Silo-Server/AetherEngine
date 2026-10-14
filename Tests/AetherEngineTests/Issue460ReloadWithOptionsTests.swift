@@ -17,6 +17,27 @@ struct Issue460SessionOptionCorrectionTests {
         }
     }
 
+    /// Listing a field as identity refuses nothing on its own: `refusedFields` compares each one by
+    /// hand, and `sharedOutputRole` was listed without a comparison.
+    @Test("every identity field, flipped alone, is refused by name")
+    func everyIdentityFieldIsRefused() {
+        let base = LoadOptions()
+        let flips: [String: (inout LoadOptions) -> Void] = [
+            "isLive": { $0.isLive.toggle() },
+            "audioOnly": { $0.audioOnly.toggle() },
+            "nativeRemoteHLS": { $0.nativeRemoteHLS.toggle() },
+            "sequentialOrigin": { $0.sequentialOrigin.toggle() },
+            "heldSourceConnection": { $0.heldSourceConnection.toggle() },
+            "sharedOutputRole": { $0.sharedOutputRole = $0.sharedOutputRole == .primary ? .secondary : .primary },
+        ]
+        #expect(Set(flips.keys) == Set(SessionOptionCorrection.loadIdentityFields))
+        for (field, flip) in flips {
+            var proposed = base
+            flip(&proposed)
+            #expect(SessionOptionCorrection.refusedFields(from: base, to: proposed) == [field])
+        }
+    }
+
     /// The inventory guard. A field added to `LoadOptions` is correctable by default (it falls
     /// through `refusedFields`), which is right for a tuning lever and wrong for one that names the
     /// session, so adding one has to be a decision. This fails until someone makes it.

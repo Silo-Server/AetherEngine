@@ -29,6 +29,28 @@ enum MasterFallbackDecision {
         code == -11868 || code == -11848
     }
 
+    /// AE#535: whether a refusal teaches the process something about the panel.
+    ///
+    /// A display rejection answers "does this output configuration accept an HDR master" only while
+    /// the display is eligible for HDR at all. Measured on an Apple TV 4K on tvOS 26.6: an audio route
+    /// death right after a display mode switch opens a window in which the criteria readout reads
+    /// `matching=off hdrEligible=no`, a session-preserving reload lands in it, and AVPlayer fails the
+    /// master with -11868 because nothing HDR is compatible WITH AN INELIGIBLE DISPLAY. That refusal is
+    /// fully explained by the window, so it earns this item its media fallback and nothing more.
+    /// Latching it cost the rest of the viewing session its master, and in a process that never
+    /// backgrounds the AE#588 clear never came.
+    ///
+    /// AE#667: nor while a display mode switch is in progress. AVPlayer answers for the mode the panel is
+    /// in at that moment, which mid-switch is the one it is leaving, so the refusal is about the moment.
+    ///
+    /// AE#535 (2026-10-11): nor when the refused master advertised `VIDEO-RANGE=SDR`. A refusal of an SDR
+    /// master says nothing about HDR presentation, yet it latched the HDR route for every later title
+    /// (cmcpherson274, two SDR titles' -11848 refusals at 7.15.1 and 7.17.1).
+    static func shouldLatchPanelRefusal(code: Int, servedMasterIsHDR: Bool, displayEligibleForHDRNow: Bool,
+                                        displaySwitchInProgress: Bool) -> Bool {
+        isDisplayRejectionCode(code) && servedMasterIsHDR && displayEligibleForHDRNow && !displaySwitchInProgress
+    }
+
     /// Any code that means "AVPlayer rejected the served master itself": the display-rejection pair
     /// plus NSURLErrorDomain -1002 "unsupported URL", which AVPlayer surfaces when it filters EVERY
     /// EXT-X-STREAM-INF out of the master at parse time and is left with no variant URL to load
@@ -38,6 +60,19 @@ enum MasterFallbackDecision {
     /// GETs the server demonstrably answered, so the code cannot mean a genuinely bad host URL.
     static func isMasterRejectionCode(_ code: Int) -> Bool {
         isDisplayRejectionCode(code) || code == -1002
+    }
+
+    /// A malformed media playlist can be wrapped in the same -11848 as a display refusal.
+    /// It says nothing about HDR support and must not poison the process's display decision.
+    static func isMasterRejection(_ error: NSError, mediaErrorCodes: [Int] = []) -> Bool {
+        guard !mediaErrorCodes.contains(-12642) else { return false }
+        var current: NSError? = error
+        for _ in 0..<8 {
+            guard let value = current else { break }
+            if value.domain == "CoreMediaErrorDomain", value.code == -12642 { return false }
+            current = value.userInfo[NSUnderlyingErrorKey] as? NSError
+        }
+        return isMasterRejectionCode(error.code)
     }
 
     /// Fall back to the media playlist only when a master-rejection failed the item, the engine was

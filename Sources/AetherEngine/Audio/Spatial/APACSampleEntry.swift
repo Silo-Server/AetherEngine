@@ -23,7 +23,10 @@ enum APACSampleEntry {
         body.append(contentsOf: [0, 2])                     // channelcount
         body.append(contentsOf: [0, 16])                    // samplesize
         body.append(contentsOf: [0, 0, 0, 0])               // pre_defined, reserved
-        let rate = UInt32(clamping: sampleRate) << 16       // 16.16 fixed point
+        // 16.16 fixed point: a v0 entry cannot state a rate above 65535 Hz, and the shift would
+        // wrap silently. Object audio is 48 kHz only.
+        precondition((1...65535).contains(sampleRate), "an AudioSampleEntry v0 holds rates up to 65535 Hz")
+        let rate = UInt32(sampleRate) << 16
         body.append(contentsOf: bigEndian(rate))
         body.append(magicCookie)
         var box = Data(bigEndian(UInt32(8 + body.count)))
@@ -93,6 +96,8 @@ enum APACSampleEntry {
             // Every ancestor's header precedes the replaced entry, so its offset is the same in `out`.
             for ancestor in [stsd, stbl, minf, mdia, trak, moov] {
                 let old = Int(u32(ancestor.start)!)
+                // Size 0 means "to the end of the file", which stays true after the splice.
+                if old == 0 { continue }
                 let new = UInt32(old + delta)
                 out.replaceSubrange(ancestor.start..<ancestor.start + 4, with: bigEndian(new))
             }

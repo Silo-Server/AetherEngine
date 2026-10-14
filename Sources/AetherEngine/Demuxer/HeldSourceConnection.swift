@@ -72,9 +72,11 @@ final class HeldSourceConnection: @unchecked Sendable {
         case malformedResponse(String)
         case tooManyRedirects
         case unsupportedURL(URL)
+        case invalidHeaderField(String)
 
         var errorDescription: String? {
             switch self {
+            case .invalidHeaderField(let name): return "a line break in the request field \(name)"
             case .malformedResponse(let detail): return "malformed HTTP response: \(detail)"
             case .tooManyRedirects: return "too many redirects"
             case .unsupportedURL(let url): return "unsupported URL for a held connection: \(url)"
@@ -119,7 +121,7 @@ final class HeldSourceConnection: @unchecked Sendable {
         self.generation = generation
         self.ticket = ticket
         self.delegate = delegate
-        self.queue = DispatchQueue(label: "aether.avio.held.\(label)")
+        self.queue = DispatchQueue(label: "aether.avio.held.\(label)", qos: .userInitiated)
     }
 
     var isCancelled: Bool {
@@ -178,17 +180,24 @@ final class HeldSourceConnection: @unchecked Sendable {
     }
 
     private func openAndPump() throws {
+        let source = respondedBy
         var target = respondedBy
         var hops = 0
         while true {
             if isCancelled { return }
-            let head = try open(target)
+            // Audit DMX-3: the headers were built for the source, so every hop gets the #126
+            // policy every URLSession path applies: credentials only to the same origin, and
+            // never down from https to http.
+            let headers = RedirectHeaderPolicy.headersToReplay(
+                extraHeaders: extraHeaders, originalURL: source, redirectURL: target)
+            let head = try open(target, headers: headers)
             if let location = Self.redirectLocation(head), hops < Self.maxRedirects {
                 guard let next = URL(string: location, relativeTo: target)?.absoluteURL else {
                     throw ConnectionError.malformedResponse("unresolvable Location: \(location)")
                 }
                 hops += 1
                 closeSocket()
+                OriginRequestBudget.shared.noteRedirect(from: source, to: next)
                 target = next
                 continue
             }
@@ -206,7 +215,7 @@ final class HeldSourceConnection: @unchecked Sendable {
     }
 
     /// Connect, write the request, and read until the head is complete.
-    private func open(_ target: URL) throws -> ResponseHead {
+    private func open(_ target: URL, headers: [String: String]) throws -> ResponseHead {
         guard let host = target.host, let scheme = target.scheme?.lowercased(),
               scheme == "http" || scheme == "https" else {
             throw ConnectionError.unsupportedURL(target)
@@ -219,7 +228,7 @@ final class HeldSourceConnection: @unchecked Sendable {
         configuration.timeoutIntervalForResource = .greatestFiniteMagnitude
         let session = URLSession(configuration: configuration,
                                  delegate: EngineTLS.sessionDelegate,
-                                 delegateQueue: nil)
+                                 delegateQueue: AVIOReader.makePlaybackDelegateQueue())
         let task = session.streamTask(withHostName: host, port: port)
 
         stateLock.lock()
@@ -237,7 +246,7 @@ final class HeldSourceConnection: @unchecked Sendable {
         if secure { task.startSecureConnection() }
 
         try write(Self.requestBytes(target: target, host: host, port: port, secure: secure,
-                                    offset: offset, extraHeaders: extraHeaders,
+                                    offset: offset, extraHeaders: headers,
                                     userAgent: userAgent))
         return try readHead()
     }
@@ -439,20 +448,28 @@ extension HeldSourceConnection {
                              host: String,
                              port: Int,
                              secure: Bool,
-                             offset: Int64,
+                             offset: Int64?,
                              extraHeaders: [String: String],
-                             userAgent: String?) -> Data {
-        var path = target.path.isEmpty ? "/" : target.path
-        if let query = target.query, !query.isEmpty { path += "?" + query }
+                             userAgent: String?) throws -> Data {
+        // Audit DMX-4: the path goes on the wire as the URL spells it. `URL.path` is decoded, so
+        // `%20`, `%3F` or `%2F` changed the resource asked for, a trailing slash was dropped, and a
+        // `%0D%0A` in a redirect target became a raw line break in the request.
+        let components = URLComponents(url: target, resolvingAgainstBaseURL: true)
+        let encodedPath = components?.percentEncodedPath ?? ""
+        var path = encodedPath.isEmpty ? "/" : encodedPath
+        if let query = components?.percentEncodedQuery, !query.isEmpty { path += "?" + query }
+        // An IPv6 literal is bracketed in Host, or its colons read as the port separator.
+        let hostName = host.contains(":") && !host.hasPrefix("[") ? "[\(host)]" : host
         // A non-default port belongs in Host, since the origin may route on it.
-        let hostHeader = (secure && port == 443) || (!secure && port == 80) ? host : "\(host):\(port)"
+        let hostHeader = (secure && port == 443) || (!secure && port == 80) ? hostName : "\(hostName):\(port)"
 
+        // A nil offset is a whole-resource GET (AE#732's segment fetches), which carries no Range.
         var lines = ["GET \(path) HTTP/1.1",
-                     "Host: \(hostHeader)",
-                     "Range: bytes=\(offset)-",
-                     "Accept: */*",
-                     "Accept-Encoding: identity",
-                     "Connection: keep-alive"]
+                     "Host: \(hostHeader)"]
+        if let offset { lines.append("Range: bytes=\(offset)-") }
+        lines += ["Accept: */*",
+                  "Accept-Encoding: identity",
+                  "Connection: keep-alive"]
         if let userAgent { lines.append("User-Agent: \(userAgent)") }
         // The caller's headers win: they carry the source's authentication, and a duplicate of a
         // header set above would be sent twice.
@@ -460,6 +477,11 @@ extension HeldSourceConnection {
         for (name, value) in extraHeaders where !reserved.contains(name.lowercased()) {
             lines.removeAll { $0.lowercased().hasPrefix(name.lowercased() + ":") }
             lines.append("\(name): \(value)")
+        }
+        // Every field is written raw, so one carrying a line break would add lines of its own.
+        // `isNewline`, because CRLF is a single Swift Character that matches neither "\r" nor "\n".
+        if let bad = lines.first(where: { $0.contains(where: \.isNewline) }) {
+            throw ConnectionError.invalidHeaderField(String(bad.prefix(while: { $0 != ":" && $0 != " " })))
         }
         return Data((lines.joined(separator: "\r\n") + "\r\n\r\n").utf8)
     }
@@ -485,6 +507,16 @@ final class ChunkedBodyDecoder {
     private var buffer = Data()
     private var state: State = .size
 
+    /// Audit DMX-111: a size, terminator or trailer line longer than this is a malformed origin. A
+    /// line with no CRLF would otherwise be buffered and rescanned for one that is not coming.
+    static let maxLineBytes = 4096
+    /// Framing bytes (size lines, terminators, blank lines, trailer fields) the decoder consumes
+    /// without one byte of body in between. Bounds the states that consume without producing:
+    /// endless blank lines, endless trailer fields.
+    static let maxFramingBytes = 64 * 1024
+    private static let crlf = Data("\r\n".utf8)
+    private var framingBytes = 0
+
     var isComplete: Bool {
         if case .done = state { return true }
         return false
@@ -503,7 +535,7 @@ final class ChunkedBodyDecoder {
             case .done:
                 break loop
             case .size:
-                guard let line = takeLine() else { break loop }
+                guard let line = try takeLine() else { break loop }
                 if line.isEmpty { continue }   // tolerate the CRLF of a preceding chunk
                 let sizeField = line.split(separator: ";", maxSplits: 1).first.map(String.init) ?? line
                 guard let size = Int(sizeField.trimmingCharacters(in: .whitespaces), radix: 16), size >= 0 else {
@@ -516,34 +548,48 @@ final class ChunkedBodyDecoder {
                 if want == 0 { break loop }
                 out.append(buffer.prefix(want))
                 buffer.removeFirst(want)
+                framingBytes = 0
                 state = remaining - want == 0 ? .dataTerminator : .data(remaining: remaining - want)
             case .dataTerminator:
-                guard let line = takeLine() else { break loop }
+                guard let line = try takeLine() else { break loop }
                 guard line.isEmpty else { throw ChunkedError.expectedChunkTerminator(line) }
                 state = .size
             case .trailer:
-                guard let line = takeLine() else { break loop }
+                guard let line = try takeLine() else { break loop }
                 if line.isEmpty { state = .done }
             }
         }
         return out.isEmpty ? nil : out
     }
 
-    private func takeLine() -> String? {
-        guard let range = buffer.range(of: Data("\r\n".utf8)) else { return nil }
+    /// The next CRLF-terminated line, nil while there is not one yet. Only the first
+    /// `maxLineBytes + 2` bytes are searched, so a line with no end costs a bounded scan and is
+    /// refused instead of waited for.
+    private func takeLine() throws -> String? {
+        let window = buffer.startIndex..<min(buffer.endIndex, buffer.startIndex + Self.maxLineBytes + 2)
+        guard let range = buffer.range(of: Self.crlf, in: window) else {
+            if buffer.count >= Self.maxLineBytes + 2 { throw ChunkedError.lineTooLong }
+            return nil
+        }
+        framingBytes += buffer.distance(from: buffer.startIndex, to: range.upperBound)
+        if framingBytes > Self.maxFramingBytes { throw ChunkedError.framingTooLong }
         let line = String(decoding: buffer[..<range.lowerBound], as: UTF8.self)
         buffer.removeSubrange(..<range.upperBound)
         return line
     }
 
-    enum ChunkedError: LocalizedError {
+    enum ChunkedError: LocalizedError, Equatable {
         case badChunkSize(String)
         case expectedChunkTerminator(String)
+        case lineTooLong
+        case framingTooLong
 
         var errorDescription: String? {
             switch self {
             case .badChunkSize(let line): return "bad chunk size line: \(line)"
             case .expectedChunkTerminator(let line): return "expected a chunk terminator, got: \(line)"
+            case .lineTooLong: return "a chunked size or trailer line passed \(ChunkedBodyDecoder.maxLineBytes) bytes"
+            case .framingTooLong: return "chunked framing passed \(ChunkedBodyDecoder.maxFramingBytes) bytes without a body byte"
             }
         }
     }

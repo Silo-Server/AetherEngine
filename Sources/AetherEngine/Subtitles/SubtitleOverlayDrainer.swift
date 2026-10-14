@@ -94,6 +94,24 @@ enum SubtitleOverlayDrainer {
         return end
     }
 
+    /// The cap for one tick's window, which starts at the cursor: `cap`, raised to take every packet
+    /// due by `urgentThrough` (the playhead plus `subtitleDrainUrgentLeadSeconds`), up to `catchUpCap`.
+    /// A drain already past that horizon keeps the steady cap; one that is behind it (a fresh
+    /// selection, a seek, a passage denser than the steady cap's throughput) catches up in one tick
+    /// instead of trailing the viewer. The window is PTS-ascending, so the count is a binary search.
+    /// A track that does not `catchesUp` (bitmap and teletext, `EmbeddedSubtitleDecoder.drainCatchesUp`)
+    /// keeps the steady cap: a catch-up batch of decoded images would hold hundreds of megabytes.
+    static func tickCap(count: Int, cap: Int, urgentThrough: Double, catchUpCap: Int,
+                        catchesUp: Bool = true, ptsAt: (Int) -> Double) -> Int {
+        guard cap > 0, catchesUp else { return cap }
+        var low = 0, high = count
+        while low < high {
+            let mid = (low + high) / 2
+            if ptsAt(mid) <= urgentThrough { low = mid + 1 } else { high = mid }
+        }
+        return max(cap, min(catchUpCap, low))
+    }
+
     /// #362: where a tick has to stop because the stored window has a hole the harvest is still
     /// filling, rather than a stretch the author left empty. Returns how many entries may decode,
     /// the position the hold is anchored on and the harvest sequence there, or nil when the window
@@ -128,15 +146,25 @@ enum SubtitleOverlayDrainer {
     /// the island and carry the cursor past the hole. That is the reported shape exactly (a set at
     /// 280 s closed at 295 s, the four packets between them never read). Pass nil on a reset, whose
     /// window starts at a backscan boundary rather than at something that was read.
+    ///
+    /// A descending pair is also what a re-harvest leaves when the forward prefetch is AHEAD of the
+    /// pump: the prefetch stores the stretch first, the pump re-reads it behind and each duplicate
+    /// takes the fresh sequence, so wherever the pump has got to the order breaks over ground the
+    /// prefetch has already read. That seam moves with the pump, renewing the hold on every tick
+    /// and pinning the drain a few seconds ahead of the playhead instead of its 60 s lead. `isRead`
+    /// answers whether some run demonstrably read the span between the pair (the store's #416
+    /// coverage); a span that was read is a seam, not a hole, and does not stop the tick.
     static func harvestGapCut(count: Int, ptsAt: (Int) -> Double,
                               sequenceAt: (Int) -> UInt64,
                               resumeFrom: (pts: Double, sequence: UInt64)?,
-                              notBefore: Double) -> (index: Int, at: Double, sequence: UInt64)? {
+                              notBefore: Double,
+                              isRead: (Double, Double) -> Bool = { _, _ in false })
+        -> (index: Int, at: Double, sequence: UInt64)? {
         guard count > 0 else { return nil }
         var previous = resumeFrom
         for index in 0..<count {
             if let previous, previous.sequence > 0, sequenceAt(index) < previous.sequence,
-               previous.pts >= notBefore {
+               previous.pts >= notBefore, !isRead(previous.pts, ptsAt(index)) {
                 return (index, previous.pts, previous.sequence)
             }
             previous = (ptsAt(index), sequenceAt(index))

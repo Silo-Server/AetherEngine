@@ -19,6 +19,7 @@
 #   a53-captions.mp4              - H.264 with in-picture A/53 CEA-608 SEI (#131, #259)
 #   hev1-inband-xps.mp4           - HEVC with in-band VPS/SPS/PPS and an empty hvcC
 #   cue-axis-bframes.mkv/.mp4     - one HEVC B-pyramid stream in both containers (AE#561)
+#   long-first-gop-{aac,pcm}.mkv  - 11 s first GOP, then 2 s GOPs; passthrough and bridged audio
 #   bridge-eac3-51.mkv            - 5.1 PCM in MKV, drives the EAC3 audio bridge (AE#561 follow-up)
 #
 # Real-world DV / Atmos / multichannel sources have to come from your
@@ -369,6 +370,21 @@ ffmpeg -hide_banner -loglevel error -y -copyts -i "$OFFSET_TS" -c copy \
     -f hls -hls_time 6 -hls_list_size 0 -hls_playlist_type vod \
     -hls_segment_filename "$FIXTURES_DIR/user/hls-hevc-vod-offset/seg%03d.ts" \
     "$FIXTURES_DIR/user/hls-hevc-vod-offset/media.m3u8"
+
+# A sequential origin's playlist is cut on video keyframes. A first GOP far longer than the 4 s stride
+# is the shape a remote MKV had (11.3 s). Served forward-only its Cues are never read, so the plan is
+# the uniform stride and audio reaches every boundary long before a keyframe does. One clip per audio
+# path: AAC is passed through, stereo PCM goes through the FLAC bridge (the reporter's Vorbis did).
+for AUDIO in aac pcm; do
+    CODEC=aac; [ "$AUDIO" = pcm ] && CODEC=pcm_s16le
+    echo "→ long-first-gop-$AUDIO.mkv (keyframes at 0, 11, 13, 15 ... s, 30 s)"
+    ffmpeg -hide_banner -loglevel error -y \
+        -f lavfi -i "testsrc2=size=320x180:rate=24" \
+        -f lavfi -i "sine=frequency=440:sample_rate=48000" -t 30 \
+        -c:v libx264 -preset veryfast -pix_fmt yuv420p -b:v 200k -bf 0 \
+        -g 1000 -sc_threshold 0 -force_key_frames "0,11,13,15,17,19,21,23,25,27,29" \
+        -c:a "$CODEC" -ac 2 -f matroska "$FIXTURES_DIR/long-first-gop-$AUDIO.mkv"
+done
 
 echo ""
 echo "Done. Try:"

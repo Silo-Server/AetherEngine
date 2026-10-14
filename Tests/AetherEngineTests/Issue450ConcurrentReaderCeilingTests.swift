@@ -45,12 +45,11 @@ struct Issue450ConcurrentReaderCeilingTests {
         }
     }
 
-    private static func read(_ reader: AVIOReader, bytes target: Int, deadline: TimeInterval) -> Int {
+    private static func read(_ reader: AVIOReader, bytes target: Int) -> Int {
         let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: target)
         defer { buf.deallocate() }
         var got = 0
-        let stopAt = Date().addingTimeInterval(deadline)
-        while got < target && Date() < stopAt {
+        while got < target {
             let n = reader.read(into: buf, size: Int32(target - got))
             if n <= 0 { break }
             got += Int(n)
@@ -66,29 +65,6 @@ struct Issue450ConcurrentReaderCeilingTests {
             let n = (counts[offset] ?? 0) + 1
             counts[offset] = n
             return n
-        }
-    }
-
-    /// `EngineLog.handler` is process-global and swift-testing runs suites in parallel, so this
-    /// collects whatever else is logging at the same time. It only ever filters, never counts a
-    /// total, so a foreign line cannot change a verdict here.
-    private final class LogSink: @unchecked Sendable {
-        private let lock = NSLock()
-        private var lines: [String] = []
-        private let previous: ((String) -> Void)?
-        init() {
-            previous = EngineLog.handler
-            let sink = { [self] (line: String) in
-                lock.lock()
-                lines.append(line)
-                lock.unlock()
-            }
-            EngineLog.handler = sink
-        }
-        func restore() { EngineLog.handler = previous }
-        func matching(_ needle: String) -> [String] {
-            lock.lock(); defer { lock.unlock() }
-            return lines.filter { $0.contains(needle) }
         }
     }
 
@@ -108,6 +84,8 @@ struct Issue450ConcurrentReaderCeilingTests {
         defer { session.invalidateAndCancel() }
 
         Self.fireOpenEnded(session, port: server.port, count: 3)
+        try await waitFor { Self.pathsSeen(server).count >= 2 }
+        // The window the third request is given to show up and must not use.
         try await Task.sleep(for: .seconds(5))
 
         #expect(Self.pathsSeen(server).count == 2,
@@ -125,7 +103,7 @@ struct Issue450ConcurrentReaderCeilingTests {
         defer { session.invalidateAndCancel() }
 
         Self.fireOpenEnded(session, port: server.port, count: 3)
-        try await Task.sleep(for: .seconds(5))
+        try await waitFor { Self.pathsSeen(server).count >= 3 }
 
         #expect(Self.pathsSeen(server).count == 3,
                 "an open-ended request was parked by the long-lived pool: \(Self.pathsSeen(server))")
@@ -190,10 +168,12 @@ struct Issue450ConcurrentReaderCeilingTests {
         let server = try #require(serverMaybe)
         defer { server.stop() }
 
-        let sink = LogSink()
-        defer { sink.restore() }
+        let sink = EngineLogCapture()
+        defer { sink.end() }
 
+        let label = "silent-\(UUID().uuidString)"
         let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!,
+                                label: label,
                                 boundedInitialFetch: firstRange,
                                 connStallTimeout: stallTimeout)
         defer { reader.markClosed(); reader.close() }
@@ -201,11 +181,13 @@ struct Issue450ConcurrentReaderCeilingTests {
 
         // Let the first range complete, then consume enough to put the refill on the wire. That
         // refill is the generation that receives headers and no body.
-        try await waitFor(upTo: .seconds(10)) { !reader.hasLiveConnectionForTesting }
-        #expect(Self.read(reader, bytes: 512 * 1024, deadline: 10) == 512 * 1024)
-        try await waitFor(upTo: .seconds(10)) { !sink.matching("no first byte after").isEmpty }
+        try await waitFor { !reader.hasLiveConnectionForTesting }
+        #expect(Self.read(reader, bytes: 512 * 1024) == 512 * 1024)
+        // The capture sees every reader in the process, so the reader's own label picks its line.
+        func reported() -> [String] { sink.matching(label).filter { $0.contains("no first byte after") } }
+        try await waitFor { !reported().isEmpty }
 
-        let lines = sink.matching("no first byte after")
+        let lines = reported()
         #expect(!lines.isEmpty, "a generation that received headers and no body was never reported")
         // The two facts that separate a parked request from an origin sitting on one. Without them
         // the line names the silence but not the side it is on.

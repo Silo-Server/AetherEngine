@@ -48,6 +48,43 @@ struct Issue592PacketEnvelopeTests {
         #expect(try SoftwareStoredPacket.decode(p.encoded()) == p)
     }
 
+    /// The binary property list encoder uniqued every object through a `Set`, which hashed the
+    /// whole payload on every packet: 92 % of the envelope's encode time in a release profile of a
+    /// 91 Mbit/s HEVC session. The envelope is now the payload plus a fixed header, so its size
+    /// says whether anything else crept back in.
+    @Test("the envelope is a fixed header, the payload and the side data, nothing else")
+    func envelopeSizeIsExact() throws {
+        let p = packet(payload: 425_000, sideData: 3)
+        let side = p.sideData.reduce(0) { $0 + SoftwareStoredPacket.sideDataHeaderBytes + $1.bytes.count }
+        #expect(try p.encoded().count == SoftwareStoredPacket.headerBytes + 425_000 + side)
+    }
+
+    @Test("a truncated envelope throws instead of reading past its end")
+    func truncatedEnvelopeThrows() throws {
+        let data = try packet(payload: 4_096, sideData: 2).encoded()
+        for cut in [0, 1, SoftwareStoredPacket.headerBytes - 1, SoftwareStoredPacket.headerBytes + 10, data.count - 1] {
+            #expect(throws: (any Error).self) { try SoftwareStoredPacket.decode(data.prefix(cut)) }
+        }
+    }
+
+    @Test("an envelope of another version or with trailing bytes throws")
+    func foreignEnvelopeThrows() throws {
+        var data = try packet(payload: 16).encoded()
+        var trailing = data
+        trailing.append(0)
+        #expect(throws: (any Error).self) { try SoftwareStoredPacket.decode(trailing) }
+        data[data.startIndex] = 0xFF
+        #expect(throws: (any Error).self) { try SoftwareStoredPacket.decode(data) }
+    }
+
+    @Test("a slice decodes like the whole buffer")
+    func sliceDecodes() throws {
+        let p = packet(payload: 777, sideData: 1)
+        var framed = Data([1, 2, 3])
+        framed.append(try p.encoded())
+        #expect(try SoftwareStoredPacket.decode(framed.dropFirst(3)) == p)
+    }
+
     /// Reported, not asserted: a throughput floor pinned here would be a CI coin toss. The number is
     /// the deliverable, read off the run. Each round gets its own payload, so nothing is reused
     /// across iterations and a copy the encoder makes is a copy this measures.

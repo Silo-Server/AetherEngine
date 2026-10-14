@@ -356,6 +356,8 @@ enum SubtitleForwardPrefetcher {
             else {
                 var p: UnsafeMutablePointer<AVPacket>? = pkt
                 trackedPacketFree(&p)
+                // #362: a dropped subtitle packet was read but not stored.
+                if isTarget { store.notePrefetchDroppedPacket(streamIndex: streamIdx) }
                 timeBaseFailures += 1
                 SubtitlePrefetchTelemetry.recordTimeBaseFallback()
                 if timeBaseFailures == 1 {

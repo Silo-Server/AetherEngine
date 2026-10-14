@@ -32,11 +32,21 @@ enum RedirectHeaderPolicy {
         headers.filter { !credentialHeaders.contains($0.key.lowercased()) }
     }
 
+    /// Audit NET-7: the headers a host handed over for `anchor` as they may be sent to `target`, a URI
+    /// some playlist named. A playlist can name any host and scheme, so it gets the rule a redirect
+    /// gets: credentials only to the same origin with no TLS downgrade, everything else as given.
+    static func scoped(_ headers: [String: String], grantedFor anchor: URL?, sentTo target: URL?)
+        -> [String: String]
+    {
+        headersToReplay(extraHeaders: headers, originalURL: anchor, redirectURL: target)
+    }
+
     /// Builds the request actually handed back to URLSession on redirect: re-applies the
-    /// original Range (URLSession drops custom headers on cross-host redirect, and
-    /// Range-dependent proxies 400 without it), replays the policy-filtered extra
-    /// headers, and scrubs any credential header URLSession itself carried over when
-    /// the target is not credential-worthy.
+    /// original Range (Range-dependent proxies 400 without it), replays the policy-filtered
+    /// extra headers, and scrubs any credential header URLSession itself carried over when
+    /// the target is not credential-worthy. URLSession's default redirect copies every custom
+    /// header except `Authorization` to the new host (measured on CFNetwork 3896, audit
+    /// NET-108), so the scrub is what keeps a token and a cookie off a cross-origin target.
     static func redirectRequest(
         _ request: URLRequest,
         originalURL: URL?,
@@ -63,7 +73,7 @@ enum RedirectHeaderPolicy {
     /// Same host and no TLS downgrade. Ports may differ only across an http -> https
     /// upgrade (Emby-style 8096 -> 8920); within the same scheme a port change is a
     /// different origin.
-    private static func credentialsAllowed(from original: URL?, to redirect: URL?) -> Bool {
+    static func credentialsAllowed(from original: URL?, to redirect: URL?) -> Bool {
         guard let original, let redirect,
               let fromHost = original.host?.lowercased(),
               let toHost = redirect.host?.lowercased(),
@@ -80,5 +90,31 @@ enum RedirectHeaderPolicy {
 
     private static func effectivePort(_ url: URL, scheme: String) -> Int {
         url.port ?? (scheme == "https" ? 443 : 80)
+    }
+}
+
+/// Audit NET-109: which URLs may receive the headers a host handed over. Being allowed to fetch a
+/// URL (a playlist named it, a redirect landed there) and being granted the host's credentials are
+/// separate decisions: only the URLs the host itself passed in are anchors, and every other target
+/// gets the same headers minus the credentials, the rule a redirect follows. One type so the relay,
+/// the subtitle proxy, the audio tap and the live rendition fetch cannot each decide differently.
+struct CredentialScope: Sendable {
+    let headers: [String: String]
+    let anchors: [URL]
+
+    init(headers: [String: String], anchors: [URL]) {
+        self.headers = headers
+        self.anchors = anchors
+    }
+
+    init(headers: [String: String], anchor: URL?) {
+        self.init(headers: headers, anchors: anchor.map { [$0] } ?? [])
+    }
+
+    func headers(for target: URL) -> [String: String] {
+        if anchors.contains(where: { RedirectHeaderPolicy.credentialsAllowed(from: $0, to: target) }) {
+            return headers
+        }
+        return RedirectHeaderPolicy.scoped(headers, grantedFor: nil, sentTo: target)
     }
 }

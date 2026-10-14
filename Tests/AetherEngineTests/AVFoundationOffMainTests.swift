@@ -20,7 +20,7 @@ struct AVFoundationOffMainTests {
     }
 
     @Test("a blocked body must not block the main actor", .timeLimit(.minutes(3)))
-    func blockedBodyKeepsMainActorResponsive() async {
+    func blockedBodyKeepsMainActorResponsive() async throws {
         let queue = DispatchQueue(label: "test.avfread.stall")
         let release = DispatchSemaphore(value: 0)
         let player = AVPlayer()
@@ -39,7 +39,7 @@ struct AVFoundationOffMainTests {
             }
             finished.set(true)
         }
-        for _ in 0..<5 { try? await Task.sleep(for: .milliseconds(20)) }
+        for _ in 0..<5 { try await Task.sleep(for: .milliseconds(20)) }
         #expect(finished.get() == false)
 
         release.signal()
@@ -74,7 +74,7 @@ struct AVFoundationOffMainTests {
     /// concurrent queue has to fail here rather than pass on an unrelated carrier test.
     @Test("the diagnostics pool reads on two lanes, each on its own thread", .timeLimit(.minutes(3)))
     func poolAdmitsTwoLanesOffThePool() async throws {
-        let pool = ItemDiagnosticReadPool()
+        let pool = ItemDiagnosticReadPool.withoutReadTimeout()
         let counter = LaneCounter()
         let release = DispatchSemaphore(value: 0)
         defer { release.signal() }

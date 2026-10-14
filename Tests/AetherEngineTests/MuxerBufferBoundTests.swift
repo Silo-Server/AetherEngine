@@ -60,4 +60,12 @@ struct MuxerBufferBoundTests {
         #expect(MP4SegmentMuxer.bufferedTicksExceedsBound(
             firstDts: 0, currentDts: 10_000_000, boundTicks: 0) == false)
     }
+
+    @Test("A span wider than Int64 counts as past the bound instead of trapping (audit SEG-101)")
+    func spanOverflow() {
+        #expect(MP4SegmentMuxer.bufferedTicksExceedsBound(
+            firstDts: Int64.min + 1, currentDts: Int64.max, boundTicks: 128_000))
+        #expect(MP4SegmentMuxer.bufferedTicksExceedsBound(
+            firstDts: -(Int64(1) << 62), currentDts: Int64(1) << 62, boundTicks: Int64.max))
+    }
 }

@@ -14,7 +14,7 @@ func runSegVerify(url: URL, from: Int, count: Int, dvModeAvailable: Bool,
                   dolbyVisionHandling: DolbyVisionHandling = .automatic,
                   dumpDir: String? = nil) -> Int32 {
     setvbuf(stdout, nil, _IONBF, 0)   // unbuffered: progressive output survives a long-running run
-    print("segverify: starting engine for \(url.absoluteString)")
+    print(EngineLog.redacted("segverify: starting engine for \(url.absoluteString)"))
     let engine = HLSVideoEngine(url: url, dvModeAvailable: dvModeAvailable,
                                 forceDolbyVisionOnNonDVDisplay: forceDVWithoutDisplay,
                                 dolbyVisionHandling: dolbyVisionHandling,

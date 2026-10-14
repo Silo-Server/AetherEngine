@@ -122,6 +122,13 @@ struct SubtitleHarvestCoverage: Sendable, Equatable {
         return cursor >= through
     }
 
+    /// `writer`'s current run, with no seam tolerance and nothing merged from finished runs. A run
+    /// is contiguous by construction, so this is exact where `covers` is generous: a merged history
+    /// can bridge up to `seamSeconds` nobody read.
+    func currentRun(_ writer: SubtitlePacketStore.Writer) -> Span? {
+        open[writer]
+    }
+
     /// Every span this ledger holds, open runs included, sorted by start. Small by construction
     /// (`maxSpans` plus one run per writer), so the sort is cheaper than keeping a second index.
     func sortedSpans() -> [Span] {

@@ -8,10 +8,14 @@ import AetherLibavfilter
 /// AV_PIX_FMT_VIDEOTOOLBOX frames wrapping CVPixelBuffers, and mode=send_field doubles the
 /// output cadence on the sink's time_base.
 ///
-/// Both tests self-skip (early return, engine falls back to .software) when the linked build has
-/// no yadif_videotoolbox or the machine has no Metal device (CI VMs), the fallback itself is
-/// covered by the software tests.
+/// The three tests are reported as skipped (not passed) when the linked build has no
+/// yadif_videotoolbox or the machine has no Metal device (CI VMs): the engine then falls back to
+/// .software, and the fallback itself is covered by the software tests.
 struct DeinterlaceHardwareTests {
+
+    /// Built once: the probe stands up and tears down a whole filter graph.
+    private static let hardwareAvailable = DeinterlaceFilter.prewarmHardwarePipeline()
+    private static let needsHardware: Comment = "needs yadif_videotoolbox and a Metal device"
 
     private func makeFrame(pts: Int64) -> UnsafeMutablePointer<AVFrame> {
         let f = av_frame_alloc()!
@@ -52,7 +56,7 @@ struct DeinterlaceHardwareTests {
             guard hardware else {
                 var ff: UnsafeMutablePointer<AVFrame>? = f
                 av_frame_free(&ff)
-                return ([], false)  // no yadif_videotoolbox / no Metal device: caller skips
+                return ([], false)
             }
 
             #expect(filter.push(f) >= 0)
@@ -72,7 +76,8 @@ struct DeinterlaceHardwareTests {
         return (seconds, hardware)
     }
 
-    @Test("HW engine emits VideoToolbox frames wrapping CVPixelBuffers")
+    @Test("HW engine emits VideoToolbox frames wrapping CVPixelBuffers",
+          .enabled(if: DeinterlaceHardwareTests.hardwareAvailable, DeinterlaceHardwareTests.needsHardware))
     func hardwareEmitsVideoToolboxFrames() {
         var sawVTFrame = false
         let (seconds, hardware) = run(fieldRate: .field, count: 8) { out in
@@ -91,18 +96,18 @@ struct DeinterlaceHardwareTests {
                 Issue.record("AV_PIX_FMT_VIDEOTOOLBOX frame with nil data[3]")
             }
         }
-        guard hardware else { return }  // linked build predates yadif_videotoolbox, or no Metal
+        #expect(hardware)
         #expect(sawVTFrame, "hw graph engaged but produced no frames")
         #expect(!seconds.isEmpty)
     }
 
-    @Test("send_field doubles output cadence; send_frame keeps it")
+    @Test("send_field doubles output cadence; send_frame keeps it",
+          .enabled(if: DeinterlaceHardwareTests.hardwareAvailable, DeinterlaceHardwareTests.needsHardware))
     func fieldRateControlsCadence() {
         let streamTBSeconds = 1.0 / 30.0
         let (fieldSeconds, hwField) = run(fieldRate: .field, count: 8)
-        guard hwField else { return }  // self-skip, see type doc
         let (frameSeconds, hwFrame) = run(fieldRate: .frame, count: 8)
-        guard hwFrame else { return }
+        #expect(hwField && hwFrame)
 
         // Field rate must produce ~2x the frames of frame rate (lookahead trims the tails).
         #expect(fieldSeconds.count > frameSeconds.count + 2,
@@ -129,11 +134,10 @@ struct DeinterlaceHardwareTests {
         }
     }
 
-    @Test("warm-up releases its temporary graph and a fresh hardware graph remains usable")
+    @Test("warm-up releases its temporary graph and a fresh hardware graph remains usable",
+          .enabled(if: DeinterlaceHardwareTests.hardwareAvailable, DeinterlaceHardwareTests.needsHardware))
     func warmupLeavesFreshGraphUsable() {
-        guard DeinterlaceFilter.prewarmHardwarePipeline() else {
-            return
-        }
+        #expect(DeinterlaceFilter.prewarmHardwarePipeline())
 
         let (seconds, hardware) = run(fieldRate: .field, count: 8)
         #expect(hardware)

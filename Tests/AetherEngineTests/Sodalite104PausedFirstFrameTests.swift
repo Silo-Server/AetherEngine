@@ -4,6 +4,67 @@ import Testing
 @Suite("PausedFirstFrame (Sodalite#104 round 4: a pause before the first frame still presents it)")
 struct Sodalite104PausedFirstFrameTests {
 
+    @Test("paused seek ignores stale and preroll frames, then parks after the target picture")
+    func pausedSeekPresentsOnlyItsTargetFrame() {
+        var gate = PausedFrameGate()
+        gate.arm(generation: 2, minimumPTS: 40)
+        let consumed1 = gate.consume(generation: 1, pts: 80)
+        #expect(!consumed1)
+        let consumed2 = gate.consume(generation: 2, pts: 39)
+        #expect(!consumed2)
+        #expect(gate.isPending)
+        let consumed3 = gate.consume(generation: 2, pts: 40)
+        #expect(consumed3)
+        #expect(!gate.isPending)
+        let consumed4 = gate.consume(generation: 2, pts: 41)
+        #expect(!consumed4)
+    }
+
+    @Test("a newer seek replaces the pending paused picture")
+    func newerSeekOwnsThePicture() {
+        var gate = PausedFrameGate()
+        gate.arm(generation: 1, minimumPTS: 80)
+        gate.arm(generation: 2, minimumPTS: 0)
+        let consumed5 = gate.consume(generation: 1, pts: 80)
+        #expect(!consumed5)
+        #expect(gate.isPending)
+        let consumed6 = gate.consume(generation: 2, pts: 0)
+        #expect(consumed6)
+    }
+
+    @Test("play or stop cancels the paused picture; startup accepts a finite first frame")
+    func transportCancellationAndInitialFrame() {
+        var gate = PausedFrameGate()
+        gate.arm(generation: 1)
+        let consumed7 = gate.consume(generation: 1, pts: .nan)
+        #expect(!consumed7)
+        #expect(gate.isPending)
+        let consumed8 = gate.consume(generation: 1, pts: 1.5)
+        #expect(consumed8)
+        gate.arm(generation: 2, minimumPTS: 40)
+        gate.cancel()
+        #expect(!gate.isPending)
+        let consumed9 = gate.consume(generation: 2, pts: 40)
+        #expect(!consumed9)
+    }
+
+    @Test("end of media held under a paused seek is released once, and only for that seek")
+    func heldEndBelongsToItsSeek() {
+        var held = HeldEndOfMedia()
+        let nothingHeld = held.release(currentGeneration: 1)
+        #expect(!nothingHeld)
+        held.hold(generation: 2)
+        let superseded = held.release(currentGeneration: 3)
+        #expect(!superseded)
+        let afterSuperseded = held.release(currentGeneration: 2)
+        #expect(!afterSuperseded)
+        held.hold(generation: 4)
+        let current = held.release(currentGeneration: 4)
+        #expect(current)
+        let again = held.release(currentGeneration: 4)
+        #expect(!again)
+    }
+
     @Test("a pause before the first frame keeps the loops running, one after it parks them")
     func holdsOnlyBeforeTheFirstFrame() {
         #expect(PausedFirstFrame.holdsForFirstFrame(loopsStarted: true, framesEnqueued: 0))

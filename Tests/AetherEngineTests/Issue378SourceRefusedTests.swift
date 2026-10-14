@@ -69,7 +69,7 @@ struct Issue378SourceRefusedTests {
                 "expected exactly one suffix tail prefetch: \(requests)")
     }
 
-    @Test("a refusal does not latch the suffix-range denial for the origin")
+    @Test("a refusal does not latch the suffix-range denial for the origin", .timeLimit(.minutes(2)))
     func refusalDoesNotLatchSuffixRanges() async throws {
         let server = try Self.refusingOrigin()
         defer { server.stop() }
@@ -80,14 +80,16 @@ struct Issue378SourceRefusedTests {
         first.markClosed(); first.close()
         // Let the tail prefetch's own outcome land: the 403 arrives at once from a loopback origin,
         // but the outcome closure runs on the delegate queue after open() has already thrown.
-        try? await Task.sleep(nanoseconds: 300_000_000)
+        try await Task.sleep(nanoseconds: 300_000_000)
         #expect(SuffixRangeSupport.shared.denialReason(for: url) == nil,
                 "a 403 during the refusal latched the origin: \(SuffixRangeSupport.shared.denialReason(for: url) ?? "")")
 
         let second = AVIOReader(url: url)
         defer { second.markClosed(); second.close() }
         #expect(throws: AVIOReaderError.httpStatus(403)) { try second.open() }
-        try? await Task.sleep(nanoseconds: 300_000_000)
+        try await waitFor { server.requests.filter { $0.range?.hasPrefix("bytes=-") == true }.count >= 2 }
+        // A third ask, if one is coming, gets the same chance the original fixed wait gave it.
+        try await Task.sleep(nanoseconds: 300_000_000)
 
         let suffixRequests = server.requests.filter { $0.range?.hasPrefix("bytes=-") == true }
         #expect(suffixRequests.count == 2,
@@ -96,7 +98,7 @@ struct Issue378SourceRefusedTests {
 
     /// The regression guard for #281: an origin that answers the suffix form itself — here with a
     /// 416 — is still remembered after one occurrence.
-    @Test("a 416 to the suffix form still latches")
+    @Test("a 416 to the suffix form still latches", .timeLimit(.minutes(1)))
     func rangeNotSatisfiableStillLatches() async throws {
         let declared: Int64 = 4 * 1024 * 1024 * 1024
         let server = try #require(ScriptedOriginServer { recorded in
@@ -114,9 +116,7 @@ struct Issue378SourceRefusedTests {
         let reader = AVIOReader(url: url)
         defer { reader.markClosed(); reader.close() }
         try reader.open()
-        for _ in 0..<100 where SuffixRangeSupport.shared.denialReason(for: url) == nil {
-            try? await Task.sleep(nanoseconds: 20_000_000)
-        }
+        try await waitFor { SuffixRangeSupport.shared.denialReason(for: url) != nil }
         let reason = try #require(SuffixRangeSupport.shared.denialReason(for: url))
         #expect(reason.contains("416"))
     }

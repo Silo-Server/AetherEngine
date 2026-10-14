@@ -133,10 +133,16 @@ enum H264SPS {
         return nil
     }
 
-    /// Scan Annex-B for a coded IDR slice NAL (type 5). #133: a mid-stream live join must open on a true
-    /// IDR, not an open-GOP recovery-point I-slice (type 1) whose references precede the join point; starting
-    /// there renders garbage (green frames) until the next real IDR. Cheap NAL-header walk, no RBSP parse.
-    static func containsIDR(fromAnnexB data: UnsafeBufferPointer<UInt8>) -> Bool {
+    /// AE#627: whether a decoder can start at this access unit. An IDR slice qualifies, and so does a
+    /// picture coded only in I/SI slices behind a recovery point SEI with `recovery_frame_cnt == 0`:
+    /// every picture from it on in output order decodes exactly (H.264 D.2.8), and the leading
+    /// pictures that do not are dropped behind the gate. Some broadcast encoders never send an IDR,
+    /// so on those feeds a gate that required one never opened. A recovery point with a later
+    /// recovery frame (gradual refresh) is not an entry point and stays refused.
+    static func isRandomAccessEntry(fromAnnexB data: UnsafeBufferPointer<UInt8>) -> Bool {
+        var recoversHere = false
+        var sawSlice = false
+        var allIntra = true
         var i = 0
         let n = data.count
         func startCode(at p: Int) -> Int {
@@ -149,10 +155,49 @@ enum H264SPS {
             if sc == 0 { i += 1; continue }
             let start = i + sc
             guard start < n else { break }
-            if (data[start] & 0x1f) == 5 { return true }
-            i = start
+            var j = start
+            while j < n, startCode(at: j) == 0 { j += 1 }
+            switch data[start] & 0x1f {
+            case 5:
+                return true
+            case 1:
+                sawSlice = true
+                // first_mb_in_slice and slice_type sit in the first few bytes.
+                let head = unescape(Array(data[(start + 1)..<min(j, start + 17)]))
+                var r = BitReader(head)
+                guard r.ue() != nil, let sliceType = r.ue() else { return false }
+                if sliceType % 5 != 2 && sliceType % 5 != 4 { allIntra = false }
+            case 6:
+                if recoveryFrameCount(seiRBSP: unescape(Array(data[(start + 1)..<j]))) == 0 {
+                    recoversHere = true
+                }
+            default:
+                break
+            }
+            i = j
         }
-        return false
+        return recoversHere && sawSlice && allIntra
+    }
+
+    /// `recovery_frame_cnt` of the recovery point message in one SEI NAL payload (header stripped), nil if absent.
+    static func recoveryFrameCount(seiRBSP rbsp: [UInt8]) -> Int? {
+        var p = 0
+        func sei() -> Int? {
+            var v = 0
+            while p < rbsp.count, rbsp[p] == 0xff { v += 255; p += 1 }
+            guard p < rbsp.count else { return nil }
+            v += Int(rbsp[p]); p += 1
+            return v
+        }
+        while p < rbsp.count, rbsp[p] != 0x80 {
+            guard let type = sei(), let size = sei(), p + size <= rbsp.count else { return nil }
+            if type == 6 {
+                var r = BitReader(Array(rbsp[p..<(p + size)]))
+                return r.ue()
+            }
+            p += size
+        }
+        return nil
     }
 
     /// Build Annex-B extradata the mov muxer accepts directly; ff_isom_write_avcc sniffs the start code and packs avcC.
@@ -161,7 +206,7 @@ enum H264SPS {
         return sc + sps + sc + pps
     }
 
-    private static func unescape(_ b: [UInt8]) -> [UInt8] {  // remove emulation-prevention bytes (00 00 03 -> 00 00)
+    static func unescape(_ b: [UInt8]) -> [UInt8] {  // remove emulation-prevention bytes (00 00 03 -> 00 00)
         var out = [UInt8](); out.reserveCapacity(b.count)
         var zeros = 0
         var i = 0

@@ -29,6 +29,12 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     private let httpHeaders: [String: String]
     private let session: URLSession
     private let ownsSession: Bool
+    /// AE#732: set under `LoadOptions.heldSourceConnection`. Every request of this reader then goes over
+    /// one persistent HTTP/1.1 connection per origin, segments one at a time, instead of `session`.
+    private let transport: PersistentHTTP1Transport?
+    /// AE#732: the first segment, downloaded whole by the carriage probe on the persistent path (a probe
+    /// that stopped mid-body would cost the connection), handed to the producer that starts there.
+    private var primedSegment: (url: URL, bytes: Data)?
     private let condition = NSCondition()
     private let keyCacheLock = NSLock()
     private var keyCache: [String: Data] = [:]
@@ -51,10 +57,12 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     init(
         playlistURL: URL,
         httpHeaders: [String: String],
-        session: URLSession? = nil
+        session: URLSession? = nil,
+        persistentHTTP1: Bool = false
     ) {
         self.playlistURL = playlistURL
         self.httpHeaders = httpHeaders
+        transport = persistentHTTP1 ? PersistentHTTP1Transport(label: "vod") : nil
         if let session {
             self.session = session
             ownsSession = false
@@ -77,12 +85,14 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     static func makeIfHEVCMPEGTS(
         playlistURL: URL,
         httpHeaders: [String: String],
-        session: URLSession? = nil
+        session: URLSession? = nil,
+        persistentHTTP1: Bool = false
     ) async throws -> HLSVODIngestReader? {
         let reader = HLSVODIngestReader(
             playlistURL: playlistURL,
             httpHeaders: httpHeaders,
-            session: session
+            session: session,
+            persistentHTTP1: persistentHTTP1
         )
         var accepted = false
         defer {
@@ -98,7 +108,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
                   ) else {
                 return nil
             }
-            guard try await reader.probeCarriage(segmentURL) == .hevcInMPEGTS else {
+            guard try await reader.probeCarriage(segmentURL, duration: first.duration) == .hevcInMPEGTS else {
                 return nil
             }
             reader.condition.withLock {
@@ -111,7 +121,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         } catch {
             if Task.isCancelled { throw CancellationError() }
             EngineLog.emit(
-                "[HLSVODIngest] carriage probe inconclusive: \(error)",
+                "[HLSVODIngest] carriage probe inconclusive: \(EngineLog.summary(of: error))",
                 category: .engine
             )
             return nil
@@ -204,7 +214,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         finished = false
         failed = false
         producerStartIndex = startIndex
-        producer = Task.detached(priority: .userInitiated) { [self] in
+        producer = BlockingWork.detached(priority: .userInitiated) { [self] in
             await produce(
                 resolved: resolved,
                 startIndex: startIndex,
@@ -272,6 +282,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         condition.broadcast()
         condition.unlock()
         task?.cancel()
+        transport?.close()
         if ownsSession {
             session.invalidateAndCancel()
         }
@@ -294,7 +305,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         let currentGeneration = generation
         let preResolved = resolved
         producerStartIndex = 0
-        producer = Task.detached(priority: .userInitiated) { [self] in
+        producer = BlockingWork.detached(priority: .userInitiated) { [self] in
             do {
                 let media: ResolvedMedia
                 if let preResolved {
@@ -376,6 +387,11 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
             return (segment, url)
         }
 
+        if transport != nil {
+            try await ingestSequentially(resolvedSegments, mediaURL: mediaURL, generation: generation)
+            return
+        }
+
         try await withThrowingTaskGroup(of: (Int, Data).self) { group in
             var nextToSpawn = 0
             var nextToCommit = 0
@@ -384,7 +400,8 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
             func spawn(_ index: Int) {
                 let item = resolvedSegments[index]
                 group.addTask {
-                    let bytes = try await self.fetch(item.1)
+                    let bytes = try await self.fetch(
+                        item.1, limit: BoundedFetch.segmentLimit(forDuration: item.0.duration))
                     guard let crypt = item.0.crypt else { return (index, bytes) }
                     return (
                         index,
@@ -424,6 +441,36 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         }
     }
 
+    /// AE#732: one segment at a time, so the persistent connection carries them back to back. The FIFO
+    /// is the read-ahead; a parallel window would need a connection per in-flight segment, and a second
+    /// connection is what the origins this path exists for refuse.
+    private func ingestSequentially(
+        _ segments: [(HLSMediaSegment, URL)],
+        mediaURL: URL,
+        generation: UInt64
+    ) async throws {
+        let primed = condition.withLock { () -> (url: URL, bytes: Data)? in
+            defer { primedSegment = nil }
+            return primedSegment
+        }
+        for (offset, (segment, url)) in segments.enumerated() {
+            try Task.checkCancellation()
+            var bytes: Data
+            if offset == 0, let primed, primed.url == url {
+                bytes = primed.bytes
+            } else {
+                bytes = try await fetch(url, limit: BoundedFetch.segmentLimit(forDuration: segment.duration))
+            }
+            if let crypt = segment.crypt {
+                bytes = try await decrypt(bytes, crypt: crypt, baseURL: mediaURL)
+            }
+            if offset == 0, LiveSegmentFormat.classify(bytes) != .mpegts {
+                throw HLSIngestError.unsupportedSegmentFormat
+            }
+            guard append(bytes, generation: generation) else { return }
+        }
+    }
+
     private func append(_ data: Data, generation: UInt64) -> Bool {
         condition.lock()
         defer { condition.unlock() }
@@ -449,7 +496,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         producer = nil
         condition.broadcast()
         condition.unlock()
-        EngineLog.emit("[HLSVODIngest] terminal: \(error)", category: .engine)
+        EngineLog.emit("[HLSVODIngest] terminal: \(EngineLog.summary(of: error))", category: .engine)
     }
 
     private func resolveMedia() async throws -> ResolvedMedia {
@@ -481,47 +528,86 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         guard !media.hasUnsupportedEncryption else {
             throw HLSIngestError.encryptedNotSupported
         }
+        let timeline = try Self.segmentTimeline(media.segments)
+        return ResolvedMedia(
+            url: mediaURL,
+            segments: media.segments,
+            starts: timeline.starts,
+            duration: timeline.duration
+        )
+    }
+
+    static func segmentTimeline(_ segments: [HLSMediaSegment]) throws -> (starts: [Double], duration: Double) {
         var starts: [Double] = []
-        starts.reserveCapacity(media.segments.count)
+        starts.reserveCapacity(segments.count)
         var duration = 0.0
-        for segment in media.segments {
+        for segment in segments {
             guard segment.duration.isFinite, segment.duration > 0 else {
                 throw HLSIngestError.playlistInvalid(reason: "segment duration must be positive")
             }
             starts.append(duration)
             duration += segment.duration
         }
-        return ResolvedMedia(
-            url: mediaURL,
-            segments: media.segments,
-            starts: starts,
-            duration: duration
-        )
+        // Audit HLS-102: each entry is inside the parser's ceiling, the sum need not be. A tiny entry
+        // after a large sum also leaves the total unmoved, the starts stop being monotonic, and the
+        // uniform fallback plans the whole sum.
+        guard duration <= MediaDurationCeiling.seconds else {
+            throw HLSIngestError.playlistInvalid(reason: "program duration exceeds \(MediaDurationCeiling.seconds)s")
+        }
+        return (starts, duration)
     }
 
-    private func makeRequest(_ url: URL) -> URLRequest {
+    /// Credentials only where the host's playlist is (audit NET-7).
+    func makeRequest(_ url: URL) -> URLRequest {
         var request = URLRequest(url: url)
-        for (field, value) in httpHeaders {
+        for (field, value) in scopedHeaders(url) {
             request.setValue(value, forHTTPHeaderField: field)
         }
         return request
     }
 
+    private func scopedHeaders(_ url: URL) -> [String: String] {
+        RedirectHeaderPolicy.scoped(httpHeaders, grantedFor: playlistURL, sentTo: url)
+    }
+
     private func fetchPlaylist(_ url: URL) async throws -> (HLSPlaylist, URL) {
-        let (data, response) = try await session.data(for: makeRequest(url))
+        let data: Data
+        let response: URLResponse
+        if let transport {
+            do {
+                let answer = try await transport.get(url, headers: scopedHeaders(url), limit: Self.maximumPlaylistBytes)
+                (data, response) = (answer.body, answer.response)
+            } catch let error as BoundedFetch.Exceeded {
+                throw HLSIngestError.playlistInvalid(reason: "playlist exceeds \(error.limit) bytes")
+            }
+        } else {
+            (data, response) = try await BoundedPlaylistFetch.data(
+                for: makeRequest(url), session: session, limit: Self.maximumPlaylistBytes)
+        }
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard (200..<300).contains(status) else {
             throw HLSIngestError.playlistUnreachable(status: status)
         }
-        guard data.count <= Self.maximumPlaylistBytes,
-              let text = String(data: data, encoding: .utf8) else {
+        guard let text = String(data: data, encoding: .utf8) else {
             throw HLSIngestError.playlistInvalid(reason: "playlist is not bounded UTF-8")
         }
         return (try HLSPlaylistParser.parse(text), response.url ?? url)
     }
 
-    private func fetch(_ url: URL) async throws -> Data {
-        let (data, response) = try await session.data(for: makeRequest(url))
+    /// A segment or a key body, cut off at `limit` while it arrives (audit NET-112).
+    private func fetch(_ url: URL, limit: Int) async throws -> Data {
+        let data: Data
+        let response: URLResponse
+        do {
+            if let transport {
+                let answer = try await transport.get(url, headers: scopedHeaders(url), limit: limit)
+                (data, response) = (answer.body, answer.response)
+            } else {
+                (data, response) = try await BoundedFetch.data(for: makeRequest(url), session: session, limit: limit)
+            }
+        } catch is BoundedFetch.Exceeded {
+            throw HLSIngestError.playlistInvalid(reason: "body exceeds \(limit) bytes")
+        }
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard (200..<300).contains(status), !data.isEmpty else {
             throw HLSIngestError.playlistUnreachable(status: status)
@@ -531,10 +617,21 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
 
     /// Reads the head of the first segment and classifies its carriage (AE#293 shares this read with the
     /// live probe, so both paths judge a source the same way).
-    private func probeCarriage(_ url: URL) async throws -> MPEGTransportStreamCodecProbe.Verdict {
-        try await HLSCarriageProbe.classifySegmentHead(
+    private func probeCarriage(
+        _ url: URL, duration: Double
+    ) async throws -> MPEGTransportStreamCodecProbe.Verdict {
+        if transport != nil {
+            let bytes = try await fetch(url, limit: BoundedFetch.segmentLimit(forDuration: duration))
+            let verdict = MPEGTransportStreamCodecProbe.classify(
+                bytes.prefix(HLSCarriageProbe.maximumSegmentHeadBytes))
+            if verdict == .hevcInMPEGTS {
+                condition.withLock { primedSegment = (url, bytes) }
+            }
+            return verdict
+        }
+        return try await HLSCarriageProbe.classifySegmentHead(
             url: url,
-            httpHeaders: httpHeaders,
+            httpHeaders: RedirectHeaderPolicy.scoped(httpHeaders, grantedFor: playlistURL, sentTo: url),
             session: session
         )
     }
@@ -551,7 +648,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         if let cached = keyCacheLock.withLock({ keyCache[keyURL.absoluteString] }) {
             key = cached
         } else {
-            let fetched = try await fetch(keyURL)
+            let fetched = try await fetch(keyURL, limit: BoundedFetch.keyLimit)
             guard fetched.count == kCCKeySizeAES128 else {
                 throw HLSIngestError.segmentDecryptFailed(reason: "key length is not 16 bytes")
             }
@@ -569,11 +666,15 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     }
 }
 
-/// Bounded MPEG-TS PMT inspection. HEVC is stream_type 0x24; no URL suffix or
-/// response MIME type is treated as codec evidence.
+/// Bounded MPEG-TS PMT inspection. HEVC is stream_type 0x24, or private PES (0x06) carrying a
+/// well-formed `registration_descriptor("HEVC")` (AE#718); no URL suffix or response MIME type is
+/// treated as codec evidence.
 enum MPEGTransportStreamCodecProbe {
     private static let packetSize = 188
     private static let hevcStreamType: UInt8 = 0x24
+    private static let privatePESStreamType: UInt8 = 0x06
+    private static let registrationDescriptorTag: UInt8 = 0x05
+    private static let hevcFormatIdentifier: [UInt8] = Array("HEVC".utf8)
 
     enum Verdict: Equatable {
         /// PMT declares HEVC: AVFoundation builds no video track for this carriage (HLS Authoring
@@ -639,9 +740,32 @@ enum MPEGTransportStreamCodecProbe {
             let infoLength =
                 (Int(bytes[stream + 3] & 0x0F) << 8)
                     | Int(bytes[stream + 4])
-            stream += 5 + infoLength
+            let descriptorsEnd = stream + 5 + infoLength
+            if bytes[stream] == privatePESStreamType,
+               descriptorsEnd <= sectionEnd,
+               registersHEVC(bytes, descriptors: (stream + 5)..<descriptorsEnd) {
+                return .hevcInMPEGTS
+            }
+            stream = descriptorsEnd
         }
         return .otherCarriage
+    }
+
+    /// AE#718: a descriptor loop that runs past its own bounds is not evidence, so a truncated
+    /// registration descriptor never counts.
+    private static func registersHEVC(_ bytes: [UInt8], descriptors: Range<Int>) -> Bool {
+        var descriptor = descriptors.lowerBound
+        while descriptor + 2 <= descriptors.upperBound {
+            let length = Int(bytes[descriptor + 1])
+            let body = descriptor + 2
+            guard body + length <= descriptors.upperBound else { return false }
+            if bytes[descriptor] == registrationDescriptorTag, length >= 4,
+               Array(bytes[body..<(body + 4)]) == hevcFormatIdentifier {
+                return true
+            }
+            descriptor = body + length
+        }
+        return false
     }
 }
 

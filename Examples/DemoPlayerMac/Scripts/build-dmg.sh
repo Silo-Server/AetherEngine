@@ -183,22 +183,18 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Hardened Runtime entitlements. Both flags are conservative defaults
-# for a SwiftUI app that ships static FFmpeg libraries: the unsigned
-# executable memory entitlement covers Swift / SwiftUI runtime JIT
-# paths; the library-validation disable is a safety net in case
-# FFmpegBuild ever introduces a dynamic load. Drop them once a clean
-# notarization run confirms they're unnecessary.
+# Hardened Runtime with no exceptions. The two this script used to grant
+# (allow-unsigned-executable-memory, disable-library-validation) were
+# conservative defaults waiting on a clean notarization run; the frameworks
+# are embedded and re-signed below with the same Developer ID as the app, so
+# library validation has nothing to exempt, and nothing here needs JIT memory
+# (audit OPS-112). If a launch ever fails with a dyld or code-signing error,
+# the error names the framework that needs its own fix, not a blanket key.
 cat > "$ENTITLEMENTS" <<ENT
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
-<dict>
-    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
-    <true/>
-    <key>com.apple.security.cs.disable-library-validation</key>
-    <true/>
-</dict>
+<dict/>
 </plist>
 ENT
 

@@ -74,4 +74,21 @@ struct PregateAudioBufferTests {
             isAudioPkt: true, audioWaitForVideo: true, isHeadOfStream: false, isLive: false,
             bufferedBytes: cap - 1024, packetSize: 1025, capBytes: cap) == false)
     }
+
+    // Audit SEG-102: the byte cap counts payload only, so 1-byte (or empty) laced packets let the
+    // buffer pin about 8.4 million AVPackets, 1.4 GB of heap, while the VOD gate waits unbounded.
+    @Test("Tiny packets are refused once the entry cap is reached, however few bytes they carry")
+    func entryCapBindsTinyPackets() {
+        let entries = HLSSegmentProducer.maxPregateAudioBufferEntries
+        #expect(entries == 65_536)
+        #expect(HLSSegmentProducer.shouldBufferPregateAudio(
+            isAudioPkt: true, audioWaitForVideo: true, isHeadOfStream: true, isLive: false,
+            bufferedBytes: entries - 1, packetSize: 1, capBytes: cap, bufferedCount: entries - 1) == true)
+        #expect(HLSSegmentProducer.shouldBufferPregateAudio(
+            isAudioPkt: true, audioWaitForVideo: true, isHeadOfStream: true, isLive: false,
+            bufferedBytes: entries, packetSize: 1, capBytes: cap, bufferedCount: entries) == false)
+        #expect(HLSSegmentProducer.shouldBufferPregateAudio(
+            isAudioPkt: true, audioWaitForVideo: true, isHeadOfStream: false, isLive: false,
+            bufferedBytes: 0, packetSize: 0, capBytes: cap, bufferedCount: entries) == false)
+    }
 }

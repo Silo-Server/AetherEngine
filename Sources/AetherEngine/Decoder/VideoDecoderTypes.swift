@@ -1,6 +1,7 @@
 import Foundation
 import CoreMedia
 import CoreVideo
+import CoreGraphics
 import AetherLibavformat
 import AetherLibavcodec
 
@@ -20,6 +21,8 @@ protocol VideoDecodingPipeline: AnyObject, Sendable {
     /// Only the software decoder produces it; VideoToolbox surfaces no A53 side data (H.264/HEVC
     /// never route through the SW host, so nothing is missed there).
     var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)? { get set }
+    /// AE#658: the decoded format and its display buffer, reported on the first frame and on change.
+    var onDecodedFormat: (@Sendable (DecodedVideoFormat) -> Void)? { get set }
     var skipUntilPTS: CMTime? { get set }
 
     /// AE#492: the decoder's current feed epoch. A caller that decides a batch of packets is
@@ -62,15 +65,23 @@ enum ColorAttachments {
         case AVCOL_PRI_BT709:    kCVImageBufferColorPrimaries_ITU_R_709_2
         case AVCOL_PRI_BT2020:   kCVImageBufferColorPrimaries_ITU_R_2020
         case AVCOL_PRI_SMPTE432: kCVImageBufferColorPrimaries_P3_D65
+        case AVCOL_PRI_SMPTE431: kCVImageBufferColorPrimaries_DCI_P3
+        case AVCOL_PRI_SMPTE170M, AVCOL_PRI_SMPTE240M: kCVImageBufferColorPrimaries_SMPTE_C
+        case AVCOL_PRI_BT470BG:  kCVImageBufferColorPrimaries_EBU_3213
         default:                 nil
         }
     }
 
     static func transfer(_ v: AVColorTransferCharacteristic) -> CFString? {
         switch v {
-        case AVCOL_TRC_BT709:        kCVImageBufferTransferFunction_ITU_R_709_2
+        // BT.601 and the SDR BT.2020 codepoints name the BT.709 curve, CoreVideo has one constant for all.
+        case AVCOL_TRC_BT709, AVCOL_TRC_SMPTE170M, AVCOL_TRC_BT2020_10, AVCOL_TRC_BT2020_12:
+            kCVImageBufferTransferFunction_ITU_R_709_2
         case AVCOL_TRC_SMPTE2084:    kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ
         case AVCOL_TRC_ARIB_STD_B67: kCVImageBufferTransferFunction_ITU_R_2100_HLG
+        case AVCOL_TRC_IEC61966_2_1: kCVImageBufferTransferFunction_sRGB
+        case AVCOL_TRC_LINEAR:       kCVImageBufferTransferFunction_Linear
+        case AVCOL_TRC_SMPTE240M:    kCVImageBufferTransferFunction_SMPTE_240M_1995
         default:                     nil
         }
     }
@@ -79,8 +90,66 @@ enum ColorAttachments {
         switch v {
         case AVCOL_SPC_BT709:                       kCVImageBufferYCbCrMatrix_ITU_R_709_2
         case AVCOL_SPC_BT2020_NCL, AVCOL_SPC_BT2020_CL: kCVImageBufferYCbCrMatrix_ITU_R_2020
+        case AVCOL_SPC_SMPTE170M, AVCOL_SPC_BT470BG: kCVImageBufferYCbCrMatrix_ITU_R_601_4
+        case AVCOL_SPC_SMPTE240M:                   kCVImageBufferYCbCrMatrix_SMPTE_240M_1995
         default:                                    nil
         }
+    }
+
+    struct Tags: Equatable {
+        var primaries: CFString
+        var transfer: CFString
+        var matrix: CFString
+    }
+
+    /// AE#654: the tags a software-decoded buffer is presented with, gaps filled the way VideoToolbox
+    /// fills them on the hardware path. A buffer without tags is not read as BT.709 by the display
+    /// layer, the report has it going out in the panel's own gamut, so one untagged file looked two
+    /// ways depending on which decoder the route picked. Measured
+    /// on VideoToolbox's output (`ColorInfoGuessedBy`): nothing declared reads as BT.709 in all three,
+    /// at 720x480 and 720x576 as much as at 1080p and for MPEG-2 as much as H.264, and a lone BT.601
+    /// matrix gets SMPTE-C primaries and the BT.709 curve.
+    static func presented(_ d: ColorDescription) -> Tags {
+        let declaredPrimaries = primaries(d.primaries)
+        let declaredMatrix = matrix(d.matrix)
+        let bt709 = kCVImageBufferColorPrimaries_ITU_R_709_2
+        let bt601Matrix = kCVImageBufferYCbCrMatrix_ITU_R_601_4
+        let bt2020Matrix = kCVImageBufferYCbCrMatrix_ITU_R_2020
+        let bt2020Primaries = kCVImageBufferColorPrimaries_ITU_R_2020
+        let smpteC = kCVImageBufferColorPrimaries_SMPTE_C
+        let ebu = kCVImageBufferColorPrimaries_EBU_3213
+
+        let resolvedPrimaries: CFString = declaredPrimaries ?? {
+            switch declaredMatrix {
+            case bt601Matrix?:  smpteC
+            case bt2020Matrix?: bt2020Primaries
+            default:            bt709
+            }
+        }()
+        let resolvedMatrix: CFString = declaredMatrix ?? {
+            switch declaredPrimaries {
+            case smpteC?, ebu?:     bt601Matrix
+            case bt2020Primaries?:  bt2020Matrix
+            default:                kCVImageBufferYCbCrMatrix_ITU_R_709_2
+            }
+        }()
+        return Tags(
+            primaries: resolvedPrimaries,
+            transfer: transfer(d.transfer) ?? kCVImageBufferTransferFunction_ITU_R_709_2,
+            matrix: resolvedMatrix)
+    }
+
+    /// The colour space CoreVideo manages a buffer with these tags in, i.e. the one playback shows the
+    /// picture in. An RGB still converted from the same picture has to carry it: tagged sRGB instead,
+    /// a BT.709 still drew 8 levels darker than VideoToolbox's own conversion of the frame, and an SDR
+    /// BT.2020 one up to 57 levels off in red.
+    static func colorSpace(for tags: Tags) -> CGColorSpace? {
+        let attachments: NSDictionary = [
+            kCVImageBufferColorPrimariesKey: tags.primaries,
+            kCVImageBufferTransferFunctionKey: tags.transfer,
+            kCVImageBufferYCbCrMatrixKey: tags.matrix,
+        ]
+        return CVImageBufferCreateColorSpaceFromAttachments(attachments)?.takeRetainedValue()
     }
 
     /// PQ (ST 2084) or HLG transfer means the stream is HDR.

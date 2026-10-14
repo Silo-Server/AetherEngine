@@ -98,4 +98,28 @@ struct LiveRecordingQueueTests {
         q.finish()
         #expect(q.offer(packet(64)) == false)
     }
+
+    /// Audit REC-1: `finish` used to drain what was left on the calling thread, which for a stop was
+    /// the main actor, one `removeFirst()` per packet.
+    @Test("finish drains a large backlog in order on the writer queue, not the caller's thread")
+    func finishDrainsBacklogOnTheWriterQueue() {
+        let gate = Latch()
+        let seen = Locked<[Int64]>([])
+        let offQueue = Locked(0)
+        let q = LiveRecordingQueue(ceilingBytes: 1 << 24) { item in
+            gate.wait()
+            let label = String(cString: __dispatch_queue_get_label(nil))
+            if label != "de.superuser404.aether.recording.write" { offQueue.withLock { $0 += 1 } }
+            seen.withLock { $0.append(item.pts) }
+        }
+        let count = 100_000
+        for i in 0..<count { _ = q.offer(packet(16, pts: Int64(i))) }
+        gate.open()
+        let start = DispatchTime.now()
+        q.finish()
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1e9
+        #expect(seen.withLock { $0 } == (0..<count).map(Int64.init))
+        #expect(offQueue.withLock { $0 } == 0)
+        #expect(elapsed < 5, "draining \(count) packets took \(elapsed) s")
+    }
 }

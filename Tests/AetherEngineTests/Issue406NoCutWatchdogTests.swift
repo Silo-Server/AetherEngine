@@ -142,6 +142,34 @@ struct Issue406NoCutWatchdogTests {
 
     // MARK: - Parked pump
 
+    @Test("a replay scan is not a cutter wedge while packets keep arriving")
+    func replayScanTracksSourceProgress() {
+        let w = makeWatchdog()
+        w.noteFinalize(at: t0)
+        w.setReplayChecking(true, at: t0.addingTimeInterval(1))
+        for second in stride(from: 2, through: 50, by: 2) {
+            w.noteReplayPacketRead(at: t0.addingTimeInterval(Double(second)))
+            #expect(w.evaluate(now: t0.addingTimeInterval(Double(second) + 1)) == nil)
+        }
+        w.setReplayChecking(false, at: t0.addingTimeInterval(51))
+        #expect(w.evaluate(now: t0.addingTimeInterval(60)) == nil)
+    }
+
+    @Test("a replay scan still aborts a source that stops delivering packets")
+    func replayScanSourceStarvation() {
+        let w = makeWatchdog()
+        w.noteFinalize(at: t0)
+        w.setReplayChecking(true, at: t0.addingTimeInterval(1))
+        w.noteReplayPacketRead(at: t0.addingTimeInterval(2))
+        #expect(w.evaluate(now: t0.addingTimeInterval(36)) == nil)
+        guard case .exitForRetune(let window)? = w.evaluate(now: t0.addingTimeInterval(38)) else {
+            Issue.record("expected a timeout after the last replay packet")
+            return
+        }
+        #expect(window.progress == 1)
+        #expect(window.isWedge == false)
+    }
+
     @Test("a parked pump is not judged, and resuming re-arms the window")
     func parkedPumpIsNotJudged() {
         // The live headroom park sleeps the read thread on purpose (a consumer that stopped
@@ -198,6 +226,22 @@ struct Issue406NoCutWatchdogTests {
         #expect(window.lastForeignStreamIndex == 7)
         #expect(window.packetsRead == 15)
         #expect(abs(window.videoPtsAdvanceSeconds - 0.36) < 0.001)  // 9 * 3600 ticks at 90 kHz
+    }
+
+    @Test("a PTS advance across opposite ends of Int64 saturates instead of trapping (audit SEG-101)")
+    func ptsAdvanceSaturates() {
+        let w = makeWatchdog()
+        w.noteFinalize(at: t0)
+        w.notePacketRead()
+        w.noteVideoPacket(pts: Int64.min + 1, isKeyframe: true)
+        w.notePacketRead()
+        w.noteVideoPacket(pts: Int64.max, isKeyframe: false)
+        guard case .exitForRetune(let window)? = w.evaluate(now: t0.addingTimeInterval(36)) else {
+            Issue.record("expected an exit")
+            return
+        }
+        #expect(window.videoPtsAdvanceSeconds > 0)
+        #expect(window.videoPtsAdvanceSeconds.isFinite)
     }
 
     @Test("a video packet without a PTS does not open the advance window")

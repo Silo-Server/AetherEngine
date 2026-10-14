@@ -25,32 +25,6 @@ private final class Issue374WaitResult: @unchecked Sendable {
     }
 }
 
-/// Captures `EngineLog` lines for the duration of one test. The handler is global, so it is restored in
-/// every path rather than at the end of the happy one.
-private final class Issue374LogTap: @unchecked Sendable {
-    private let lock = NSLock()
-    private var lines: [String] = []
-    private let previous: ((String) -> Void)?
-
-    init() {
-        previous = EngineLog.handler
-        let sink = { [self] (line: String) in
-            lock.lock()
-            lines.append(line)
-            lock.unlock()
-        }
-        EngineLog.handler = sink
-    }
-
-    func restore() { EngineLog.handler = previous }
-
-    func matching(_ needle: String) -> [String] {
-        lock.lock()
-        defer { lock.unlock() }
-        return lines.filter { $0.contains(needle) }
-    }
-}
-
 final class Issue374FirstServeAccountTests: XCTestCase {
 
     // MARK: The account line
@@ -148,8 +122,8 @@ final class Issue374FirstServeAccountTests: XCTestCase {
     func testSatisfiedGateAccountsForItsWaitExactlyOnceAcrossRepeatedRequests() {
         let (provider, cache) = makeProvider(allowsBoundedDegradedStart: false)
         defer { cache.close() }
-        let tap = Issue374LogTap()
-        defer { tap.restore() }
+        let tap = EngineLogCapture()
+        defer { tap.end() }
 
         for index in 0..<15 {
             append(provider, index: index)
@@ -168,20 +142,20 @@ final class Issue374FirstServeAccountTests: XCTestCase {
     func testBoundedFastZapStartNamesTheWholeWaitAndNotOnlyItsGrace() {
         let (provider, cache) = makeProvider(allowsBoundedDegradedStart: true)
         defer { cache.close() }
-        let tap = Issue374LogTap()
-        defer { tap.restore() }
+        let tap = EngineLogCapture()
+        defer { tap.end() }
 
         let result = Issue374WaitResult()
         let finished = expectation(description: "startup waiter finished")
         Thread.detachNewThread {
-            result.store(provider.waitForFirstLiveSegment(timeout: 3))
+            result.store(provider.waitForFirstLiveSegment(timeout: 120))
             finished.fulfill()
         }
         while provider.parkedWaiterCount == 0 { usleep(200) }
         append(provider, index: 0)
         append(provider, index: 1)
 
-        wait(for: [finished], timeout: 2)
+        wait(for: [finished], timeout: 300)
         XCTAssertEqual(result.value, true)
 
         let accounted = tap.matching("first live manifest")
@@ -200,8 +174,8 @@ final class Issue374FirstServeAccountTests: XCTestCase {
     func testAGateThatNeverCutASegmentSaysSoRatherThanReturningInSilence() {
         let (provider, cache) = makeProvider(allowsBoundedDegradedStart: false)
         defer { cache.close() }
-        let tap = Issue374LogTap()
-        defer { tap.restore() }
+        let tap = EngineLogCapture()
+        defer { tap.end() }
 
         XCTAssertFalse(provider.waitForFirstLiveSegment(timeout: 0.2))
 

@@ -37,7 +37,8 @@ struct Issue119RemoteHLSHeaderTests {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.protocolClasses = [HeaderCaptureURLProtocol.self]
         return AudioTapHLSFetcher(session: URLSession(configuration: cfg),
-                                  httpHeaders: httpHeaders)
+                                  httpHeaders: httpHeaders,
+                                  credentialOrigin: URL(string: "https://origin.test/live/channel.m3u8"))
     }
 
     @Test("fetchPlaylist sends the configured headers")

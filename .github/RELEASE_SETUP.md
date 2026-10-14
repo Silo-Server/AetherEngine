@@ -67,6 +67,7 @@ Once all six secrets are set:
 
 1. Make sure a release exists (use the existing `2.0.0` or create a draft tag).
 2. Trigger the workflow manually: [Actions](https://github.com/superuser404notfound/AetherEngine/actions) → `Release .dmg` → `Run workflow` → enter the tag → Run.
+   The job checks out that tag, whatever branch the "Use workflow from" dropdown says, so a tag that predates `Examples/DemoPlayerMac/Scripts/build-dmg.sh` fails loudly instead of building `main`. The log's "Building commit" line names the built SHA.
 3. Watch the job. It should reach "Upload .dmg to release" and finish green in 3-6 minutes.
 4. Confirm the `.dmg` appears under the release's Assets (or got `--clobber`'d over the existing one if you pointed at `2.0.0`).
 

@@ -111,7 +111,7 @@ struct Issue464PlacementRationaleTests {
     }
 
     @Test("a backwards audio step is clamped away, so a smaller offset cannot be spliced mid-track")
-    func sanitizerEatsABackwardsStep() {
+    func sanitizerEatsABackwardsStep() throws {
         // The naive loopback implementation lowers the muxer's offset and keeps cutting into the same
         // output track. OutputTimestampSanitizer enforces strictly increasing DTS per stream, so the
         // overlap the change creates is not delivered: it is clamped to last+1 and the audio stays
@@ -119,7 +119,8 @@ struct Issue464PlacementRationaleTests {
         var sanitizer = OutputTimestampSanitizer()
         let audio: Int32 = 1
         _ = sanitizer.sanitize(streamIndex: audio, pts: 48000, dts: 48000)
-        let stepBack = sanitizer.sanitize(streamIndex: audio, pts: 43200, dts: 43200)   // -100 ms @48k
+        let clamped = sanitizer.sanitize(streamIndex: audio, pts: 43200, dts: 43200)   // -100 ms @48k
+        let stepBack = try #require(clamped)
         #expect(stepBack.dts == 48001, "the backwards step was clamped, not honoured")
         #expect(stepBack.pts >= stepBack.dts)
     }

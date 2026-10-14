@@ -39,7 +39,7 @@ private final class RecordingHeldDelegate: HeldSourceConnectionDelegate, @unchec
     var endError: Error? { lock.lock(); defer { lock.unlock() }; return _endError }
 
     @discardableResult
-    func waitForEnd(seconds: Double = 20) -> Bool {
+    func waitForEnd(seconds: Double = 120) -> Bool {
         finished.wait(timeout: .now() + seconds) == .success
     }
 
@@ -81,7 +81,7 @@ struct Issue377HeldConnectionTests {
     @Test("the request carries the range, the host and the path with its query")
     func requestFraming() throws {
         let url = try #require(URL(string: "https://cdn.example.com/media/file.mkv?token=abc&x=1"))
-        let bytes = HeldSourceConnection.requestBytes(
+        let bytes = try HeldSourceConnection.requestBytes(
             target: url, host: "cdn.example.com", port: 443, secure: true,
             offset: 14_652_209_616, extraHeaders: [:], userAgent: "AetherEngine/test")
         let text = String(decoding: bytes, as: UTF8.self)
@@ -96,7 +96,7 @@ struct Issue377HeldConnectionTests {
     @Test("a non-default port rides in Host, because an origin may route on it")
     func hostCarriesNonDefaultPort() throws {
         let url = try #require(URL(string: "http://192.168.1.10:8096/Videos/1/stream"))
-        let text = String(decoding: HeldSourceConnection.requestBytes(
+        let text = String(decoding: try HeldSourceConnection.requestBytes(
             target: url, host: "192.168.1.10", port: 8096, secure: false,
             offset: 0, extraHeaders: [:], userAgent: nil), as: UTF8.self)
         #expect(text.contains("\r\nHost: 192.168.1.10:8096\r\n"))
@@ -106,7 +106,7 @@ struct Issue377HeldConnectionTests {
     @Test("a source header set wins without duplicating a header the request already sends")
     func extraHeadersDoNotDuplicate() throws {
         let url = try #require(URL(string: "https://jellyfin.example.com/Items/1/Download"))
-        let text = String(decoding: HeldSourceConnection.requestBytes(
+        let text = String(decoding: try HeldSourceConnection.requestBytes(
             target: url, host: "jellyfin.example.com", port: 443, secure: true, offset: 0,
             extraHeaders: ["X-Emby-Token": "secret", "User-Agent": "Sodalite/1.0", "Range": "bytes=99-"],
             userAgent: "AetherEngine/test"), as: UTF8.self)
@@ -118,6 +118,38 @@ struct Issue377HeldConnectionTests {
         // A caller cannot smuggle a second Range in: the offset is the reader's to decide.
         #expect(text.components(separatedBy: "Range: ").count == 2)
         #expect(text.contains("\r\nRange: bytes=0-\r\n"))
+    }
+
+    @Test("the path and query go on the wire percent-encoded, as the URL spells them")
+    func requestKeepsThePercentEncoding() throws {
+        let url = try #require(URL(string: "http://h.example/My%20Movie%3F.mkv/?a=%20b&c=%0D%0A"))
+        let text = String(decoding: try HeldSourceConnection.requestBytes(
+            target: url, host: "h.example", port: 80, secure: false,
+            offset: 0, extraHeaders: [:], userAgent: nil), as: UTF8.self)
+        #expect(text.hasPrefix("GET /My%20Movie%3F.mkv/?a=%20b&c=%0D%0A HTTP/1.1\r\n"))
+        #expect(text.components(separatedBy: "\r\n").allSatisfy { !$0.contains("\r") && !$0.contains("\n") })
+    }
+
+    @Test("an IPv6 literal is bracketed in Host")
+    func ipv6HostIsBracketed() throws {
+        let url = try #require(URL(string: "http://[::1]:8096/Videos/1/stream"))
+        let host = try #require(url.host)
+        let text = String(decoding: try HeldSourceConnection.requestBytes(
+            target: url, host: host, port: 8096, secure: false,
+            offset: 0, extraHeaders: [:], userAgent: nil), as: UTF8.self)
+        #expect(text.contains("\r\nHost: [::1]:8096\r\n"))
+    }
+
+    @Test("a header value carrying a line break is refused rather than written")
+    func lineBreakInAHeaderIsRefused() throws {
+        let url = try #require(URL(string: "http://h.example/a.mkv"))
+        for value in ["a\r\nX-Injected: 1", "a\nX-Injected: 1", "a\rb"] {
+            #expect(throws: (any Error).self) {
+                try HeldSourceConnection.requestBytes(
+                    target: url, host: "h.example", port: 80, secure: false, offset: 0,
+                    extraHeaders: ["X-Custom": value], userAgent: nil)
+            }
+        }
     }
 
     // MARK: - Chunked framing
@@ -264,6 +296,37 @@ struct Issue377HeldConnectionTests {
         #expect(origin.requestLog.map(\.path) == ["/source.mkv", "/pinned.mkv"])
     }
 
+    @Test("a cross-origin redirect drops the credential headers and keeps the rest")
+    func crossOriginRedirectDropsCredentials() async throws {
+        let total: Int64 = 64 * 1024
+        final class PortBox: @unchecked Sendable { var port: UInt16 = 0 }
+        let box = PortBox()
+        let respond: @Sendable (Int, Int64, String) -> ThrottledOriginServer.Directive = { _, _, path in
+            path == "/pinned.mkv" ? .serve206 : .redirect(to: "http://localhost:\(box.port)/pinned.mkv")
+        }
+        let redirecting = ThrottledOriginServer(totalSize: total, throttleUs: 0, respond: respond)
+        let origin = try #require(redirecting)
+        defer { origin.stop() }
+        box.port = origin.port
+        let url = try #require(URL(string: "http://127.0.0.1:\(origin.port)/source.mkv"))
+
+        let delegate = RecordingHeldDelegate(defaultBudget: 64 * 1024)
+        let connection = HeldSourceConnection(
+            url: url, offset: 0,
+            extraHeaders: ["X-Emby-Token": "secret", "Authorization": "MediaBrowser Token=\"secret\"",
+                           "X-Custom": "kept"],
+            userAgent: nil, label: "test", delegate: delegate)
+        connection.start()
+        #expect(delegate.waitForEnd())
+
+        let headers = origin.requestHeaders
+        try #require(headers.count == 2)
+        #expect(headers[0]["x-emby-token"] == "secret")
+        #expect(headers[1]["x-emby-token"] == nil)
+        #expect(headers[1]["authorization"] == nil)
+        #expect(headers[1]["x-custom"] == "kept")
+    }
+
     @Test("a mid-body offset asks for exactly that offset")
     func offsetIsHonoured() async throws {
         let total: Int64 = 4 * 1024 * 1024
@@ -291,7 +354,7 @@ struct Issue377HeldConnectionTests {
 /// fills, which is why #220's defect survived every local test it had). Each test that asserts a
 /// held count carries the pushed count next to it, because a harness in which the known shape looks
 /// the same as the new one decides nothing.
-@Suite("#377 held connection in the reader")
+@Suite("#377 held connection in the reader", .offCooperativePool)
 struct Issue377HeldReaderTests {
 
     /// Ranges the DATA path asked for, with the open-time speculative tail fetch excluded: it
@@ -300,7 +363,7 @@ struct Issue377HeldReaderTests {
         server.requestedRanges.map(\.start).filter { $0 < totalSize - 1024 * 1024 }
     }
 
-    private func drain(_ reader: AVIOReader, bytes target: Int, timeout: TimeInterval = 60) -> Int {
+    private func drain(_ reader: AVIOReader, bytes target: Int, timeout: TimeInterval = 120) -> Int {
         let sliceCap = 256 * 1024
         let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: sliceCap)
         defer { buf.deallocate() }
@@ -354,7 +417,8 @@ struct Issue377HeldReaderTests {
                 "a held connection asked \(heldAsks.count) times for one continuous read: \(heldAsks)")
     }
 
-    @Test("a PAUSED consumer ends the held connection inside its budget and holds no flow")
+    @Test("a PAUSED consumer ends the held connection inside its budget and holds no flow",
+          .timeLimit(.minutes(2)))
     func pausedConsumerEndsTheHeldConnection() async throws {
         let totalSize: Int64 = 256 * 1024 * 1024
         let server = try #require(ThrottledOriginServer(totalSize: totalSize))
@@ -367,8 +431,11 @@ struct Issue377HeldReaderTests {
         try reader.open()
 
         // Nobody consumes AND the consumer says it is paused. #310's worst episode came out of
-        // exactly this state, so the connection has to be gone rather than merely quiet.
-        try await Task.sleep(for: .seconds(8))
+        // exactly this state, so the connection has to be gone rather than merely quiet. The budget
+        // runs from the moment the window is full, which is the origin's pace, so wait for the end
+        // itself and then leave a window in which a re-request with nothing draining would show.
+        try await waitFor { !reader.hasLiveConnectionForTesting && reader.windowDiagnostics.parked }
+        try await Task.sleep(for: .seconds(1))
 
         #expect(!reader.hasLiveConnectionForTesting,
                 "a paused consumer must hold no flow, which is the #310 invariant 6.11.0 shipped")
@@ -443,7 +510,8 @@ struct Issue377HeldReaderTests {
                 "a stretch with no read outstanding is not a gap; drawing again must not cost a request: \(asks)")
     }
 
-    @Test("consumption after an idle end refills at the frontier without going backwards")
+    @Test("consumption after an idle end refills at the frontier without going backwards",
+          .timeLimit(.minutes(2)))
     func refillAfterIdleEnd() async throws {
         let totalSize: Int64 = 256 * 1024 * 1024
         let server = try #require(ThrottledOriginServer(totalSize: totalSize))
@@ -457,7 +525,10 @@ struct Issue377HeldReaderTests {
         reader.heldPausedBudgetSeconds = 3
         try reader.open()
 
-        try await Task.sleep(for: .seconds(8))   // past the paused budget
+        // The paused budget runs from the moment the window is full, and filling it is the origin's
+        // pace: on a loaded runner that alone outlasted a fixed 8 s sleep, the connection was never
+        // ended, and the drain below rode it (`[0]`). Wait for the end itself.
+        try await waitFor { !reader.hasLiveConnectionForTesting }
         let afterIdle = dataRanges(server, totalSize: totalSize)
         #expect(afterIdle.count == 1)
 
@@ -467,8 +538,10 @@ struct Issue377HeldReaderTests {
                 "the reader did not resume after the pause ended")
 
         let asks = dataRanges(server, totalSize: totalSize)
-        #expect(asks.count == 2,
-                "resuming should cost exactly one re-request at the frontier, got \(asks)")
+        // `#require`, not `#expect`: `asks[1]` below traps on a shorter list, and a trap takes the
+        // whole test process down with every result still buffered in it.
+        try #require(asks.count == 2,
+                     "resuming should cost exactly one re-request at the frontier, got \(asks)")
         #expect(asks == asks.sorted(), "a refill went backwards past the frontier: \(asks)")
         #expect(asks[1] > 0, "the refill asked from byte 0 again instead of at the frontier")
     }

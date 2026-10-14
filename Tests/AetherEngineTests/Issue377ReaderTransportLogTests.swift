@@ -8,43 +8,18 @@
 import XCTest
 @testable import AetherEngine
 
-/// Captures `EngineLog` lines for one test. The handler is global, so it is restored on every path.
-private final class Issue377LogTap: @unchecked Sendable {
-    private let lock = NSLock()
-    private var lines: [String] = []
-    private let previous: ((String) -> Void)?
-
-    init() {
-        previous = EngineLog.handler
-        let sink = { [self] (line: String) in
-            lock.lock()
-            lines.append(line)
-            lock.unlock()
-        }
-        EngineLog.handler = sink
-    }
-
-    func restore() { EngineLog.handler = previous }
-
-    func matching(_ needle: String) -> [String] {
-        lock.lock()
-        defer { lock.unlock() }
-        return lines.filter { $0.contains(needle) }
-    }
-}
-
 final class Issue377ReaderTransportLogTests: XCTestCase {
 
-    private var tap: Issue377LogTap!
+    private var tap: EngineLogCapture!
 
     override func setUp() {
         super.setUp()
         ReaderTransportLog.resetForTesting()
-        tap = Issue377LogTap()
+        tap = EngineLogCapture()
     }
 
     override func tearDown() {
-        tap.restore()
+        tap.end()
         tap = nil
         ReaderTransportLog.resetForTesting()
         super.tearDown()

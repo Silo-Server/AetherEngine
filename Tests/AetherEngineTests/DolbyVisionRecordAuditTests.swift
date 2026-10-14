@@ -252,14 +252,14 @@ struct DolbyVisionRecordAuditTests {
         #expect(r.dvVariant == .profile7)
     }
 
-    @Test("the same correction on a display without Dolby Vision plays the HDR10 base")
+    @Test("the same correction on a display without Dolby Vision is converted and served as 8.1 too")
     func relabelledSevenOnNonDVDisplay() throws {
         let r = try Self.route(Self.relabelledProfile5(), dvDisplay: false, rpuProfile: 7)
         #expect(r.codecTagOverride == "hvc1")
         #expect(r.videoRange == .pq)
-        #expect(r.supplementalCodecs == nil)
-        #expect(r.doviConfig == .strip)
-        #expect(r.convertP7ToProfile81 == false)
+        #expect(r.supplementalCodecs == "dvh1.08.06/db1p")
+        #expect(r.doviConfig == .rewriteToProfile81)
+        #expect(r.convertP7ToProfile81)
     }
 
     @Test("without a verdict the record stands and the route does not move")
@@ -284,6 +284,15 @@ struct DolbyVisionRecordAuditTests {
         #expect(r.supplementalCodecs == nil)
         #expect(r.doviConfig == .strip)
         #expect(r.convertP7ToProfile81 == false)
+    }
+
+    @Test("the RPU walk ends on foreign packets and bytes, not only on video packets")
+    func walkIsBoundedByEveryPacket() {
+        #expect(!DolbyVisionRecordAudit.walkExhausted(packetsRead: 63, bytesRead: 0, packetBudget: 4))
+        #expect(DolbyVisionRecordAudit.walkExhausted(packetsRead: 64, bytesRead: 0, packetBudget: 4))
+        #expect(DolbyVisionRecordAudit.walkExhausted(
+            packetsRead: 1, bytesRead: DolbyVisionRecordAudit.walkByteBudget, packetBudget: 4))
+        #expect(!DolbyVisionRecordAudit.walkExhausted(packetsRead: 1, bytesRead: 0, packetBudget: Int.max))
     }
 
     // MARK: - Against real media

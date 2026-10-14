@@ -25,6 +25,11 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// mirror SoftwareVideoDecoder.extractHDR10PlusBytes). Flag kept so host wiring stays identical to SW path.
     var onFirstHDR10PlusDetected: (@Sendable () -> Void)?
     var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)?
+    var onDecodedFormat: (@Sendable (DecodedVideoFormat) -> Void)?
+    private var streamColor = ColorDescription.unspecified
+    private var streamCodecID = AV_CODEC_ID_NONE
+    private var streamProfile = AV_PROFILE_UNKNOWN
+    private var reportedPixelBufferType: OSType = 0
 
     /// Skip pre-seek RASL frames to avoid the "fast forward" effect; decoded for reference but not delivered.
     /// Guarded by `skipLock` not `lock`: close() holds `lock` across VTDecompressionSessionWaitForAsynchronousFrames,
@@ -79,6 +84,25 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     var feedEpoch: UInt64 {
         lock.lock(); defer { lock.unlock() }; return _feedEpoch
     }
+
+    /// AE#739: the system invalidates the session behind our back (iOS screen lock, media services
+    /// reset), after which every `VTDecompressionSessionDecodeFrame` returns `kVTInvalidSessionErr`.
+    /// Fired once per lost session, on the decode thread. The owner decides when to `rebuildSession()`,
+    /// because only it knows whether the app is in the foreground and where the playhead is.
+    var onSessionLost: (@Sendable () -> Void)? {
+        get { skipLock.lock(); defer { skipLock.unlock() }; return _onSessionLost }
+        set { skipLock.lock(); _onSessionLost = newValue; skipLock.unlock() }
+    }
+    private var _onSessionLost: (@Sendable () -> Void)?
+
+    /// AE#739, all guarded by `lock`. `sessionLost` drops every packet instead of feeding a dead
+    /// session; `awaitingKeyframe` drops packets after a rebuild until one the new session can start
+    /// from.
+    private var sessionLost = false
+    private var awaitingKeyframe = false
+    private var droppedAwaitingKeyframe = 0
+    private var decoderSpecification: NSDictionary?
+    private var pixelBufferAttributes: NSDictionary?
 
     /// Heap-allocated box carrying a weak self reference for the C decompression callback's refCon.
     /// Separate object so we can pass UnsafeMutablePointer<RefConBox> to VT without unsafe bit-casts.
@@ -162,6 +186,9 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let isHDRTransfer = ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc)
         let use10Bit = bitsPerSample > 8 || isHDRTransfer
 
+        streamColor = ColorDescription(codecpar: codecpar)
+        streamCodecID = codecpar.pointee.codec_id
+        streamProfile = codecpar.pointee.profile
         self.colorPrimaries = ColorAttachments.primaries(codecpar.pointee.color_primaries)
         self.colorTransfer = ColorAttachments.transfer(codecpar.pointee.color_trc)
         self.colorMatrix = ColorAttachments.matrix(codecpar.pointee.color_space)
@@ -175,38 +202,21 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             kCVPixelBufferMetalCompatibilityKey: true,
         ]
 
+        decoderSpecification = decoderSpec
+        pixelBufferAttributes = pixelBufferAttrs
+
         // 4. Output callback: C function dispatches into handleDecodedFrame via refCon.
         let box = RefConBox(self)
         let unmanaged = Unmanaged.passRetained(box)
         refConBox = unmanaged
 
-        var callback = VTDecompressionOutputCallbackRecord(
-            decompressionOutputCallback: hwDecoderOutputCallback,
-            decompressionOutputRefCon: unmanaged.toOpaque()
-        )
-
-        var sessionOut: VTDecompressionSession?
-        let status = VTDecompressionSessionCreate(
-            allocator: kCFAllocatorDefault,
-            formatDescription: formatDesc,
-            decoderSpecification: decoderSpec,
-            imageBufferAttributes: pixelBufferAttrs,
-            outputCallback: &callback,
-            decompressionSessionOut: &sessionOut
-        )
-        guard status == noErr, let createdSession = sessionOut else {
+        let created = makeSession(formatDescription: formatDesc, refCon: unmanaged)
+        guard let createdSession = created.session else {
             unmanaged.release()
             refConBox = nil
-            throw VideoDecoderError.sessionCreationFailed(status: status)
+            throw VideoDecoderError.sessionCreationFailed(status: created.status)
         }
         session = createdSession
-
-        // 5. Pass through per-frame HDR metadata for correct tone mapping; unknown-key set returns -12911 on older OSes (swallowed).
-        VTSessionSetProperty(
-            createdSession,
-            key: kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata,
-            value: kCFBooleanTrue
-        )
 
         EngineLog.emit(
             "[HardwareVideoDecoder] opened HEVC \(width)x\(height) "
@@ -216,13 +226,82 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         )
     }
 
+    /// The one place a session is created, so `open()` and `rebuildSession()` cannot drift apart.
+    private func makeSession(
+        formatDescription: CMVideoFormatDescription, refCon: Unmanaged<RefConBox>
+    ) -> (session: VTDecompressionSession?, status: OSStatus) {
+        var callback = VTDecompressionOutputCallbackRecord(
+            decompressionOutputCallback: hwDecoderOutputCallback,
+            decompressionOutputRefCon: refCon.toOpaque()
+        )
+        var sessionOut: VTDecompressionSession?
+        let status = VTDecompressionSessionCreate(
+            allocator: kCFAllocatorDefault,
+            formatDescription: formatDescription,
+            decoderSpecification: decoderSpecification,
+            imageBufferAttributes: pixelBufferAttributes,
+            outputCallback: &callback,
+            decompressionSessionOut: &sessionOut
+        )
+        guard status == noErr, let created = sessionOut else { return (nil, status) }
+        // Pass through per-frame HDR metadata for correct tone mapping; unknown-key set returns -12911 on older OSes (swallowed).
+        VTSessionSetProperty(
+            created,
+            key: kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata,
+            value: kCFBooleanTrue
+        )
+        return (created, noErr)
+    }
+
+    /// AE#739: replace the session with a fresh one built from the same format description and
+    /// attributes, keeping the refCon box so every callback and setting carries over. Bumps the feed
+    /// epoch and drops packets until the next keyframe, which is the first one a new session can
+    /// decode. Returns false when VT refuses (the app is still in the background, typically); the
+    /// decoder then stays lost and drops every packet until a later call succeeds.
+    @discardableResult
+    func rebuildSession() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let formatDescription, let refConBox else { return false }
+        if let old = session {
+            VTDecompressionSessionInvalidate(old)
+            session = nil
+        }
+        _feedEpoch &+= 1
+        let created = makeSession(formatDescription: formatDescription, refCon: refConBox)
+        guard let fresh = created.session else {
+            sessionLost = true
+            EngineLog.emit(
+                "[HardwareVideoDecoder] AE#739 session rebuild refused (status \(created.status))",
+                category: .swPlayback
+            )
+            return false
+        }
+        session = fresh
+        sessionLost = false
+        awaitingKeyframe = true
+        droppedAwaitingKeyframe = 0
+        EngineLog.emit("[HardwareVideoDecoder] AE#739 session rebuilt", category: .swPlayback)
+        return true
+    }
+
+    #if DEBUG
+    /// Invalidate the live session without forgetting it, which is what the system does on an iOS
+    /// screen lock: the next decode returns `kVTInvalidSessionErr`. For the aetherctl harness.
+    func invalidateSessionForTesting() {
+        lock.lock()
+        if let session { VTDecompressionSessionInvalidate(session) }
+        lock.unlock()
+    }
+    #endif
+
     // MARK: - Decode
 
     func decode(packet: UnsafeMutablePointer<AVPacket>, epoch: UInt64? = nil) {
         lock.lock()
         // AE#492: see `SoftwareVideoDecoder.decode`. Same rule, same lock as `flush()`.
         if let epoch, epoch != _feedEpoch { lock.unlock(); return }
-        guard let session = session, let formatDesc = formatDescription else {
+        guard session != nil, !sessionLost, let formatDesc = formatDescription else {
             lock.unlock()
             return
         }
@@ -253,19 +332,10 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             copied.deallocate()
             return
         }
-        let ptsRaw = packet.pointee.pts
-        let dtsRaw = packet.pointee.dts
-        let durRaw = packet.pointee.duration
-        let timescale = max(timeBase.den, 1)
-
-        let pts = (ptsRaw != Int64.min)
-            ? CMTimeMake(value: ptsRaw * Int64(timeBase.num), timescale: timescale)
-            : CMTime.invalid
-        let dts = (dtsRaw != Int64.min)
-            ? CMTimeMake(value: dtsRaw * Int64(timeBase.num), timescale: timescale)
-            : CMTime.invalid
-        let dur = (durRaw > 0)
-            ? CMTimeMake(value: durRaw * Int64(timeBase.num), timescale: timescale)
+        let pts = SourceTimestampBounds.cmTime(ticks: packet.pointee.pts, timeBase: timeBase)
+        let dts = SourceTimestampBounds.cmTime(ticks: packet.pointee.dts, timeBase: timeBase)
+        let dur = packet.pointee.duration > 0
+            ? SourceTimestampBounds.cmTime(ticks: packet.pointee.duration, timeBase: timeBase)
             : CMTime.invalid
 
         var timing = CMSampleTimingInfo(duration: dur, presentationTimeStamp: pts, decodeTimeStamp: dts)
@@ -304,6 +374,22 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             }
         }
 
+        // Audit DEC-4: the epoch check and the send sit under one hold of `lock`, or a flush landing
+        // while the sample buffer is built lets a pre-seek packet into VT after it. Safe to hold:
+        // the output callback never takes `lock`, and `close()` already holds it across the VT wait.
+        lock.lock()
+        if let epoch, epoch != _feedEpoch { lock.unlock(); return }
+        guard let session = self.session, !sessionLost else { lock.unlock(); return }
+        var recoveredAfterDropping: Int?
+        if awaitingKeyframe {
+            guard (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0 else {
+                droppedAwaitingKeyframe += 1
+                lock.unlock()
+                return
+            }
+            awaitingKeyframe = false
+            recoveredAfterDropping = droppedAwaitingKeyframe
+        }
         // Async decode with temporal queueing; callback fires on VT's internal queue.
         var infoFlags = VTDecodeInfoFlags()
         let decodeStatus = VTDecompressionSessionDecodeFrame(
@@ -313,9 +399,28 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             frameRefcon: nil,
             infoFlagsOut: &infoFlags
         )
-        if decodeStatus != noErr {
+        // AE#739: permanent for this session. Still under the hold that fed it, so a rebuild cannot
+        // land between the call and the verdict and have the new session condemned for the old one.
+        let lostNow = decodeStatus == kVTInvalidSessionErr && !sessionLost
+        if lostNow { sessionLost = true }
+        lock.unlock()
+        if let recoveredAfterDropping {
             EngineLog.emit(
-                "[HardwareVideoDecoder] decode error \(decodeStatus) at pts=\(ptsRaw)",
+                "[HardwareVideoDecoder] AE#739 recovered at keyframe pts=\(packet.pointee.pts) "
+                + "after dropping \(recoveredAfterDropping) packet(s)",
+                category: .swPlayback
+            )
+        }
+        if lostNow {
+            EngineLog.emit(
+                "[HardwareVideoDecoder] AE#739 session invalidated by the system (\(decodeStatus)) "
+                + "at pts=\(packet.pointee.pts); dropping video until it is rebuilt",
+                category: .swPlayback
+            )
+            onSessionLost?()
+        } else if decodeStatus != noErr {
+            EngineLog.emit(
+                "[HardwareVideoDecoder] decode error \(decodeStatus) at pts=\(packet.pointee.pts)",
                 category: .swPlayback
             )
         }
@@ -406,7 +511,25 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             CVBufferRemoveAttachment(imageBuffer, kCVImageBufferPixelAspectRatioKey)
         }
 
+        reportDecodedFormat(imageBuffer)
         onFrame?(imageBuffer, pts, nil)
+    }
+
+    /// VideoToolbox decodes straight into the display buffer, so the buffer IS the decoded picture; its
+    /// colour is what this decoder attached, which is the stream's declaration.
+    private func reportDecodedFormat(_ buffer: CVImageBuffer) {
+        guard let onDecodedFormat else { return }
+        let type = CVPixelBufferGetPixelFormatType(buffer)
+        guard type != reportedPixelBufferType else { return }
+        reportedPixelBufferType = type
+        onDecodedFormat(DecodedVideoFormat(
+            frame: VideoStreamFormat(
+                pixelFormat: DecodedVideoFormat.libavPixelFormat(forPixelBufferType: type),
+                declaredBitDepth: 0,
+                color: streamColor,
+                codecID: streamCodecID,
+                profile: streamProfile),
+            pixelBufferFormat: DecodedVideoFormat.fourCC(type)))
     }
 }
 

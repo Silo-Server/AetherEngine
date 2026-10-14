@@ -41,8 +41,8 @@ struct APACSampleEntryTests {
                 + box("minf", box("smhd", [0, 0, 0, 0, 0, 0, 0, 0])
                     + box("stbl", box("stsd", [0, 0, 0, 0, 0, 0, 0, 1] + alac) + box("stts", [0, 0, 0, 0, 0, 0, 0, 0])))))
         let videoTrak = box("trak", box("mdia", box("hdlr", [0, 0, 0, 0, 0, 0, 0, 0] + Array("vide".utf8) + [0])))
-        let initBytes = Data(box("ftyp", Array("iso5".utf8) + [0, 0, 0, 1]) + box("moov", box("mvhd", [UInt8](repeating: 0, count: 100)) + videoTrak + soundTrak)
-            + box("mvex", []))
+        let initBytes = Data(box("ftyp", Array("iso5".utf8) + [0, 0, 0, 1])
+            + box("moov", box("mvhd", [UInt8](repeating: 0, count: 100)) + videoTrak + soundTrak + box("mvex", [])))
         let entry = APACSampleEntry.sampleEntry(magicCookie: Data(box("dapa", [UInt8](repeating: 7, count: 120))), sampleRate: 48_000)
 
         let out = try #require(APACSampleEntry.replacingSoundSampleEntry(in: initBytes, with: entry))
@@ -56,9 +56,11 @@ struct APACSampleEntryTests {
             return out
         }
         let top = children(0, b.count)
-        #expect(top.map(\.0) == ["ftyp", "moov", "mvex"])
+        #expect(top.map(\.0) == ["ftyp", "moov"])
         let moov = top[1]
-        let traks = children(moov.1 + 8, moov.2).filter { $0.0 == "trak" }
+        let inMoov = children(moov.1 + 8, moov.2)
+        #expect(inMoov.map(\.0) == ["mvhd", "trak", "trak", "mvex"])
+        let traks = inMoov.filter { $0.0 == "trak" }
         let sound = traks[1]
         let mdia = children(sound.1 + 8, sound.2).first { $0.0 == "mdia" }!
         let minf = children(mdia.1 + 8, mdia.2).first { $0.0 == "minf" }!
@@ -67,6 +69,17 @@ struct APACSampleEntryTests {
         let entries = children(stsd.1 + 16, stsd.2)
         #expect(entries.map(\.0) == ["apac"])
         #expect(Data(b[entries[0].1..<entries[0].2]) == entry)
+    }
+
+    @Test("a 64-bit box or a truncated init is refused, not misparsed")
+    func oddBoxesAreRefused() {
+        let entry = Data(box("apac", []))
+        // size == 1: a largesize box, which movenc never writes for an init.
+        let large = Data(be32(1) + Array("moov".utf8) + [0, 0, 0, 0, 0, 0, 0, 16])
+        #expect(APACSampleEntry.replacingSoundSampleEntry(in: large, with: entry) == nil)
+        let truncated = Data(box("moov", box("trak", [])).dropLast(3))
+        #expect(APACSampleEntry.replacingSoundSampleEntry(in: truncated, with: entry) == nil)
+        #expect(APACSampleEntry.replacingSoundSampleEntry(in: Data(), with: entry) == nil)
     }
 
     @Test("an init with no sound track is left for the caller to forward unchanged")
@@ -110,5 +123,14 @@ struct APACSampleEntryTests {
         let again = try encoder.encode(planes: planes.map { UnsafePointer($0) }, frameCount: 8192)
         #expect(again.count >= 4)
         #expect(again.first?.isSync == true)
+    }
+
+    @Test("the muxer installs an override, forwards an init without one untouched, and survives one with no sound track")
+    func muxerInstallsOverride() {
+        let entry = APACSampleEntry.sampleEntry(magicCookie: Data(box("dapa", [1, 2, 3, 4])), sampleRate: 48_000)
+        let videoOnly = Data(box("ftyp", Array("iso5".utf8) + [0, 0, 0, 1])
+            + box("moov", box("trak", box("mdia", box("hdlr", [0, 0, 0, 0, 0, 0, 0, 0] + Array("vide".utf8) + [0])))))
+        #expect(MP4SegmentMuxer.installingSoundSampleEntry(nil, in: videoOnly) == videoOnly)
+        #expect(MP4SegmentMuxer.installingSoundSampleEntry(entry, in: videoOnly) == videoOnly)
     }
 }

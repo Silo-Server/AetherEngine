@@ -159,6 +159,9 @@ enum H264MatroskaSlotPermutation {
         /// Presentation slots in the order they arrived, which for this defect is decode order. The
         /// slot a picture owns is the one at its DISPLAY rank, so this is the whole lookup table.
         private(set) var slots: [Int64] = []
+        /// Slot positions already spoken for in this sequence: a rank handed out, or the coding
+        /// position of a picture that goes out on its own slot.
+        private var claimed: Set<Int64> = []
         private(set) var repairedPictures = 0
         private(set) var unrepairedPictures = 0
         /// A seek leaves the sequence behind; only an IDR starts a new one. A landing that is not one
@@ -176,7 +179,15 @@ enum H264MatroskaSlotPermutation {
 
         mutating func noteSeek() {
             slots.removeAll(keepingCapacity: true)
+            claimed.removeAll(keepingCapacity: true)
             awaitingSequenceStart = true
+        }
+
+        /// Audit BIT-3: the slots of this sequence no picture has claimed, in display order. When an
+        /// IDR closes the sequence these are the only slots the pictures still waiting on it can own;
+        /// the next sequence's slots belong to its own pictures.
+        func unclaimedSlots() -> [Int64] {
+            slots.indices.filter { !claimed.contains(Int64($0)) }.map { slots[$0] }
         }
 
         /// Records a video picture and returns the display rank whose slot it should carry, or nil
@@ -196,6 +207,7 @@ enum H264MatroskaSlotPermutation {
             }
             if isKeyframe, pictureOrderCount == 0 {
                 slots = [slot]
+                claimed = [0]
                 awaitingSequenceStart = false
                 repairedPictures += 1
                 return 0
@@ -209,21 +221,24 @@ enum H264MatroskaSlotPermutation {
                 return nil
             }
             slots.append(slot)
+            let codingIndex = Int64(slots.count - 1)
             guard let pictureOrderCount, pictureOrderCount >= 0,
                   pictureOrderCount % pocStep == 0 else {
                 unrepairedPictures += 1
+                claimed.insert(codingIndex)
                 return nil
             }
             let rank = pictureOrderCount / pocStep
-            let codingIndex = Int64(slots.count - 1)
             // Behind its own slot by more than the reorder delay would put the picture before its
             // stated decode time; further ahead than the ceiling is not a mini-GOP any more.
             guard codingIndex - rank <= Int64(videoDelay),
                   rank - codingIndex <= H264MatroskaSlotPermutation.lookaheadCeiling else {
                 unrepairedPictures += 1
+                claimed.insert(codingIndex)
                 return nil
             }
             repairedPictures += 1
+            claimed.insert(rank)
             return rank
         }
 
@@ -342,10 +357,35 @@ final class H264MatroskaSlotPermutationSession: H264TimestampRepairSession {
         _ packet: UnsafeMutablePointer<AVPacket>,
         pictureOrderCount: Int64?
     ) -> Int64? {
-        sequence?.admit(
-            slot: packet.pointee.pts,
-            pictureOrderCount: packet.pointee.pts == Int64.min ? nil : pictureOrderCount,
-            isKeyframe: isKeyframe(packet))
+        let pictureOrderCount = packet.pointee.pts == Int64.min ? nil : pictureOrderCount
+        let keyframe = isKeyframe(packet)
+        if keyframe, pictureOrderCount == 0 { settleRanksOfClosingSequence() }
+        return sequence?.admit(slot: packet.pointee.pts, pictureOrderCount: pictureOrderCount, isKeyframe: keyframe)
+    }
+
+    /// Audit BIT-3: a rank means something only on the ladder it was counted against, and an IDR is
+    /// about to replace that ladder. Every held picture still carrying a rank gets its slot from the
+    /// closing sequence now: the one its rank owns when the container stated it, else one of the
+    /// slots no picture claimed, in display order. Left pending, the lookup answered from the NEW
+    /// sequence and two pictures shared one presentation time.
+    private func settleRanksOfClosingSequence() {
+        guard let sequence, sequence.brokenReason == nil else { return }
+        var waiting: [(index: Int, rank: Int64)] = []
+        for index in pending.indices {
+            guard let rank = pending[index].rank else { continue }
+            if let slot = sequence.slot(forRank: rank) {
+                pending[index].packet.pointee.pts = slot
+            } else {
+                waiting.append((index, rank))
+            }
+            pending[index].rank = nil
+        }
+        guard !waiting.isEmpty else { return }
+        var free = sequence.unclaimedSlots()[...]
+        for entry in waiting.sorted(by: { $0.rank < $1.rank }) {
+            guard let slot = free.popFirst() else { break }
+            pending[entry.index].packet.pointee.pts = slot
+        }
     }
 
     /// Hands out everything at the head of the queue whose slot is known. A picture still waiting for
@@ -418,8 +458,9 @@ final class H264MatroskaSlotPermutationSession: H264TimestampRepairSession {
             // is stateful and must see each picture exactly once.
             for index in pending.indices where pending[index].isPicture {
                 let entry = pending[index]
-                pending[index].rank = admit(
-                    entry.packet, pictureOrderCount: entry.pictureOrderCount)
+                // Bound first: admitting an IDR settles the ranks already held in `pending`.
+                let rank = admit(entry.packet, pictureOrderCount: entry.pictureOrderCount)
+                pending[index].rank = rank
             }
             drain()
         case .healthy:

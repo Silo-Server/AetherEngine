@@ -8,7 +8,7 @@ func runAudioTap(url: URL, duration: Double, outPath: String,
     if software { return runSoftwareAudioTap(url: url, duration: duration, outPath: outPath) }
     EngineLog.handler = { print($0) }
     let mode = remote ? "remote-HLS" : "loopback"
-    print("aetherctl audiotap (\(mode)): \(url.absoluteString) duration=\(duration)s out=\(outPath)")
+    print(EngineLog.redacted("aetherctl audiotap (\(mode)): \(url.absoluteString) duration=\(duration)s out=\(outPath)"))
     do {
         let report = remote
             ? try AudioTapProbe.runRemote(url: url, durationSeconds: duration, outPath: outPath)
@@ -26,7 +26,7 @@ func runAudioTap(url: URL, duration: Double, outPath: String,
 /// main thread would deadlock its executor (same shape as `bgaudio`).
 private func runSoftwareAudioTap(url: URL, duration: Double, outPath: String) -> Int32 {
     EngineLog.handler = { print($0) }
-    print("aetherctl audiotap (software): \(url.absoluteString) duration=\(duration)s out=\(outPath)")
+    print(EngineLog.redacted("aetherctl audiotap (software): \(url.absoluteString) duration=\(duration)s out=\(outPath)"))
     let box = UncheckedBox<Int32?>(nil)
     Task { @MainActor in
         do {

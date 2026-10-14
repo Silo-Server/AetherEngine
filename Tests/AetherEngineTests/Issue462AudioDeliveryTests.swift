@@ -158,9 +158,15 @@ struct AudioDeliveryClassificationTests {
     /// video-only, exactly like the loopback tail and just as silently.
     @Test("the software host separates an absent track from a decoder that would not open")
     func softwareHostSeparatesAbsentFromDropped() {
-        #expect(SoftwarePlaybackHost.audioDelivery(resolvedAudioIndex: 1, decoderOpened: true) == .decoded)
-        #expect(SoftwarePlaybackHost.audioDelivery(resolvedAudioIndex: 1, decoderOpened: false) == .droppedNoPipeline)
-        #expect(SoftwarePlaybackHost.audioDelivery(resolvedAudioIndex: -1, decoderOpened: false) == .noAudioInSource)
+        #expect(SoftwarePlaybackHost.audioDelivery(resolvedAudioIndex: 1, decoderOpened: true,
+                                                   sourceCarriesAudio: true) == .decoded)
+        #expect(SoftwarePlaybackHost.audioDelivery(resolvedAudioIndex: 1, decoderOpened: false,
+                                                   sourceCarriesAudio: true) == .droppedNoPipeline)
+        #expect(SoftwarePlaybackHost.audioDelivery(resolvedAudioIndex: -1, decoderOpened: false,
+                                                   sourceCarriesAudio: false) == .noAudioInSource)
+        // AE#641: a stream the pick passed over (empty parameters) is still the source's audio.
+        #expect(SoftwarePlaybackHost.audioDelivery(resolvedAudioIndex: -1, decoderOpened: false,
+                                                   sourceCarriesAudio: true) == .droppedNoPipeline)
     }
 
     /// The label is the second half of the same lie: it was built from the probe's track list, so a

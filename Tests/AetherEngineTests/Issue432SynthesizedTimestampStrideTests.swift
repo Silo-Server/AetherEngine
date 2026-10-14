@@ -51,6 +51,41 @@ struct Issue432SynthesizedTimestampStrideTests {
             packetDuration: -1, observedStride: -5, fallbackDuration: -40) == 1)
     }
 
+    /// Audit SEG-101: the packet-duration arm was the one left uncapped, so a crafted BlockDuration
+    /// just under the source bound walked nine packets to Int64.max.
+    @Test("every arm of the cascade is capped at one second of ticks")
+    func strideIsCapped() {
+        let cap: Int64 = 90_000
+        #expect(HLSSegmentProducer.repairStrideTicks(
+            packetDuration: (1 << 60) - 1, observedStride: 0, fallbackDuration: 0, maxStrideTicks: cap) == cap)
+        #expect(HLSSegmentProducer.repairStrideTicks(
+            packetDuration: 0, observedStride: 1 << 40, fallbackDuration: 0, maxStrideTicks: cap) == cap)
+        #expect(HLSSegmentProducer.repairStrideTicks(
+            packetDuration: 0, observedStride: 0, fallbackDuration: 1 << 40, maxStrideTicks: cap) == cap)
+        #expect(HLSSegmentProducer.repairStrideTicks(
+            packetDuration: 1800, observedStride: 0, fallbackDuration: 0, maxStrideTicks: cap) == 1800)
+        #expect(HLSSegmentProducer.repairStrideTicks(
+            packetDuration: 1800, observedStride: 0, fallbackDuration: 0, maxStrideTicks: 0) == 1)
+    }
+
+    @Test("a synthesized timestamp that would leave the source range drops the packet instead")
+    func synthesizedWalkStaysInRange() {
+        #expect(HLSSegmentProducer.synthesizedDts(anchor: 1000, stride: 1800) == 2800)
+        #expect(HLSSegmentProducer.synthesizedDts(anchor: (1 << 60) - 10, stride: 90_000) == nil)
+        #expect(HLSSegmentProducer.synthesizedDts(anchor: Int64.max - 5, stride: 10) == nil)
+        var anchor: Int64 = 0
+        for _ in 0..<9 {
+            let stride = HLSSegmentProducer.repairStrideTicks(
+                packetDuration: (1 << 60) - 1, observedStride: 0, fallbackDuration: 0, maxStrideTicks: 90_000)
+            guard let next = HLSSegmentProducer.synthesizedDts(anchor: anchor, stride: stride) else {
+                Issue.record("a one-second stride from 0 cannot leave the range")
+                return
+            }
+            anchor = next
+        }
+        #expect(anchor == 9 * 90_000)
+    }
+
     // MARK: - Learning the stride from the source
 
     @Test("a forward delta inside the cap becomes the stride")

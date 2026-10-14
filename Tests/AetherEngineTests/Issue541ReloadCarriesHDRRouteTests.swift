@@ -110,7 +110,7 @@ struct Issue541ReloadCarriesHDRRouteTests {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent("Sources/AetherEngine/AetherEngine+Loading.swift")
-        guard let text = try? String(contentsOf: source, encoding: .utf8) else { return }
+        let text = try String(contentsOf: source, encoding: .utf8)
         #expect(!text.contains("panelIsInHDRMode: loadedOptions.panelIsInHDRMode"))
         #expect(text.contains("panelIsInHDRMode: reloadRoutingPanelHDR"))
     }

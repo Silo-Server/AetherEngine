@@ -16,9 +16,13 @@ final class SubtitleFrameCompositor: @unchecked Sendable {
         let maxTextWidth: CGFloat
     }
 
-    /// Plain window check; cue times and SW frame PTS share the source axis.
-    nonisolated static func activeCues(in cues: [SubtitleCue], at seconds: Double) -> [SubtitleCue] {
-        cues.filter { $0.startTime <= seconds && seconds < $0.endTime }
+    /// Cue times and frame PTS share the source axis. Shift subtitle presentation only;
+    /// playback rate already advances the frame clock in media seconds.
+    nonisolated static func activeCues(in cues: [SubtitleCue], at seconds: Double,
+                                       delaySeconds: Double = 0) -> [SubtitleCue] {
+        let subtitleTime = seconds - delaySeconds
+        guard seconds.isFinite, delaySeconds.isFinite, subtitleTime.isFinite else { return [] }
+        return cues.filter { $0.startTime <= subtitleTime && subtitleTime < $0.endTime }
     }
 
     /// Default look: readable in a small window, resolution-independent.
@@ -61,6 +65,7 @@ final class SubtitleFrameCompositor: @unchecked Sendable {
     private let lock = NSLock()
     private var cues: [SubtitleCue] = []
     private var enabled = false
+    private var delaySeconds: Double = 0
     /// Cache key of the overlay currently rendered (active cue ids); nil = no overlay cached.
     private var cachedCueIDs: [Int]?
     private var cachedOverlay: CIImage?
@@ -71,10 +76,11 @@ final class SubtitleFrameCompositor: @unchecked Sendable {
     private var poolFormat: (width: Int, height: Int, pixelFormat: OSType)?
 
     /// Any thread; called by the engine when its published cues or the PiP flag change.
-    func update(cues: [SubtitleCue], enabled: Bool) {
+    func update(cues: [SubtitleCue], enabled: Bool, delaySeconds: Double) {
         lock.lock()
         self.cues = cues
         self.enabled = enabled
+        if delaySeconds.isFinite { self.delaySeconds = delaySeconds }
         lock.unlock()
     }
 
@@ -83,10 +89,11 @@ final class SubtitleFrameCompositor: @unchecked Sendable {
         lock.lock()
         let enabled = self.enabled
         let cues = self.cues
+        let delay = self.delaySeconds
         lock.unlock()
         guard enabled else { return buffer }
 
-        let active = Self.activeCues(in: cues, at: ptsSeconds)
+        let active = Self.activeCues(in: cues, at: ptsSeconds, delaySeconds: delay)
         guard !active.isEmpty else {
             lock.lock(); cachedCueIDs = nil; cachedOverlay = nil; lock.unlock()
             return buffer
@@ -116,10 +123,33 @@ final class SubtitleFrameCompositor: @unchecked Sendable {
             logFailureOnce("pool exhausted")
             return buffer
         }
+        // Audit DEC-3: the renderer builds the format description from the delivered buffer, so
+        // the output has to carry the source's pixel aspect ratio and colour tags, or anamorphic
+        // content shows at coded size and HDR drops to SDR for as long as a cue is up. Carried
+        // before the render too, because CoreImage picks the YCbCr matrix from the destination.
+        Self.carryAttachments(from: buffer, to: output)
         let base = CIImage(cvPixelBuffer: buffer)
         let composited = overlay.composited(over: base)
-        ciContext.render(composited, to: output, bounds: CGRect(x: 0, y: 0, width: width, height: height), colorSpace: CGColorSpace(name: CGColorSpace.itur_709))
+        ciContext.render(composited, to: output, bounds: CGRect(x: 0, y: 0, width: width, height: height),
+                         colorSpace: Self.renderColorSpace(for: buffer))
+        Self.carryAttachments(from: buffer, to: output)
         return output
+    }
+
+    /// The source's own colour space, so the render encodes the picture the way it was decoded
+    /// (PQ and HLG included). BT.709 only when the source carries no usable tags.
+    nonisolated static func renderColorSpace(for buffer: CVPixelBuffer) -> CGColorSpace {
+        if let attachments = CVBufferCopyAttachments(buffer, .shouldPropagate),
+           let space = CVImageBufferCreateColorSpaceFromAttachments(attachments)?.takeRetainedValue() {
+            return space
+        }
+        return CGColorSpace(name: CGColorSpace.itur_709) ?? CGColorSpaceCreateDeviceRGB()
+    }
+
+    /// Replaces rather than adds: a recycled pool buffer can hold a previous source's tags.
+    nonisolated static func carryAttachments(from source: CVPixelBuffer, to output: CVPixelBuffer) {
+        CVBufferRemoveAllAttachments(output)
+        CVBufferPropagateAttachments(source, output)
     }
 
     /// One CGImage per cue-set change: text cues bottom-up in the default look, image cues at their
@@ -317,7 +347,11 @@ final class SubtitleFrameCompositor: @unchecked Sendable {
         }
     }
 
+    /// Audit DEC-5: `reset()` clears the pool under `lock` from the actor while the decode thread can
+    /// be in here, so the pool reference is only read and replaced under the same lock.
     private func dequeueBuffer(width: Int, height: Int, pixelFormat: OSType) -> CVPixelBuffer? {
+        lock.lock()
+        defer { lock.unlock() }
         if poolFormat?.width != width || poolFormat?.height != height || poolFormat?.pixelFormat != pixelFormat {
             let attrs: [CFString: Any] = [
                 kCVPixelBufferWidthKey: width,

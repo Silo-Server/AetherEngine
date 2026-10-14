@@ -47,24 +47,29 @@ final class H264SPSTests: XCTestCase {
         bytes.withUnsafeBufferPointer { body($0) }
     }
 
-    // #133: a mid-stream join must start on a true IDR (NAL type 5), not an open-GOP recovery
-    // point (non-IDR slice, type 1), or the panel renders references it never received (green frames).
-    func testContainsIDRDetectsType5Slice() {
-        let au = annexB([sps720, pps, [0x65, 0x88, 0x84, 0x00]]) // 0x65 = IDR slice (type 5)
-        XCTAssertTrue(withBuf(au) { H264SPS.containsIDR(fromAnnexB: $0) })
+    // #133 / AE#627: a mid-stream join opens on an entry point: an IDR (NAL type 5), or an intra
+    // picture behind a recovery point SEI with recovery_frame_cnt 0. A bare non-IDR slice is neither.
+    private var iSlice: [UInt8] { [0x41, 0x88, 0x84, 0x00] }          // non-IDR, first_mb 0, slice_type 7 (I)
+    private var pSlice: [UInt8] { [0x41, 0x9a, 0x00, 0x00] }          // non-IDR, first_mb 0, slice_type 5 (P)
+    private var recoveryNow: [UInt8] { [0x06, 0x06, 0x01, 0xc4, 0x80] }  // recovery point, cnt 0 (x264's bytes)
+    private var recoveryLater: [UInt8] { [0x06, 0x06, 0x01, 0x71, 0x80] } // recovery point, cnt 2 (gradual refresh)
+
+    func testIDRIsAnEntry() {
+        let au = annexB([sps720, pps, [0x65, 0x88, 0x84, 0x00]])
+        XCTAssertTrue(withBuf(au) { H264SPS.isRandomAccessEntry(fromAnnexB: $0) })
     }
 
-    func testContainsIDRRejectsNonIDRAccessUnit() {
-        let au = annexB([sps720, pps, [0x41, 0x9a, 0x00, 0x00]]) // 0x41 = non-IDR slice (type 1)
-        XCTAssertFalse(withBuf(au) { H264SPS.containsIDR(fromAnnexB: $0) })
+    func testBareNonIDRSliceIsNotAnEntry() {
+        XCTAssertFalse(withBuf(annexB([sps720, pps, pSlice])) { H264SPS.isRandomAccessEntry(fromAnnexB: $0) })
+        XCTAssertFalse(withBuf(annexB([sps720, pps, iSlice])) { H264SPS.isRandomAccessEntry(fromAnnexB: $0) })
     }
 
-    func testContainsIDRRejectsBareParameterSets() {
-        let au = annexB([sps720, pps]) // params only, no coded slice
-        XCTAssertFalse(withBuf(au) { H264SPS.containsIDR(fromAnnexB: $0) })
+    func testBareParameterSetsAreNotAnEntry() {
+        XCTAssertFalse(withBuf(annexB([sps720, pps])) { H264SPS.isRandomAccessEntry(fromAnnexB: $0) })
+        XCTAssertFalse(withBuf(annexB([sps720, pps, recoveryNow])) { H264SPS.isRandomAccessEntry(fromAnnexB: $0) })
     }
 
-    func testContainsIDRHandlesThreeByteStartCodes() {
+    func testEntryHandlesThreeByteStartCodes() {
         let sc3: [UInt8] = [0, 0, 1]
         var au: [UInt8] = sc3
         au += sps720
@@ -72,17 +77,47 @@ final class H264SPSTests: XCTestCase {
         au += pps
         au += sc3
         au += [0x65, 0x88]
-        XCTAssertTrue(withBuf(au) { H264SPS.containsIDR(fromAnnexB: $0) })
+        XCTAssertTrue(withBuf(au) { H264SPS.isRandomAccessEntry(fromAnnexB: $0) })
     }
 
-    // #133 join gate: the decodable-access-unit predicate needs SPS + PPS + IDR all present.
-    // A recovery-point AU (params present, but slice is non-IDR) must NOT satisfy it.
+    // AE#627: the reporter's feed never sends an IDR. Its entry points are AUD, SPS, PPS, SEI
+    // [recovery point cnt 0, pic_timing], then an I-picture.
+    func testImmediateIntraRecoveryPointIsAnEntry() {
+        let aud: [UInt8] = [0x09, 0xf0]
+        let au = annexB([aud, sps720, pps, recoveryNow, iSlice])
+        XCTAssertTrue(withBuf(au) { H264SPS.isRandomAccessEntry(fromAnnexB: $0) })
+    }
+
+    func testRecoveryPointBehindAnotherSEIMessageIsFound() {
+        let sei: [UInt8] = [0x06, 0x05, 0x02, 0xaa, 0xbb, 0x06, 0x01, 0xc4, 0x80]
+        XCTAssertTrue(withBuf(annexB([sps720, pps, sei, iSlice])) { H264SPS.isRandomAccessEntry(fromAnnexB: $0) })
+    }
+
+    func testGradualRefreshRecoveryPointIsNotAnEntry() {
+        XCTAssertFalse(withBuf(annexB([sps720, pps, recoveryLater, iSlice])) {
+            H264SPS.isRandomAccessEntry(fromAnnexB: $0)
+        })
+    }
+
+    func testRecoveryPointOnAPictureWithAPSliceIsNotAnEntry() {
+        XCTAssertFalse(withBuf(annexB([sps720, pps, recoveryNow, pSlice])) { H264SPS.isRandomAccessEntry(fromAnnexB: $0) })
+        XCTAssertFalse(withBuf(annexB([sps720, pps, recoveryNow, iSlice, pSlice])) {
+            H264SPS.isRandomAccessEntry(fromAnnexB: $0)
+        })
+    }
+
+    func testRecoveryFrameCountParsesTheMessage() {
+        XCTAssertEqual(H264SPS.recoveryFrameCount(seiRBSP: [0x06, 0x01, 0xc4, 0x80]), 0)
+        XCTAssertEqual(H264SPS.recoveryFrameCount(seiRBSP: [0x06, 0x01, 0x71, 0x80]), 2)
+        XCTAssertNil(H264SPS.recoveryFrameCount(seiRBSP: [0x05, 0x02, 0xaa, 0xbb, 0x80]))
+        XCTAssertNil(H264SPS.recoveryFrameCount(seiRBSP: [0x06, 0x09, 0xc4]))  // size past the end
+    }
+
     func testExtractSPSandPPSStillSucceedsOnRecoveryPointAU() {
-        let au = annexB([sps720, pps, [0x41, 0x9a]])
+        let au = annexB([sps720, pps, recoveryNow, iSlice])
         let got = withBuf(au) { H264SPS.extractSPSandPPS(fromAnnexB: $0) }
-        XCTAssertNotNil(got)                                    // params are there
+        XCTAssertNotNil(got)
         XCTAssertEqual(H264SPS.dimensions(fromNAL: got!.sps)?.width, 1280)
-        XCTAssertFalse(withBuf(au) { H264SPS.containsIDR(fromAnnexB: $0) }) // but no IDR -> gate stays closed
     }
 
     // MARK: - #150 frame_mbs_only_flag fallback
