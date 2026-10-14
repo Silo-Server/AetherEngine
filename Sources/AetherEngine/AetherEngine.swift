@@ -99,6 +99,11 @@ public final class AetherEngine: ObservableObject {
         }
     }
 
+    /// Whether the loaded VOD source can only be read forwards: a sequential origin, declared or
+    /// promoted, or a byte source the probe found unseekable. A duration does not change this, and
+    /// a seek or a rewind on such a source can only be refused.
+    var sourceIsForwardOnly: Bool { loadedOptions.sequentialOrigin || isSourceSeekable == false }
+
     /// Whether the active session accepts a seek. Live playback requires a DVR window;
     /// forward-only VOD never advertises arbitrary seeking even when its duration is known.
     /// Remote HLS uses the native item's measured range instead of container metadata.
@@ -109,7 +114,7 @@ public final class AetherEngine: ObservableObject {
         default: break
         }
         if isLive { return seekableLiveRange != nil }
-        guard !loadedOptions.sequentialOrigin, isSourceSeekable != false,
+        guard !sourceIsForwardOnly,
               duration.isFinite, duration > 0 else { return false }
         if videoRoute == .remoteBypass {
             guard let nativeHost else { return false }
@@ -3567,10 +3572,16 @@ public final class AetherEngine: ObservableObject {
     /// `AVPlayer.play()` at end-of-media is a no-op, freezing the button. `.ended` is deliberately
     /// excluded: it is terminal (#63), the host revives it by reloading, and a play press racing the end
     /// card must not silently restart the finished session.
+    ///
+    /// A source that cannot be repositioned never rewinds. Its container can report a duration far
+    /// short of the stream (a fragmented MP4 served as one response reports its first fragment, a
+    /// few seconds), which reads as "parked at the end" for the rest of the session. `seek(to:)`
+    /// rejects the rewind, so `play()` would retry it forever and never resume.
     nonisolated static func shouldRewindBeforePlay(
-        state: PlaybackState, currentTime: Double, duration: Double, isLive: Bool
+        state: PlaybackState, currentTime: Double, duration: Double, isLive: Bool,
+        sourceCanReposition: Bool = true
     ) -> Bool {
-        guard state != .ended else { return false }
+        guard state != .ended, sourceCanReposition else { return false }
         return isAtEndOfMedia(currentTime: currentTime, duration: duration, isLive: isLive)
     }
 
@@ -5491,7 +5502,8 @@ public final class AetherEngine: ObservableObject {
         // first, then resume. `.ended` is excluded (see shouldRewindBeforePlay): it stays terminal so a
         // play press racing the host end card does not silently revive a finished session (#63).
         if Self.shouldRewindBeforePlay(
-            state: state, currentTime: currentTime, duration: duration, isLive: isLive
+            state: state, currentTime: currentTime, duration: duration, isLive: isLive,
+            sourceCanReposition: !sourceIsForwardOnly
         ) {
             Task { @MainActor in
                 await self.seek(to: 0)
@@ -5720,7 +5732,7 @@ public final class AetherEngine: ObservableObject {
                 return
             }
         }
-        if !isLive, loadedOptions.sequentialOrigin || isSourceSeekable == false {
+        if !isLive, sourceIsForwardOnly {
             EngineLog.emit("[AetherEngine] seek(to:\(seconds)) rejected: source is forward-only", category: .engine)
             // A seek stashed during load must relinquish its optimistic clock as well.
             let wasDeferred = deferredSeekInFlight

@@ -1,3 +1,4 @@
+import Combine
 import Testing
 @testable import AetherEngine
 
@@ -137,6 +138,29 @@ struct SeekToEndOfMediaTests {
         }
         #expect(engine.currentTime == 0)
         #expect(engine.state == .playing)
+    }
+
+    @MainActor
+    @Test("play() on a forward-only source past its container duration resumes without a rewind")
+    func playOnForwardOnlySourceDoesNotRewind() async throws {
+        // A fragmented MP4 served as one response reports its first fragment as the duration. The
+        // rewind play() used to request is a seek this source rejects, and play() then asked again,
+        // round after round, without ever resuming.
+        let engine = try AetherEngine()
+        engine.state = .paused
+        engine.isSessionReady = true
+        engine.duration = 3.5
+        engine.isSourceSeekable = false
+        engine.clock.currentTime = 4.6
+        var events: [SeekEvent] = []
+        let sub = engine.seekEvents.sink { events.append($0) }
+        defer { sub.cancel(); engine.stop() }
+
+        engine.play()
+        for _ in 0..<50 { await Task.yield() }
+        #expect(events.isEmpty)
+        #expect(engine.state == .playing)
+        #expect(engine.currentTime == 4.6)
     }
 
     @MainActor
