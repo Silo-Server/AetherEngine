@@ -1,3 +1,4 @@
+import Combine
 import Testing
 @testable import AetherEngine
 
@@ -66,19 +67,33 @@ struct SeekToEndOfMediaTests {
 
     @Test("Rewind before play when parked at end-of-media")
     func rewindWhenParkedAtEnd() {
-        #expect(AetherEngine.shouldRewindBeforePlay(state: .paused, currentTime: 100, duration: 100, isLive: false))
-        #expect(AetherEngine.shouldRewindBeforePlay(state: .playing, currentTime: 100, duration: 100, isLive: false))
+        #expect(AetherEngine.shouldRewindBeforePlay(state: .paused, currentTime: 100, duration: 100, isLive: false, sourceIsForwardOnly: false))
+        #expect(AetherEngine.shouldRewindBeforePlay(state: .playing, currentTime: 100, duration: 100, isLive: false, sourceIsForwardOnly: false))
     }
 
     @Test(".ended never rewinds (terminal, #63 end-card must not be revived)")
     func endedNeverRewinds() {
-        #expect(!AetherEngine.shouldRewindBeforePlay(state: .ended, currentTime: 100, duration: 100, isLive: false))
+        #expect(!AetherEngine.shouldRewindBeforePlay(state: .ended, currentTime: 100, duration: 100, isLive: false, sourceIsForwardOnly: false))
     }
 
     @Test("No rewind mid-stream or when live")
     func noRewindMidStreamOrLive() {
-        #expect(!AetherEngine.shouldRewindBeforePlay(state: .paused, currentTime: 50, duration: 100, isLive: false))
-        #expect(!AetherEngine.shouldRewindBeforePlay(state: .paused, currentTime: 100, duration: 100, isLive: true))
+        #expect(!AetherEngine.shouldRewindBeforePlay(state: .paused, currentTime: 50, duration: 100, isLive: false, sourceIsForwardOnly: false))
+        #expect(!AetherEngine.shouldRewindBeforePlay(state: .paused, currentTime: 100, duration: 100, isLive: true, sourceIsForwardOnly: false))
+    }
+
+    @Test("A source that cannot be repositioned never rewinds, whatever its duration claims")
+    func forwardOnlySourceNeverRewinds() {
+        // A fragmented MP4 served as one response reports its first fragment as the duration:
+        // 3.6 s for a film with over an hour left. Twenty minutes in, that reads as parked at
+        // the end, and the rewind is a seek this source cannot serve.
+        #expect(!AetherEngine.shouldRewindBeforePlay(
+            state: .paused, currentTime: 1_196.7, duration: 3.6, isLive: false, sourceIsForwardOnly: true))
+        #expect(!AetherEngine.shouldRewindBeforePlay(
+            state: .paused, currentTime: 100, duration: 100, isLive: false, sourceIsForwardOnly: true))
+        // The same playhead on a source that can rewind still does.
+        #expect(AetherEngine.shouldRewindBeforePlay(
+            state: .paused, currentTime: 100, duration: 100, isLive: false, sourceIsForwardOnly: false))
     }
 
     // MARK: - Integration: real seek() / play() paths (no hosts)
@@ -123,6 +138,47 @@ struct SeekToEndOfMediaTests {
         }
         #expect(engine.currentTime == 0)
         #expect(engine.state == .playing)
+    }
+
+    @MainActor
+    @Test("play() on a forward-only source past its container duration resumes without a rewind")
+    func playOnForwardOnlySourceDoesNotRewind() async throws {
+        // A fragmented MP4 served as one response reports its first fragment as the duration. The
+        // rewind play() used to request is a seek this source rejects, and play() then asked again,
+        // round after round, without ever resuming.
+        let engine = try AetherEngine()
+        engine.state = .paused
+        engine.isSessionReady = true
+        engine.duration = 3.5
+        engine.isSourceSeekable = false
+        engine.clock.currentTime = 4.6
+        var events: [SeekEvent] = []
+        let sub = engine.seekEvents.sink { events.append($0) }
+        defer { sub.cancel(); engine.stop() }
+
+        engine.play()
+        for _ in 0..<50 { await Task.yield() }
+        #expect(events.isEmpty)
+        #expect(engine.state == .playing)
+        #expect(engine.currentTime == 4.6)
+    }
+
+    @MainActor
+    @Test("play() asks for one rewind per press, even when the seek is rejected")
+    func playRewindsOncePerPress() async throws {
+        // An errored session keeps its playhead; seek(to:) rejects the rewind with noActiveSession and
+        // nothing moves. play() used to ask again on every round, thousands of times a second.
+        let engine = try AetherEngine()
+        engine.state = .error("decoder failed")
+        engine.duration = 100
+        engine.clock.currentTime = 100
+        var events: [SeekEvent] = []
+        let sub = engine.seekEvents.sink { events.append($0) }
+        defer { sub.cancel(); engine.stop() }
+
+        engine.play()
+        for _ in 0..<50 { await Task.yield() }
+        #expect(events.map(\.outcome) == [.rejected(.noActiveSession)])
     }
 
     @MainActor

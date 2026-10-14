@@ -2136,6 +2136,9 @@ extension AetherEngine {
             host.stop()
             try checkLoadCurrent(generation)
         }
+        // A rebuild (audio switch, reload) ran stopInternal, which cleared the capability; without it
+        // `canSeek` reads false on a seekable source and the forward-only rules stop applying.
+        isSourceSeekable = host.openedSourceIsSeekable
     }
 
     /// Open `AudioPlaybackHost` for an audio-only source. No HLS pipeline, display layer, or display-criteria handshake. Same lifecycle as `loadSoftware`.
