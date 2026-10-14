@@ -3573,15 +3573,15 @@ public final class AetherEngine: ObservableObject {
     /// excluded: it is terminal (#63), the host revives it by reloading, and a play press racing the end
     /// card must not silently restart the finished session.
     ///
-    /// A source that cannot be repositioned never rewinds. Its container can report a duration far
-    /// short of the stream (a fragmented MP4 served as one response reports its first fragment, a
-    /// few seconds), which reads as "parked at the end" for the rest of the session. `seek(to:)`
-    /// rejects the rewind, so `play()` would retry it forever and never resume.
+    /// A forward-only source never rewinds. Its container can report a duration far short of the
+    /// stream (a fragmented MP4 served as one response reports its first fragment, a few seconds),
+    /// which reads as "parked at the end" for the rest of the session, and `seek(to:)` rejects the
+    /// rewind anyway.
     nonisolated static func shouldRewindBeforePlay(
         state: PlaybackState, currentTime: Double, duration: Double, isLive: Bool,
-        sourceCanReposition: Bool = true
+        sourceIsForwardOnly: Bool
     ) -> Bool {
-        guard state != .ended, sourceCanReposition else { return false }
+        guard state != .ended, !sourceIsForwardOnly else { return false }
         return isAtEndOfMedia(currentTime: currentTime, duration: duration, isLive: isLive)
     }
 
@@ -5503,14 +5503,23 @@ public final class AetherEngine: ObservableObject {
         // play press racing the host end card does not silently revive a finished session (#63).
         if Self.shouldRewindBeforePlay(
             state: state, currentTime: currentTime, duration: duration, isLive: isLive,
-            sourceCanReposition: !sourceIsForwardOnly
+            sourceIsForwardOnly: sourceIsForwardOnly
         ) {
+            let generation = loadGeneration
             Task { @MainActor in
                 await self.seek(to: 0)
-                self.play()
+                // One rewind per press. A rejected or superseded seek leaves the playhead where it was,
+                // and calling play() again would ask for the same rewind without end. A load that
+                // started meanwhile owns the transport now.
+                guard self.loadGeneration == generation else { return }
+                self.resumeTransport()
             }
             return
         }
+        resumeTransport()
+    }
+
+    private func resumeTransport() {
         activeTransportHost?.play()
         if state == .paused || state == .loading {
             state = .playing

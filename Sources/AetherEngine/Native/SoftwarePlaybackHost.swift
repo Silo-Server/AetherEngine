@@ -135,6 +135,9 @@ final class SoftwarePlaybackHost {
     private var audioDecoder: AudioDecoder?
     private var audioOutput: AudioOutput?
     private var demuxer: Demuxer?
+    /// Whether the source this host opened can be repositioned, taken once in `load()` so the main
+    /// actor never polls the demuxer the read loop owns. The engine republishes it after a rebuild.
+    private(set) var openedSourceIsSeekable = false
     private var vodPacketReadAhead: SoftwarePacketReadAhead?
     /// #687: this host's entries in the process-wide retention ledger, released on `stop()`.
     private var retentionClaims: [RetentionClaims.Claim] = []
@@ -890,6 +893,7 @@ final class SoftwarePlaybackHost {
         forwardBufferSegments: Int? = nil
     ) async throws {
         self.demuxer = dem
+        openedSourceIsSeekable = dem.isSourceSeekable
         self.duration = dem.duration
         self.isLive = isLive
 

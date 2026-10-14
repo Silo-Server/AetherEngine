@@ -208,8 +208,10 @@ player.$state          // .idle, .loading, .playing, .paused, .seeking, .ended, 
                        // .ended = played to completion (any backend); .idle = pre-load / stopped.
                        // .ended is TERMINAL: seek is rejected and play() does not revive it, so a
                        // replay is another load(). A VOD merely parked at its final frame is the
-                       // other case and play() rewinds it. How every other failure arrives, and
-                       // why a CancellationError out of load() is not one, is in docs/api.md.
+                       // other case and play() rewinds it, once per press; a forward-only source
+                       // (canSeek false) cannot rewind and resumes where it is. How every other
+                       // failure arrives, and why a CancellationError out of load() is not one, is
+                       // in docs/api.md.
 player.$errorInfo      // PlaybackErrorInfo?, the machine-readable half of .error: a stable
                        // PlaybackErrorKind plus the underlying NSError domain and code. Classify on
                        // this. The message cannot: on the native paths it is AVPlayerItem.error
