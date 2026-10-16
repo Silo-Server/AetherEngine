@@ -52,15 +52,19 @@ struct ItemSwapStillTests {
         // then takes nothing more until audio catches up. With a `requestMediaDataWhenReady` block
         // per track that catching up depends on AVFoundation calling the audio block again, and on
         // a loaded CI runner it did not: `video 88/120 ready=false, audio 21/40 ready=true`, the
-        // audio block called once in total, until the deadline below. A loop that waits on one
+        // audio block called once in total, until the deadline. A loop that waits on one
         // track at a time deadlocks the same way from the other side.
         let chunk = 4800
         var frame = 0
         var chunks = 0
         var videoDone = false
         var audioDone = false
-        let deadline = ContinuousClock.now + .seconds(20)
-        while !(videoDone && audioDone), writer.status == .writing, ContinuousClock.now < deadline {
+        // A stall deadline, not a total one: under load the writer can be slow and still moving
+        // (`video 4/120 ready=true, audio 24/40 ready=true` after a fixed 20 s on CI), and only a
+        // writer that takes nothing for 20 s is the deadlock described above.
+        var lastProgress = ContinuousClock.now
+        while !(videoDone && audioDone), writer.status == .writing,
+              ContinuousClock.now - lastProgress < .seconds(20) {
             var fed = false
             if !videoDone, video.isReadyForMoreMediaData {
                 // Our own buffer, not one from the adaptor's pool: that pool belongs to the
@@ -108,7 +112,7 @@ struct ItemSwapStillTests {
                     audioDone = true
                 }
             }
-            if !fed { try await Task.sleep(for: .milliseconds(5)) }
+            if fed { lastProgress = .now } else { try await Task.sleep(for: .milliseconds(5)) }
         }
         guard videoDone, audioDone else {
             let state = "video \(frame)/120 ready=\(video.isReadyForMoreMediaData), "

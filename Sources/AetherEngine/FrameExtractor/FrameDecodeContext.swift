@@ -13,7 +13,11 @@ import AetherLibswscale
 /// NOT thread-safe; FrameExtractor serializes all access on its decode queue.
 final class FrameDecodeContext: @unchecked Sendable {
     private let url: URL
-    private let httpHeaders: [String: String]
+    private let openedHTTPHeaders: [String: String]
+    /// AE#792: the session's live header set for an extractor over the session's own source, so a
+    /// still fetched after a credential rotation carries the current token. Nil otherwise.
+    private let requestHeaderStore: RequestHeaderStore?
+    private var httpHeaders: [String: String] { requestHeaderStore?.current ?? openedHTTPHeaders }
     /// When non-nil, opens from this independent reader (custom source clone) not the URL.
     /// Closed at deinit, NOT in close() (which tears down only demuxer/decoder so the
     /// idle-reopen path can rebuild over the still-alive reader).
@@ -124,9 +128,10 @@ final class FrameDecodeContext: @unchecked Sendable {
     }
 
     init(url: URL, httpHeaders: [String: String], selectTitleID: Int? = nil,
-         allowsHardwareDecode: Bool = false) {
+         allowsHardwareDecode: Bool = false, requestHeaderStore: RequestHeaderStore? = nil) {
         self.url = url
-        self.httpHeaders = httpHeaders
+        self.openedHTTPHeaders = httpHeaders
+        self.requestHeaderStore = requestHeaderStore
         self.reader = nil
         self.formatHint = nil
         self.selectTitleID = selectTitleID
@@ -136,7 +141,8 @@ final class FrameDecodeContext: @unchecked Sendable {
     init(reader: IOReader, formatHint: String?, allowsHardwareDecode: Bool = false) {
         // Placeholder; unused when reader != nil (openInternal opens the reader).
         self.url = URL(string: "aether-custom://frame-extractor")!
-        self.httpHeaders = [:]
+        self.openedHTTPHeaders = [:]
+        self.requestHeaderStore = nil
         self.reader = reader
         self.formatHint = formatHint
         self.selectTitleID = nil
@@ -223,7 +229,9 @@ final class FrameDecodeContext: @unchecked Sendable {
         } else if let reader = reader {
             try demuxer.open(reader: reader, formatHint: formatHint, profile: .stillExtraction)
         } else {
-            try demuxer.open(url: url, extraHeaders: httpHeaders, profile: .stillExtraction, selectTitleID: selectTitleID)
+            try demuxer.open(url: url, extraHeaders: httpHeaders,
+                             profile: DemuxerOpenProfile.stillExtraction.withRequestHeaders(requestHeaderStore),
+                             selectTitleID: selectTitleID)
         }
         self.demuxer = demuxer
 

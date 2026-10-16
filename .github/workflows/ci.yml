@@ -39,6 +39,10 @@ jobs:
       - name: swift build
         run: swift build
 
+      # The object-audio decoder libraries are traits a host can turn off; keep that build compiling.
+      - name: swift build (traits off)
+        run: swift build --disable-default-traits --build-tests --scratch-path .build-notraits
+
       # A test process that dies mid-run reads as exit 1 with no ✘, no backtrace and no swift-testing
       # summary: `swift test` collapses every abnormal child exit to a plain 1, and a signal takes the
       # buffered tail of the event stream with it. What was in flight is whatever the log still lists
@@ -86,6 +90,15 @@ jobs:
       - name: build the transport probe (AE#377)
         run: swift build --build-tests --package-path Probes/TransportProbe
 
+      # The pulse test's scripts are Python, shell and Swift nobody runs in CI; a syntax error in one is found
+      # at the television. Compiling them is all that can be checked without a phone recording.
+      - name: Compile the Dolby Vision pulse scripts
+        run: |
+          python3 -m py_compile Probes/DolbyVisionPulse/Scripts/*.py
+          zsh -n Probes/DolbyVisionPulse/Scripts/build.sh
+          zsh -n Probes/DolbyVisionPulse/Scripts/run_tv.sh
+          swiftc -typecheck Probes/DolbyVisionPulse/Scripts/dump_attachments.swift
+
   build-tvos:
     name: xcodebuild (tvOS + visionOS Simulator)
     runs-on: xcode-27
@@ -125,6 +138,21 @@ jobs:
             -scheme TransportProbe \
             -destination 'generic/platform=tvOS Simulator' \
             -derivedDataPath .build/xcode-probe \
+            CODE_SIGNING_ALLOWED=NO
+
+      # The Dolby Vision pulse host is the other device harness, and the one that links the engine
+      # itself, so it is also the one that breaks when a public API it uses moves. It plays clips on an
+      # Apple TV that someone films, runs nowhere in CI, and would otherwise be found out by the person
+      # who needed a measurement that evening. EXCLUDED_ARCHS for the reason given above: an app cannot
+      # link the x86_64 slice.
+      - name: Build the Dolby Vision pulse host (Probes/DolbyVisionPulse)
+        run: |
+          xcodebuild build \
+            -project Probes/DolbyVisionPulse/Device/DolbyVisionPulse.xcodeproj \
+            -scheme DolbyVisionPulse \
+            -destination 'generic/platform=tvOS Simulator' \
+            -derivedDataPath .build/xcode-pulse \
+            EXCLUDED_ARCHS=x86_64 \
             CODE_SIGNING_ALLOWED=NO
 
       # #344: the package has declared visionOS since 6.0.0 and nothing here compiled for it, so an

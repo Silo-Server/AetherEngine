@@ -58,6 +58,7 @@ extension HLSVideoEngine {
         }
     }
 
+    #if DTSXObjectAudio
     /// Packets of the source's head `dtsxVerdict` may look at. LibDTSX needs three frames of the
     /// track, which a muxed file interleaves within the first few dozen packets; the same budget as
     /// the planner's head scans bounds a file whose audio starts late.
@@ -87,6 +88,7 @@ extension HLSVideoEngine {
         }
         return verdict
     }
+    #endif
 
     /// Build the producer on a `SpatialAudioBridge` when the host asked for object rendering and the
     /// source qualifies. Nil means "not this route": ineligible, unsupported OS, not DTS:X, or a
@@ -155,8 +157,17 @@ extension HLSVideoEngine {
             let decoder: ObjectAudioDecoding
             switch source {
             case .trueHDAtmos:
+                #if TrueHDObjectAudio
                 decoder = try TrueHDObjectAudioDecoder()
+                #else
+                EngineLog.emit(
+                    "[HLSVideoEngine] built without the TrueHDObjectAudio trait (no LibTrueHD); keeping the channel bridge",
+                    category: .session
+                )
+                return nil
+                #endif
             case .dtsHDMasterAudio:
+                #if DTSXObjectAudio
                 let dtsx = try DTSXObjectAudioDecoder()
                 // On a resume the verdict reads where the first producer starts, not the file head
                 // that step 8's seek would then drop; LibDTSX decides mid-stream as well.
@@ -177,6 +188,7 @@ extension HLSVideoEngine {
                     // The verdict decoded the first packets; the bridge starts from the same ones again.
                     dtsx.reset()
                     decoder = dtsx
+                    audioIsConfirmedDTSX = true
                 case .refused(let reason):
                     EngineLog.emit(
                         "[HLSVideoEngine] DTS-HD MA track is not DTS:X LibDTSX renders (\(reason)); "
@@ -192,6 +204,13 @@ extension HLSVideoEngine {
                     )
                     return nil
                 }
+                #else
+                EngineLog.emit(
+                    "[HLSVideoEngine] built without the DTSXObjectAudio trait (no LibDTSX); keeping the channel bridge",
+                    category: .session
+                )
+                return nil
+                #endif
             }
             bridge = try SpatialAudioBridge(
                 srcTimeBase: audioStream.pointee.time_base, layout: layout, decoder: decoder)
