@@ -1,3 +1,5 @@
+// Only with the DTSXObjectAudio trait (on by default), which links LibDTSX.
+#if DTSXObjectAudio
 import Foundation
 import DTSX
 
@@ -185,3 +187,4 @@ final class DTSXObjectAudioDecoder: ObjectAudioDecoding {
             gain: element.flags & DTSX_ELEMENT_ACTIVE != 0 ? element.gain : 0)
     }
 }
+#endif

@@ -502,7 +502,7 @@ struct SpatialAudioBridgeTests {
         try (muxed.initBytes + Data(contentsOf: muxed.segment)).write(to: file)
 
         let asset = AVURLAsset(url: file)
-        let track = try #require(try await asset.loadTracks(withMediaType: .audio).first)
+        nonisolated(unsafe) let track = try #require(try await asset.loadTracks(withMediaType: .audio).first)
         // copyNextSampleBuffer blocks until AVFoundation has decoded the next buffer. Called from the
         // cooperative pool it held one of a three-core CI runner's threads while that decode waited
         // for one, and the whole test process stalled. A thread of its own cannot starve the pool.
