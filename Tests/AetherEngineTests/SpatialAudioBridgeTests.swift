@@ -15,6 +15,7 @@ import AetherLibavutil
 /// behaves like the real one on exactly those points.
 @Suite("TrueHD Atmos spatial bridge", .timeLimit(.minutes(2)))
 struct SpatialAudioBridgeTests {
+    #if TrueHDObjectAudio || DTSXObjectAudio
 
     /// Stand-in object decoder: one pushed byte is one 40-frame access unit (TrueHD's 1/1200 s),
     /// the first `skipAfterReset` access units after a reset are discarded as a real decoder does
@@ -23,6 +24,9 @@ struct SpatialAudioBridgeTests {
         let framesPerAU = 40
         var skipAfterReset: Int
         var dropAt: (push: Int, count: Int)?
+        /// Carry the left bed channel and the LFE as the stream's channel presentation too, as the
+        /// TrueHD decoder does for the bed splitter.
+        var withBed = false
         private var pushes = 0
         private var skipped = 0
         private var inputFrames: Int64 = 0
@@ -30,9 +34,10 @@ struct SpatialAudioBridgeTests {
         private let planes: [UnsafeMutablePointer<Float>] = (0..<3).map { _ in .allocate(capacity: 1 << 16) }
         private var t = 0
 
-        init(skipAfterReset: Int, dropAt: (push: Int, count: Int)? = nil) {
+        init(skipAfterReset: Int, dropAt: (push: Int, count: Int)? = nil, withBed: Bool = false) {
             self.skipAfterReset = skipAfterReset
             self.dropAt = dropAt
+            self.withBed = withBed
         }
         deinit { planes.forEach { $0.deallocate() } }
 
@@ -69,7 +74,9 @@ struct SpatialAudioBridgeTests {
                 configurationGeneration: 0, roles: [.bed(.left), .lfe, .object],
                 planes: planes.map { UnsafePointer($0) },
                 updates: [.init(frameOffset: 0, rampFrames: b.frames,
-                                states: [.init(), .init(), .init(position: SIMD3(x, 0.5, 1))])])
+                                states: [.init(), .init(), .init(position: SIMD3(x, 0.5, 1))])],
+                bed: withBed ? ObjectAudioBed(roles: [.bed(.left), .lfe],
+                                              planes: [UnsafePointer(planes[0]), UnsafePointer(planes[1])]) : nil)
         }
 
         func reset() { skipped = 0; inputFrames = 0; blocks = []; pushes = 0 }
@@ -93,7 +100,8 @@ struct SpatialAudioBridgeTests {
         private var stateSent = false
         private let plane = UnsafeMutablePointer<Float>.allocate(capacity: 1 << 16)
 
-        init(clickFrame: Int64) { self.clickFrame = clickFrame }
+        let withBed: Bool
+        init(clickFrame: Int64, withBed: Bool = false) { self.clickFrame = clickFrame; self.withBed = withBed }
         deinit { plane.deallocate() }
 
         func push(_ bytes: UnsafeRawBufferPointer) throws {
@@ -112,7 +120,8 @@ struct SpatialAudioBridgeTests {
             return ObjectAudioDecodedBlock(
                 sampleRate: 48_000, frameCount: b.frames, inputFrameOffset: b.offset,
                 configurationGeneration: 0, roles: [.bed(.left)], planes: [UnsafePointer(plane)],
-                updates: stateSent ? [] : [.init(frameOffset: 0, rampFrames: 0, states: [.init()])])
+                updates: stateSent ? [] : [.init(frameOffset: 0, rampFrames: 0, states: [.init()])],
+                bed: withBed ? ObjectAudioBed(roles: [.bed(.left)], planes: [UnsafePointer(plane)]) : nil)
         }
 
         func reset() { inputFrames = 0; blocks = []; stateSent = false }
@@ -142,6 +151,9 @@ struct SpatialAudioBridgeTests {
         return out
     }
 
+    #endif
+
+    #if TrueHDObjectAudio
     @Test("only TrueHD that FFmpeg marks Atmos, at 48 kHz or not yet known, is rendered")
     func eligibility() {
         let on = ObjectAudioRendering.apac(.l714)
@@ -154,7 +166,9 @@ struct SpatialAudioBridgeTests {
                 "E-AC-3 JOC is already Atmos and stream-copies")
         #expect(HLSVideoEngine.spatialRenderingLayout(rendering: .off, codecID: AV_CODEC_ID_TRUEHD, profile: 30, sampleRate: 48_000) == nil)
     }
+    #endif
 
+    #if DTSXObjectAudio
     @Test("every 48 kHz DTS-HD MA track is a DTS:X candidate, whatever FFmpeg's label; lossy DTS is not")
     func dtsEligibility() {
         let on = ObjectAudioRendering.apac(.l714)
@@ -164,6 +178,13 @@ struct SpatialAudioBridgeTests {
             #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_DTS, profile: profile, sampleRate: 48_000) == .l714)
             #expect(HLSVideoEngine.objectAudioSource(codecID: AV_CODEC_ID_DTS, profile: profile) == .dtsHDMasterAudio)
         }
+        // Only layouts that carry the 7.1 bed and the four heights one to one.
+        for layout in SpatialSpeakerLayout.allCases {
+            let expected: SpatialSpeakerLayout? = layout == .l714 || layout == .l916 ? layout : nil
+            #expect(HLSVideoEngine.spatialRenderingLayout(
+                rendering: .apac(layout), codecID: AV_CODEC_ID_DTS, profile: AV_PROFILE_DTS_HD_MA_X,
+                sampleRate: 48_000) == expected, "\(layout.rawValue)")
+        }
         for profile in [AV_PROFILE_DTS, AV_PROFILE_DTS_ES, AV_PROFILE_DTS_HD_HRA, AV_PROFILE_DTS_EXPRESS] {
             #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_DTS, profile: profile, sampleRate: 48_000) == nil)
         }
@@ -171,13 +192,26 @@ struct SpatialAudioBridgeTests {
         #expect(HLSVideoEngine.spatialRenderingLayout(rendering: .off, codecID: AV_CODEC_ID_DTS, profile: AV_PROFILE_DTS_HD_MA_X, sampleRate: 48_000) == nil)
         #expect(HLSVideoEngine.objectAudioSource(codecID: AV_CODEC_ID_TRUEHD, profile: 30) == .trueHDAtmos)
     }
+    #endif
 
-    @Test("the first packet sits at the source position of the first decodable frame, and steps by 1024")
-    func anchorsOnSource() throws {
+    #if TrueHDObjectAudio || DTSXObjectAudio
+    /// With the stream's bed the output comes from `BedSplitter`, whose latency the bridge has to
+    /// keep off the timeline: the same timestamps, and the same tail at the end.
+    static let bedArms: [Bool] = {
+        #if TrueHDObjectAudio
+        [false, true]
+        #else
+        [false]
+        #endif
+    }()
+
+    @Test("the first packet sits at the source position of the first decodable frame, and steps by 1024",
+          arguments: bedArms)
+    func anchorsOnSource(withBed: Bool) throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
         let bridge = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
-            decoder: SyntheticDecoder(skipAfterReset: 5))
+            decoder: SyntheticDecoder(skipAfterReset: 5, withBed: withBed))
         defer { bridge.close() }
         var packets = try feed(bridge, startMs: 1000, count: 100)
         packets += bridge.flush().map { fp in
@@ -350,12 +384,12 @@ struct SpatialAudioBridgeTests {
         #expect(a == b)
     }
 
-    @Test("a producer restart re-anchors on the new position")
-    func restartReanchors() throws {
+    @Test("a producer restart re-anchors on the new position", arguments: bedArms)
+    func restartReanchors(withBed: Bool) throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
         let bridge = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l916,
-            decoder: SyntheticDecoder(skipAfterReset: 3))
+            decoder: SyntheticDecoder(skipAfterReset: 3, withBed: withBed))
         defer { bridge.close() }
         _ = try feed(bridge, startMs: 0, count: 30)
         bridge.startSegment()
@@ -364,12 +398,12 @@ struct SpatialAudioBridgeTests {
         #expect(zip(packets, packets.dropFirst()).allSatisfy { $1.pts - $0.pts == 1024 })
     }
 
-    @Test("a span the decoder drops is filled, so everything after it keeps its timestamp")
-    func gapKeepsTimeline() throws {
+    @Test("a span the decoder drops is filled, so everything after it keeps its timestamp", arguments: bedArms)
+    func gapKeepsTimeline(withBed: Bool) throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
         let bridge = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
-            decoder: SyntheticDecoder(skipAfterReset: 0, dropAt: (push: 10, count: 12)))
+            decoder: SyntheticDecoder(skipAfterReset: 0, dropAt: (push: 10, count: 12), withBed: withBed))
         defer { bridge.close() }
         var packets = try feed(bridge, startMs: 0, count: 100)
         packets += bridge.flush().map { fp in
@@ -442,6 +476,7 @@ struct SpatialAudioBridgeTests {
         return (try #require(initBytes), segment, sessionDir)
     }
 
+    #endif
     @Test("the Atmos output activator's bundled stream reads as E-AC-3 with the Atmos extension")
     @MainActor
     func silentAtmosStreamIsAtmos() async throws {
@@ -457,6 +492,7 @@ struct SpatialAudioBridgeTests {
         #expect(CMFormatDescriptionGetMediaSubType(format) == kAudioFormatEnhancedAC3)
     }
 
+    #if TrueHDObjectAudio || DTSXObjectAudio
     @Test("movenc muxes the stand-in and the init segment carries the real apac entry")
     func muxedInitCarriesAPAC() throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
@@ -487,13 +523,13 @@ struct SpatialAudioBridgeTests {
     /// rendered, encoded, muxed and decoded back by AVFoundation, which presents APAC the way
     /// AVPlayer does, and has to come out where the source put it. With the encoder's priming
     /// packets dropped it came out 2048 frames (42.7 ms) early, and so did every session's audio.
-    @Test("a click decodes back at its source position through AVFoundation")
-    func clickDecodesOnItsSourcePosition() async throws {
+    @Test("a click decodes back at its source position through AVFoundation", arguments: bedArms)
+    func clickDecodesOnItsSourcePosition(withBed: Bool) async throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
         // The source starts at 0 and the click is 12000 frames in, so it belongs at 0.25 s.
         let bridge = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
-            decoder: ClickDecoder(clickFrame: 12_000))
+            decoder: ClickDecoder(clickFrame: 12_000, withBed: withBed))
         defer { bridge.close() }
         guard let muxed = try muxWithProbeVideo(bridge, startMs: 0, count: 30) else { return }
         let sessionDir = muxed.sessionDir
@@ -545,8 +581,10 @@ struct SpatialAudioBridgeTests {
         }
         return nil
     }
+    #endif
 }
 
+#if TrueHDObjectAudio || DTSXObjectAudio
 /// The bed level line is the engine's half of a missing-heights report: it says which channels of the
 /// rendered bed carried sound in what AVPlayer was handed, so a silent height here and a silent height
 /// at the receiver are told apart.
@@ -626,6 +664,28 @@ struct BedLevelMeterTests {
         _ = meter.restart()
         let afterSeek = try #require(feed(&meter, chunks: 118).first)
         #expect(afterSeek.contains("; objects: up to 0 active, 0 elevated;"))
+    }
+
+    @Test("the counts reach LiveTelemetry as they stand, with heights carried as bed channels")
+    func activityForTelemetry() {
+        var meter = BedLevelMeter(layout: .l714, sampleRate: 48_000)
+        #expect(meter.activity == ObjectAudioActivity(
+            layout: .l714, objects: 0, activeObjects: 0, elevatedObjects: 0, heightChannels: 0))
+        // DTS:X's standard presentation: its heights are bed channels, not objects.
+        meter.observe(roles: [.bed(.left), .bed(.right), .bed(.topFrontLeft), .bed(.topFrontRight)], updates: [])
+        #expect(meter.activity == ObjectAudioActivity(
+            layout: .l714, objects: 0, activeObjects: 0, elevatedObjects: 0, heightChannels: 2))
+        // TrueHD Atmos: an LFE and objects, one overhead, one at ear level, one muted.
+        meter.observe(roles: [.lfe, .object, .object, .object], updates: [ObjectAudioMetadataUpdate(
+            frameOffset: 0, rampFrames: 0, states: [
+                .init(), .init(position: SIMD3(0.5, 0.5, 1)), .init(position: SIMD3(0.5, 0.5, 0)), .init(gain: 0),
+            ])], configurationChanged: true)
+        #expect(meter.activity == ObjectAudioActivity(
+            layout: .l714, objects: 3, activeObjects: 2, elevatedObjects: 1, heightChannels: 0))
+        // A seek forgets which objects play until the decoder restates them; the configuration stays.
+        _ = meter.restart()
+        #expect(meter.activity.activeObjects == 0)
+        #expect(meter.activity.objects == 3)
     }
 
     @Test("a configuration without objects does not keep reporting the previous configuration's objects")
@@ -791,3 +851,4 @@ extension SpatialAudioBridgeTests {
         #expect(bridge.servedChannelCount == layout.channelCount)
     }
 }
+#endif

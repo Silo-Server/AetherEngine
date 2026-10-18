@@ -78,10 +78,11 @@ func printUsage() {
                  [--reload-applying <key>=<value>]... [--reload-applying-at <ms>]
                  [--drop-audio]
                  [--sequential-origin] [--declared-duration S]
-             [--max-concurrent-requests N]
+             [--max-concurrent-requests N] [--atmos-bed 7.1.4]
                      [--audio-stats] [--host-calls play,extractor,setrate,pausestart,reloadlive,seekback,seekfar,pauseseek,pausereload,playreload,extplayreload,reloadnext] <url>
                      (full load+play session smoke test; --fel opts into the Profile 7
-                      FEL dual-layer route (off by default, as in the engine; --no-fel
+                      FEL dual-layer route (off by default, as in the engine, and only in
+                      a build with the DualLayerDolbyVision trait; --no-fel
                       is accepted and does nothing); --surface (or --window) presents
                       into a window; --cycle-el S flips the FEL residual every S
                       seconds, which needs --fel and a surface; --subs activates the first
@@ -111,7 +112,7 @@ func printUsage() {
                           (#92: SW-decode each segment in isolation; framesDecoded==0 => not independent)
       aetherctl disc-inspect <disc.iso>
       aetherctl dovitest [--out PATH.hevc] <file>
-      aetherctl feltest [--frames N] <file>
+      aetherctl feltest [--frames N] <file>   (DualLayerDolbyVision trait)
       aetherctl dvsurvey [--frames N] [--list K] <file>
       aetherctl extract [--at <sec>] [--snapshot] [--width <px>] [--loops <n>] <url>
       aetherctl audio [--seconds N] <url>
@@ -309,6 +310,22 @@ func printUsage() {
     """)
 }
 
+// MARK: - Object audio
+
+/// `--atmos-bed 7.1.4`: TrueHD Atmos or DTS:X rendered into that bed and delivered as APAC
+/// (`LoadOptions.objectAudioRendering`, #731). Without it the channel bridge plays them.
+private func objectAudioRendering(_ flag: String?) -> ObjectAudioRendering {
+    guard let flag else { return .off }
+    guard let layout = SpatialSpeakerLayout(rawValue: flag) else {
+        print("ERROR: --atmos-bed expects one of \(SpatialSpeakerLayout.allCases.map(\.rawValue)), got '\(flag)'")
+        exit(64)
+    }
+    #if !(TrueHDObjectAudio || DTSXObjectAudio)
+    print("[aetherctl] note: --atmos-bed renders nothing without the TrueHDObjectAudio / DTSXObjectAudio traits")
+    #endif
+    return .apac(layout)
+}
+
 // MARK: - URL parsing
 
 private func parseSourceURL(_ raw: String) -> URL {
@@ -489,7 +506,12 @@ if first == "feltest" {
     }
     rest.removeAll { $0 == urlArg }
     rejectStrayFlags(rest, subcommand: "feltest")
+    #if DualLayerDolbyVision
     exit(runFelTest(url: parseSourceURL(urlArg), maxFrames: frames))
+    #else
+    print("ERROR: feltest needs the DualLayerDolbyVision trait (swift build --traits DualLayerDolbyVision)")
+    exit(64)
+    #endif
 }
 
 // Dolby Vision display-metadata survey: picks the pin for the on-device consumption test.
@@ -718,6 +740,10 @@ if first == "play" {
             print("ERROR: --cycle-el takes a period of at least 0.1 seconds, got '\(spec)'")
             exit(64)
         }
+        #if !DualLayerDolbyVision
+        print("ERROR: --cycle-el needs the DualLayerDolbyVision trait (swift build --traits DualLayerDolbyVision)")
+        exit(64)
+        #else
         if !playFel {
             print("[aetherctl] note: --cycle-el only changes a session on the dual-layer route; add --fel")
         }
@@ -737,10 +763,14 @@ if first == "play" {
             }
         }
         t.start()
+        #endif
     }
     // `--dv-pin <spec>`: arm the Dolby Vision pin test (DEBUG builds), same grammar `dvsurvey` prints.
     if let spec = takeStringFlag("--dv-pin", from: &rest) {
-        #if DEBUG
+        #if !DualLayerDolbyVision
+        print("ERROR: --dv-pin needs the DualLayerDolbyVision trait (swift build --traits DualLayerDolbyVision)")
+        exit(64)
+        #elseif DEBUG
         guard AetherEngine.armDolbyVisionPinTest(spec) else {
             print("ERROR: --dv-pin '\(spec)' carries no capture rule (e.g. 'darkest:240,period:2')")
             exit(64)
@@ -796,6 +826,8 @@ if first == "play" {
     // LoadOptions.progressiveSegmentDelivery: serve each VOD segment while it is written. Pair it
     // with a throttled origin to see the startup difference; on a fast source nothing changes.
     let progressiveSegments = takeFlag("--progressive-segments", from: &rest)
+    // #731: TrueHD Atmos or DTS:X rendered into a bed as APAC; the 1 Hz line then reports its objects.
+    let playObjectAudio = objectAudioRendering(takeStringFlag("--atmos-bed", from: &rest))
     let declaredDuration = takeDoubleFlag("--declared-duration", from: &rest)
     // #311: install the software frame-time observer and read the presentation timebase, so the
     // per-frame boundaries and the clock a host would pace an overlay against are both observable.
@@ -1002,6 +1034,7 @@ if first == "play" {
                  sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests,
                  heldConnection: heldConnection,
                  progressiveSegments: progressiveSegments,
+                 objectAudioRendering: playObjectAudio,
                  declaredDuration: declaredDuration,
                  httpHeaders: playHeaders,
                  deinterlaceFieldRate: playFieldRate,
@@ -1104,17 +1137,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     // being judged by ear.
     let serveAudioDelayMs = takeIntFlag("--audio-delay", from: &rest) ?? 0
     // #731: TrueHD Atmos or DTS:X rendered into a speaker bed and served as APAC (LoadOptions.objectAudioRendering).
-    let atmosBedFlag = takeStringFlag("--atmos-bed", from: &rest)
-    let serveObjectAudioRendering: ObjectAudioRendering
-    if let atmosBedFlag {
-        guard let layout = SpatialSpeakerLayout(rawValue: atmosBedFlag) else {
-            print("ERROR: --atmos-bed expects one of \(SpatialSpeakerLayout.allCases.map(\.rawValue)), got '\(atmosBedFlag)'")
-            exit(64)
-        }
-        serveObjectAudioRendering = .apac(layout)
-    } else {
-        serveObjectAudioRendering = .off
-    }
+    let serveObjectAudioRendering = objectAudioRendering(takeStringFlag("--atmos-bed", from: &rest))
     rejectStrayFlags(rest, subcommand: first)
     guard let urlArg = rest.first else {
         print("ERROR: \(first) requires a <url> argument")
