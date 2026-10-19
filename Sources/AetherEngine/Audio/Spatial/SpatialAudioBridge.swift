@@ -1,3 +1,5 @@
+// Only with the TrueHDObjectAudio or DTSXObjectAudio trait (both off by default).
+#if TrueHDObjectAudio || DTSXObjectAudio
 import Foundation
 import AetherLibavcodec
 import AetherLibavutil
@@ -41,6 +43,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     /// HLS `CODECS` value for the track.
     let hlsCodecs: String
     var servedChannelCount: Int? { layout.channelCount }
+    let peakOutputBitRate: Int64
 
     private let srcTimeBase: AVRational
     private let decoder: ObjectAudioDecoding
@@ -58,6 +61,20 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     /// `encodeChunkFrames` at a time (see `APACEncodePipeline`).
     private var output: APACEncodePipeline.PlaneBuffer
     private var pendingFrames = 0
+#if TrueHDObjectAudio
+    /// Built from the first block that carries a bed: every output comes from that bed instead of
+    /// the renderer's mix (see `BedSplitter`). Its latency is the frames it holds, `backlog`.
+    private var splitter: BedSplitter?
+    private var gainSnapshot = ObjectAudioGainSnapshot()
+#endif
+    /// Frames taken from the decoder that have not reached `output` yet.
+    private var heldBack: Int {
+#if TrueHDObjectAudio
+        splitter?.backlog ?? 0
+#else
+        0
+#endif
+    }
     private static let encodeChunkFrames = 2048
 
     /// Timeline, in 48 kHz frames on the output time base.
@@ -82,6 +99,13 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     private var stats = AudioBridge.FeedStats()
     private(set) var outputBytesLifetime: Int64 = 0
 
+    /// `LiveTelemetry.objectAudio`: written on the pump thread for every rendered block, read at 1 Hz
+    /// by the telemetry sampler. Behind a lock of its own, so that read never waits for a decode or
+    /// an encode holding `opLock`.
+    private let activityLock = NSLock()
+    private var latestActivity: ObjectAudioActivity?
+    var objectAudioActivity: ObjectAudioActivity? { activityLock.withLock { latestActivity } }
+
     /// AE#641: called once, on the pump thread, when the object decoder has been fed
     /// `silentFeedPacketThreshold` packets in a row without returning a block. The APAC
     /// sample entry is written up front, like FLAC's, so nothing downstream fails on its own and the
@@ -92,15 +116,16 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     private static let avNoPTS: Int64 = -0x7FFFFFFFFFFFFFFF - 1
 
     /// Packets the object decoder may take without a block before it counts as producing nothing.
-    /// Not the channel bridge's 64: a TrueHD packet is one 40-frame access unit, and after a start or
-    /// resume mid-stream the decoder waits for the next major sync before its first block. Measured
+    /// Not the channel bridge's default 64 (it takes this bound for TrueHD too, AE#786): a TrueHD
+    /// packet is one 40-frame access unit, and after a start or resume mid-stream the decoder waits
+    /// for the next major sync before its first block. Measured
     /// on Dolby's Unfold demo, that wait was up to 102 access units; at 64 every resume past the
     /// opening seconds was reported as a dead decoder and the session went to `.error` while it
     /// played, ignoring every seek after it. 1200 is a second of TrueHD, still a fraction of a second
     /// of the producer's time. A DTS-HD packet is a 512-frame frame, so for DTS:X it is 12.8 s; the
     /// track was confirmed as DTS:X before the bridge was built, and its decoder outputs from the
     /// third packet after every reset.
-    static let silentFeedPacketThreshold = 1200
+    static let silentFeedPacketThreshold = AudioBridge.trueHDSilentFeedPacketThreshold
 
     init(
         srcTimeBase: AVRational,
@@ -114,6 +139,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         levelMeter = BedLevelMeter(layout: layout, sampleRate: Self.sampleRate)
         limiter = PeakLimiter(sampleRate: Self.sampleRate)
         let rate = bitRate ?? layout.channelCount * Self.bitRatePerChannel
+        peakOutputBitRate = Int64(rate)
         let encoder = try APACEncoder(layout: layout, sampleRate: Double(Self.sampleRate), bitRate: rate)
         let pipeline = APACEncodePipeline(
             encoder: encoder, channels: layout.channelCount, bufferFrames: Self.encodeChunkFrames * 4)
@@ -275,6 +301,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         var results: [UnsafeMutablePointer<AVPacket>] = []
         // Audio the decoder held back for metadata that never came plays as it is.
         renderHeldBlocks(into: &results)
+        drainSplitter()
         encodePending()
         logLevels(levelMeter.restart())
         let finished = pipeline.finish()
@@ -291,6 +318,9 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         defer { opLock.unlock() }
         decoder.reset()
         renderer?.reset()
+#if TrueHDObjectAudio
+        splitter?.reset()
+#endif
         pipeline.reset()
         limiter.reset()
         logLevels(levelMeter.restart())
@@ -362,6 +392,8 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         }
         levelMeter.observe(roles: block.roles, updates: block.updates, configurationChanged: rebuilt)
         levelMeter.measureInput(roles: block.roles, planes: block.planes, frameCount: block.frameCount)
+        let activity = levelMeter.activity
+        activityLock.withLock { latestActivity = activity }
         // Anchor the encoder on the first block after a reset, and keep the encoder's input
         // contiguous with the source afterwards: a gap the decoder skipped (corrupt access units) is
         // filled with silence so everything after it stays on its timestamp.
@@ -370,20 +402,57 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         } else if reanchorPending, let start = encoderStartFrame {
             // After the decoder's own reset: put this block where the source says it plays.
             reanchorPending = false
-            let target = (originFrame ?? start + encoderFramesIn + Int64(pendingFrames)) + block.inputFrameOffset
+            let target = (originFrame ?? start + encoderFramesIn + Int64(pendingFrames + heldBack))
+                + block.inputFrameOffset
             place(at: target)
         } else if let expected = nextExpectedInputOffset, block.inputFrameOffset > expected,
                   let start = encoderStartFrame {
-            let end = start + encoderFramesIn + Int64(pendingFrames)
+            let end = start + encoderFramesIn + Int64(pendingFrames + heldBack)
             place(at: end + (block.inputFrameOffset - expected))
         }
         nextExpectedInputOffset = block.inputFrameOffset + Int64(block.frameCount)
 
         output.ensureCapacity(pendingFrames + block.frameCount, keeping: pendingFrames)
+#if TrueHDObjectAudio
+        if let bed = block.bed {
+            if splitter?.bedRoles != bed.roles {
+                drainSplitter()
+                output.ensureCapacity(pendingFrames + block.frameCount, keeping: pendingFrames)
+                splitter = BedSplitter(layout: layout, bedRoles: bed.roles)
+                EngineLog.emit(
+                    "[SpatialAudioBridge] every output from the stream's \(bed.roles.count)-channel presentation, "
+                    + "split by the objects' energy (latency \(BedSplitter.latency) frames)",
+                    category: .session)
+            }
+            renderer!.advance(frameCount: block.frameCount, updates: block.updates)
+            renderer!.snapshot(into: &gainSnapshot)
+            splitter!.setGains(gainSnapshot)
+            pendingFrames += splitter!.process(
+                elements: block.planes, bed: bed.planes, frameCount: block.frameCount,
+                output: output.planes.map { $0 + pendingFrames })
+        } else if let splitter {
+            // A block without its bed in a stream that has one: silence on the bed's timeline.
+            renderer!.advance(frameCount: block.frameCount, updates: block.updates)
+            pendingFrames += splitter.process(
+                elements: nil, bed: nil, frameCount: block.frameCount,
+                output: output.planes.map { $0 + pendingFrames })
+        } else if decoder.playsBedOnly {
+            // No bed yet: silence, never a mix of the object signals.
+            renderer!.advance(frameCount: block.frameCount, updates: block.updates)
+            for plane in output.planes { (plane + pendingFrames).update(repeating: 0, count: block.frameCount) }
+            pendingFrames += block.frameCount
+        } else {
+            renderer!.render(
+                inputs: block.planes, frameCount: block.frameCount, updates: block.updates,
+                outputs: output.planes.map { $0 + pendingFrames })
+            pendingFrames += block.frameCount
+        }
+#else
         renderer!.render(
             inputs: block.planes, frameCount: block.frameCount, updates: block.updates,
             outputs: output.planes.map { $0 + pendingFrames })
         pendingFrames += block.frameCount
+#endif
         stats.samplesEnqueued += Int64(block.frameCount)
         stats.packetsFedSinceLastEnqueue = 0
         if pendingFrames >= Self.encodeChunkFrames { encodePending() }
@@ -394,13 +463,14 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     /// later packet keeps its source position.
     private func place(at target: Int64) {
         guard let start = encoderStartFrame else { return }
-        let end = start + encoderFramesIn + Int64(pendingFrames)
+        let end = start + encoderFramesIn + Int64(pendingFrames + heldBack)
         let gap = target - end
         if gap == 0 { return }
         if gap > 0, gap <= Int64(Self.maxSilenceFillFrames) {
             encodeSilence(frames: Int(gap))
             return
         }
+        drainSplitter()
         encodePending()
         pipeline.restart()
         limiter.reset()
@@ -422,11 +492,30 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
             let n = min(remaining, max(Self.encodeChunkFrames - pendingFrames, 0))
             if n == 0 { encodePending(); continue }
             output.ensureCapacity(pendingFrames + n, keeping: pendingFrames)
+#if TrueHDObjectAudio
+            if let splitter {
+                pendingFrames += splitter.process(
+                    elements: nil, bed: nil, frameCount: n, output: output.planes.map { $0 + pendingFrames })
+                remaining -= n
+                if pendingFrames >= Self.encodeChunkFrames { encodePending() }
+                continue
+            }
+#endif
             for plane in output.planes { (plane + pendingFrames).update(repeating: 0, count: n) }
             pendingFrames += n
             remaining -= n
             if pendingFrames >= Self.encodeChunkFrames { encodePending() }
         }
+    }
+
+    /// The frames the splitter still holds, into `output`: before the encoder restarts somewhere else
+    /// or the input ends, so the audio up to there plays in full.
+    private func drainSplitter() {
+#if TrueHDObjectAudio
+        guard let splitter, splitter.backlog > 0 else { return }
+        output.ensureCapacity(pendingFrames + splitter.backlog, keeping: pendingFrames)
+        pendingFrames += splitter.drain(output: output.planes.map { $0 + pendingFrames })
+#endif
     }
 
     /// Hand the rendered frames to the encoder's queue. Its packets come back through
@@ -501,3 +590,4 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         }
     }
 }
+#endif

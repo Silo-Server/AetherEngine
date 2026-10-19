@@ -782,6 +782,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     private let frameRate: Double?
     private let hdcpLevel: String?
     private let sourceBitrate: Int64
+    private let sourcePeakBitrate: Int64?
+    private let bridgedAudioPeakBitrate: Int64
 
     /// AE#458: ISO 639-2/T of the ONE audio track muxed into the variant, for the master's
     /// EXT-X-MEDIA:TYPE=AUDIO tag. Nil for a source whose audio carries no resolvable language.
@@ -1015,6 +1017,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         frameRate: Double?,
         hdcpLevel: String?,
         sourceBitrate: Int64,
+        sourcePeakBitrate: Int64? = nil,
+        bridgedAudioPeakBitrate: Int64 = 0,
         audioLanguage: String? = nil,
         audioChannelCount: Int? = nil,
         audioIsAtmosStreamCopy: Bool = false,
@@ -1076,6 +1080,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         self.frameRate = frameRate
         self.hdcpLevel = hdcpLevel
         self.sourceBitrate = sourceBitrate
+        self.sourcePeakBitrate = sourcePeakBitrate
+        self.bridgedAudioPeakBitrate = bridgedAudioPeakBitrate
         self.audioLanguage = audioLanguage
         self.audioChannelCount = audioChannelCount
         self.audioIsAtmosStreamCopy = audioIsAtmosStreamCopy
@@ -2975,6 +2981,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     }
 
     var iFrameRenditionServed: Bool { iFrameSource != nil }
+    var iFrameRenditionFormat: IFrameRenditionFormat? { iFrameSource?.format }
     func iFrameInitSegment() -> Data? { iFrameSource?.initSegment() }
     func iFrameSegment(at index: Int) -> Data? { iFrameSource?.fragment(at: index) }
 
@@ -2989,10 +2996,35 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         sourceBitrate > 0 ? Int(sourceBitrate) : 25_000_000
     }
 
-    /// 2x average as peak estimate (4K HDR action bursts to ~2x); 5 Mbps floor for corrupt-bitrate sources.
     var masterBandwidth: Int? {
-        let avg = masterAverageBandwidth ?? 25_000_000
-        return max(avg * 2, 5_000_000)
+        Self.declaredPeakBandwidth(averageBandwidth: masterAverageBandwidth ?? 25_000_000,
+                                   sourcePeakBitrate: sourcePeakBitrate,
+                                   bridgedAudioPeakBitrate: bridgedAudioPeakBitrate)
+    }
+
+    /// Headroom over the measured peak for the fMP4 boxes and for Cue positions that sit on a Cluster
+    /// rather than on the keyframe itself.
+    static let measuredPeakHeadroom = 1.2
+
+    /// The most a measurement may raise the declaration to: four times the average, 40 Mbps at least,
+    /// and never past 160 Mbps. A declaration AVPlayer cannot meet is worse than an exceeded one: at
+    /// 2.25 Gbps it never picked the variant at all (the disc title in 7.35.x).
+    static func measuredPeakCeiling(averageBandwidth: Int) -> Int {
+        min(max(averageBandwidth * 4, 40_000_000), 160_000_000)
+    }
+
+    /// The variant's `BANDWIDTH`, a peak AVPlayer checks every segment against (-12318). Twice the
+    /// average, 5 Mbps at least, stays the floor (4K HDR action bursts to ~2x). AE#783: where the
+    /// index measures each segment, the highest of them plus the bridged track's ceiling raises it,
+    /// up to `measuredPeakCeiling`; a VBR ending ran past twice the average, and a FLAC track can
+    /// weigh several times the Opus it replaced.
+    static func declaredPeakBandwidth(averageBandwidth: Int, sourcePeakBitrate: Int64?,
+                                      bridgedAudioPeakBitrate: Int64) -> Int {
+        let estimate = max(averageBandwidth * 2, 5_000_000)
+        guard let peak = sourcePeakBitrate, peak > 0 else { return estimate }
+        let measured = Double(peak) * measuredPeakHeadroom + Double(max(0, bridgedAudioPeakBitrate))
+        let ceiling = measuredPeakCeiling(averageBandwidth: averageBandwidth)
+        return max(estimate, Int(min(measured, Double(ceiling))))
     }
     var masterFrameRate: Double? { frameRate }
     var masterHDCPLevel: String? { hdcpLevel }
