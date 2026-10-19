@@ -54,7 +54,10 @@ let package = Package(
             name: "DolbyVisionStillReshaping",
             description: "Compile the CPU reshaping that turns a Dolby Vision Profile 5 / 10.0 frame into a still (scrub thumbnails, I-frame stills, held pictures)."
         ),
-        .default(enabledTraits: []),
+        // Silo fork: the two object-audio traits are on by default, because Silo's XcodeGen project
+        // cannot set package traits. Upstream keeps every trait off. Silo takes on the licensing note
+        // above for these two.
+        .default(enabledTraits: ["TrueHDObjectAudio", "DTSXObjectAudio"]),
     ],
     dependencies: [
         // Minimal FFmpeg build (avcodec, avformat, avutil, swresample only).
