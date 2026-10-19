@@ -12,6 +12,12 @@ the public-API contract.
 
 ### Changed
 
+- **Silo fork: `TrueHDObjectAudio` and `DTSXObjectAudio` are on by default.** Silo's XcodeGen project
+  cannot set package traits, so the fork turns on the two object-audio components that
+  `objectAudioRendering` needs (7.40.0's TrueHD Atmos bed split and DTS:X standard presentation).
+  LibTrueHD and LibDTSX resolve and link again; `DualLayerDolbyVision` and `DolbyVisionStillReshaping`
+  stay off. Upstream keeps every trait off.
+
 - CI runs the HLS, subtitle/resource authorization and live trust-evaluator suites in a separate test process so unrelated blocking tests cannot delay their resolvers. All tests and existing deadlines remain enforced.
 - Once a redirect chain has reached HTTPS, the engine drops credential headers (`Authorization`, `Cookie`, Emby/Jellyfin tokens) from every later HTTP hop, including headers returned by `HTTPRequestAuthorization`. A provider that authorizes every URL can no longer send its credentials in cleartext after a downgrade. The HTTP hop still runs, so anonymous redirects keep working, and an origin the host configured as HTTP still receives provider credentials.
 
