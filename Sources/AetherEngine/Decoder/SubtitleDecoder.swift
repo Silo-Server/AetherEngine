@@ -12,6 +12,11 @@ enum SubtitleDecoderError: Error, CustomStringConvertible, LocalizedError {
     case streamIndexNotSubtitle(index: Int32)
     case noDecoder
     case codecOpenFailed(code: Int32)
+    /// The source ended in a read error, not at its end: a download cut short, a stalled origin, a
+    /// later request the origin refused. `partial` holds the cues decoded before it, positional like
+    /// the multi-stream result, so a caller can show them while it fetches again. A read that ends
+    /// early is never reported as a complete file.
+    case truncated(partial: [SidecarDecodeResult], code: Int32)
 
     var description: String {
         switch self {
@@ -20,6 +25,9 @@ enum SubtitleDecoderError: Error, CustomStringConvertible, LocalizedError {
         case .streamIndexNotSubtitle(let index): "SubtitleDecoder: stream \(index) is out of range or not a subtitle stream"
         case .noDecoder: "SubtitleDecoder: no decoder for the subtitle codec"
         case .codecOpenFailed(let code): "SubtitleDecoder: decoder open failed (\(FFmpegErr.text(for: code)))"
+        case .truncated(let partial, let code):
+            "SubtitleDecoder: source ended early (\(FFmpegErr.text(for: code))) after "
+                + "\(partial.map { String($0.cues.count) }.joined(separator: "/")) cues"
         }
     }
 
@@ -37,6 +45,12 @@ struct SidecarDecodeResult {
 /// Opens the URL as its own AVFormatContext; sidecars are separate files the main demuxer never sees.
 enum SubtitleDecoder {
 
+    /// How long a sidecar fetch may go without a byte, on the relay and in the reader. A server that
+    /// extracts an embedded track while it serves it delivers the body as its demux reaches each cue,
+    /// so the whole transfer can take minutes and a sparse track can be quiet for a long stretch.
+    /// The transfer itself has no lifetime cap.
+    static let sidecarIdleTimeout: TimeInterval = 60
+
     /// Decode every cue from the subtitle file at `url`, cancellable via Task.cancel().
     /// When preserveASSMarkup is true, ASS/SSA cues carry the raw libavcodec event line
     /// (ReadOrder,Layer,Style,...,Text) so ASSScriptBuilder can restyle them; no effect on SRT/VTT.
@@ -49,12 +63,13 @@ enum SubtitleDecoder {
         httpHeaders: [String: String] = [:],
         httpRequestAuthorization: HTTPRequestAuthorization? = nil,
         preserveASSMarkup: Bool = false,
-        sourceStreamIndex: Int32? = nil
+        sourceStreamIndex: Int32? = nil,
+        idleTimeout: TimeInterval = sidecarIdleTimeout
     ) async throws -> SidecarDecodeResult {
         let results = try await decode(
             url: url, httpHeaders: httpHeaders, httpRequestAuthorization: httpRequestAuthorization,
             preserveASSMarkup: preserveASSMarkup,
-            requested: sourceStreamIndex.map { [$0] }
+            requested: sourceStreamIndex.map { [$0] }, idleTimeout: idleTimeout
         )
         guard let only = results.first else { throw SubtitleDecoderError.noSubtitleStream }
         return only
@@ -76,7 +91,7 @@ enum SubtitleDecoder {
         return try await decode(
             url: url, httpHeaders: httpHeaders, httpRequestAuthorization: httpRequestAuthorization,
             preserveASSMarkup: preserveASSMarkup,
-            requested: sourceStreamIndices
+            requested: sourceStreamIndices, idleTimeout: sidecarIdleTimeout
         )
     }
 
@@ -86,7 +101,8 @@ enum SubtitleDecoder {
         httpHeaders: [String: String],
         httpRequestAuthorization: HTTPRequestAuthorization?,
         preserveASSMarkup: Bool,
-        requested: [Int32?]?
+        requested: [Int32?]?,
+        idleTimeout: TimeInterval
     ) async throws -> [SidecarDecodeResult] {
         // Task cancellation does not reach the dispatched decode. Bridge it explicitly via
         // CancelFlag so the decode loop + AVIO reader abort promptly.
@@ -99,7 +115,8 @@ enum SubtitleDecoder {
                 try decodeBlocking(
                     url: url, httpHeaders: httpHeaders,
                     httpRequestAuthorization: httpRequestAuthorization,
-                    preserveASSMarkup: preserveASSMarkup, requested: requested, token: token)
+                    preserveASSMarkup: preserveASSMarkup, requested: requested,
+                    idleTimeout: idleTimeout, token: token)
             }.value
         } onCancel: {
             token.cancel()
@@ -112,6 +129,7 @@ enum SubtitleDecoder {
         httpRequestAuthorization: HTTPRequestAuthorization?,
         preserveASSMarkup: Bool,
         requested: [Int32?]?,
+        idleTimeout: TimeInterval,
         token: CancelFlag
     ) throws -> [SidecarDecodeResult] {
         if token.isCancelled { throw CancellationError() }
@@ -123,7 +141,8 @@ enum SubtitleDecoder {
         var decodeURL = url
         if let httpRequestAuthorization {
             let transport = HLSOriginRelay(authorization: httpRequestAuthorization,
-                rawResources: true, onRequestFailure: { [weak token] in token?.cancel() })
+                resourceTimeout: nil, idleTimeout: idleTimeout,
+                rawResources: true, onRequestFailure: { [weak token] in token?.failSource() })
             relay = transport
             let localServer = HLSLocalServer(relay: transport)
             server = localServer
@@ -136,7 +155,8 @@ enum SubtitleDecoder {
         }
         let result = try decodeFileSync(
             url: decodeURL, httpHeaders: httpRequestAuthorization == nil ? httpHeaders : [:],
-            preserveASSMarkup: preserveASSMarkup, requested: requested, cancel: token
+            preserveASSMarkup: preserveASSMarkup, requested: requested, idleTimeout: idleTimeout,
+            cancel: token
         )
         if token.isCancelled { throw CancellationError() }
         return result
@@ -146,6 +166,7 @@ enum SubtitleDecoder {
     private final class CancelFlag: @unchecked Sendable {
         private let lock = NSLock()
         private var cancelled = false
+        private var sourceFailed = false
         private var reader: AVIOReader?
         private var relay: HLSOriginRelay?
         private var server: HLSLocalServer?
@@ -153,6 +174,22 @@ enum SubtitleDecoder {
         func cancel() {
             lock.lock()
             cancelled = true
+            lock.unlock()
+            stopSource()
+        }
+
+        /// The relay saw a request fail. Ends the source without cancelling the decode: the cues
+        /// already read (a text sidecar's whole body is queued at open) are still decoded, and
+        /// the decode then reports itself truncated rather than complete.
+        func failSource() {
+            lock.lock()
+            sourceFailed = true
+            lock.unlock()
+            stopSource()
+        }
+
+        private func stopSource() {
+            lock.lock()
             let r = reader
             let transport = relay
             let localServer = server
@@ -160,6 +197,10 @@ enum SubtitleDecoder {
             transport?.stop()
             r?.markClosed()
             localServer?.stop()
+        }
+
+        var didFailSource: Bool {
+            lock.lock(); defer { lock.unlock() }; return sourceFailed
         }
 
         func register(relay: HLSOriginRelay, server: HLSLocalServer) {
@@ -416,7 +457,7 @@ enum SubtitleDecoder {
 
     private static func decodeFileSync(
         url: URL, httpHeaders: [String: String],
-        preserveASSMarkup: Bool, requested: [Int32?]?, cancel: CancelFlag
+        preserveASSMarkup: Bool, requested: [Int32?]?, idleTimeout: TimeInterval, cancel: CancelFlag
     ) throws -> [SidecarDecodeResult] {
         let isHTTP = url.scheme == "http" || url.scheme == "https"
 
@@ -424,7 +465,8 @@ enum SubtitleDecoder {
         var avioReader: AVIOReader?
 
         if isHTTP {
-            let reader = AVIOReader(url: url, extraHeaders: httpHeaders)
+            let reader = AVIOReader(url: url, extraHeaders: httpHeaders,
+                                    streamIdleTimeout: idleTimeout)
             // Register BEFORE open(): open does a synchronous network probe (up to ~60 s on stalled origins);
             // cancellation during the probe must abort via markClosed rather than waiting for timeout (#32).
             cancel.register(reader)
@@ -501,12 +543,14 @@ enum SubtitleDecoder {
                 streamIndex: index, stream: stream, preserveASSMarkup: preserveASSMarkup)
         }
 
+        var readError: Int32?
         while !cancel.isCancelled {
             var pktPtr: UnsafeMutablePointer<AVPacket>? = trackedPacketAlloc()
             guard let pkt = pktPtr else { break }
             let readRet = av_read_frame(fmt, pkt)
             if readRet < 0 {
                 trackedPacketFree(&pktPtr)
+                if readRet != FFmpegErr.eof { readError = readRet }
                 break
             }
 
@@ -524,7 +568,22 @@ enum SubtitleDecoder {
 
         for decoder in decodersByStream.values { decoder.flush(cancel: cancel) }
 
-        return resolved.compactMap { decodersByStream[$0]?.result }
+        let results = resolved.compactMap { decodersByStream[$0]?.result }
+        // A cancelled decode is the caller's doing; decodeBlocking reports it as such.
+        if cancel.isCancelled { return results }
+        // Text demuxers (SRT, WebVTT, ASS) read the whole body at open and stop quietly at a read
+        // error, so av_read_frame then ends the queue with a clean EOF. The AVIO context keeps the
+        // error, and the relay reports a body it saw broken off.
+        if let readError {
+            throw SubtitleDecoderError.truncated(partial: results, code: readError)
+        }
+        if let ioError = fmt.pointee.pb?.pointee.error, ioError < 0 {
+            throw SubtitleDecoderError.truncated(partial: results, code: ioError)
+        }
+        if cancel.didFailSource {
+            throw SubtitleDecoderError.truncated(partial: results, code: FFmpegErr.eio)
+        }
+        return results
     }
 
     private static func firstSubtitleStreamIndex(in fmt: UnsafeMutablePointer<AVFormatContext>) -> Int32? {

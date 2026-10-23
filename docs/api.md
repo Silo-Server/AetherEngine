@@ -888,6 +888,7 @@ display drops the suppression and shows it.
 | `selectSubtitleTrack(index:)`, `clearSubtitle()` | Drives the host-overlay path, or AVPlayer's media selection on `.remoteBypass`. `clearSubtitle()` keeps `nativeSubtitleTracks` listed; only `load` / `stop` reset that. |
 | `$subtitleCues` | `[SubtitleCue]`: `.text`, `.richText([SubtitleTextRun])`, or `.image(SubtitleImage)`, with an optional `SubtitleTextPlacement`. Cues carry raw source PTS. |
 | `$isSubtitleActive`, `$isLoadingSubtitles` | State for a subtitle toggle: active is the selection, loading is a sidecar or side-demuxer pass in flight. |
+| `$isSubtitleTrackIncomplete`, `$isSecondarySubtitleTrackIncomplete` | True while a sidecar's cues are known to be short of the file: its download ended early, so the cues on screen are what arrived while the engine refetches it (2 s, 5 s, then 10 s apart, five times), or what was left once those refetches ran out. Cleared by a complete decode or a new selection. |
 | `$activeSubtitleTrackIndex` | The selected id, including one resolved by `preferredSubtitleLanguages`. |
 | `$sidecarASSHeader` | The ASS header for the active sidecar, for hosts rendering authored styling. |
 | `selectSecondarySubtitleTrack(index:)`, `selectSecondarySidecarSubtitle(url:httpHeaders:)`, `clearSecondarySubtitle()`, `$secondarySubtitleCues`, `$isSecondarySubtitleActive`, `$isLoadingSecondarySubtitles` | The independent second track (bilingual / language learning). |

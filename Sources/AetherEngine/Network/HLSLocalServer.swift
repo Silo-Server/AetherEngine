@@ -1116,7 +1116,8 @@ final class HLSLocalServer: @unchecked Sendable {
                             && self.writeAll(fd: fd, data: Self.chunkFrameTrailer, path: normalizedPath)
                     }
                     return self.writeAll(fd: fd, data: chunk, path: normalizedPath)
-                })
+                },
+                connected: { Self.peerConnected(fd: fd) })
             switch relay.respond(
                 query: query,
                 host: Self.requestHeader(named: "host", in: headerLines),
@@ -1670,6 +1671,15 @@ final class HLSLocalServer: @unchecked Sendable {
     }
 
     /// Blocking send loop. Uses withUnsafeBytes so mmap-backed Data stays mmap-backed (kernel page-faults in only the bytes copied to the socket send buffer, no heap accumulation).
+    /// Whether the peer still holds its end open, without reading or waiting: an orderly close
+    /// peeks as 0 bytes and a reset as an error, while a live idle connection has nothing to read.
+    static func peerConnected(fd: Int32) -> Bool {
+        var byte: UInt8 = 0
+        let peeked = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT)
+        if peeked > 0 { return true }
+        return peeked < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)
+    }
+
     private func writeAll(fd: Int32, data: Data, path: String) -> Bool {
         var written = 0
         let total = data.count

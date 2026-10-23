@@ -1426,6 +1426,10 @@ public final class AetherEngine: ObservableObject {
     nonisolated static let subtitleForwardPrefetchRestartBackoffNanoseconds: UInt64 = 1_000_000_000
 
     @Published public internal(set) var isLoadingSubtitles: Bool = false
+    /// True while the primary sidecar's cues are known to be short of the file: its download ended
+    /// early, so `subtitleCues` holds what arrived while the engine fetches it again, or after the
+    /// retries are spent. Cleared when a fetch completes and whenever the selection changes.
+    @Published public internal(set) var isSubtitleTrackIncomplete: Bool = false
     @Published public internal(set) var isSubtitleActive: Bool = false
     /// Active primary embedded subtitle stream index (matches TrackInfo.id), or nil when subtitles are off or
     /// a sidecar (not an embedded track) is active. Mirrors `activeAudioTrackIndex` so a host picker reflects
@@ -1441,6 +1445,8 @@ public final class AetherEngine: ObservableObject {
     /// Cues for the secondary subtitle track (#47). Text-only (bitmap rejected); independent of primary.
     @Published public internal(set) var secondarySubtitleCues: [SubtitleCue] = []
     @Published public internal(set) var isLoadingSecondarySubtitles: Bool = false
+    /// `isSubtitleTrackIncomplete` for the secondary sidecar.
+    @Published public internal(set) var isSecondarySubtitleTrackIncomplete: Bool = false
     @Published public internal(set) var isSecondarySubtitleActive: Bool = false
 
     /// True once the NativeSubtitleCueStore has at least one cue for the native mov_text track (#55).
