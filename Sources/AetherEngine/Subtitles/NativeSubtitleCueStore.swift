@@ -21,6 +21,7 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
     private var shiftSeconds: Double = 0
     private var externalTimelineOffsetSeconds: Double = 0
     private var finished = false
+    private var endedEarly = false
     /// Sodalite#32: the pump tap and a side reader can feed the same store concurrently (and a producer
     /// restart re-reads a region), so appends dedup on (start, end, text) instead of trusting the source.
     private var seenKeys: Set<String> = []
@@ -44,8 +45,13 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
     }
 
     /// Set once the reader has read the track to EOF, so a whole-program .vtt consumer knows every cue is present (Sodalite#32).
-    func markFinished() { lock.lock(); finished = true; lock.unlock() }
+    /// `endedEarly` finishes a fill whose download was cut short: the rendition still serves it, but the
+    /// overlay must not take it for the whole file.
+    func markFinished(endedEarly: Bool = false) {
+        lock.lock(); finished = true; self.endedEarly = endedEarly; lock.unlock()
+    }
     var isFinished: Bool { lock.lock(); defer { lock.unlock() }; return finished }
+    var didEndEarly: Bool { lock.lock(); defer { lock.unlock() }; return endedEarly }
 
     func replaceCues(_ newCues: [SubtitleCue]) {
         lock.lock(); defer { lock.unlock() }
@@ -75,6 +81,7 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
         seenKeys.removeAll(keepingCapacity: false)
         maxCueEndSeconds = 0
         finished = false
+        endedEarly = false
         lock.unlock()
     }
 

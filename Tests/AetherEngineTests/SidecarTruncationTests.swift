@@ -82,6 +82,16 @@ struct SidecarTruncationTests {
         #expect(!kept.complete)
         #expect(kept.result.cues.count == 5)
 
+        // A cut that delivered no cues still ends incomplete, not failed.
+        let empty = Script([.failure(cut(0)), .failure(cut(0))])
+        let emptyShown = Shown()
+        let none = try await AetherEngine.decodeSidecarRetryingTruncation(
+            label: "test", delays: [0], decode: { try await empty.next() },
+            showPartial: { await emptyShown.append($0.cues.count) })
+        #expect(!none.complete)
+        #expect(none.result.cues.isEmpty)
+        #expect(await emptyShown.counts == [0])
+
         // A first fetch that fails outright is not retried.
         let refused = Script([.failure(URLError(.badServerResponse)), .success(Self.result(cues: 1))])
         await #expect(throws: URLError.self) {

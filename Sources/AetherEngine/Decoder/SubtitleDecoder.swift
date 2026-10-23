@@ -543,14 +543,12 @@ enum SubtitleDecoder {
                 streamIndex: index, stream: stream, preserveASSMarkup: preserveASSMarkup)
         }
 
-        var readError: Int32?
         while !cancel.isCancelled {
             var pktPtr: UnsafeMutablePointer<AVPacket>? = trackedPacketAlloc()
             guard let pkt = pktPtr else { break }
             let readRet = av_read_frame(fmt, pkt)
             if readRet < 0 {
                 trackedPacketFree(&pktPtr)
-                if readRet != FFmpegErr.eof { readError = readRet }
                 break
             }
 
@@ -571,12 +569,11 @@ enum SubtitleDecoder {
         let results = resolved.compactMap { decodersByStream[$0]?.result }
         // A cancelled decode is the caller's doing; decodeBlocking reports it as such.
         if cancel.isCancelled { return results }
-        // Text demuxers (SRT, WebVTT, ASS) read the whole body at open and stop quietly at a read
-        // error, so av_read_frame then ends the queue with a clean EOF. The AVIO context keeps the
-        // error, and the relay reports a body it saw broken off.
-        if let readError {
-            throw SubtitleDecoderError.truncated(partial: results, code: readError)
-        }
+        // Only a source failure is a truncation; a demux error on a body that arrived whole would
+        // read the same on every refetch. Text demuxers (SRT, WebVTT, ASS) read the whole body at
+        // open and stop quietly at a read error, so av_read_frame then ends the queue with a clean
+        // EOF. The AVIO context keeps the read error either way, and the relay reports a body it
+        // saw broken off.
         if let ioError = fmt.pointee.pb?.pointee.error, ioError < 0 {
             throw SubtitleDecoderError.truncated(partial: results, code: ioError)
         }

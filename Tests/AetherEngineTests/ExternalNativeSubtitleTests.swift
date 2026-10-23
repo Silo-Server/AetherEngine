@@ -45,13 +45,15 @@ struct ExternalNativeSubtitleTests {
         #expect(engine.activeSubtitleTrackIndex == info.id)
     }
 
-    @Test("an unfinished store does not short-circuit; the sidecar decode runs")
-    func unfinishedStoreDecodes() throws {
+    @Test("an unfinished or cut-short store does not short-circuit; the sidecar decode runs",
+          arguments: [false, true])
+    func unfinishedStoreDecodes(cutShort: Bool) throws {
         let engine = try AetherEngine()
         let info = engine.addExternalSubtitleTrack(
             ExternalSubtitleTrack(url: URL(string: "https://s/x.srt")!, language: "de"))
         let store = NativeSubtitleCueStore()
         store.appendCues([SubtitleCue(id: 1, startTime: 1, endTime: 2, body: .text("hi"))])
+        if cutShort { store.markFinished(endedEarly: true) }
         engine.nativeSubtitleTrackTable = [
             .init(sourceStreamIndex: nil, externalID: info.id, language: "de")
         ]
