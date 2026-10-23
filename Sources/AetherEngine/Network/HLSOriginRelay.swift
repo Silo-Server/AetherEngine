@@ -99,8 +99,13 @@ final class HLSOriginRelay: @unchecked Sendable {
     }
     private var _cappedFetchCount = 0
 
+    /// - Parameters:
+    ///   - resourceTimeout: the cap on one transfer's whole lifetime; nil leaves it uncapped, for a
+    ///     body that legitimately takes minutes (a server extracting a subtitle track while it serves it).
+    ///   - idleTimeout: how long a transfer may go without a byte; nil derives it from the cap.
     init(authorization: HTTPRequestAuthorization? = nil, authorizationTimeout: TimeInterval = 10,
-         resourceTimeout: TimeInterval = 120, deadline: Date? = nil, rawResources: Bool = false,
+         resourceTimeout: TimeInterval? = 120, idleTimeout: TimeInterval? = nil,
+         deadline: Date? = nil, rawResources: Bool = false,
          onRequestFailure: (@Sendable () -> Void)? = nil,
          maximumHeldBodyBytes: Int = HLSOriginRelay.maximumHeldBodyBytes,
          maximumPendingBytes: Int = HLSOriginRelay.maximumPendingBytes) {
@@ -119,8 +124,8 @@ final class HLSOriginRelay: @unchecked Sendable {
             config.httpCookieStorage = nil
             config.urlCredentialStorage = nil
         }
-        config.timeoutIntervalForRequest = min(30, resourceTimeout / 2)
-        config.timeoutIntervalForResource = resourceTimeout
+        config.timeoutIntervalForRequest = idleTimeout ?? min(30, (resourceTimeout ?? 60) / 2)
+        if let resourceTimeout { config.timeoutIntervalForResource = resourceTimeout }
         session = URLSession(
             configuration: config, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
         if let deadline {
@@ -145,7 +150,8 @@ final class HLSOriginRelay: @unchecked Sendable {
         session.invalidateAndCancel()
     }
 
-    /// A raw decoder must not treat a refused later range as EOF and publish partial cues.
+    /// A raw decoder must not treat a refused later range, or a body the origin broke off, as EOF
+    /// and publish partial cues.
     /// Notify once, on the relay worker after request teardown, with no relay locks held. The
     /// owner may cancel its reader and stop this relay from the callback.
     private func reportRequestFailure() {
@@ -358,6 +364,9 @@ final class HLSOriginRelay: @unchecked Sendable {
         let head: @Sendable (_ status: Int, _ contentType: String, _ contentRange: String?,
                              _ contentLength: Int) -> Bool
         let body: @Sendable (Data) -> Bool
+        /// Whether whoever asked is still there, for telling a broken-off body apart from a
+        /// consumer that left while the origin was quiet. Answers without blocking.
+        var connected: @Sendable () -> Bool = { true }
     }
 
     /// What the relay did with one request.
@@ -398,6 +407,8 @@ final class HLSOriginRelay: @unchecked Sendable {
                 Response(status: 502, body: Data(), contentType: "text/plain", contentRange: nil))
         case .streamed(let ok):
             return .streamed(ok: ok)
+        case .truncated:
+            return .streamed(ok: false)
         case .held(let fetched):
             // A body is only rewritten when the origin said it served one AND it is a playlist. An
             // answer that is not a success is passed through as it stands: rewriting a 404 page and
@@ -447,6 +458,9 @@ final class HLSOriginRelay: @unchecked Sendable {
     private enum Upstream {
         /// Written through the sink already; the flag is whether the writes held.
         case streamed(ok: Bool)
+        /// Written through the sink until the origin's side of the transfer failed (a timeout, a
+        /// dropped connection), so the consumer got a short body it still wanted.
+        case truncated
         /// Read whole, because it has to be rewritten or because the origin refused.
         case held(Fetched)
         /// Never got a response head. The trust refusal, if that is what it was, is already recorded.
@@ -518,7 +532,7 @@ final class HLSOriginRelay: @unchecked Sendable {
                             interceptChallenge: authorization != nil && !challenged) {
             case .complete(let result):
                 switch result {
-                case .failed: reportRequestFailure()
+                case .failed, .truncated: reportRequestFailure()
                 case .held(let response) where !(200..<300).contains(response.status):
                     // AVIO treats rejection of a speculative suffix range as a supported
                     // negotiation result and continues on its ordinary data connection.
@@ -745,7 +759,10 @@ final class HLSOriginRelay: @unchecked Sendable {
         // was promised, so the answer cannot be finished; the server closes the connection on false.
         if let error = pump.awaitFailure() {
             note(failure: error, origin: origin)
-            return .complete(.streamed(ok: false))
+            // The consumer hanging up (an AVIO seek, a prefetch it no longer wants) or this relay
+            // stopping is not the origin failing. Only a body the origin broke off is reported.
+            let cut = written && pump.originEndedTransfer && sink.connected()
+            return .complete(cut ? .truncated : .streamed(ok: false))
         }
         return .complete(.streamed(ok: written))
     }
@@ -925,6 +942,14 @@ private final class UpstreamPump: NSObject, URLSessionDataDelegate, @unchecked S
         }
         condition.broadcast()
         condition.unlock()
+    }
+
+    /// Whether the transport, not this side, ended the fetch with its error: false for a consumer
+    /// that gave up and for a fetch cut at the cap. Only meaningful after `awaitFailure`.
+    var originEndedTransfer: Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        return failure != nil && !consumerGaveUp && !capped
     }
 
     /// The transport error, once the fetch has finished. Only meaningful after a drain.

@@ -522,6 +522,20 @@ final class SubtitleAuthorizationOrigin {
                 self.wfile.write(b"0\r\n\r\n")
                 return
             elif self.path == "/slow": time.sleep(30)
+            elif self.path == "/cut.srt":
+                # A server extracting the track while it serves it: no length, Range ignored, twenty
+                # cues out, then nothing for longer than the client waits.
+                self.send_response(200)
+                self.send_header("Connection", "close")
+                self.close_connection = True
+                self.end_headers()
+                try:
+                    self.wfile.write(b"".join(b"%d\n00:00:%02d,000 --> 00:00:%02d,500\nLine %d\n\n" % (i + 1, i, i, i + 1) for i in range(20)))
+                    self.wfile.flush()
+                except OSError:
+                    return
+                time.sleep(30)
+                return
             if status == 200 and "range" in headers and self.path != "/compressed.ass":
                 selected = headers["range"].split("=",1)[1].split("-",1)
                 if not selected[0] and self.path == "/no-suffix.ass":

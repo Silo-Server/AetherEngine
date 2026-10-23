@@ -1450,7 +1450,8 @@ extension AetherEngine {
 
     /// #88: activate a registered external track. A finished native store holds the whole file's
     /// cues (decoded plain-text at load), so the overlay backfills instantly with no re-download.
-    /// Styled ASS wants raw markup, which the store strips, so it re-decodes via the sidecar path.
+    /// Styled ASS wants raw markup, which the store strips, so it re-decodes via the sidecar path,
+    /// as does a store whose fill was cut short: the sidecar decode refetches it.
     private func selectExternalSubtitleTrack(id: Int, track: ExternalSubtitleTrack) {
         let codec = ExternalSubtitleTrack.codecName(url: track.url, formatHint: track.formatHint)
         let wantsStyledASS = loadedOptions.preserveASSMarkup && codec == "ass"
@@ -1460,7 +1461,7 @@ extension AetherEngine {
            // the sidecar for its images, never backfill from that store.
            !nativeSubtitleTrackTable[ordinal].needsOCR,
            let store = nativeStore(atOrdinal: ordinal),
-           store.isFinished, store.cueCount > 0 {
+           store.isFinished, !store.didEndEarly, store.cueCount > 0 {
             deselectInjectedSubtitleForOverlay()
             cancelSidecarTask()
             clearSubtitleDrainTarget(channel: .primary, reason: .externalStoreBackfill)   // #112 rework
@@ -1515,13 +1516,14 @@ extension AetherEngine {
     /// store that could not be filled stays UNfinished, or the rendition would serve a complete but
     /// blank .vtt.
     nonisolated static func runExternalSubtitleFill(job: ExternalSubtitleFillJob) async {
-        if let results = try? await SubtitleDecoder.decodeFile(
-            url: job.url, httpHeaders: job.headers, httpRequestAuthorization: job.httpRequestAuthorization,
-            sourceStreamIndices: job.targets.map(\.streamIndex)
-        ) {
-            for (target, result) in zip(job.targets, results) {
+        if let fill = await fillDecode(job.url, {
+            try await SubtitleDecoder.decodeFile(
+                url: job.url, httpHeaders: job.headers, httpRequestAuthorization: job.httpRequestAuthorization,
+                sourceStreamIndices: job.targets.map(\.streamIndex))
+        }) {
+            for (target, result) in zip(job.targets, fill.results) {
                 target.store.appendCues(result.cues)
-                target.store.markFinished()
+                target.store.markFinished(endedEarly: fill.endedEarly)
             }
             return
         }
@@ -1532,15 +1534,34 @@ extension AetherEngine {
         EngineLog.emit("[AetherEngine] external native store fill: shared pass over \(job.url.lastPathComponent) failed, retrying \(job.targets.count) targets individually", category: .engine)
         for target in job.targets {
             if Task.isCancelled { return }
-            guard let result = try? await SubtitleDecoder.decodeFile(
-                url: job.url, httpHeaders: job.headers, httpRequestAuthorization: job.httpRequestAuthorization,
-                sourceStreamIndex: target.streamIndex
-            ) else {
+            guard let fill = await fillDecode(job.url, {
+                [try await SubtitleDecoder.decodeFile(
+                    url: job.url, httpHeaders: job.headers, httpRequestAuthorization: job.httpRequestAuthorization,
+                    sourceStreamIndex: target.streamIndex)]
+            }), let result = fill.results.first else {
                 EngineLog.emit("[AetherEngine] external native store fill failed: \(job.url.lastPathComponent) stream=\(target.streamIndex.map(String.init) ?? "auto")", category: .engine)
                 continue
             }
             target.store.appendCues(result.cues)
-            target.store.markFinished()
+            target.store.markFinished(endedEarly: fill.endedEarly)
+        }
+    }
+
+    /// A fill whose download ended early still fills with what it decoded: the rendition serves only
+    /// a finished store, and one left unfinished would hold the player's subtitle read on it.
+    /// `endedEarly` keeps the overlay from backfilling that partial store as the whole file.
+    nonisolated private static func fillDecode(
+        _ url: URL, _ decode: () async throws -> [SidecarDecodeResult]
+    ) async -> (results: [SidecarDecodeResult], endedEarly: Bool)? {
+        do {
+            return (try await decode(), false)
+        } catch SubtitleDecoderError.truncated(let partial, _) {
+            EngineLog.emit("[AetherEngine] external native store fill: \(url.lastPathComponent) ended early, "
+                           + "filling \(partial.map { String($0.cues.count) }.joined(separator: "/")) cues",
+                           category: .engine)
+            return (partial, true)
+        } catch {
+            return nil
         }
     }
 
@@ -1594,12 +1615,23 @@ extension AetherEngine {
         let preserveASS = loadedOptions.preserveASSMarkup
         sidecarTask = Task { [weak self] in
             let result: SidecarDecodeResult
+            let complete: Bool
             do {
-                result = try await SubtitleDecoder.decodeFile(
-                    url: url, httpHeaders: effectiveHeaders, httpRequestAuthorization: httpRequestAuthorization,
-                    preserveASSMarkup: preserveASS,
-                    sourceStreamIndex: sourceStreamIndex
-                )
+                (result, complete) = try await Self.decodeSidecarRetryingTruncation(label: "sidecar") {
+                    try await SubtitleDecoder.decodeFile(
+                        url: url, httpHeaders: effectiveHeaders, httpRequestAuthorization: httpRequestAuthorization,
+                        preserveASSMarkup: preserveASS,
+                        sourceStreamIndex: sourceStreamIndex
+                    )
+                } showPartial: { partial in
+                    await MainActor.run {
+                        guard !Task.isCancelled, let self, self.isSubtitleActive else { return }
+                        self.sidecarASSHeader = partial.assHeader
+                        self.subtitleCues = partial.cues
+                        self.isSubtitleTrackIncomplete = true
+                        self.isLoadingSubtitles = false
+                    }
+                }
             } catch {
                 EngineLog.emit("[AetherEngine] sidecar decode failed: \(error)", category: .engine)
                 await MainActor.run {
@@ -1617,6 +1649,7 @@ extension AetherEngine {
                 // Sidecar cues are in source PTS; host renders against engine.sourceTime (which folds playlistShiftSeconds).
                 self.sidecarASSHeader = result.assHeader
                 self.subtitleCues = result.cues
+                self.isSubtitleTrackIncomplete = !complete
                 self.isLoadingSubtitles = false
                 // #496: the counterpart to the drainer's "overlay fed by packet-store drainer"
                 // line. Without it a whole-file publish is invisible, and a static `subCues` in
@@ -1626,13 +1659,64 @@ extension AetherEngine {
                     "[AetherEngine] overlay fed by sidecar decode: id="
                     + "\(externalTrackID.map(String.init) ?? "-") "
                     + "stream=\(sourceStreamIndex.map(String.init) ?? "auto") "
-                    + "(\(result.cues.count) cues)",
+                    + "(\(result.cues.count) cues\(complete ? "" : ", incomplete"))",
                     category: .engine)
                 // Native mov_text moov is declared at load; runtime sidecars drive only the host overlay (#55).
                 // Phase D: an external bitmap sidecar fills its OCR rendition store from THIS
                 // decode's image cues (no second download).
                 self.startSidecarOCRFillIfNeeded(externalTrackID: externalTrackID, cues: result.cues)
             }
+        }
+    }
+
+    /// Waits before each refetch of a sidecar whose download ended early. A server still extracting
+    /// the track serves a refetch everything demuxed so far at once, then the rest as it goes.
+    nonisolated static let sidecarTruncationRetryDelaysSeconds: [Double] = [2, 5, 10, 10, 10]
+
+    /// Runs `decode` until it reads the whole sidecar. A download that ended early is fetched
+    /// again after each delay in `sidecarTruncationRetryDelaysSeconds`, and each partial set holding
+    /// more cues than the one before goes to `showPartial`, so the overlay keeps what has arrived in
+    /// the meantime. Returns the complete result, or the largest partial once the retries are spent.
+    /// Any other failure on the first fetch throws, as it did before.
+    nonisolated static func decodeSidecarRetryingTruncation(
+        label: String,
+        delays: [Double] = sidecarTruncationRetryDelaysSeconds,
+        decode: @Sendable () async throws -> SidecarDecodeResult,
+        showPartial: @Sendable (SidecarDecodeResult) async -> Void
+    ) async throws -> (result: SidecarDecodeResult, complete: Bool) {
+        var best: SidecarDecodeResult?
+        var truncated = false
+        var attempt = 0
+        while true {
+            let failure: Error
+            do {
+                return (try await decode(), true)
+            } catch {
+                failure = error
+            }
+            try Task.checkCancellation()
+            if case .truncated(let partial, _)? = failure as? SubtitleDecoderError {
+                truncated = true
+                // The first partial is kept even when empty, so a cut that delivered nothing still
+                // ends as an incomplete track rather than a failed one.
+                if let cut = partial.first, cut.cues.count > (best?.cues.count ?? -1) {
+                    best = cut
+                    await showPartial(cut)
+                }
+            }
+            // A refetch after a cut can also fail outright (the server restarting); that is retried
+            // too, but a first fetch that never got anywhere fails the way it always has.
+            guard truncated else { throw failure }
+            guard attempt < delays.count else {
+                EngineLog.emit("[AetherEngine] \(label) still incomplete after \(attempt) refetches, "
+                               + "keeping \(best?.cues.count ?? 0) cues: \(failure)", category: .engine)
+                if let best { return (best, false) }
+                throw failure
+            }
+            EngineLog.emit("[AetherEngine] \(label) download ended early (\(failure)); refetching in "
+                           + "\(delays[attempt])s (\(attempt + 1)/\(delays.count))", category: .engine)
+            try await Task.sleep(for: .seconds(delays[attempt]))
+            attempt += 1
         }
     }
 
@@ -1659,11 +1743,21 @@ extension AetherEngine {
         let effectiveHeaders = httpHeaders ?? loadedOptions.httpHeaders
         secondarySidecarTask = Task { [weak self] in
             let result: SidecarDecodeResult
+            let complete: Bool
             do {
-                // Secondary is plain text only (never drives libass, mirroring embedded secondary #47).
-                result = try await SubtitleDecoder.decodeFile(
-                    url: url, httpHeaders: effectiveHeaders, httpRequestAuthorization: httpRequestAuthorization,
-                    sourceStreamIndex: sourceStreamIndex)
+                (result, complete) = try await Self.decodeSidecarRetryingTruncation(label: "secondary sidecar") {
+                    // Secondary is plain text only (never drives libass, mirroring embedded secondary #47).
+                    try await SubtitleDecoder.decodeFile(
+                        url: url, httpHeaders: effectiveHeaders, httpRequestAuthorization: httpRequestAuthorization,
+                        sourceStreamIndex: sourceStreamIndex)
+                } showPartial: { partial in
+                    await MainActor.run {
+                        guard !Task.isCancelled, let self, self.isSecondarySubtitleActive else { return }
+                        self.secondarySubtitleCues = partial.cues
+                        self.isSecondarySubtitleTrackIncomplete = true
+                        self.isLoadingSecondarySubtitles = false
+                    }
+                }
             } catch {
                 EngineLog.emit("[AetherEngine] secondary sidecar decode failed: \(error)", category: .engine)
                 await MainActor.run {
@@ -1676,6 +1770,7 @@ extension AetherEngine {
                 guard !Task.isCancelled, let self = self else { return }
                 guard self.isSecondarySubtitleActive else { return }
                 self.secondarySubtitleCues = result.cues
+                self.isSecondarySubtitleTrackIncomplete = !complete
                 self.isLoadingSecondarySubtitles = false
             }
         }
@@ -1750,9 +1845,11 @@ extension AetherEngine {
         case .primary:
             sidecarTask?.cancel()
             sidecarTask = nil
+            isSubtitleTrackIncomplete = false
         case .secondary:
             secondarySidecarTask?.cancel()
             secondarySidecarTask = nil
+            isSecondarySubtitleTrackIncomplete = false
         }
     }
 

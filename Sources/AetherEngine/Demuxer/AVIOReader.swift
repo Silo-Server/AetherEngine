@@ -563,6 +563,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// Audit DMX-107: why the streaming GET was ended by this reader when it was not the transport's
     /// doing. Guarded by `streamLock`.
     private var streamFailureCause: AVIOReaderError?
+    /// How long a forward-only read waits for the next byte before the source counts as stalled out
+    /// (EIO). A sidecar extract the server is still demuxing can be quiet far longer than a media
+    /// stream on a sparse track, so its decoder passes a wider budget.
+    static let streamIdleTimeoutDefault: TimeInterval = 15
+    private let streamIdleTimeout: TimeInterval
     /// The status the streaming GET was answered with when it was anything but 200/206, 0 while
     /// none. A status is not media: the delegate hangs up at the header, and `open()` fails typed
     /// on it rather than handing FFmpeg an empty stream to misreport as invalid data. Written on
@@ -1184,7 +1189,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private let probeDrainLock = NSLock()
     private var drainingProbeRequest = false
 
-    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, windowHighWater: Int? = nil, streamHighWater: Int? = nil, detourIdleSeconds: TimeInterval? = nil, detourFetchBudget: TimeInterval? = nil, heldConnection: Bool = false, probeControl: ProbeControl? = nil, probeRequestSession: URLSession? = nil, sourceOpenPolicy: SourceOpenPolicy = .init(), requestHeaderStore: RequestHeaderStore? = nil, backoffScale: Double = 1, pinIdleSeconds: TimeInterval = AVIOReader.pinIdleRepinSecondsDefault, liveRefusalRetryBudget: TimeInterval = AVIOReader.liveRefusalRetryBudget) {
+    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, windowHighWater: Int? = nil, streamHighWater: Int? = nil, detourIdleSeconds: TimeInterval? = nil, detourFetchBudget: TimeInterval? = nil, heldConnection: Bool = false, probeControl: ProbeControl? = nil, probeRequestSession: URLSession? = nil, sourceOpenPolicy: SourceOpenPolicy = .init(), requestHeaderStore: RequestHeaderStore? = nil, backoffScale: Double = 1, pinIdleSeconds: TimeInterval = AVIOReader.pinIdleRepinSecondsDefault, liveRefusalRetryBudget: TimeInterval = AVIOReader.liveRefusalRetryBudget, streamIdleTimeout: TimeInterval = AVIOReader.streamIdleTimeoutDefault) {
         self.sourceOpenPolicy = sourceOpenPolicy
         self.probeControl = probeControl
         self.probeRequestSession = probeControl == nil ? nil : probeRequestSession
@@ -1203,6 +1208,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         self.backoffScale = backoffScale
         self.pinIdleSeconds = pinIdleSeconds
         self.liveRefusalRetryBudgetSeconds = liveRefusalRetryBudget
+        self.streamIdleTimeout = max(0.05, streamIdleTimeout)
         self.connStallTimeout = max(0.05, connStallTimeout)
         self.winHighWater = max(1, windowHighWater
             ?? (isLive ? Self.liveWinHighWaterDefault : Self.winHighWaterDefault))
@@ -2164,7 +2170,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 }
                 streamLock.unlock()
                 toResume?.resume()
-                let timeout = streamDataReady.wait(timeout: .now() + .seconds(15))
+                let timeout = streamDataReady.wait(timeout: .now() + streamIdleTimeout)
                 if timeout == .timedOut { break }
             }
         }
