@@ -179,7 +179,7 @@ struct RemoteHLSSubtitleProxyTests {
         let track = RemoteHLSSubtitleProvider.Track(externalID: 100_000,
             source: ExternalSubtitleTrack(url: file, nativeTimelineOffsetSeconds: 600))
         let provider = RemoteHLSSubtitleProvider(tracks: [track], masterBody: Self.master,
-            programDuration: 60, defaultHeaders: [:], vttFillWaitSeconds: 0)
+            programDuration: 60, defaultHeaders: [:], mediaURL: nil, vttFillWaitSeconds: 0)
         let server = HLSLocalServer(provider: provider)
         try server.start()
         defer { server.stop(); provider.cancelFill() }
