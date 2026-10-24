@@ -88,8 +88,10 @@ final class SidecarASSMarkupTests: XCTestCase {
 @MainActor
 @Suite(.timeLimit(.minutes(1)))
 struct SecondarySidecarASSMarkupTests {
-    @Test("secondary ASS preserves raw events and its own script header when requested")
-    func secondaryASSPreservesMarkupAndHeader() async throws {
+    /// Silo fork: upstream #826 preserves secondary ASS markup; the fork keeps raw ASS on the primary
+    /// overlay only (as the embedded secondary drain does), because Silo draws secondary cues as text.
+    @Test("secondary ASS stays plain text while the primary keeps raw events")
+    func secondaryASSStaysPlain() async throws {
         let url = try MultiASSPlayResFixture.write()
         defer { try? FileManager.default.removeItem(at: url) }
         let engine = try AetherEngine()
@@ -107,21 +109,15 @@ struct SecondarySidecarASSMarkupTests {
         await engine.secondarySidecarTask?.value
 
         #expect(engine.sidecarASSHeader?.contains("PlayResX: 640") == true)
-        #expect(engine.secondarySidecarASSHeader?.contains("PlayResX: 1920") == true)
-        guard case .text(let primaryRaw) = try #require(engine.subtitleCues.first).body,
-              case .text(let secondaryRaw) = try #require(engine.secondarySubtitleCues.first).body
-        else {
-            Issue.record("preserved ASS cues must publish raw event lines on both channels")
+        #expect(engine.secondarySidecarASSHeader == nil)
+        guard case .text(let primaryRaw) = try #require(engine.subtitleCues.first).body else {
+            Issue.record("preserved ASS cues must publish raw event lines on the primary channel")
             return
         }
         #expect(primaryRaw.contains(#"{\pos(320,240)}"#))
-        #expect(secondaryRaw.contains(#"{\pos(320,240)}"#))
-
-        engine.loadedURL = URL(string: "https://media.example/movie.mkv")!
-        engine.selectSecondarySubtitleTrack(index: 3)
-        #expect(engine.secondarySidecarASSHeader == nil)
+        #expect(!engine.secondarySubtitleCues.isEmpty)
+        #expect(engine.secondarySubtitleCues.allSatisfy { !($0.text ?? "").contains("{\\pos") })
     }
-
 
     @Test("default secondary ASS output stays headerless")
     func defaultOutput() async throws {
@@ -136,33 +132,21 @@ struct SecondarySidecarASSMarkupTests {
         #expect(engine.secondarySubtitleCues.allSatisfy { !($0.text ?? "").contains("{\\pos") })
     }
 
-    @Test("clear, stop and cancelled decode cannot leave secondary ASS metadata behind")
-    func lifecycle() async throws {
+    @Test("a cancelled secondary decode leaves no cues behind")
+    func cancelledDecode() async throws {
         let url = try MultiASSPlayResFixture.write()
         defer { try? FileManager.default.removeItem(at: url) }
         let engine = try AetherEngine()
         engine.setLoadedOptionsForTesting(LoadOptions(preserveASSMarkup: true))
-        engine.selectSecondarySidecarSubtitle(url: url)
-        await engine.secondarySidecarTask?.value
-        #expect(engine.secondarySidecarASSHeader != nil)
-        engine.clearSubtitle()
-        #expect(engine.secondarySidecarASSHeader != nil)
-        engine.clearSecondarySubtitle()
-        #expect(engine.secondarySidecarASSHeader == nil)
         engine.selectSecondarySidecarSubtitle(url: url)
         let pending = engine.secondarySidecarTask
         engine.clearSecondarySubtitle()
         await pending?.value
         #expect(engine.secondarySidecarASSHeader == nil)
         #expect(engine.secondarySubtitleCues.isEmpty)
-        engine.selectSecondarySidecarSubtitle(url: url)
-        await engine.secondarySidecarTask?.value
-        #expect(engine.secondarySidecarASSHeader != nil)
-        engine.stopInternal()
-        #expect(engine.secondarySidecarASSHeader == nil)
     }
 
-    @Test("switching to SubRip removes ASS header without turning its text into ASS")
+    @Test("switching to SubRip keeps secondary text plain")
     func switchToSubRip() async throws {
         let ass = try MultiASSPlayResFixture.write()
         let srt = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".srt")
@@ -173,15 +157,13 @@ struct SecondarySidecarASSMarkupTests {
         engine.setLoadedOptionsForTesting(LoadOptions(preserveASSMarkup: true))
         engine.selectSecondarySidecarSubtitle(url: ass)
         await engine.secondarySidecarTask?.value
-        #expect(engine.secondarySidecarASSHeader != nil)
         engine.selectSecondarySidecarSubtitle(url: srt)
-        #expect(engine.secondarySidecarASSHeader == nil)
         await engine.secondarySidecarTask?.value
         #expect(engine.secondarySidecarASSHeader == nil)
         #expect(engine.secondarySubtitleCues.compactMap(\.text) == ["Hello"])
     }
 
-    @Test("session carryover restores the secondary ASS header from its sidecar")
+    @Test("session carryover restores the secondary sidecar as plain text")
     func restoreAfterTeardown() async throws {
         let url = try MultiASSPlayResFixture.write()
         defer { try? FileManager.default.removeItem(at: url) }
@@ -190,15 +172,15 @@ struct SecondarySidecarASSMarkupTests {
         engine.setLoadedOptionsForTesting(LoadOptions(preserveASSMarkup: true))
         engine.selectSecondarySidecarSubtitle(url: url)
         await engine.secondarySidecarTask?.value
-        let header = try #require(engine.secondarySidecarASSHeader)
+        let cues = engine.secondarySubtitleCues.compactMap(\.text)
+        #expect(!cues.isEmpty)
         let carryover = engine.captureSubtitleSessionCarryover()
         engine.stopInternal()
-        #expect(engine.secondarySidecarASSHeader == nil)
         engine.setLoadedOptionsForTesting(LoadOptions(preserveASSMarkup: true))
         engine.restoreSubtitleSelection(from: carryover, resumeAnchor: 0)
         await engine.secondarySidecarTask?.value
-        #expect(engine.secondarySidecarASSHeader == header)
-        #expect(!engine.secondarySubtitleCues.isEmpty)
+        #expect(engine.secondarySidecarASSHeader == nil)
+        #expect(engine.secondarySubtitleCues.compactMap(\.text) == cues)
     }
 
     @Test("preserveASSMarkup does not turn secondary WebVTT into raw ASS")

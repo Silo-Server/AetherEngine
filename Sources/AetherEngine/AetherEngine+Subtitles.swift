@@ -1789,7 +1789,8 @@ extension AetherEngine {
         let effectiveHeaders = Self.resolvedSubtitleHeaders(
             for: url, explicit: httpHeaders, mediaURL: loadedURL,
             mediaHeaders: loadedOptions.httpHeaders)
-        let preserveASS = loadedOptions.preserveASSMarkup
+        // Silo fork: raw ASS goes to the primary overlay only, as in makeSubtitleDrainDecoder, so a
+        // secondary sidecar stays plain text and publishes no secondarySidecarASSHeader (#826 upstream).
         let sessionGeneration = loadGeneration
         let preparationPolicy = activeSecondaryExternalSubtitleTrackID.flatMap { externalSubtitleRegistry[$0] }?.preparationPolicy
         secondarySidecarTask = Task { [weak self] in
@@ -1799,7 +1800,6 @@ extension AetherEngine {
                 (result, complete) = try await Self.decodeSidecarRetryingTruncation(label: "secondary sidecar") {
                     try await SubtitleDecoder.decodeFile(
                         url: url, httpHeaders: effectiveHeaders, httpRequestAuthorization: httpRequestAuthorization,
-                        preserveASSMarkup: preserveASS,
                         sourceStreamIndex: sourceStreamIndex, preparationPolicy: preparationPolicy)
                 } showPartial: { partial in
                     await MainActor.run {
