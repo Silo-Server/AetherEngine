@@ -201,7 +201,7 @@ struct PreparedExternalSubtitleTests {
     }
 
     @Test(arguments: [false, true])
-    func preparedASSKeepsRequestedStyleAndSecondaryHeader(preserve: Bool) async throws {
+    func preparedSecondaryASSKeepsStyledText(preserve: Bool) async throws {
         let ass = """
         [Script Info]
         ScriptType: v4.00+
@@ -223,18 +223,11 @@ struct PreparedExternalSubtitleTests {
         let candidate = try await engine.prepareExternalSubtitle(ExternalSubtitleTrack(url: url))
         let track = try engine.commitExternalSubtitle(candidate, secondary: true)
         let cue = try #require(engine.secondarySubtitleCues.first)
-        if preserve {
-            let header = try #require(engine.secondarySidecarASSHeader)
-            #expect(header.contains("PlayResX: 1920"))
-            let builder = ASSScriptBuilder(header: header)
-            #expect(builder.add(rawEventText: try #require(cue.text), start: cue.startTime, end: cue.endTime))
-            #expect(builder.script().contains("{\\i1}Hello{\\i0} world"))
-        } else {
-            #expect(engine.secondarySidecarASSHeader == nil)
-            #expect(cue.text == "Hello world")
-            guard case .richText(let runs) = cue.body else { Issue.record("default ASS styling was lost"); return }
-            #expect(runs.first?.isItalic == true)
-        }
+        // Silo fork: the secondary channel stays styled text with or without preserveASSMarkup.
+        #expect(engine.secondarySidecarASSHeader == nil)
+        #expect(cue.text == "Hello world")
+        guard case .richText(let runs) = cue.body else { Issue.record("default ASS styling was lost"); return }
+        #expect(runs.first?.isItalic == true)
         #expect(engine.subtitleCues.first?.text == "Old")
         #expect(engine.externalSubtitleRegistry[track.id]?.preparationPolicy != nil)
     }
@@ -272,5 +265,34 @@ struct PreparedExternalSubtitleTests {
         _ = try engine.commitExternalSubtitle(candidate)
         #expect(rejection == .stale)
         #expect(engine.subtitleTracks.count == 1)
+    }
+
+    /// Silo fork: a secondary commit drops the raw event fields but keeps the dialogue and its placement.
+    @Test func secondaryASSCommitStaysPlainWhenMarkupIsPreserved() async throws {
+        let ass = """
+        [Script Info]
+        ScriptType: v4.00+
+        PlayResX: 640
+        PlayResY: 360
+
+        [V4+ Styles]
+        Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+        Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,0,2,10,10,10,1
+
+        [Events]
+        Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+        Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,{\\pos(320,240)}Hello, there
+
+        """
+        let url = try file(ass, ext: "ass")
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let engine = try player()
+        engine.setLoadedOptionsForTesting(LoadOptions(preserveASSMarkup: true))
+        let prepared = try await engine.prepareExternalSubtitle(ExternalSubtitleTrack(url: url))
+        _ = try engine.commitExternalSubtitle(prepared, secondary: true)
+        #expect(engine.secondarySidecarASSHeader == nil)
+        let cue = try #require(engine.secondarySubtitleCues.first)
+        #expect(cue.text == "Hello, there")
+        #expect(cue.placement?.position != nil)
     }
 }

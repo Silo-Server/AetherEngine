@@ -110,8 +110,20 @@ extension AetherEngine {
             activeSecondaryExternalSubtitleTrackID = info.id
             loadedSecondarySidecarURL = prepared.track.url
             isSecondarySubtitleActive = true
-            secondarySubtitleCues = decoded.cues
-            secondarySidecarASSHeader = decoded.assHeader
+            // Silo fork: the secondary channel gets the same styled text as startSecondarySidecarDecode,
+            // so raw ASS events kept under preserveASSMarkup are parsed here the way the plain decode does.
+            if let header = decoded.assHeader {
+                let playRes = SubtitleRectText.playRes(fromASSHeader: header) ?? SubtitleRectText.defaultASSPlayRes
+                secondarySubtitleCues = decoded.cues.compactMap { cue in
+                    guard let raw = cue.text,
+                          let parsed = SubtitleRectText.styledBody(fromASSEventLine: raw, playRes: playRes) else { return nil }
+                    return SubtitleCue(id: cue.id, startTime: cue.startTime, endTime: cue.endTime,
+                                       body: parsed.body, placement: parsed.placement)
+                }
+            } else {
+                secondarySubtitleCues = decoded.cues
+            }
+            secondarySidecarASSHeader = nil
             isLoadingSecondarySubtitles = false
         } else {
             cancelSubtitleOCRWorker()

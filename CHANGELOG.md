@@ -38,6 +38,8 @@ the public-API contract.
   `secondarySidecarASSHeader` for a secondary sidecar when `preserveASSMarkup` is on. The fork keeps
   raw ASS on the primary overlay only, as it already does for an embedded secondary track, so a host
   that draws secondary cues as text never shows event lines; `secondarySidecarASSHeader` stays nil.
+  `commitExternalSubtitle(_:secondary: true)` follows the same rule: it parses a prepared ASS
+  candidate's raw events into styled text and placement instead of publishing them.
 
 - A sidecar subtitle download that ends early no longer reads as the whole file. A read error, a stalled source, or an origin that breaks the body off after its headers now fails the decode as truncated, with the cues read so far. The primary and secondary sidecars keep those cues on screen, refetch up to five times, and replace them when a decode completes; `isSubtitleTrackIncomplete` / `isSecondarySubtitleTrackIncomplete` say when the cues are known to be short. An authorized sidecar fetch has no lifetime cap any more, only a 60 s idle timeout (it was cut at 120 s, while a server extracting a track from a large remux can take minutes), and its forward-only read waits 60 s for data instead of 15 s. A native-rendition fill cut short still serves what it received, and selecting that track for the overlay decodes the sidecar again instead of taking the partial store as the whole file.
 - CI runs the HLS, subtitle/resource authorization and live trust-evaluator suites in a separate test process so unrelated blocking tests cannot delay their resolvers. All tests and existing deadlines remain enforced.
