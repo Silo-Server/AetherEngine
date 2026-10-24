@@ -574,7 +574,10 @@ final class PersistentHTTP1Connection: @unchecked Sendable {
 
     /// The next piece of a body under `framing`, nil at its end, plus the framing after it. No
     /// cancellation handler: the caller decides whether an abandoned body is drained or closed.
-    func readChunk(_ framing: Framing, progress: () -> String) async throws -> (Data?, Framing) {
+    func readChunk(
+        _ framing: Framing, progress: () -> String,
+        isolation: isolated (any Actor)? = #isolation
+    ) async throws -> (Data?, Framing) {
         guard let task = stateLock.withLock({ retired ? nil : task }) else { throw CancellationError() }
         while true {
             switch framing {
@@ -731,7 +734,10 @@ final class PersistentHTTP1Connection: @unchecked Sendable {
     }
 
     /// Bytes left over from the head read first, then the socket. nil is EOF.
-    private func nextBytes(_ task: URLSessionStreamTask, upTo limit: Int, progress: () -> String) async throws -> Data? {
+    private func nextBytes(
+        _ task: URLSessionStreamTask, upTo limit: Int, progress: () -> String,
+        isolation: isolated (any Actor)? = #isolation
+    ) async throws -> Data? {
         let buffered = stateLock.withLock { () -> Data in
             let slice = pending.prefix(limit)
             pending.removeFirst(slice.count)

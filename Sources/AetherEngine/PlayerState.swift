@@ -414,8 +414,14 @@ public enum DolbyVisionHandling: String, Sendable, Equatable, CaseIterable {
 public struct LoadOptions: Sendable, Equatable {
     /// Diagnostic lever: omit BT.2020 / transfer / YCbCr matrix from AVDisplayCriteria so AVPlayer re-reads color from the bitstream. Default off.
     public var omitCriteriaColorExtensions: Bool
-    /// Skip display-criteria handshake entirely. For previews and `aetherctl` where no panel exists. Default off.
+    /// The engine writes no display criteria because AVKit does: `true` is `DisplayCriteriaOwner.avKit`, and the
+    /// engine holds play() up to a second for AVKit's write on HDR and Dolby Vision content. Also the setting for
+    /// previews and `aetherctl`, where no panel exists. A host that keeps the panel in its system format, or
+    /// writes criteria itself, wants `displayCriteriaOwner = .host` instead. Default off.
     public var suppressDisplayCriteria: Bool
+    /// Who writes `preferredDisplayCriteria` for this load (AE#842). `.engine` (default) defers to
+    /// `suppressDisplayCriteria`; `.avKit` and `.host` win over it. See `DisplayCriteriaOwner`.
+    public var displayCriteriaOwner: DisplayCriteriaOwner = .engine
     /// Extra HTTP headers for HEAD probe, Range chunks, side-demuxer fetches. On the loopback paths they are NOT forwarded to AVPlayer (it hits the local server); on `nativeRemoteHLS` they ride into the AVURLAsset so header-enforcing origins (IPTV Referer / User-Agent / Authorization) work (#119). Forwarded to `selectSidecarSubtitle` by default; pass explicit headers to override (#32). Default empty.
     public var httpHeaders: [String: String]
     /// Refreshable complete headers for native HLS relay requests and playlist preflight. Forces
@@ -589,6 +595,14 @@ public struct LoadOptions: Sendable, Equatable {
     /// (`AetherEngine.OptionalComponent`).
     public var objectAudioRendering: ObjectAudioRendering
 
+    /// How a 3D source is presented where the system shows stereo (visionOS; elsewhere every source plays
+    /// 2D as before). `.automatic` (default) keeps an MV-HEVC stream's second view and presents the frame
+    /// packing a container declares; `.sideBySide` / `.overUnder` say what the file's name alone says (a
+    /// host's per-title choice); `.mono` plays 2D. Frame packing is signalled on HEVC only: AVPlayer
+    /// refuses it on H.264 over HLS, so an H.264 packed frame plays 2D. See `StereoVideoSignal`. A tuning
+    /// field: `reloadAtCurrentPosition(applying:)` carries a change (a viewer's per-title 2D / 3D choice).
+    public var stereoPresentation: StereoPresentation = .automatic
+
     /// Treat the source as a live stream. `seek(to:)` becomes a no-op; `isLive` surface reflects this for host UIs. Set explicitly: auto-detection from `probe.durationSeconds == 0` is too noisy (VOD MKVs with broken duration headers). Default `false`.
     public var isLive: Bool
 
@@ -650,6 +664,29 @@ public struct LoadOptions: Sendable, Equatable {
     /// A shallow initial playlist can rebuffer if the next segment arrives late. Hosts choose
     /// this latency/resilience tradeoff; invalid values preserve the two-segment minimum.
     public var liveStartupSingleSegmentMinimumSeconds: Double? = nil
+
+    /// How far behind the live edge a live session plays, in seconds: the buffer a live viewer has
+    /// against a link that is slower or less steady than the channel. nil (default) keeps each path's
+    /// own distance (`liveJoinProfile` decides it on the loopback, the source's delivery unit on the
+    /// software path, the origin's HOLD-BACK on `nativeRemoteHLS`). A value only ever moves the
+    /// playhead FURTHER back, never closer than the path's own safe distance, and is clamped to
+    /// `LiveEdgePolicy.maximumEdgeCushionSeconds` (45 s).
+    ///
+    /// Live media arrives in real time, so a cushion can only be bought by waiting: a join holds
+    /// until that much media stands behind the newest (a live HLS origin that lists a backlog fills it
+    /// at link speed, a raw MPEG-TS channel only at 1x after its connect burst), and the session then
+    /// plays that far behind the broadcast for as long as it runs. On the loopback it raises the
+    /// advertised `HOLD-BACK` and the first-serve gate with it (and floors `.fastZap`'s bounded start
+    /// at it), and the live HLS ingest joins deep enough to cover it; on the software path it is the
+    /// join lead and the cushion a rebuffer refills before resuming (a session without a DVR window
+    /// keeps a packet ring that deep for it and still publishes no rewind window); on `nativeRemoteHLS` it is
+    /// `AVPlayerItem.configuredTimeOffsetFromLive`, preserved across stalls and raised to the origin's
+    /// `recommendedTimeOffsetFromLive` once its playlist is read. A session holding the
+    /// cushion reads `isAtLiveEdge` (on the AVPlayer paths the published edge already sits a holdback
+    /// back; the software path widens its tolerance by the cushion). It cannot help a link that is slower than the channel's bitrate,
+    /// where a deeper buffer only delays the stall. Invalid or non-positive values mean nil. Ignored
+    /// for VOD. Default nil.
+    public var liveEdgeCushionSeconds: Double? = nil
 
     /// Cut AVPlayer's stall-avoidance wait short at the live join, once it is holding on media it has
     /// already buffered. Live sessions on the AVPlayer-backed paths only. Default `false` (AE#440).
@@ -747,7 +784,7 @@ public struct LoadOptions: Sendable, Equatable {
     /// this runs the same bounded decode pass as `AetherEngine.probeDetectingAtmos` (see `AtmosDetectionOptions`
     /// for the caps) on a second handle to the source, once per E-AC-3 track, and republishes `audioTracks` as
     /// tracks confirm. It starts only after the session is up and runs at utility priority, so it never delays
-    /// the first frame. Skipped for live sources and for forward-only custom readers, which cannot be re-read.
+    /// the first frame. Skipped for live sources, for forward-only custom readers, which cannot be re-read, and where a second request would cost the video path its link: an origin limited to one request (`maxConcurrentSourceRequests == 1`, or a limit the engine learned from 429/503/509 refusals, re-checked before every track), `sequentialOrigin` and `heldSourceConnection`. One `[AtmosConfirmation]` log line names the reason, or how far a stopped pass got.
     /// Default `false` (#214 follow-up).
     public var confirmAtmos: Bool = false
 
@@ -886,6 +923,11 @@ public struct LoadOptions: Sendable, Equatable {
     /// remote server directly.
     public var forwardBufferSegments: Int?
 
+    /// Optional temporary session-cache budget. Nil retains automatic sizing; zero keeps only the working window.
+    public var sessionCacheByteBudget: Int? = nil
+    /// Compressed-packet storage for seekable software VOD; automatic retains platform defaults.
+    public var softwarePacketCacheStorage: SoftwarePacketCacheStorage = .automatic
+
     /// Serve each VOD loopback segment while it is being written instead of after its cut. The
     /// muxer flushes a fragment about every half second and the loopback server sends each one as
     /// it lands, so AVPlayer can show and start on the first fragments of a segment rather than
@@ -988,6 +1030,7 @@ public struct LoadOptions: Sendable, Equatable {
     public init(
         omitCriteriaColorExtensions: Bool = false,
         suppressDisplayCriteria: Bool = false,
+        displayCriteriaOwner: DisplayCriteriaOwner = .engine,
         httpHeaders: [String: String] = [:],
         httpRequestAuthorization: HTTPRequestAuthorization? = nil,
         keepDvh1TagWithoutDV: Bool = false,
@@ -1000,6 +1043,7 @@ public struct LoadOptions: Sendable, Equatable {
         panelPresentsDolbyVision: Bool = false,
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         objectAudioRendering: ObjectAudioRendering = .off,
+        stereoPresentation: StereoPresentation = .automatic,
         isLive: Bool = false,
         audioOnly: Bool = false,
         dvrWindowSeconds: Double? = nil,
@@ -1008,6 +1052,7 @@ public struct LoadOptions: Sendable, Equatable {
         sourceOpenPolicy: SourceOpenPolicy = .init(),
         liveStartupGraceSeconds: Double? = nil,
         liveStartupSingleSegmentMinimumSeconds: Double? = nil,
+        liveEdgeCushionSeconds: Double? = nil,
         liveJoinStartsImmediately: Bool = true,
         clampsLiveResumeToWindow: Bool = true,
         nativeRemoteHLS: Bool = false,
@@ -1028,6 +1073,8 @@ public struct LoadOptions: Sendable, Equatable {
         preferredSubtitleLanguages: [String] = [],
         externalSubtitles: [ExternalSubtitleTrack] = [],
         forwardBufferSegments: Int? = nil,
+        sessionCacheByteBudget: Int? = nil,
+        softwarePacketCacheStorage: SoftwarePacketCacheStorage = .automatic,
         progressiveSegmentDelivery: Bool = false,
         autoplay: Bool = true,
         teletextPage: Int? = nil,
@@ -1043,6 +1090,7 @@ public struct LoadOptions: Sendable, Equatable {
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
+        self.displayCriteriaOwner = displayCriteriaOwner
         self.httpHeaders = httpHeaders
         self.httpRequestAuthorization = httpRequestAuthorization
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
@@ -1055,6 +1103,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.panelPresentsDolbyVision = panelPresentsDolbyVision
         self.audioBridgeMode = audioBridgeMode
         self.objectAudioRendering = objectAudioRendering
+        self.stereoPresentation = stereoPresentation
         self.isLive = isLive
         self.audioOnly = audioOnly
         self.dvrWindowSeconds = dvrWindowSeconds
@@ -1063,6 +1112,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.sourceOpenPolicy = sourceOpenPolicy
         self.liveStartupGraceSeconds = liveStartupGraceSeconds
         self.liveStartupSingleSegmentMinimumSeconds = liveStartupSingleSegmentMinimumSeconds
+        self.liveEdgeCushionSeconds = liveEdgeCushionSeconds
         self.liveJoinStartsImmediately = liveJoinStartsImmediately
         self.clampsLiveResumeToWindow = clampsLiveResumeToWindow
         self.nativeRemoteHLS = nativeRemoteHLS
@@ -1083,6 +1133,8 @@ public struct LoadOptions: Sendable, Equatable {
         self.preferredSubtitleLanguages = preferredSubtitleLanguages
         self.externalSubtitles = externalSubtitles
         self.forwardBufferSegments = forwardBufferSegments
+        self.sessionCacheByteBudget = sessionCacheByteBudget
+        self.softwarePacketCacheStorage = softwarePacketCacheStorage
         self.progressiveSegmentDelivery = progressiveSegmentDelivery
         self.autoplay = autoplay
         self.teletextPage = teletextPage
@@ -1292,8 +1344,8 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
     public internal(set) var isAtmos: Bool
 
     /// DTS:X. True from the probe when libavcodec labels the profile DTS:X, and set during playback when
-    /// LibDTSX confirms a track FFmpeg labelled plain DTS-HD MA (FFmpeg reads only two of DTS:X's
-    /// markers). Never cleared once set for a session's source, so a confirmed track keeps its name in a
+    /// the DTS:X decoder confirms a track the probe labelled plain DTS-HD MA (the label rests on the
+    /// frames the probe read). Never cleared once set for a session's source, so a confirmed track keeps its name in a
     /// track menu after a switch away from it.
     public internal(set) var isDTSX: Bool
 

@@ -27,6 +27,7 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
     private let programDuration: Double
     private let stores: [NativeSubtitleCueStore]
     private let defaultHeaders: [String: String]
+    private let mediaURL: URL?
     /// Guards `fillTask` alone: the fill is started from the proxy's build (off the main actor) and
     /// cancelled from the engine's teardown (on it), so the handle is genuinely shared.
     private let fillLock = NSLock()
@@ -54,7 +55,7 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
     private let vttFillWaitSeconds: TimeInterval
 
     init(tracks: [Track], masterBody: String, programDuration: Double,
-         defaultHeaders: [String: String],
+         defaultHeaders: [String: String], mediaURL: URL?,
          vttFillWaitSeconds: TimeInterval = defaultVTTFillWaitSeconds) {
         self.tracks = tracks
         self.staticMasterPlaylistBody = masterBody
@@ -66,6 +67,7 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
         let finiteDuration = programDuration.isFinite ? programDuration : 1
         self.programDuration = min(max(1, finiteDuration), RemoteHLSSubtitleProxy.maxProgramDurationSeconds)
         self.defaultHeaders = defaultHeaders
+        self.mediaURL = mediaURL
         self.vttFillWaitSeconds = vttFillWaitSeconds
         self.stores = tracks.map { _ in NativeSubtitleCueStore() }
     }
@@ -93,7 +95,7 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
     /// once and a single bad stream index cannot blank its siblings.
     func startFill() {
         cancelDecode()
-        let jobs = Self.fillJobs(tracks: tracks, stores: stores, defaultHeaders: defaultHeaders)
+        let jobs = Self.fillJobs(tracks: tracks, stores: stores, defaultHeaders: defaultHeaders, mediaURL: mediaURL)
         guard !jobs.isEmpty else { return }
         let task = BlockingWork.detached(priority: .utility) { [jobs] in
             for job in jobs {
@@ -195,7 +197,7 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
     /// `AetherEngine.externalSubtitleFillJobs`, which keys off the loopback's rendition table.
     static func fillJobs(tracks: [Track],
                          stores: [NativeSubtitleCueStore],
-                         defaultHeaders: [String: String]) -> [AetherEngine.ExternalSubtitleFillJob] {
+                         defaultHeaders: [String: String], mediaURL: URL?) -> [AetherEngine.ExternalSubtitleFillJob] {
         struct Key: Hashable {
             let url: URL
             let headers: [String: String]
@@ -206,7 +208,9 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
         var targetsByKey: [Key: [AetherEngine.ExternalSubtitleFillJob.Target]] = [:]
         for (ordinal, track) in tracks.enumerated() where ordinal < stores.count {
             stores[ordinal].setExternalTimelineOffsetSeconds(track.source.nativeTimelineOffsetSeconds)
-            let key = Key(url: track.source.url, headers: track.source.httpHeaders ?? defaultHeaders,
+            let key = Key(url: track.source.url, headers: AetherEngine.resolvedSubtitleHeaders(
+                              for: track.source.url, explicit: track.source.httpHeaders, mediaURL: mediaURL,
+                              mediaHeaders: defaultHeaders),
                           authorizationID: track.source.httpRequestAuthorization.map(ObjectIdentifier.init))
             authorizationsByKey[key] = track.source.httpRequestAuthorization
             if targetsByKey[key] == nil { order.append(key) }
