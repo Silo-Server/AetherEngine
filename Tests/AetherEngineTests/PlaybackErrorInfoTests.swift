@@ -50,6 +50,28 @@ struct PlaybackErrorInfoTests {
         #expect(observed?.kind == .liveSourceUnavailable)
     }
 
+    @MainActor
+    @Test("A plain-URL live open the origin refuses publishes its answer, not an outage (#796)",
+          .timeLimit(.minutes(1)),
+          arguments: [(503, PlaybackErrorKind.sourceRateLimited), (403, .sourceRefused)])
+    func refusedLiveOpenPublishesTheOriginsAnswer(status: Int, kind: PlaybackErrorKind) async throws {
+        let origin = try #require(RefusingOrigin(status: status))
+        defer { origin.stop() }
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        var options = LoadOptions()
+        options.isLive = true
+        do {
+            _ = try await engine.load(
+                url: try #require(URL(string: "http://127.0.0.1:\(origin.port)/live/1.ts")), options: options)
+            Issue.record("A refused live open must fail the load")
+        } catch {
+            #expect(error as? AVIOReaderError == .httpStatus(status))
+        }
+        #expect(engine.errorInfo?.kind == kind)
+        #expect(engine.errorInfo?.underlyingCode == status)
+    }
+
     /// Loads `url` live through the engine's own HLS ingest, as a known HLS playlist on the live path
     /// is, and returns the failure the load published.
     @MainActor

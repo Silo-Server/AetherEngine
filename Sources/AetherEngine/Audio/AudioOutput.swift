@@ -372,8 +372,7 @@ final class AudioOutput: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         _epoch &+= 1
-        prerollGeneration &+= 1
-        prerollRate = nil
+        endPreroll()
         synchronizer.setRate(0.0, time: .zero)
         renderer.flush()
     }
@@ -384,24 +383,26 @@ final class AudioOutput: @unchecked Sendable {
     func seekClock(to time: CMTime, rate: Float) {
         // Asked before taking `lock`: the gate reads the video renderer's state under its own lock.
         let preroll = rate > 0 ? videoPrerollSatisfied?(time.seconds) : nil
+        let progress = preroll == false ? videoPrerollProgress?() : nil
         lock.lock()
         defer { lock.unlock() }
         EngineLog.emit("[AudioOutput] seekClock to=\(String(format: "%.3f", time.seconds)) rate=\(rate)", category: .swPlayback)
-        prerollGeneration &+= 1
-        prerollRate = nil
-        guard let preroll else {
+        endPreroll()
+        switch preroll {
+        case nil:
             synchronizer.setRate(rate, time: timeline.rendererTime(forSource: time))
-            return
-        }
-        if preroll {
+        case true?:
             startAfterPreroll(rate: rate, time: time)
-            return
+        case false?:
+            synchronizer.setRate(0, time: timeline.rendererTime(forSource: time))
+            let gen = prerollGeneration
+            prerollRate = rate
+            let started = CACurrentMediaTime()
+            _onPrerollTransition?(PrerollTransition(generation: gen, event: .began))
+            let wait = PrerollWait(gen: gen, time: time, started: started,
+                                   progress: progress, progressAt: started)
+            prerollQueue.async { [weak self] in self?.pollPreroll(wait) }
         }
-        synchronizer.setRate(0, time: timeline.rendererTime(forSource: time))
-        let gen = prerollGeneration
-        prerollRate = rate
-        let started = CACurrentMediaTime()
-        prerollQueue.async { [weak self] in self?.pollPreroll(gen: gen, time: time, started: started) }
     }
 
     // MARK: - Video preroll
@@ -424,8 +425,38 @@ final class AudioOutput: @unchecked Sendable {
     }
     private var _videoPrerollSatisfied: (@Sendable (Double) -> Bool?)?  // guarded by lock
 
-    /// How long a preroll may hold the clock. A decoder that never delivers must not freeze playback.
+    /// The decoder's progress for the preroll (`VideoDecodingPipeline.framesDecoded`): a hold whose
+    /// decoder keeps producing frames, the ones it skips on the way to the target included, may outlast
+    /// `prerollTimeout` up to `prerollProgressCap`. nil, or a count that never moves, keeps the plain
+    /// timeout.
+    var videoPrerollProgress: (@Sendable () -> UInt64)? {
+        get { lock.lock(); defer { lock.unlock() }; return _videoPrerollProgress }
+        set { lock.lock(); _videoPrerollProgress = newValue; lock.unlock() }
+    }
+    private var _videoPrerollProgress: (@Sendable () -> UInt64)?  // guarded by lock
+
+    /// Every hold of the clock and its end, in order (`AetherEngine.clockHoldEvents`). Called off main
+    /// with `lock` held, so it must not call back into this object.
+    var onPrerollTransition: (@Sendable (PrerollTransition) -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return _onPrerollTransition }
+        set { lock.lock(); _onPrerollTransition = newValue; lock.unlock() }
+    }
+    private var _onPrerollTransition: (@Sendable (PrerollTransition) -> Void)?  // guarded by lock
+
+    struct PrerollTransition: Sendable, Equatable {
+        let generation: Int
+        let event: ClockHoldEvent
+    }
+
+    /// How long a preroll may hold the clock with the decoder producing nothing. A decoder that never
+    /// delivers must not freeze playback.
     static let prerollTimeout: Double = 2
+
+    /// How long a preroll may hold the clock while the decoder is still producing frames. 4K AV1 in
+    /// libdav1d on an Apple TV 4K (A15) took 2.9 to 3.9 s from a seek to its first frame at the target,
+    /// so a plain 2 s timeout started the clock 0.6 to 1.6 s ahead of the picture and dropped what it
+    /// owed (#800).
+    static let prerollProgressCap: Double = 6
 
     /// How far ahead of now a prerolled start is scheduled. On tvOS the synchronizer lives in another
     /// process, and the display path learns of a rate change about as late as the audio route's output
@@ -447,29 +478,52 @@ final class AudioOutput: @unchecked Sendable {
         return prerollRate != nil
     }
 
-    private func pollPreroll(gen: Int, time: CMTime, started: CFTimeInterval) {
+    private struct PrerollWait: Sendable {
+        let gen: Int
+        let time: CMTime
+        let started: CFTimeInterval
+        var progress: UInt64?
+        var progressAt: CFTimeInterval
+    }
+
+    /// Whether a hold that is not ready yet waits on: inside `prerollTimeout` of its start or of the
+    /// decoder's last frame, and never past `prerollProgressCap`.
+    static func prerollKeepsWaiting(waited: Double, sinceProgress: Double) -> Bool {
+        waited < prerollProgressCap && sinceProgress < prerollTimeout
+    }
+
+    private func pollPreroll(_ wait: PrerollWait) {
         // A pause, seek or stop since: this chain is over. Without the check every cancelled preroll
         // polled on at 500 Hz, taking both locks, until its gate opened or it timed out.
         lock.lock()
-        let current = prerollGeneration == gen && prerollRate != nil
+        let current = prerollGeneration == wait.gen && prerollRate != nil
         lock.unlock()
         guard current else { return }
-        let ready = videoPrerollSatisfied?(time.seconds) != false
-        let waited = CACurrentMediaTime() - started
-        if !ready, waited < Self.prerollTimeout {
+        let ready = videoPrerollSatisfied?(wait.time.seconds) != false
+        let now = CACurrentMediaTime()
+        var wait = wait
+        if let count = videoPrerollProgress?(), count != wait.progress {
+            if wait.progress != nil { wait.progressAt = now }
+            wait.progress = count
+        }
+        let waited = now - wait.started
+        if !ready, Self.prerollKeepsWaiting(waited: waited, sinceProgress: now - wait.progressAt) {
+            let next = wait
             prerollQueue.asyncAfter(deadline: .now() + .milliseconds(2)) { [weak self] in
-                self?.pollPreroll(gen: gen, time: time, started: started)
+                self?.pollPreroll(next)
             }
             return
         }
         lock.lock()
         defer { lock.unlock() }
-        guard prerollGeneration == gen, let rate = prerollRate else { return }
+        guard prerollGeneration == wait.gen, let rate = prerollRate else { return }
         prerollRate = nil
         EngineLog.emit("[AudioOutput] preroll \(ready ? "ready" : "timed out") after "
-                       + "\(String(format: "%.0f", waited * 1000)) ms; starting at t=\(String(format: "%.3f", time.seconds)) rate=\(rate)",
+                       + "\(String(format: "%.0f", waited * 1000)) ms; starting at t=\(String(format: "%.3f", wait.time.seconds)) rate=\(rate)",
                        category: .swPlayback)
-        startAfterPreroll(rate: rate, time: time)
+        startAfterPreroll(rate: rate, time: wait.time)
+        let release: ClockHoldRelease = ready ? .ready(waitedSeconds: waited) : .timedOut(waitedSeconds: waited)
+        _onPrerollTransition?(PrerollTransition(generation: wait.gen, event: .released(release)))
     }
 
     /// Starts the clock `prerollStartLead` from now. Called with `lock` held.
@@ -481,9 +535,18 @@ final class AudioOutput: @unchecked Sendable {
 
     private func cancelPreroll() {
         lock.lock()
+        endPreroll()
+        lock.unlock()
+    }
+
+    /// Retires the current preroll chain, and reports a hold that was still waiting as cancelled.
+    /// Called with `lock` held.
+    private func endPreroll() {
+        if prerollRate != nil {
+            _onPrerollTransition?(PrerollTransition(generation: prerollGeneration, event: .released(.cancelled)))
+        }
         prerollGeneration &+= 1
         prerollRate = nil
-        lock.unlock()
     }
 
     private func updatePrerollRate(_ rate: Float) -> Bool {

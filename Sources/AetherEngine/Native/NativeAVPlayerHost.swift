@@ -133,6 +133,9 @@ final class NativeAVPlayerHost {
     private var prematureEndRecoveryInFlight = false
     /// Mirrors avPlayer.timeControlStatus so the engine can reconcile when AVKit's transport bar, Control Center, or hardware buttons toggle the player externally (without this, engine state goes stale and play/pause presses are swallowed).
     @Published private(set) var timeControlStatus: AVPlayer.TimeControlStatus = .paused
+    /// Mirrors avPlayer.reasonForWaitingToPlay. Written before `timeControlStatus` on a status edge, so a
+    /// `$timeControlStatus` sink reads the reason that came with it (Sodalite#168).
+    @Published private(set) var waitingReason: AVPlayer.WaitingReason?
     /// Monotonic count of AVPlayerItem playbackStalled notifications (#93 residual): the engine
     /// opens its spurious-pause recovery window on each stall.
     @Published private(set) var stallCount: Int = 0
@@ -294,6 +297,9 @@ final class NativeAVPlayerHost {
     /// observation alone leaves the decision to whether AVFoundation happens to republish the status.
     private var waitingReasonObservation: NSKeyValueObservation?
     private var seekableObservation: NSKeyValueObservation?
+    /// Raises a host's live cushion to the origin's own recommended offset (its HOLD-BACK) once the
+    /// playlist is read, so the cushion never plays closer to the edge than the origin asks for.
+    private var liveOffsetFloorObservation: NSKeyValueObservation?
     /// Diagnostic: isReadyForDisplay is the only signal for first-frame-on-screen; t+ stamps localize the audio-leads-black-video gap.
     private var layerReadyObservation: NSKeyValueObservation?
     /// t+ reference for startup diagnostics; written on MainActor, read off-main from KVO -- diagnostic-only, a torn read is harmless.
@@ -428,6 +434,13 @@ final class NativeAVPlayerHost {
     ///
     /// `swapItem` is the fix rather than a longer argument list: a swap has no contract argument to get
     /// wrong, and a genuinely new session states its own.
+    /// The offset from the live edge a remote-HLS session holds: the host's cushion, never closer
+    /// than the origin's recommended offset once that is known.
+    nonisolated static func liveEdgeOffset(cushionSeconds: Double, recommendedSeconds: Double) -> Double {
+        guard recommendedSeconds.isFinite, recommendedSeconds > 0 else { return cushionSeconds }
+        return max(cushionSeconds, recommendedSeconds)
+    }
+
     struct SessionLoadContract: Sendable, Equatable {
         /// Whether the session is live. Gates the AE#440 join override and the AE#287 premature-end
         /// recovery, which only makes sense for a presentation with an advertised end.
@@ -438,6 +451,10 @@ final class NativeAVPlayerHost {
         /// 4 s matches the loopback segment cadence; the remote-HLS bypass passes 0 (system adaptive),
         /// where 4 s forced a 3-4 s black screen on bandwidth-limited Jellyfin live transcodes.
         var forwardBufferDuration: Double = 4.0
+        /// `LoadOptions.liveEdgeCushionSeconds` on the remote-HLS bypass, validated: the item's
+        /// `configuredTimeOffsetFromLive`, kept across stalls. nil leaves the origin's HOLD-BACK in
+        /// charge. The loopback states its cushion in the playlist it serves instead.
+        var liveEdgeOffsetSeconds: Double?
         /// The lean remote-HLS path has no live-reopen or readiness watchdog, so AVPlayer's "gave up"
         /// signal has to surface a dead upstream instead of being swallowed as a recoverable stall.
         var surfaceEndFailures: Bool = false
@@ -572,6 +589,22 @@ final class NativeAVPlayerHost {
         // 4s default matches loopback HLS segment cadence; raising it for live makes AVPlayer race to the edge and stall at the transcode warm-up gap.
         // Remote-HLS passes 0 (system adaptive): 4s forced a 3-4s black screen on bandwidth-limited Jellyfin live transcodes.
         item.preferredForwardBufferDuration = forwardBufferDuration
+        if sessionContract.isLive, let offset = sessionContract.liveEdgeOffsetSeconds {
+            item.configuredTimeOffsetFromLive = CMTime(seconds: offset, preferredTimescale: 1000)
+            item.automaticallyPreservesTimeOffsetFromLive = true
+            // The origin's HOLD-BACK is only known once its playlist is read, and a shallower cushion
+            // would otherwise move the playhead closer than it (AE#189's stall-danger zone).
+            liveOffsetFloorObservation = item.observe(\.recommendedTimeOffsetFromLive, options: [.initial, .new]) {
+                [weak self] item, _ in
+                let recommended = item.recommendedTimeOffsetFromLive.seconds
+                Task { @MainActor in
+                    guard let self, self.sessionID == sid, let item = self.playerItem else { return }
+                    let target = Self.liveEdgeOffset(cushionSeconds: offset, recommendedSeconds: recommended)
+                    guard target > offset, item.configuredTimeOffsetFromLive.seconds < target else { return }
+                    item.configuredTimeOffsetFromLive = CMTime(seconds: target, preferredTimescale: 1000)
+                }
+            }
+        }
 
         // Enables per-frame HDR10+ / DV RPU metadata; without it DV sources show in HDR10 mode (DrHurt: Philips TV stayed in HDR mode for P8 MKVs).
         // Set false on SDR-fallback paths -- the per-frame metadata pipeline is suspected of ~3 MB/sec RSS growth on long DV 8.1 sessions.
@@ -744,9 +777,11 @@ final class NativeAVPlayerHost {
         // separate edge from the one below. It carries no diagnostics and no state: the lever logs its
         // own outcome, and everything else here keys on the status.
         waitingReasonObservation = avPlayer.observe(\.reasonForWaitingToPlay, options: [.new]) { [weak self] player, _ in
-            guard let reason = player.reasonForWaitingToPlay?.rawValue else { return }
+            let reason = player.reasonForWaitingToPlay?.rawValue
             Task { @MainActor in
-                self?.startLiveJoinImmediatelyIfHolding(waitingReason: reason)
+                guard let self, self.sessionID == sid else { return }
+                self.waitingReason = reason.map(AVPlayer.WaitingReason.init(rawValue:))
+                if let reason { self.startLiveJoinImmediatelyIfHolding(waitingReason: reason) }
             }
         }
         timeControlObservation = avPlayer.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
@@ -758,13 +793,15 @@ final class NativeAVPlayerHost {
             case .playing:                         statusStr = "playing"
             @unknown default:                      statusStr = "@unknown"
             }
-            let reason = player.reasonForWaitingToPlay?.rawValue ?? "-"
+            let waitingReason = player.reasonForWaitingToPlay?.rawValue
+            let reason = waitingReason ?? "-"
             let elapsed = Double(DispatchTime.now().uptimeNanoseconds - (self?.loadStartTime ?? DispatchTime.now()).uptimeNanoseconds) / 1_000_000_000
             EngineLog.emit("[NativeAVPlayerHost] #\(sid) timeControlStatus=\(statusStr) reason=\(reason) t+\(String(format: "%.2f", elapsed))s", category: .engine)
             Task { @MainActor in
                 guard let self, self.sessionID == sid else { return }
                 // AE#287: swallow the pause AVPlayer takes while a premature-end recovery re-seeks.
                 if status == .paused, self.prematureEndRecoveryInFlight { return }
+                self.waitingReason = waitingReason.map(AVPlayer.WaitingReason.init(rawValue:))
                 self.timeControlStatus = status
                 self.startLiveJoinImmediatelyIfHolding(waitingReason: reason)
                 // First .playing: re-sample route after 2.5s settle -- AVKit only negotiates HDMI format on playback start (issue #24).
@@ -983,6 +1020,7 @@ final class NativeAVPlayerHost {
         renderedTime = 0
         duration = 0
         rate = 0
+        waitingReason = nil
         timeControlStatus = .paused
         seekableEnd = 0
     }
@@ -1939,6 +1977,7 @@ final class NativeAVPlayerHost {
         }
         avPlayer.play()
         prematureEndRecoveryInFlight = false
+        waitingReason = avPlayer.reasonForWaitingToPlay
         timeControlStatus = avPlayer.timeControlStatus
         let resumedAt = await prematureEndReading().playhead
         EngineLog.emit(
@@ -2401,6 +2440,8 @@ final class NativeAVPlayerHost {
         waitingReasonObservation = nil
         seekableObservation?.invalidate()
         seekableObservation = nil
+        liveOffsetFloorObservation?.invalidate()
+        liveOffsetFloorObservation = nil
         loadedVideoObservation?.invalidate()
         loadedVideoObservation = nil
         loadedVideoRanges = []
@@ -2470,6 +2511,7 @@ final class NativeAVPlayerHost {
         // The observation was invalidated above, so the pause just issued is never published. Left at the
         // outgoing item's `.playing`, the next session's sink reads a roll on subscribe and then publishes
         // its own pre-roll `.paused` as a real pause (a host raises its transport on it).
+        waitingReason = nil
         timeControlStatus = .paused
         // The AVAudioSession is NOT released here. Teardown ordering is the engine's call, not the host's:
         // AetherEngine.stopInternal deactivates once every render path is quiesced (#215).

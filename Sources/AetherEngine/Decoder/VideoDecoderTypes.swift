@@ -24,6 +24,10 @@ protocol VideoDecodingPipeline: AnyObject, Sendable {
     /// AE#658: the decoded format and its display buffer, reported on the first frame and on change.
     var onDecodedFormat: (@Sendable (DecodedVideoFormat) -> Void)? { get set }
     var skipUntilPTS: CMTime? { get set }
+    /// Every frame the decoder has produced since it opened, the ones `skipUntilPTS` discards
+    /// included. The preroll reads it as the decoder's progress toward a seek target (#800): a slow
+    /// decoder still working up to the target is told apart from one that delivers nothing.
+    var framesDecoded: UInt64 { get }
 
     /// AE#492: the decoder's current feed epoch. A caller that decides a batch of packets is
     /// current captures this, hands it back with each one, and the decoder refuses any packet whose
@@ -46,6 +50,8 @@ protocol VideoDecodingPipeline: AnyObject, Sendable {
 
 extension VideoDecodingPipeline {
     func drainForEndOfStream() {}
+    /// A decoder that does not count reports no progress, so its preroll times out as before.
+    var framesDecoded: UInt64 { 0 }
 }
 
 enum VideoDecoderError: Error, LocalizedError {

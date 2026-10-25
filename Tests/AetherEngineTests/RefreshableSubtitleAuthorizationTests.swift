@@ -45,13 +45,13 @@ struct RefreshableSubtitleAuthorizationTests {
         await engine.secondarySidecarTask?.value
         #expect(engine.secondarySubtitleCues.first?.text == "Hello")
         let jobs = AetherEngine.externalSubtitleFillJobs(table: engine.nativeSubtitleTrackTable,
-            registry: engine.externalSubtitleRegistry, stores: [store], defaultHeaders: [:])
+            registry: engine.externalSubtitleRegistry, stores: [store], defaultHeaders: [:], mediaURL: nil)
         await AetherEngine.runExternalSubtitleFill(job: try #require(jobs.first))
         #expect(store.isFinished)
         #expect(store.snapshotCues().first?.startTime == 2)
         #expect(store.allCues().first?.start == 1)
         let remote = RemoteHLSSubtitleProvider(tracks: [.init(externalID: info.id, source: track)],
-            masterBody: "", programDuration: 10, defaultHeaders: [:], vttFillWaitSeconds: 0)
+            masterBody: "", programDuration: 10, defaultHeaders: [:], mediaURL: nil, vttFillWaitSeconds: 0)
         remote.startFill()
         await remote.awaitFill()
         if case .ready(let vtt) = remote.nativeSubtitleVTT(ordinal: 0, segmentIndex: 0) {
@@ -366,10 +366,10 @@ struct RefreshableSubtitleAuthorizationTests {
         }
         let stores = tracks.map { _ in NativeSubtitleCueStore() }
         let registry = Dictionary(uniqueKeysWithValues: tracks.enumerated().map { (100_000 + $0.offset, $0.element) })
-        let jobs = AetherEngine.externalSubtitleFillJobs(table: table, registry: registry, stores: stores, defaultHeaders: [:])
+        let jobs = AetherEngine.externalSubtitleFillJobs(table: table, registry: registry, stores: stores, defaultHeaders: [:], mediaURL: nil)
         let remote = RemoteHLSSubtitleProvider.fillJobs(tracks: tracks.enumerated().map {
             .init(externalID: 100_000 + $0.offset, source: $0.element)
-        }, stores: stores, defaultHeaders: [:])
+        }, stores: stores, defaultHeaders: [:], mediaURL: nil)
         for grouped in [jobs, remote] {
             #expect(grouped.count == 2)
             #expect(grouped.first?.targets.map(\.streamIndex) == [0, 1])
