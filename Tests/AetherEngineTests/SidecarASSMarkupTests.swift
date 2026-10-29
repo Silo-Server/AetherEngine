@@ -56,6 +56,37 @@ final class SidecarASSMarkupTests: XCTestCase {
         XCTAssertTrue(builder.script().contains("{\\i1}Hello{\\i0} world"))
     }
 
+    /// silo-apple#600: the load-time store fill decodes once for both consumers. Its raw reading must
+    /// be what a markup-preserving decode returns, and its plain reading what the default path does.
+    func testAlsoPlainTextCarriesTheDefaultReadingBesideTheRawLines() async throws {
+        let url = try writeTempASS()
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let decoded = try await SubtitleDecoder.decodeFile(
+            url: url, preserveASSMarkup: true, alsoPlainText: true, sourceStreamIndices: [nil])
+        let both = try XCTUnwrap(decoded.first)
+        let raw = try await SubtitleDecoder.decodeFile(url: url, preserveASSMarkup: true)
+        let plain = try await SubtitleDecoder.decodeFile(url: url)
+
+        XCTAssertEqual(both.assHeader, raw.assHeader)
+        XCTAssertEqual(both.cues.map(\.text), raw.cues.map(\.text))
+        let plainCues = try XCTUnwrap(both.plainCues)
+        XCTAssertEqual(plainCues.map(\.text), plain.cues.map(\.text))
+        XCTAssertEqual(plainCues.map(\.startTime), plain.cues.map(\.startTime))
+        XCTAssertEqual(plainCues.map(\.endTime), plain.cues.map(\.endTime))
+        guard case .richText(let runs) = plainCues[0].body else {
+            return XCTFail("the plain reading keeps #233's styled body")
+        }
+        XCTAssertTrue(runs[0].isItalic)
+
+        // Without the request, and for a stream that keeps no markup, there is no second reading.
+        let unrequested = try await SubtitleDecoder.decodeFile(
+            url: url, preserveASSMarkup: true, sourceStreamIndices: [nil])
+        XCTAssertNil(unrequested.first?.plainCues)
+        let unstyled = try await SubtitleDecoder.decodeFile(url: url, alsoPlainText: true, sourceStreamIndices: [nil])
+        XCTAssertNil(unstyled.first?.plainCues)
+    }
+
     /// #233 changed half of this contract. The default path is still header-less and still hands
     /// over no raw event lines, but it no longer flattens the markup away: a styled cue arrives as
     /// `.richText` with the attributes resolved, and only an unstyled one stays `.text`. The
