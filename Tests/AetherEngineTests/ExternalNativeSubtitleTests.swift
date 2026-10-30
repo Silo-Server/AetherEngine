@@ -120,6 +120,18 @@ struct ExternalNativeSubtitleTests {
         #expect(!engine.isLoadingSubtitles)
     }
 
+    @Test("a complete fill of a track with no cues backfills it empty instead of fetching it again")
+    func completeEmptyFillBackfills() throws {
+        let engine = try AetherEngine()
+        let (info, store) = trackWithRunningFill(engine, url: "https://s/x.vtt")
+        engine.selectSubtitleTrack(index: info.id)
+        store.markFinished()
+        finishFill(engine, id: info.id, complete: true)
+        #expect(engine.sidecarTask == nil)
+        #expect(engine.subtitleCues.isEmpty)
+        #expect(!engine.isLoadingSubtitles)
+    }
+
     @Test("a fill that fails or ends early hands the waiting selection to its own decode",
           arguments: [false, true])
     func shortFillDecodes(endedEarly: Bool) throws {

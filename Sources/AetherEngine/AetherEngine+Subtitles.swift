@@ -1494,7 +1494,8 @@ extension AetherEngine {
                                      source: "store fill's styled decode")
             return
         }
-        if !wantsStyledASS, let store, store.isFinished, !store.didEndEarly, store.cueCount > 0 {
+        if !wantsStyledASS, let store, store.isFinished, !store.didEndEarly,
+           store.cueCount > 0 || completedExternalStoreFillIDs.contains(id) {
             backfillExternalSubtitle(id: id, track: track, cues: store.snapshotCues(), assHeader: nil,
                                      source: "finished store")
             return
@@ -1557,8 +1558,9 @@ extension AetherEngine {
     func externalStoreFillFinished(_ outcome: ExternalSubtitleFillOutcome, generation: UInt64) {
         guard generation == externalStoreFillGeneration else { return }
         runningExternalStoreFillIDs.remove(outcome.externalID)
-        if outcome.complete, let styled = outcome.styled {
-            externalStoreFillStyledResults[outcome.externalID] = styled
+        if outcome.complete {
+            completedExternalStoreFillIDs.insert(outcome.externalID)
+            if let styled = outcome.styled { externalStoreFillStyledResults[outcome.externalID] = styled }
         }
         resumeSelectionAwaitingExternalStoreFill()
     }
@@ -1575,6 +1577,7 @@ extension AetherEngine {
         externalStoreFillGeneration &+= 1
         runningExternalStoreFillIDs = []
         externalStoreFillStyledResults = [:]
+        completedExternalStoreFillIDs = []
         primaryAwaitingExternalStoreFillID = nil
     }
 
@@ -1599,6 +1602,7 @@ extension AetherEngine {
         externalNativeStoreFillTask = nil
         externalStoreFillGeneration &+= 1
         externalStoreFillStyledResults = [:]
+        completedExternalStoreFillIDs = []
         let jobs = Self.externalSubtitleFillJobs(
             table: nativeSubtitleTrackTable,
             registry: externalSubtitleRegistry,

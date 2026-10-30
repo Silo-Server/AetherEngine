@@ -2554,6 +2554,10 @@ public final class AetherEngine: ObservableObject {
     var runningExternalStoreFillIDs: Set<Int> = []
     /// #600: completed fills' raw-markup decodes of styled ASS tracks, by track id.
     var externalStoreFillStyledResults: [Int: SidecarDecodeResult] = [:]
+    /// #600: tracks whose fill read the whole sidecar this run. Such a store is
+    /// the whole track even when it holds no cues, so it backfills empty
+    /// instead of fetching the file again.
+    var completedExternalStoreFillIDs: Set<Int> = []
     /// #600: the primary selection waiting for its track's store fill.
     var primaryAwaitingExternalStoreFillID: Int?
     /// #600: tags a fill run so a superseded run's completions are ignored.
