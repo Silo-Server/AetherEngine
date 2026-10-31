@@ -1483,8 +1483,10 @@ extension AetherEngine {
     private func selectExternalSubtitleTrack(id: Int, track: ExternalSubtitleTrack) {
         let codec = ExternalSubtitleTrack.codecName(url: track.url, formatHint: track.formatHint)
         let wantsStyledASS = loadedOptions.preserveASSMarkup && codec == "ass"
-        // A prepared track's own decode enforces its resource policy, which the fill does not.
-        let sharesStoreFill = track.preparationPolicy == nil
+        // A prepared track's own decode enforces its resource policy, which the fill does not. A
+        // bitmap sidecar joins the fill only because `codecName` labels it subrip: its store keeps
+        // no image cues, so the fill can never serve it.
+        let sharesStoreFill = track.preparationPolicy == nil && track.isTextFormat
         let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: id, in: nativeSubtitleTrackTable)
         // Phase D: an OCR store holds recognized TEXT; the bitmap overlay must re-decode
         // the sidecar for its images, never backfill from that store.
@@ -1684,7 +1686,14 @@ extension AetherEngine {
         target.store.markFinished(endedEarly: endedEarly)
         guard let externalID = target.externalID, let onFilled else { return }
         let styled = result.plainCues == nil ? nil : SidecarDecodeResult(cues: result.cues, assHeader: result.assHeader)
-        await onFilled(ExternalSubtitleFillOutcome(externalID: externalID, complete: !endedEarly, styled: styled))
+        await onFilled(ExternalSubtitleFillOutcome(
+            externalID: externalID, complete: fillHoldsWholeTrack(result, endedEarly: endedEarly), styled: styled))
+    }
+
+    /// Whether a fill's store now holds the whole track: the fill read the entire sidecar, and the
+    /// track is text. The store keeps no image cues, so a bitmap track it decoded is not in it.
+    nonisolated static func fillHoldsWholeTrack(_ result: SidecarDecodeResult, endedEarly: Bool) -> Bool {
+        !endedEarly && !result.cues.contains { $0.text == nil }
     }
 
     nonisolated private static func unfilled(

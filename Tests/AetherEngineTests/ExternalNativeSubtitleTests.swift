@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import CoreGraphics
 @testable import AetherEngine
 
 /// AetherEngine#88: load-declared external tracks join the native rendition table (externalID set,
@@ -130,6 +131,33 @@ struct ExternalNativeSubtitleTests {
         #expect(engine.sidecarTask == nil)
         #expect(engine.subtitleCues.isEmpty)
         #expect(!engine.isLoadingSubtitles)
+    }
+
+    @Test("a bitmap sidecar declared at load decodes on its own instead of waiting on the fill")
+    func bitmapSidecarDoesNotWaitForFill() throws {
+        let engine = try AetherEngine()
+        let info = engine.addExternalSubtitleTrack(
+            ExternalSubtitleTrack(url: URL(string: "https://s/x.sup")!, language: "de", formatHint: "sup"))
+        let store = NativeSubtitleCueStore()
+        engine.nativeSubtitleTrackTable = [.init(sourceStreamIndex: nil, externalID: info.id, language: "de")]
+        engine.testHookInstallNativeStores([store])
+        engine.runningExternalStoreFillIDs = [info.id]
+        engine.selectSubtitleTrack(index: info.id)
+        #expect(engine.sidecarTask != nil, "the fill keeps no image cues, so it cannot serve this track")
+    }
+
+    @Test("a fill holds the whole track only when it read all of a text track")
+    func fillHoldsWholeTrackOnlyForCompleteText() {
+        let ctx = CGContext(data: nil, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+                            space: CGColorSpaceCreateDeviceRGB(),
+                            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        let image = SubtitleCue(id: 0, startTime: 1, endTime: 2,
+                                body: .image(SubtitleImage(cgImage: ctx.makeImage()!, position: .zero)))
+        let text = SubtitleCue(id: 1, startTime: 1, endTime: 2, body: .text("hi"))
+        #expect(AetherEngine.fillHoldsWholeTrack(.init(cues: [text], assHeader: nil), endedEarly: false))
+        #expect(AetherEngine.fillHoldsWholeTrack(.init(cues: [], assHeader: nil), endedEarly: false))
+        #expect(!AetherEngine.fillHoldsWholeTrack(.init(cues: [text], assHeader: nil), endedEarly: true))
+        #expect(!AetherEngine.fillHoldsWholeTrack(.init(cues: [image], assHeader: nil), endedEarly: false))
     }
 
     @Test("a fill that fails or ends early hands the waiting selection to its own decode",

@@ -40,8 +40,9 @@ the public-API contract.
   whole source once per request. The selection now waits for that fill, showing the track as loading,
   and backfills from it. A styled ASS track (`preserveASSMarkup`) backfills too: the fill decodes it
   once with its markup and gives the store the plain-text reading of the same packets. A fill that
-  ends early or fails still hands the selection to its own decode and refetches. Secondary
-  selections and tracks added after load are unchanged.
+  ends early or fails still hands the selection to its own decode and refetches, and so does a
+  bitmap sidecar (`.sup`), whose images the store cannot keep. Secondary selections and tracks
+  added after load are unchanged.
 
 - **Silo fork: a secondary ASS sidecar stays plain text.** Upstream #826 publishes raw ASS events and
   `secondarySidecarASSHeader` for a secondary sidecar when `preserveASSMarkup` is on. The fork keeps

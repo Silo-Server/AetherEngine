@@ -2527,8 +2527,9 @@ public final class AetherEngine: ObservableObject {
     /// #600: what one target's store fill leaves for a selection of its track.
     struct ExternalSubtitleFillOutcome: Sendable {
         let externalID: Int
-        /// Whether the fill read the whole sidecar. Anything less sends a waiting selection to a
-        /// decode of its own, which refetches a truncated download.
+        /// Whether the store holds the whole track (`fillHoldsWholeTrack`). Anything less sends a
+        /// waiting selection to a decode of its own, which refetches a truncated download and
+        /// decodes a bitmap track's images.
         let complete: Bool
         /// The raw-markup decode of a styled ASS track, which the plain-text store cannot serve.
         let styled: SidecarDecodeResult?
