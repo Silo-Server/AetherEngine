@@ -1485,8 +1485,10 @@ extension AetherEngine {
         let wantsStyledASS = loadedOptions.preserveASSMarkup && codec == "ass"
         // A prepared track's own decode enforces its resource policy, which the fill does not. A
         // bitmap sidecar joins the fill only because `codecName` labels it subrip: its store keeps
-        // no image cues, so the fill can never serve it.
-        let sharesStoreFill = track.preparationPolicy == nil && track.isTextFormat
+        // no image cues, so the fill can never serve it. A track of another format, such as one
+        // stream of a subtitle container, shares the fill, and a fill that decodes images reports
+        // that it does not hold the whole track (`fillHoldsWholeTrack`).
+        let sharesStoreFill = track.preparationPolicy == nil && !track.isKnownBitmapFormat
         let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: id, in: nativeSubtitleTrackTable)
         // Phase D: an OCR store holds recognized TEXT; the bitmap overlay must re-decode
         // the sidecar for its images, never backfill from that store.

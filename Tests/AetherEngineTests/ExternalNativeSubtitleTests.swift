@@ -146,6 +146,21 @@ struct ExternalNativeSubtitleTests {
         #expect(engine.sidecarTask != nil, "the fill keeps no image cues, so it cannot serve this track")
     }
 
+    @Test("a text stream of a subtitle container or an extensionless sidecar still waits for its fill",
+          arguments: [("https://s/multi.mkv", Int32(3)), ("https://s/subtitles/7", nil)] as [(String, Int32?)])
+    func unknownFormatSharesFill(url: String, streamIndex: Int32?) throws {
+        let engine = try AetherEngine()
+        let info = engine.addExternalSubtitleTrack(
+            ExternalSubtitleTrack(url: URL(string: url)!, language: "de", sourceStreamIndex: streamIndex))
+        let store = NativeSubtitleCueStore()
+        engine.nativeSubtitleTrackTable = [.init(sourceStreamIndex: nil, externalID: info.id, language: "de")]
+        engine.testHookInstallNativeStores([store])
+        engine.runningExternalStoreFillIDs = [info.id]
+        engine.selectSubtitleTrack(index: info.id)
+        #expect(engine.sidecarTask == nil, "a decode of its own fetches the file a second time")
+        #expect(engine.isLoadingSubtitles)
+    }
+
     @Test("a fill holds the whole track only when it read all of a text track")
     func fillHoldsWholeTrackOnlyForCompleteText() {
         let ctx = CGContext(data: nil, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
