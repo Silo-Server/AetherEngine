@@ -1474,34 +1474,115 @@ extension AetherEngine {
 
     /// #88: activate a registered external track. A finished native store holds the whole file's
     /// cues (decoded plain-text at load), so the overlay backfills instantly with no re-download.
-    /// Styled ASS wants raw markup, which the store strips, so it re-decodes via the sidecar path,
-    /// as does a store whose fill was cut short: the sidecar decode refetches it.
+    /// Styled ASS wants raw markup, which the store strips, so it backfills from the raw-markup
+    /// decode the same fill kept for it (#600). A store whose fill was cut short re-decodes via the
+    /// sidecar path, which refetches it.
+    ///
+    /// #600: while the load-time fill is still reading this track's sidecar, the selection waits for
+    /// it (`awaitExternalStoreFill`) instead of fetching the file a second time.
     private func selectExternalSubtitleTrack(id: Int, track: ExternalSubtitleTrack) {
         let codec = ExternalSubtitleTrack.codecName(url: track.url, formatHint: track.formatHint)
         let wantsStyledASS = loadedOptions.preserveASSMarkup && codec == "ass"
-        if !wantsStyledASS,
-           let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: id, in: nativeSubtitleTrackTable),
-           // Phase D: an OCR store holds recognized TEXT; the bitmap overlay must re-decode
-           // the sidecar for its images, never backfill from that store.
-           !nativeSubtitleTrackTable[ordinal].needsOCR,
-           let store = nativeStore(atOrdinal: ordinal),
-           store.isFinished, !store.didEndEarly, store.cueCount > 0 {
-            deselectInjectedSubtitleForOverlay()
-            cancelSidecarTask()
-            clearSubtitleDrainTarget(channel: .primary, reason: .externalStoreBackfill)   // #112 rework
-            activeEmbeddedSubtitleStreamIndex = -1
-            loadedSidecarURL = track.url
-            sidecarASSHeader = nil
-            isSubtitleActive = true
-            activeSubtitleTrackIndex = id
-            subtitleCues = store.snapshotCues()
-            isLoadingSubtitles = false
-            EngineLog.emit("[AetherEngine] external subtitle backfilled from finished store: id=\(id) cues=\(subtitleCues.count)", category: .engine)
+        // A prepared track's own decode enforces its resource policy, which the fill does not. A
+        // bitmap sidecar joins the fill only because `codecName` labels it subrip: its store keeps
+        // no image cues, so the fill can never serve it. A track of another format, such as one
+        // stream of a subtitle container, shares the fill, and a fill that decodes images reports
+        // that it does not hold the whole track (`fillHoldsWholeTrack`).
+        let sharesStoreFill = track.preparationPolicy == nil && !track.isKnownBitmapFormat
+        let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: id, in: nativeSubtitleTrackTable)
+        // Phase D: an OCR store holds recognized TEXT; the bitmap overlay must re-decode
+        // the sidecar for its images, never backfill from that store.
+        let store = ordinal.flatMap { nativeSubtitleTrackTable[$0].needsOCR ? nil : nativeStore(atOrdinal: $0) }
+        if wantsStyledASS, sharesStoreFill, let styled = externalStoreFillStyledResults[id] {
+            backfillExternalSubtitle(id: id, track: track, cues: styled.cues, assHeader: styled.assHeader,
+                                     source: "store fill's styled decode")
+            return
+        }
+        if !wantsStyledASS, let store, store.isFinished, !store.didEndEarly,
+           store.cueCount > 0 || completedExternalStoreFillIDs.contains(id) {
+            backfillExternalSubtitle(id: id, track: track, cues: store.snapshotCues(), assHeader: nil,
+                                     source: "finished store")
+            return
+        }
+        // A plain track backfills from its store, so it waits only while that store is still the
+        // session's (subtitles-off without the pump tap drops the stores).
+        if sharesStoreFill, runningExternalStoreFillIDs.contains(id), wantsStyledASS || store != nil {
+            awaitExternalStoreFill(id: id, track: track)
             return
         }
         startSidecarDecode(url: track.url, httpHeaders: track.httpHeaders, externalTrackID: id,
                            httpRequestAuthorization: track.httpRequestAuthorization,
                            sourceStreamIndex: track.sourceStreamIndex)
+    }
+
+    private func backfillExternalSubtitle(id: Int, track: ExternalSubtitleTrack, cues: [SubtitleCue],
+                                          assHeader: String?, source: String) {
+        deselectInjectedSubtitleForOverlay()
+        cancelSidecarTask()
+        clearSubtitleDrainTarget(channel: .primary, reason: .externalStoreBackfill)   // #112 rework
+        activeEmbeddedSubtitleStreamIndex = -1
+        loadedSidecarURL = track.url
+        sidecarASSHeader = assHeader
+        isSubtitleActive = true
+        activeSubtitleTrackIndex = id
+        subtitleCues = cues
+        isLoadingSubtitles = false
+        EngineLog.emit("[AetherEngine] external subtitle backfilled from \(source): id=\(id) cues=\(subtitleCues.count)", category: .engine)
+    }
+
+    /// #600: the load-time store fill is reading this track's sidecar right now. A decode of its own
+    /// would ask the origin for the same file a second time, and a server that extracts an embedded
+    /// track reads the whole source once per request. The overlay shows the track loading until
+    /// that fill lands (`externalStoreFillFinished`), then takes the ordinary selection path. Waiting
+    /// costs nothing over a decode of its own: both read the same file from its start.
+    private func awaitExternalStoreFill(id: Int, track: ExternalSubtitleTrack) {
+        deselectInjectedSubtitleForOverlay()
+        cancelSidecarTask()
+        clearSubtitleDrainTarget(channel: .primary, reason: .sidecarSelected)   // #112 rework
+        activeEmbeddedSubtitleStreamIndex = -1
+        activeSubtitleTrackIndex = id
+        loadedSidecarURL = track.url
+        isSubtitleActive = true
+        subtitleCues = []
+        pgsStaleArrivalGates[.primary]?.reset()   // #100
+        sidecarASSHeader = nil
+        isLoadingSubtitles = true
+        primaryAwaitingExternalStoreFillID = id
+        EngineLog.emit("[AetherEngine] external subtitle waits for its store fill: id=\(id)", category: .engine)
+    }
+
+    /// #600: the fill moved on to its next job.
+    func externalStoreFillStarted(_ job: ExternalSubtitleFillJob, generation: UInt64) {
+        guard generation == externalStoreFillGeneration else { return }
+        runningExternalStoreFillIDs.formUnion(job.targets.compactMap(\.externalID))
+    }
+
+    /// #600: one target's fill is done. A selection waiting on it now backfills from what the fill
+    /// produced, or decodes the sidecar itself when the fill fell short.
+    func externalStoreFillFinished(_ outcome: ExternalSubtitleFillOutcome, generation: UInt64) {
+        guard generation == externalStoreFillGeneration else { return }
+        runningExternalStoreFillIDs.remove(outcome.externalID)
+        if outcome.complete {
+            completedExternalStoreFillIDs.insert(outcome.externalID)
+            if let styled = outcome.styled { externalStoreFillStyledResults[outcome.externalID] = styled }
+        }
+        resumeSelectionAwaitingExternalStoreFill()
+    }
+
+    private func resumeSelectionAwaitingExternalStoreFill() {
+        guard let id = primaryAwaitingExternalStoreFillID, !runningExternalStoreFillIDs.contains(id) else { return }
+        primaryAwaitingExternalStoreFillID = nil
+        guard isSubtitleActive, activeSubtitleTrackIndex == id, let track = externalSubtitleRegistry[id] else { return }
+        selectExternalSubtitleTrack(id: id, track: track)
+    }
+
+    /// #600: a new session (or none) owns no fill yet.
+    func resetExternalStoreFillState() {
+        externalStoreFillGeneration &+= 1
+        runningExternalStoreFillIDs = []
+        externalStoreFillStyledResults = [:]
+        completedExternalStoreFillIDs = []
+        primaryAwaitingExternalStoreFillID = nil
     }
 
     /// Store lookup for the external backfill: test-hook override first, else the live session's stores.
@@ -1517,19 +1598,39 @@ extension AetherEngine {
     /// #88: fill the native stores of load-declared external tracks with one whole-file decode each
     /// (plain text, matching the WebVTT rendition), then markFinished so the .vtt handler can serve
     /// complete files and the overlay select can backfill instantly. No side demuxer, no pacing.
+    ///
+    /// #600: each filled track is also what a selection of it backfills from, so selecting a track
+    /// while its own job runs waits for the fill instead of fetching the sidecar again.
     func startExternalNativeStoreFill(session: HLSVideoEngine) {
         externalNativeStoreFillTask?.cancel()
         externalNativeStoreFillTask = nil
+        externalStoreFillGeneration &+= 1
+        externalStoreFillStyledResults = [:]
+        completedExternalStoreFillIDs = []
         let jobs = Self.externalSubtitleFillJobs(
             table: nativeSubtitleTrackTable,
             registry: externalSubtitleRegistry,
             stores: session.nativeSubtitleCueStoresForSession,
-            defaultHeaders: loadedOptions.httpHeaders, mediaURL: loadedURL)
+            defaultHeaders: loadedOptions.httpHeaders, mediaURL: loadedURL,
+            preserveASSMarkup: loadedOptions.preserveASSMarkup)
+        // The first job starts now. Marking it here, not from the task, means a host's selection right
+        // after `load` already finds it running.
+        runningExternalStoreFillIDs = Set(jobs.first?.targets.compactMap(\.externalID) ?? [])
+        // A selection still waiting on the run this one replaces would otherwise wait forever.
+        resumeSelectionAwaitingExternalStoreFill()
         guard !jobs.isEmpty else { return }
+        let generation = externalStoreFillGeneration
+        let started: @Sendable (ExternalSubtitleFillJob) async -> Void = { [weak self] job in
+            await self?.externalStoreFillStarted(job, generation: generation)
+        }
+        let filled: @Sendable (ExternalSubtitleFillOutcome) async -> Void = { [weak self] outcome in
+            await self?.externalStoreFillFinished(outcome, generation: generation)
+        }
         externalNativeStoreFillTask = BlockingWork.detached(priority: .utility) { [jobs] in
-            for job in jobs {
+            for (index, job) in jobs.enumerated() {
                 if Task.isCancelled { return }
-                await AetherEngine.runExternalSubtitleFill(job: job)
+                if index > 0 { await started(job) }
+                await AetherEngine.runExternalSubtitleFill(job: job, onFilled: filled)
             }
         }
     }
@@ -1539,35 +1640,71 @@ extension AetherEngine {
     /// individually: one host-side index mistake must not blank the container's other tracks. A
     /// store that could not be filled stays UNfinished, or the rendition would serve a complete but
     /// blank .vtt.
-    nonisolated static func runExternalSubtitleFill(job: ExternalSubtitleFillJob) async {
+    ///
+    /// `onFilled` (#600) hears every target once, filled or not, so a selection waiting on one resumes.
+    nonisolated static func runExternalSubtitleFill(
+        job: ExternalSubtitleFillJob,
+        onFilled: (@Sendable (ExternalSubtitleFillOutcome) async -> Void)? = nil
+    ) async {
         if let fill = await fillDecode(job.url, {
             try await SubtitleDecoder.decodeFile(
                 url: job.url, httpHeaders: job.headers, httpRequestAuthorization: job.httpRequestAuthorization,
+                preserveASSMarkup: job.preserveASSMarkup, alsoPlainText: true,
                 sourceStreamIndices: job.targets.map(\.streamIndex))
         }) {
             for (target, result) in zip(job.targets, fill.results) {
-                target.store.appendCues(result.cues)
-                target.store.markFinished(endedEarly: fill.endedEarly)
+                await fillStore(target, with: result, endedEarly: fill.endedEarly, onFilled: onFilled)
             }
             return
         }
         guard job.targets.count > 1 else {
             EngineLog.emit("[AetherEngine] external native store fill failed: \(job.url.lastPathComponent)", category: .engine)
+            await unfilled(job.targets, onFilled: onFilled)
             return
         }
         EngineLog.emit("[AetherEngine] external native store fill: shared pass over \(job.url.lastPathComponent) failed, retrying \(job.targets.count) targets individually", category: .engine)
         for target in job.targets {
             if Task.isCancelled { return }
             guard let fill = await fillDecode(job.url, {
-                [try await SubtitleDecoder.decodeFile(
+                try await SubtitleDecoder.decodeFile(
                     url: job.url, httpHeaders: job.headers, httpRequestAuthorization: job.httpRequestAuthorization,
-                    sourceStreamIndex: target.streamIndex)]
+                    preserveASSMarkup: job.preserveASSMarkup, alsoPlainText: true,
+                    sourceStreamIndices: [target.streamIndex])
             }), let result = fill.results.first else {
                 EngineLog.emit("[AetherEngine] external native store fill failed: \(job.url.lastPathComponent) stream=\(target.streamIndex.map(String.init) ?? "auto")", category: .engine)
+                await unfilled([target], onFilled: onFilled)
                 continue
             }
-            target.store.appendCues(result.cues)
-            target.store.markFinished(endedEarly: fill.endedEarly)
+            await fillStore(target, with: result, endedEarly: fill.endedEarly, onFilled: onFilled)
+        }
+    }
+
+    /// The store gets the plain-text reading; a raw-markup decode goes to `onFilled` for the overlay.
+    nonisolated private static func fillStore(
+        _ target: ExternalSubtitleFillJob.Target, with result: SidecarDecodeResult, endedEarly: Bool,
+        onFilled: (@Sendable (ExternalSubtitleFillOutcome) async -> Void)?
+    ) async {
+        target.store.appendCues(result.plainCues ?? result.cues)
+        target.store.markFinished(endedEarly: endedEarly)
+        guard let externalID = target.externalID, let onFilled else { return }
+        let styled = result.plainCues == nil ? nil : SidecarDecodeResult(cues: result.cues, assHeader: result.assHeader)
+        await onFilled(ExternalSubtitleFillOutcome(
+            externalID: externalID, complete: fillHoldsWholeTrack(result, endedEarly: endedEarly), styled: styled))
+    }
+
+    /// Whether a fill's store now holds the whole track: the fill read the entire sidecar, and the
+    /// track is text. The store keeps no image cues, so a bitmap track it decoded is not in it.
+    nonisolated static func fillHoldsWholeTrack(_ result: SidecarDecodeResult, endedEarly: Bool) -> Bool {
+        !endedEarly && !result.cues.contains { $0.text == nil }
+    }
+
+    nonisolated private static func unfilled(
+        _ targets: [ExternalSubtitleFillJob.Target],
+        onFilled: (@Sendable (ExternalSubtitleFillOutcome) async -> Void)?
+    ) async {
+        guard let onFilled else { return }
+        for externalID in targets.compactMap(\.externalID) {
+            await onFilled(ExternalSubtitleFillOutcome(externalID: externalID, complete: false, styled: nil))
         }
     }
 
@@ -1902,6 +2039,7 @@ extension AetherEngine {
         case .primary:
             sidecarTask?.cancel()
             sidecarTask = nil
+            primaryAwaitingExternalStoreFillID = nil   // #600: a newer selection replaces the wait
             isSubtitleTrackIncomplete = false
         case .secondary:
             secondarySidecarTask?.cancel()
@@ -2480,7 +2618,8 @@ extension AetherEngine {
         table: [NativeSubtitleTrackEntry],
         registry: [Int: ExternalSubtitleTrack],
         stores: [NativeSubtitleCueStore],
-        defaultHeaders: [String: String], mediaURL: URL?
+        defaultHeaders: [String: String], mediaURL: URL?,
+        preserveASSMarkup: Bool = false
     ) -> [ExternalSubtitleFillJob] {
         struct Key: Hashable {
             let url: URL
@@ -2504,12 +2643,13 @@ extension AetherEngine {
             authorizationsByKey[key] = track.httpRequestAuthorization
             if targetsByKey[key] == nil { order.append(key) }
             targetsByKey[key, default: []].append(
-                .init(streamIndex: track.sourceStreamIndex, store: stores[ordinal]))
+                .init(streamIndex: track.sourceStreamIndex, store: stores[ordinal], externalID: extID))
         }
         return order.map {
             ExternalSubtitleFillJob(url: $0.url, headers: $0.headers,
                                     httpRequestAuthorization: authorizationsByKey[$0],
-                                    targets: targetsByKey[$0] ?? [])
+                                    targets: targetsByKey[$0] ?? [],
+                                    preserveASSMarkup: preserveASSMarkup)
         }
     }
 

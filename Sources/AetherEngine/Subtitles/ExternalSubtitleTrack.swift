@@ -78,6 +78,16 @@ public struct ExternalSubtitleTrack: Sendable, Equatable {
             .contains((formatHint ?? url.pathExtension).lowercased())
     }
 
+    /// Bitmap subtitle formats a sidecar is known to carry by its hint or extension (#600). The text
+    /// store fill keeps no image cues, so such a track never shares it. An unrecognised format, such
+    /// as a container or an extensionless URL, may still hold text and is judged by what the fill
+    /// decodes instead.
+    var isKnownBitmapFormat: Bool {
+        ["sup", "pgs", "pgssub", "hdmv_pgs_subtitle", "sub", "idx", "vobsub", "dvdsub", "dvd_subtitle",
+         "dvbsub", "dvb_subtitle"]
+            .contains((formatHint ?? url.pathExtension).lowercased())
+    }
+
     func makeTrackInfo(id: Int, fallbackNumber: Int) -> TrackInfo {
         let resolvedName: String
         if let name, !name.isEmpty {

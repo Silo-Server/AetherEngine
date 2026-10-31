@@ -2512,11 +2512,27 @@ public final class AetherEngine: ObservableObject {
             /// Absolute AVStream index in this container, nil for its first subtitle stream.
             let streamIndex: Int32?
             let store: NativeSubtitleCueStore
+            /// #600: the registered track this target fills, so a selection waiting on it resumes.
+            var externalID: Int? = nil
         }
         let url: URL
         let headers: [String: String]
         var httpRequestAuthorization: HTTPRequestAuthorization? = nil
         let targets: [Target]
+        /// #600: decode with `LoadOptions.preserveASSMarkup`, so the one fetch also yields the raw
+        /// event lines a styled overlay needs. The stores still get the plain-text reading.
+        var preserveASSMarkup = false
+    }
+
+    /// #600: what one target's store fill leaves for a selection of its track.
+    struct ExternalSubtitleFillOutcome: Sendable {
+        let externalID: Int
+        /// Whether the store holds the whole track (`fillHoldsWholeTrack`). Anything less sends a
+        /// waiting selection to a decode of its own, which refetches a truncated download and
+        /// decodes a bitmap track's images.
+        let complete: Bool
+        /// The raw-markup decode of a styled ASS track, which the plain-text store cannot serve.
+        let styled: SidecarDecodeResult?
     }
 
     /// Native WebVTT rendition store for the in-band CEA-608 track (#98). The CC tap feeds it (via
@@ -2533,6 +2549,20 @@ public final class AetherEngine: ObservableObject {
 
     /// Whole-file decode tasks filling native stores for load-declared external tracks (#88).
     var externalNativeStoreFillTask: Task<Void, Never>? = nil
+    /// #600: external tracks whose load-time store fill is reading the sidecar right now (the fill
+    /// runs one job at a time). Selecting one waits for that fill rather than fetching the same file a
+    /// second time; a track still queued behind another job decodes on its own, as before.
+    var runningExternalStoreFillIDs: Set<Int> = []
+    /// #600: completed fills' raw-markup decodes of styled ASS tracks, by track id.
+    var externalStoreFillStyledResults: [Int: SidecarDecodeResult] = [:]
+    /// #600: tracks whose fill read the whole sidecar this run. Such a store is
+    /// the whole track even when it holds no cues, so it backfills empty
+    /// instead of fetching the file again.
+    var completedExternalStoreFillIDs: Set<Int> = []
+    /// #600: the primary selection waiting for its track's store fill.
+    var primaryAwaitingExternalStoreFillID: Int?
+    /// #600: tags a fill run so a superseded run's completions are ignored.
+    var externalStoreFillGeneration: UInt64 = 0
 
     /// Phase D: OCR worker state. Armed while the active subtitle is a needsOCR table entry;
     /// cursors/pending persist across deselect/reselect (no re-recognition of covered regions)
@@ -4415,6 +4445,7 @@ public final class AetherEngine: ObservableObject {
         pendingNativeRenderingRequest = nil
         externalNativeStoreFillTask?.cancel()
         externalNativeStoreFillTask = nil
+        resetExternalStoreFillState()   // #600
         resetSubtitleOCRState()   // Phase D: new session, new axis
         remoteHLSSubtitleDiscoveryTask?.cancel()
         remoteHLSSubtitleDiscoveryTask = nil
@@ -6868,6 +6899,7 @@ public final class AetherEngine: ObservableObject {
         pendingNativeRenderingRequest = nil   // #170: the session the latched request targeted is gone
         externalNativeStoreFillTask?.cancel()
         externalNativeStoreFillTask = nil
+        resetExternalStoreFillState()   // #600
         resetSubtitleOCRState()   // Phase D: new session, new axis
         remoteHLSSubtitleDiscoveryTask?.cancel()
         remoteHLSSubtitleDiscoveryTask = nil
