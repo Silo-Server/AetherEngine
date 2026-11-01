@@ -34,6 +34,16 @@ the public-API contract.
   LibTrueHD resolves and links; DTS:X needs no library of its own since 7.44.0. `DualLayerDolbyVision`
   and `DolbyVisionStillReshaping` stay off. Upstream keeps every trait off.
 
+- **Silo fork: a load-declared sidecar is fetched once per selection (silo-apple#600).** Selecting a
+  track declared in `LoadOptions.externalSubtitles` while its native-store fill was still reading the
+  file started a second decode of the same URL, and a server that extracts an embedded track reads the
+  whole source once per request. The selection now waits for that fill, showing the track as loading,
+  and backfills from it. A styled ASS track (`preserveASSMarkup`) backfills too: the fill decodes it
+  once with its markup and gives the store the plain-text reading of the same packets. A fill that
+  ends early or fails still hands the selection to its own decode and refetches, and so does a
+  bitmap sidecar (`.sup`), whose images the store cannot keep. Secondary selections and tracks
+  added after load are unchanged.
+
 - **Silo fork: a secondary ASS sidecar stays plain text.** Upstream #826 publishes raw ASS events and
   `secondarySidecarASSHeader` for a secondary sidecar when `preserveASSMarkup` is on. The fork keeps
   raw ASS on the primary overlay only, as it already does for an embedded secondary track, so a host
