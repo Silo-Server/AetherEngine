@@ -2522,6 +2522,8 @@ public final class AetherEngine: ObservableObject {
         /// #600: decode with `LoadOptions.preserveASSMarkup`, so the one fetch also yields the raw
         /// event lines a styled overlay needs. The stores still get the plain-text reading.
         var preserveASSMarkup = false
+        /// Every track this job fills `readsSequentially`, so its one decode is one unranged GET.
+        var sequentialSource = false
     }
 
     /// #600: what one target's store fill leaves for a selection of its track.

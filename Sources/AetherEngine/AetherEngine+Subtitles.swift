@@ -1650,7 +1650,7 @@ extension AetherEngine {
             try await SubtitleDecoder.decodeFile(
                 url: job.url, httpHeaders: job.headers, httpRequestAuthorization: job.httpRequestAuthorization,
                 preserveASSMarkup: job.preserveASSMarkup, alsoPlainText: true,
-                sourceStreamIndices: job.targets.map(\.streamIndex))
+                sourceStreamIndices: job.targets.map(\.streamIndex), sequentialSource: job.sequentialSource)
         }) {
             for (target, result) in zip(job.targets, fill.results) {
                 await fillStore(target, with: result, endedEarly: fill.endedEarly, onFilled: onFilled)
@@ -1669,7 +1669,7 @@ extension AetherEngine {
                 try await SubtitleDecoder.decodeFile(
                     url: job.url, httpHeaders: job.headers, httpRequestAuthorization: job.httpRequestAuthorization,
                     preserveASSMarkup: job.preserveASSMarkup, alsoPlainText: true,
-                    sourceStreamIndices: [target.streamIndex])
+                    sourceStreamIndices: [target.streamIndex], sequentialSource: job.sequentialSource)
             }), let result = fill.results.first else {
                 EngineLog.emit("[AetherEngine] external native store fill failed: \(job.url.lastPathComponent) stream=\(target.streamIndex.map(String.init) ?? "auto")", category: .engine)
                 await unfilled([target], onFilled: onFilled)
@@ -1777,7 +1777,9 @@ extension AetherEngine {
             for: url, explicit: httpHeaders, mediaURL: loadedURL,
             mediaHeaders: loadedOptions.httpHeaders)
         // ASS/SSA sidecars honour preserveASSMarkup so hosts can drive a styled renderer. SRT/VTT fall back to plain text regardless.
-        let preparationPolicy = externalTrackID.flatMap { externalSubtitleRegistry[$0] }?.preparationPolicy
+        let registered = externalTrackID.flatMap { externalSubtitleRegistry[$0] }
+        let preparationPolicy = registered?.preparationPolicy
+        let sequential = registered?.readsSequentially ?? false
         let preserveASS = loadedOptions.preserveASSMarkup
         sidecarTask = Task { [weak self] in
             let result: SidecarDecodeResult
@@ -1787,7 +1789,8 @@ extension AetherEngine {
                     try await SubtitleDecoder.decodeFile(
                         url: url, httpHeaders: effectiveHeaders, httpRequestAuthorization: httpRequestAuthorization,
                         preserveASSMarkup: preserveASS,
-                        sourceStreamIndex: sourceStreamIndex, preparationPolicy: preparationPolicy
+                        sourceStreamIndex: sourceStreamIndex, preparationPolicy: preparationPolicy,
+                        sequentialSource: sequential
                     )
                 } showPartial: { partial in
                     await MainActor.run {
@@ -1929,7 +1932,9 @@ extension AetherEngine {
         // Silo fork: raw ASS goes to the primary overlay only, as in makeSubtitleDrainDecoder, so a
         // secondary sidecar stays plain text and publishes no secondarySidecarASSHeader (#826 upstream).
         let sessionGeneration = loadGeneration
-        let preparationPolicy = activeSecondaryExternalSubtitleTrackID.flatMap { externalSubtitleRegistry[$0] }?.preparationPolicy
+        let registered = activeSecondaryExternalSubtitleTrackID.flatMap { externalSubtitleRegistry[$0] }
+        let preparationPolicy = registered?.preparationPolicy
+        let sequential = registered?.readsSequentially ?? false
         secondarySidecarTask = Task { [weak self] in
             let result: SidecarDecodeResult
             let complete: Bool
@@ -1937,7 +1942,8 @@ extension AetherEngine {
                 (result, complete) = try await Self.decodeSidecarRetryingTruncation(label: "secondary sidecar") {
                     try await SubtitleDecoder.decodeFile(
                         url: url, httpHeaders: effectiveHeaders, httpRequestAuthorization: httpRequestAuthorization,
-                        sourceStreamIndex: sourceStreamIndex, preparationPolicy: preparationPolicy)
+                        sourceStreamIndex: sourceStreamIndex, preparationPolicy: preparationPolicy,
+                        sequentialSource: sequential)
                 } showPartial: { partial in
                     await MainActor.run {
                         guard !Task.isCancelled, let self, self.loadGeneration == sessionGeneration,
@@ -2627,6 +2633,7 @@ extension AetherEngine {
             let authorizationID: ObjectIdentifier?
         }
         var authorizationsByKey: [Key: HTTPRequestAuthorization] = [:]
+        var sequentialByKey: [Key: Bool] = [:]
         var order: [Key] = []
         var targetsByKey: [Key: [ExternalSubtitleFillJob.Target]] = [:]
         for (ordinal, entry) in table.enumerated() {
@@ -2641,6 +2648,7 @@ extension AetherEngine {
                               mediaHeaders: defaultHeaders),
                           authorizationID: track.httpRequestAuthorization.map(ObjectIdentifier.init))
             authorizationsByKey[key] = track.httpRequestAuthorization
+            sequentialByKey[key] = (sequentialByKey[key] ?? true) && track.readsSequentially
             if targetsByKey[key] == nil { order.append(key) }
             targetsByKey[key, default: []].append(
                 .init(streamIndex: track.sourceStreamIndex, store: stores[ordinal], externalID: extID))
@@ -2649,7 +2657,8 @@ extension AetherEngine {
             ExternalSubtitleFillJob(url: $0.url, headers: $0.headers,
                                     httpRequestAuthorization: authorizationsByKey[$0],
                                     targets: targetsByKey[$0] ?? [],
-                                    preserveASSMarkup: preserveASSMarkup)
+                                    preserveASSMarkup: preserveASSMarkup,
+                                    sequentialSource: sequentialByKey[$0] ?? false)
         }
     }
 

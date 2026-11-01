@@ -77,6 +77,12 @@ enum SubtitleDecoder {
     /// URLs that are containers holding several subtitle streams; nil decodes the container's first
     /// subtitle stream (the pre-#266 behaviour). An index that is out of range or names a
     /// non-subtitle stream throws `streamIndexNotSubtitle`.
+    ///
+    /// `sequentialSource` reads an HTTP sidecar with one unranged GET from byte 0
+    /// (`AVIOReader.sequentialOnly`). For a text file, which FFmpeg reads front to back: the ranged
+    /// open otherwise sends a tail prefetch, a ranged request and a range check first, and an origin
+    /// that ignores Range and sends no length (a compressed subtitle response) answers each with
+    /// the whole body. A container that may need a seek keeps the ranged open.
     static func decodeFile(
         url: URL,
         httpHeaders: [String: String] = [:],
@@ -84,13 +90,14 @@ enum SubtitleDecoder {
         preserveASSMarkup: Bool = false,
         sourceStreamIndex: Int32? = nil,
         idleTimeout: TimeInterval = sidecarIdleTimeout,
-        preparationPolicy: ExternalSubtitlePreparationPolicy? = nil
+        preparationPolicy: ExternalSubtitlePreparationPolicy? = nil,
+        sequentialSource: Bool = false
     ) async throws -> SidecarDecodeResult {
         let results = try await decode(
             url: url, httpHeaders: httpHeaders, httpRequestAuthorization: httpRequestAuthorization,
             preserveASSMarkup: preserveASSMarkup,
             requested: sourceStreamIndex.map { [$0] }, idleTimeout: idleTimeout,
-            preparationPolicy: preparationPolicy
+            preparationPolicy: preparationPolicy, sequentialSource: sequentialSource
         )
         guard let only = results.first else { throw SubtitleDecoderError.noSubtitleStream }
         return only
@@ -111,13 +118,15 @@ enum SubtitleDecoder {
         httpRequestAuthorization: HTTPRequestAuthorization? = nil,
         preserveASSMarkup: Bool = false,
         alsoPlainText: Bool = false,
-        sourceStreamIndices: [Int32?]
+        sourceStreamIndices: [Int32?],
+        sequentialSource: Bool = false
     ) async throws -> [SidecarDecodeResult] {
         guard !sourceStreamIndices.isEmpty else { return [] }
         return try await decode(
             url: url, httpHeaders: httpHeaders, httpRequestAuthorization: httpRequestAuthorization,
             preserveASSMarkup: preserveASSMarkup, alsoPlainText: alsoPlainText,
-            requested: sourceStreamIndices, idleTimeout: sidecarIdleTimeout
+            requested: sourceStreamIndices, idleTimeout: sidecarIdleTimeout,
+            sequentialSource: sequentialSource
         )
     }
 
@@ -130,7 +139,8 @@ enum SubtitleDecoder {
         alsoPlainText: Bool = false,
         requested: [Int32?]?,
         idleTimeout: TimeInterval,
-        preparationPolicy: ExternalSubtitlePreparationPolicy? = nil
+        preparationPolicy: ExternalSubtitlePreparationPolicy? = nil,
+        sequentialSource: Bool = false
     ) async throws -> [SidecarDecodeResult] {
         // Task cancellation does not reach the dispatched decode. Bridge it explicitly via
         // CancelFlag so the decode loop + AVIO reader abort promptly.
@@ -144,7 +154,8 @@ enum SubtitleDecoder {
                     url: url, httpHeaders: httpHeaders,
                     httpRequestAuthorization: httpRequestAuthorization,
                     preserveASSMarkup: preserveASSMarkup, alsoPlainText: alsoPlainText, requested: requested,
-                    idleTimeout: idleTimeout, token: token, preparationPolicy: preparationPolicy)
+                    idleTimeout: idleTimeout, token: token, preparationPolicy: preparationPolicy,
+                    sequentialSource: sequentialSource)
             }.value
         } onCancel: {
             token.cancel()
@@ -160,7 +171,8 @@ enum SubtitleDecoder {
         requested: [Int32?]?,
         idleTimeout: TimeInterval,
         token: CancelFlag,
-        preparationPolicy: ExternalSubtitlePreparationPolicy?
+        preparationPolicy: ExternalSubtitlePreparationPolicy?,
+        sequentialSource: Bool
     ) throws -> [SidecarDecodeResult] {
         if token.isCancelled { throw CancellationError() }
         // Preserve AVIO's streaming/range access to subtitle containers. Only the relay
@@ -186,7 +198,8 @@ enum SubtitleDecoder {
         let result = try decodeFileSync(
             url: decodeURL, httpHeaders: httpRequestAuthorization == nil ? httpHeaders : [:],
             preserveASSMarkup: preserveASSMarkup, alsoPlainText: alsoPlainText, requested: requested,
-            idleTimeout: idleTimeout, cancel: token, preparationPolicy: preparationPolicy
+            idleTimeout: idleTimeout, cancel: token, preparationPolicy: preparationPolicy,
+            sequentialSource: sequentialSource
         )
         if token.isCancelled { throw CancellationError() }
         return result
@@ -565,7 +578,8 @@ enum SubtitleDecoder {
     private static func decodeFileSync(
         url: URL, httpHeaders: [String: String],
         preserveASSMarkup: Bool, alsoPlainText: Bool, requested: [Int32?]?, idleTimeout: TimeInterval,
-        cancel: CancelFlag, preparationPolicy: ExternalSubtitlePreparationPolicy?
+        cancel: CancelFlag, preparationPolicy: ExternalSubtitlePreparationPolicy?,
+        sequentialSource: Bool
     ) throws -> [SidecarDecodeResult] {
         if let preparationPolicy {
             #if DEBUG
@@ -579,7 +593,7 @@ enum SubtitleDecoder {
         var avioReader: AVIOReader?
 
         if isHTTP {
-            let reader = AVIOReader(url: url, extraHeaders: httpHeaders,
+            let reader = AVIOReader(url: url, extraHeaders: httpHeaders, sequentialOnly: sequentialSource,
                                     streamIdleTimeout: idleTimeout)
             // Register BEFORE open(): open does a synchronous network probe (up to ~60 s on stalled origins);
             // cancellation during the probe must abort via markClosed rather than waiting for timeout (#32).

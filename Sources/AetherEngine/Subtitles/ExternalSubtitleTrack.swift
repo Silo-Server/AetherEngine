@@ -78,6 +78,11 @@ public struct ExternalSubtitleTrack: Sendable, Equatable {
             .contains((formatHint ?? url.pathExtension).lowercased())
     }
 
+    /// Whether a decode reads this track with one unranged GET (`SubtitleDecoder.decodeFile`'s
+    /// `sequentialSource`): a text file is read front to back, while anything else, a container
+    /// or an unknown format, may need to seek.
+    var readsSequentially: Bool { isTextFormat }
+
     /// Bitmap subtitle formats a sidecar is known to carry by its hint or extension (#600). The text
     /// store fill keeps no image cues, so such a track never shares it. An unrecognised format, such
     /// as a container or an extensionless URL, may still hold text and is judged by what the fill
