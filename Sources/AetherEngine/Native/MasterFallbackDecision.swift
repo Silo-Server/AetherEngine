@@ -54,11 +54,18 @@ enum MasterFallbackDecision {
     /// MacBook Air M1 SDR panel: a P8.1 master with and without SUPPLEMENTAL-CODECS, a High-tier 3832x1600
     /// PQ master and an audio switch to AC-3 on both, none refused), so a refusal there is about the
     /// master, and latching it would take the master from later titles it would have served.
+    ///
+    /// AE#887: nor while the host asserts the panel presents HDR. The assertion short-circuits the route
+    /// (`sessionRoutesAsHDRPanel`), so the latch would change no routing and would only forget the panel
+    /// proof and log that later titles go media-direct, which they do not. Measured on an Apple TV 4K
+    /// (tvOS 27, output 4K HDR, headroom 1.20): a live PQ master refused with -11868 / -17223 in HDR
+    /// exactly as in SDR, so that refusal was about the stream, not the panel.
     static func shouldLatchPanelRefusal(code: Int, servedMasterIsHDR: Bool, displayEligibleForHDRNow: Bool,
                                         displaySwitchInProgress: Bool,
-                                        panelEngagesHDROnDemand: Bool = false) -> Bool {
+                                        panelEngagesHDROnDemand: Bool = false,
+                                        hostAssertsPanelHDR: Bool = false) -> Bool {
         isDisplayRejectionCode(code) && servedMasterIsHDR && displayEligibleForHDRNow && !displaySwitchInProgress
-            && !panelEngagesHDROnDemand
+            && !panelEngagesHDROnDemand && !hostAssertsPanelHDR
     }
 
     /// Any code that means "AVPlayer rejected the served master itself": the display-rejection pair

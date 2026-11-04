@@ -106,8 +106,7 @@ extension AetherEngine {
             info = registerExternalSubtitleTrack(admitted)
         }
         if secondary {
-            clearSecondarySubtitle()
-            activeSecondaryExternalSubtitleTrackID = info.id
+            clearSecondarySubtitleContent()
             loadedSecondarySidecarURL = prepared.track.url
             isSecondarySubtitleActive = true
             // Silo fork: the secondary channel gets the same styled text as startSecondarySidecarDecode,
@@ -125,6 +124,7 @@ extension AetherEngine {
             }
             secondarySidecarASSHeader = nil
             isLoadingSecondarySubtitles = false
+            setSecondarySubtitleIdentity(external: info.id)
         } else {
             cancelSubtitleOCRWorker()
             cancelSidecarTask()

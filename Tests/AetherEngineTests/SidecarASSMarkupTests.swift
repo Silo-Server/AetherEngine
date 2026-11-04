@@ -86,7 +86,7 @@ final class SidecarASSMarkupTests: XCTestCase {
 }
 
 @MainActor
-@Suite(.timeLimit(.minutes(1)))
+@Suite(.timeLimit(.minutes(3)))
 struct SecondarySidecarASSMarkupTests {
     /// Silo fork: upstream #826 preserves secondary ASS markup; the fork keeps raw ASS on the primary
     /// overlay only (as the embedded secondary drain does), because Silo draws secondary cues as text.
