@@ -29,6 +29,7 @@ struct Issue460SessionOptionCorrectionTests {
             "sequentialOrigin": { $0.sequentialOrigin.toggle() },
             "heldSourceConnection": { $0.heldSourceConnection.toggle() },
             "sharedOutputRole": { $0.sharedOutputRole = $0.sharedOutputRole == .primary ? .secondary : .primary },
+            "sourceDiagnosticsContext": { $0.sourceDiagnosticsContext = .init(playbackID: UUID(), attemptID: UUID()) },
         ]
         #expect(Set(flips.keys) == Set(SessionOptionCorrection.loadIdentityFields))
         for (field, flip) in flips {
