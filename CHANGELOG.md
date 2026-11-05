@@ -14,11 +14,11 @@ the public-API contract.
 
 Changes this fork carries on top of upstream.
 
-- **Silo fork: `TrueHDObjectAudio` and `DTSXObjectAudio` are on by default.** Silo's XcodeGen project
-  cannot set package traits, so the fork turns on the two object-audio components that
-  `objectAudioRendering` needs (the exact TrueHD Atmos object render and DTS:X's standard presentation).
-  LibTrueHD resolves and links; DTS:X needs no library of its own since 7.44.0. `DualLayerDolbyVision`
-  and `DolbyVisionStillReshaping` stay off. Upstream keeps every trait off.
+- **Silo fork: every optional component is off, as upstream ships it.** The fork had turned on
+  `TrueHDObjectAudio` and `DTSXObjectAudio` by default; both are off again because the components
+  may need third-party patent licenses. LibTrueHD no longer resolves or links, TrueHD Atmos and
+  DTS:X keep the channel bridge whatever `objectAudioRendering` asks, and
+  `DualLayerDolbyVision` and `DolbyVisionStillReshaping` stay off.
 
 - **Silo fork: a secondary ASS sidecar stays plain text.** Upstream #826 publishes raw ASS events and
   `secondarySidecarASSHeader` for a secondary sidecar when `preserveASSMarkup` is on. The fork keeps
