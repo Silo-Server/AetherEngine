@@ -106,7 +106,8 @@ enum SourcePrewarmFetcher {
                                      tail: tail,
                                      contentLength: head.total,
                                      requestHeaders: extraHeaders,
-                                     resolvedURL: head.respondedURL)
+                                     resolvedURL: head.respondedURL,
+                                     contentType: head.contentType)
         guard store.store(warmed, for: url) else {
             return decline(url, "\(warmed.byteCount) bytes exceed the prewarm store's cap")
         }
@@ -166,6 +167,7 @@ enum RangeFetch {
         /// The URL that actually answered, redirects followed. A warm that resolved a 302 knows the
         /// target the session would otherwise resolve again (#551 round 2).
         let respondedURL: URL?
+        var contentType: String? = nil
     }
 
     static func run(url: URL,
@@ -223,6 +225,7 @@ private final class RangeFetchDelegate: NSObject, URLSessionDataDelegate, @unche
     private var contentRange: (start: Int64, end: Int64, total: Int64)?
     private var rejection: String?
     private var respondedURL: URL?
+    private var contentType: String?
 
     /// Guards the handoff between the caller's thread, which installs the handler, and the
     /// session's delegate queue, which produces the outcome. Either can be first.
@@ -269,15 +272,16 @@ private final class RangeFetchDelegate: NSObject, URLSessionDataDelegate, @unche
                     willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest request: URLRequest,
                     completionHandler: @escaping (URLRequest?) -> Void) {
-        if let from = task.originalRequest?.url, let to = request.url {
-            OriginRequestBudget.shared.noteRedirect(from: from, to: to)
-        }
         // Credential headers do not follow a redirect to another host (#126 cross-origin replay).
-        completionHandler(RedirectHeaderPolicy.redirectRequest(
+        let next = RedirectHeaderPolicy.redirectRequest(
             request,
             originalURL: task.originalRequest?.url,
             originalRange: task.originalRequest?.value(forHTTPHeaderField: "Range"),
-            extraHeaders: extraHeaders))
+            extraHeaders: extraHeaders)
+        if let from = task.originalRequest?.url, let to = next.url {
+            OriginRequestBudget.shared.noteRedirect(from: from, to: to)
+        }
+        completionHandler(next)
     }
 
     func urlSession(_ session: URLSession,
@@ -330,6 +334,7 @@ private final class RangeFetchDelegate: NSObject, URLSessionDataDelegate, @unche
         // `http.url` is the URL that answered, redirects followed, which is the one a later load
         // should start at instead of resolving the chain again (#551 round 2).
         respondedURL = http.url
+        contentType = http.value(forHTTPHeaderField: "Content-Type")
         completionHandler(.allow)
     }
 
@@ -360,7 +365,8 @@ private final class RangeFetchDelegate: NSObject, URLSessionDataDelegate, @unche
         return .body(RangeFetch.Result(body: buffer,
                                        range: (start: range.start, end: range.end),
                                        total: range.total,
-                                       respondedURL: respondedURL))
+                                       respondedURL: respondedURL,
+                                       contentType: contentType))
     }
 
     /// `bytes <start>-<end>/<total>`. A `*` total is a range the origin will not size, which is

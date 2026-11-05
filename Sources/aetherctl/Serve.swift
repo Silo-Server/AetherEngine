@@ -27,7 +27,12 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
     if case .apac(let layout) = objectAudioRendering { flagSuffix += " [--atmos-bed \(layout.rawValue)]" }
     if let audioStreamIndex { flagSuffix += " [--audio-index \(audioStreamIndex)]" }
     if iFrames { flagSuffix += " [--iframes]" }
-    if case .apac(let layout) = objectAudioRendering { flagSuffix += " [--atmos-bed \(layout.rawValue)]" }
+    switch objectAudioRendering {
+    case .apac(let layout): flagSuffix += " [--atmos-bed \(layout.rawValue)]"
+    case .lpcm(let layout): flagSuffix += " [--atmos-bed \(layout.rawValue) --bed-format lpcm]"
+    case .render(let layout): flagSuffix += " [--atmos-bed \(layout.rawValue) --bed-format auto]"
+    case .off: break
+    }
     if let audioStreamIndex { flagSuffix += " [--audio-index \(audioStreamIndex)]" }
     if let stereo { flagSuffix += " [--stereo \(stereo)]" }
     print(EngineLog.redacted("aetherctl serve: \(url.absoluteString)\(flagSuffix)"))

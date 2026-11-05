@@ -43,6 +43,8 @@ enum SubtitleDecoderError: Error, CustomStringConvertible, LocalizedError {
 struct SidecarDecodeResult {
     let cues: [SubtitleCue]
     let assHeader: String?
+    /// #921: set instead of `cues` when the caller asked for a bitmap stream's packets.
+    var bitmapSource: SidecarBitmapSource? = nil
 }
 
 /// One-shot decoder for sidecar subtitle files (.srt/.ass/.vtt/.ssa).
@@ -74,6 +76,8 @@ enum SubtitleDecoder {
     /// URLs that are containers holding several subtitle streams; nil decodes the container's first
     /// subtitle stream (the pre-#266 behaviour). An index that is out of range or names a
     /// non-subtitle stream throws `streamIndexNotSubtitle`.
+    /// `keepsBitmapPackets` (#921): a bitmap stream is read into a `SidecarBitmapSource` and not
+    /// decoded at all; the result carries no cues. Text streams decode as before either way.
     static func decodeFile(
         url: URL,
         httpHeaders: [String: String] = [:],
@@ -81,13 +85,14 @@ enum SubtitleDecoder {
         preserveASSMarkup: Bool = false,
         sourceStreamIndex: Int32? = nil,
         idleTimeout: TimeInterval = sidecarIdleTimeout,
-        preparationPolicy: ExternalSubtitlePreparationPolicy? = nil
+        preparationPolicy: ExternalSubtitlePreparationPolicy? = nil,
+        keepsBitmapPackets: Bool = false
     ) async throws -> SidecarDecodeResult {
         let results = try await decode(
             url: url, httpHeaders: httpHeaders, httpRequestAuthorization: httpRequestAuthorization,
             preserveASSMarkup: preserveASSMarkup,
             requested: sourceStreamIndex.map { [$0] }, idleTimeout: idleTimeout,
-            preparationPolicy: preparationPolicy
+            preparationPolicy: preparationPolicy, keepsBitmapPackets: keepsBitmapPackets
         )
         guard let only = results.first else { throw SubtitleDecoderError.noSubtitleStream }
         return only
@@ -121,7 +126,8 @@ enum SubtitleDecoder {
         preserveASSMarkup: Bool,
         requested: [Int32?]?,
         idleTimeout: TimeInterval,
-        preparationPolicy: ExternalSubtitlePreparationPolicy? = nil
+        preparationPolicy: ExternalSubtitlePreparationPolicy? = nil,
+        keepsBitmapPackets: Bool = false
     ) async throws -> [SidecarDecodeResult] {
         // Task cancellation does not reach the dispatched decode. Bridge it explicitly via
         // CancelFlag so the decode loop + AVIO reader abort promptly.
@@ -135,7 +141,8 @@ enum SubtitleDecoder {
                     url: url, httpHeaders: httpHeaders,
                     httpRequestAuthorization: httpRequestAuthorization,
                     preserveASSMarkup: preserveASSMarkup, requested: requested,
-                    idleTimeout: idleTimeout, token: token, preparationPolicy: preparationPolicy)
+                    idleTimeout: idleTimeout, token: token, preparationPolicy: preparationPolicy,
+                    keepsBitmapPackets: keepsBitmapPackets)
             }.value
         } onCancel: {
             token.cancel()
@@ -150,7 +157,8 @@ enum SubtitleDecoder {
         requested: [Int32?]?,
         idleTimeout: TimeInterval,
         token: CancelFlag,
-        preparationPolicy: ExternalSubtitlePreparationPolicy?
+        preparationPolicy: ExternalSubtitlePreparationPolicy?,
+        keepsBitmapPackets: Bool
     ) throws -> [SidecarDecodeResult] {
         if token.isCancelled { throw CancellationError() }
         // Preserve AVIO's streaming/range access to subtitle containers. Only the relay
@@ -176,7 +184,8 @@ enum SubtitleDecoder {
         let result = try decodeFileSync(
             url: decodeURL, httpHeaders: httpRequestAuthorization == nil ? httpHeaders : [:],
             preserveASSMarkup: preserveASSMarkup, requested: requested, idleTimeout: idleTimeout,
-            cancel: token, preparationPolicy: preparationPolicy
+            cancel: token, preparationPolicy: preparationPolicy,
+            keepsBitmapPackets: keepsBitmapPackets
         )
         if token.isCancelled { throw CancellationError() }
         return result
@@ -502,7 +511,8 @@ enum SubtitleDecoder {
     private static func decodeFileSync(
         url: URL, httpHeaders: [String: String],
         preserveASSMarkup: Bool, requested: [Int32?]?, idleTimeout: TimeInterval, cancel: CancelFlag,
-        preparationPolicy: ExternalSubtitlePreparationPolicy?
+        preparationPolicy: ExternalSubtitlePreparationPolicy?,
+        keepsBitmapPackets: Bool = false
     ) throws -> [SidecarDecodeResult] {
         if let preparationPolicy {
             #if DEBUG
@@ -598,18 +608,26 @@ enum SubtitleDecoder {
         }
 
         var decodersByStream: [Int32: StreamDecode] = [:]
+        // #921: bitmap streams read into packets instead, never decoded here.
+        var bitmapSources: [Int32: SidecarBitmapSource] = [:]
         // Registered after the avformat_close_input defer, so LIFO runs it FIRST: the codec
         // contexts go before the format context, matching the pre-#266 defer order. Covers the
         // throwing paths below too.
         defer { decodersByStream.removeAll() }
-        for index in resolved where decodersByStream[index] == nil {
+        for index in resolved where decodersByStream[index] == nil && bitmapSources[index] == nil {
             guard let stream = fmt.pointee.streams[Int(index)] else {
                 throw SubtitleDecoderError.streamIndexNotSubtitle(index: index)
+            }
+            if keepsBitmapPackets, preparationPolicy == nil,
+               let source = SidecarBitmapSource(stream: stream) {
+                bitmapSources[index] = source
+                continue
             }
             decodersByStream[index] = try StreamDecode(
                 streamIndex: index, stream: stream, preserveASSMarkup: preserveASSMarkup, preparationPolicy: preparationPolicy)
         }
 
+        var reachedEOF = false
         while !cancel.isCancelled {
             var pktPtr: UnsafeMutablePointer<AVPacket>? = trackedPacketAlloc()
             guard let pkt = pktPtr else { break }
@@ -617,15 +635,18 @@ enum SubtitleDecoder {
             if readRet < 0 {
                 trackedPacketFree(&pktPtr)
                 if preparationPolicy != nil && readRet != FFmpegErr.eof { throw SubtitleDecoderError.openFailed(code: readRet) }
+                reachedEOF = readRet == FFmpegErr.eof
                 break
             }
 
-            if let decoder = decodersByStream[pkt.pointee.stream_index] {
+            let decoder = decodersByStream[pkt.pointee.stream_index]
+            let bitmapSource = bitmapSources[pkt.pointee.stream_index]
+            if decoder != nil || bitmapSource != nil,
+               let stream = fmt.pointee.streams[Int(pkt.pointee.stream_index)] {
                 // Audit FEA-101 / SUB-105: this loop reads libavformat directly, past Demuxer's bound.
-                if let stream = fmt.pointee.streams[Int(pkt.pointee.stream_index)] {
-                    SourceTimestampBounds.sanitize(pkt, timeBase: stream.pointee.time_base)
-                }
-                decoder.decode(packet: pkt)
+                SourceTimestampBounds.sanitize(pkt, timeBase: stream.pointee.time_base)
+                decoder?.decode(packet: pkt)
+                bitmapSource?.harvest(packet: pkt, timeBase: stream.pointee.time_base)
             }
 
             av_packet_unref(pkt)
@@ -644,8 +665,12 @@ enum SubtitleDecoder {
             if preparationPolicy != nil && decoder.decodeFailed { throw SubtitleDecoderError.openFailed(code: -1) }
         }
         if preparationPolicy != nil && cancel.isCancelled { throw CancellationError() }
+        if reachedEOF { bitmapSources.values.forEach { $0.finishReading() } }
 
-        let results = resolved.compactMap { decodersByStream[$0]?.result }
+        let results = resolved.compactMap { index in
+            decodersByStream[index]?.result
+                ?? bitmapSources[index].map { SidecarDecodeResult(cues: [], assHeader: nil, bitmapSource: $0) }
+        }
         // A cancelled decode is the caller's doing; decodeBlocking reports it as such.
         if cancel.isCancelled { return results }
         // Only a source failure is a truncation; a demux error on a body that arrived whole would
