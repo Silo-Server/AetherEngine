@@ -97,6 +97,71 @@ struct CFRFrameGridTests {
         #expect(grid.place(pts: 20, dts: 20, duration: 42, shift: 0) == nil)
     }
 
+    /// What the producer writes for each packet of a stream in decode order: the old duration (the
+    /// source-TB telescope through `place` or the plain rescale) and the new one (`durationToNext`).
+    private func written(
+        _ grid: CFRFrameGrid, _ packets: [(pts: Int64, dts: Int64)]
+    ) -> [(dts: Int64, oldDuration: Int64, newDuration: Int64)] {
+        packets.indices.map { i in
+            let p = packets[i]
+            let next = i + 1 < packets.count ? packets[i + 1] : nil
+            let sourceDuration = next.map { $0.dts - p.dts } ?? 42
+            let dts = grid.writtenDts(pts: p.pts, dts: p.dts, shift: 0)
+            let old = grid.place(pts: p.pts, dts: p.dts, duration: sourceDuration, shift: 0)?.duration
+                ?? grid.rescale(sourceDuration)
+            let new = next.flatMap {
+                grid.durationToNext(writtenDts: dts, nextPts: $0.pts, nextDts: $0.dts, shift: 0, capTicks: 10_000)
+            } ?? old
+            return (dts, old, new)
+        }
+    }
+
+    /// Overshoots past the next written DTS, in output ticks. movenc logs each one that falls on a
+    /// fragment boundary as `Packet duration: -N` and drops that keyframe's PTS.
+    private func overshoots(_ rows: [(dts: Int64, oldDuration: Int64, newDuration: Int64)],
+                            useNew: Bool) -> [Int64] {
+        zip(rows, rows.dropFirst()).compactMap { cur, next in
+            let end = cur.dts + (useNew ? cur.newDuration : cur.oldDuration)
+            return end > next.dts ? end - next.dts : nil
+        }
+    }
+
+    @Test("AE#886: a held packet's duration ends on the next packet's written DTS")
+    func durationEndsOnNextWrittenDts() throws {
+        let grid = try #require(CFRFrameGrid.make(sourceTimeBase: ms, frameRate: AVRational(num: 24000, den: 1001), startPts: 0))
+        // On the grid (DTS slot 2002), then an off-grid keyframe whose DTS rescales to 2496.
+        let rows = written(grid, [(pts: 125, dts: 83), (pts: 147, dts: 104)])
+        #expect(rows[1].dts == 2496)
+        #expect(rows[0].dts + rows[0].oldDuration > rows[1].dts)   // what the device logged
+        #expect(rows[0].newDuration == 2496 - 2002)
+        // No successor, or one that does not move forward: nil, the caller keeps its duration.
+        #expect(grid.durationToNext(writtenDts: 2002, nextPts: 125, nextDts: 83, shift: 0, capTicks: 10_000) == nil)
+        #expect(grid.durationToNext(writtenDts: Int64.min, nextPts: 147, nextDts: 104, shift: 0, capTicks: 10_000) == nil)
+        // A gap past the cap (a wrap, a discontinuity) is not a duration either.
+        #expect(grid.durationToNext(writtenDts: 0, nextPts: 50_000, nextDts: 50_000, shift: 0, capTicks: 10_000) == nil)
+    }
+
+    @Test("AE#886: a stream that leaves and rejoins the grid never overshoots a written DTS")
+    func mixedGridStreamNeverOvershoots() throws {
+        let rate = 24000.0 / 1001.0
+        let grid = try #require(CFRFrameGrid.make(sourceTimeBase: ms, frameRate: AVRational(num: 24000, den: 1001), startPts: 0))
+        // Frames 0..<400 on the grid, then an edit moves the next 400 by 2 ms (off the grid by more
+        // than one source tick), then the grid again. Decode order with one B-frame per pair
+        // (I P B P B ...), DTS one frame behind PTS as mkvmerge and the demuxer's repair produce.
+        var packets: [(pts: Int64, dts: Int64)] = []
+        func pts(_ n: Int64) -> Int64 { matroskaPts(n, rate: rate) + ((400..<800).contains(n) ? 2 : 0) }
+        for n in Int64(0)..<1200 {
+            let display: Int64 = n == 0 ? 0 : (n % 2 == 1 ? n + 1 : n - 1)
+            packets.append((pts: pts(display) + matroskaPts(1, rate: rate), dts: pts(n)))
+        }
+        let rows = written(grid, packets)
+        #expect(!overshoots(rows, useNew: false).isEmpty)
+        #expect(overshoots(rows, useNew: true).isEmpty)
+        // On-grid stretches keep exact one-frame durations.
+        #expect(rows[10].newDuration == 1001)
+        #expect(rows[1000].newDuration == 1001)
+    }
+
     @Test("A duration that is not one frame is rescaled, not replaced")
     func durationKeptWhenNotAFrame() throws {
         let grid = try #require(CFRFrameGrid.make(sourceTimeBase: ms, frameRate: AVRational(num: 24000, den: 1001), startPts: 0))
