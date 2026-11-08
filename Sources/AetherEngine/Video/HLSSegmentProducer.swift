@@ -4685,7 +4685,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                                                    pts: prev.pointee.pts)
                                 }
                             }
-                            finalizeAndWriteVideo(prev, nextDts: packet.pointee.dts, muxer: muxer)
+                            finalizeAndWriteVideo(prev, nextDts: packet.pointee.dts, nextPts: packet.pointee.pts, muxer: muxer)
                             bumpPacketsWritten()
                         } else {
                             var pkt: UnsafeMutablePointer<AVPacket>? = prev
@@ -5020,6 +5020,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private func finalizeAndWriteVideo(
         _ packet: UnsafeMutablePointer<AVPacket>,
         nextDts: Int64?,
+        nextPts: Int64? = nil,
         muxer: MP4SegmentMuxer
     ) {
         packet.pointee.duration = Self.resolveVideoSampleDuration(
@@ -5073,10 +5074,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
         let tapForWrite = convertP7Active ? videoPacketTapProvider?() : nil
 
         // AE#886: decided on the source time base, before the rescale rounds it away.
-        let gridded = muxer.muxerVideoTimeBase.den == frameGrid?.outputTimeBase.den
-            ? frameGrid?.place(pts: packet.pointee.pts, dts: packet.pointee.dts,
-                               duration: packet.pointee.duration, shift: videoShiftPts)
-            : nil
+        let muxGrid = muxer.muxerVideoTimeBase.den == frameGrid?.outputTimeBase.den ? frameGrid : nil
+        let gridded = muxGrid?.place(pts: packet.pointee.pts, dts: packet.pointee.dts,
+                                     duration: packet.pointee.duration, shift: videoShiftPts)
         av_packet_rescale_ts(packet, sourceVideoTimeBase, muxer.muxerVideoTimeBase)
         if let gridded {
             packet.pointee.pts = gridded.pts
@@ -5085,6 +5085,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
             griddedVideoPackets += 1
         } else if frameGrid != nil {
             offGridVideoPackets += 1
+        }
+        // AE#886: the grid moves each DTS on its own, so the #92 telescope on the source time
+        // base no longer ends on the next written DTS. Measure it again on the output time base.
+        if let muxGrid, let nextDts, let nextPts,
+           let toNext = muxGrid.durationToNext(writtenDts: packet.pointee.dts, nextPts: nextPts,
+                                               nextDts: nextDts, shift: videoShiftPts,
+                                               capTicks: videoSampleDurationCapTicks) {
+            packet.pointee.duration = toNext
         }
         let write = muxer.writePacket(packet)
         if write.rc < 0, !loggedVideoWriteFailure {

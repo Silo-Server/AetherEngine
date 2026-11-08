@@ -14,6 +14,15 @@ the public-API contract.
 
 Changes this fork carries on top of upstream.
 
+- **A Matroska title on the frame grid no longer flashes a frame at segment starts.** AE#886 moves
+  each 23.976 (or 29.97, 59.94, ...) DTS onto its 1/24000 slot, or rescales it when the PTS is off
+  the grid, but a held packet's duration was still measured on the 1 ms source time base. Where
+  on-grid and off-grid packets meet, that duration ended a few ticks past the next written DTS. At
+  a fragment boundary movenc logged `Packet duration: -N ... out of range`, clamped the DTS and
+  dropped the PTS of the segment's opening keyframe, which AVPlayer showed as a flashed frame and a
+  stutter every few seconds (a Blu-ray remux episode had 37 to 72% of its packets off the grid). The
+  duration is now the distance between the two written DTS values.
+
 - **Silo fork: every optional component is off, as upstream ships it.** The fork had turned on
   `TrueHDObjectAudio` and `DTSXObjectAudio` by default; both are off again because the components
   may need third-party patent licenses. LibTrueHD no longer resolves or links, TrueHD Atmos and

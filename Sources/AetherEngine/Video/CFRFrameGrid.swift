@@ -104,6 +104,32 @@ struct CFRFrameGrid {
         return (outPts, outDts, outDuration)
     }
 
+    /// The DTS a packet is written with on this grid's time base: the placed DTS when its PTS is on
+    /// the grid, the plain rescale otherwise. `pts` and `dts` are item-axis, as for `place`.
+    func writtenDts(pts: Int64, dts: Int64, shift: Int64) -> Int64 {
+        guard dts != Int64.min else { return Int64.min }
+        return place(pts: pts, dts: dts, duration: 0, shift: shift)?.dts ?? rescale(dts)
+    }
+
+    /// The written duration of a packet whose successor is known: the distance from its written DTS
+    /// to the successor's. #92 telescopes the duration to the next DTS on the source time base, but
+    /// the grid moves each DTS on its own (onto a slot, or by the plain rescale when the PTS is off
+    /// the grid), so the source delta, or one frame, can end past the next written DTS. At a
+    /// fragment boundary movenc measures the next DTS against `start_dts + track_duration`; an
+    /// overshoot of a few ticks there is `Packet duration: -N ... out of range`, and movenc drops
+    /// the PTS of the segment's opening keyframe (seen on device as a flashed frame every few seconds
+    /// on Blu-ray remuxes with 37 to 72% of their packets off the grid).
+    /// Nil when there is no positive distance within `capTicks` (source ticks), in which case the
+    /// caller keeps the duration it had.
+    func durationToNext(writtenDts: Int64, nextPts: Int64, nextDts: Int64, shift: Int64, capTicks: Int64) -> Int64? {
+        guard writtenDts != Int64.min, nextDts != Int64.min else { return nil }
+        let next = self.writtenDts(pts: nextPts, dts: nextDts, shift: shift)
+        let (gap, overflow) = next.subtractingReportingOverflow(writtenDts)
+        guard !overflow, gap > 0 else { return nil }
+        if capTicks != Int64.max, gap > rescale(capTicks) { return nil }
+        return gap
+    }
+
     private static func roundedQuotient(_ n: Int64, _ d: Int64) -> Int64 {
         let q = n / d
         let r = n % d
