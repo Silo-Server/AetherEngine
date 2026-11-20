@@ -94,6 +94,17 @@ public struct LiveTelemetry: Equatable, Sendable {
     /// Bytes pulled from the SOURCE in the session, across every demuxer it has had. The origin-side
     /// counterpart to `networkTransferredBytes`, and the one that is about the same link on both paths.
     public let demuxerBytesFetched: Int64
+    /// Silo fork: on a relayed remote HLS load (`LoadOptions.httpRequestAuthorization`, or an origin the
+    /// system's trust refuses), the bytes of the media bodies the relay received from the origin, and
+    /// the milliseconds they spent arriving, both counted from each body's first byte to its last and
+    /// both running totals for the relay. The time an origin takes to produce a segment before it
+    /// answers is not in them, so their quotient is a lower bound on the link's rate while it
+    /// delivered, where `networkThroughputMbps` (AVPlayer's access log on the loopback hop) reads that
+    /// wait as transfer time. A body that arrived in under 1 s, a subtitle rendition and a playlist do not count;
+    /// overlapping bodies count their shared time once. nil without a relay; a new load's relay starts
+    /// again from 0.
+    public let relayMediaReceivedBytes: Int64?
+    public let relayMediaReceivingMs: Int64?
     public let audioBridgeLiveBytes: Int
     public let rssMb: Int
 
@@ -120,6 +131,8 @@ public struct LiveTelemetry: Equatable, Sendable {
         serverBytesSentLifetime: Int64,
         serverRequestCount: Int,
         demuxerBytesFetched: Int64,
+        relayMediaReceivedBytes: Int64? = nil,
+        relayMediaReceivingMs: Int64? = nil,
         audioBridgeLiveBytes: Int,
         rssMb: Int
     ) {
@@ -145,6 +158,8 @@ public struct LiveTelemetry: Equatable, Sendable {
         self.serverBytesSentLifetime = serverBytesSentLifetime
         self.serverRequestCount = serverRequestCount
         self.demuxerBytesFetched = demuxerBytesFetched
+        self.relayMediaReceivedBytes = relayMediaReceivedBytes
+        self.relayMediaReceivingMs = relayMediaReceivingMs
         self.audioBridgeLiveBytes = audioBridgeLiveBytes
         self.rssMb = rssMb
     }
