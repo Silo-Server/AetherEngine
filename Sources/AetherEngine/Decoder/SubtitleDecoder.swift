@@ -226,6 +226,7 @@ enum SubtitleDecoder {
             do {
                 result = try decode(sequential: false)
             } catch {
+                if token.isCancelled { throw CancellationError() }
                 // A cut keeps its cues and stays retryable as a truncation; an outright failure of
                 // the reopen would lose both, so the fuller cut of the two attempts is reported.
                 guard case SubtitleDecoderError.truncated(let kept, _) = first else { throw error }
