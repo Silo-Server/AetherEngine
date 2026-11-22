@@ -292,6 +292,58 @@ struct ExternalNativeSubtitleTests {
         #expect(srtStore.snapshotCues().compactMap(\.text) == ["Hello"])
     }
 
+    @Test("a failed shared pass lets a later target's selection decode on its own instead of waiting out the retries (silo-apple#600)")
+    func failedSharedPassReleasesLaterTargets() async throws {
+        let srt = FileManager.default.temporaryDirectory.appendingPathComponent("silo-600-\(UUID().uuidString).srt")
+        try "1\n00:00:01,000 --> 00:00:02,000\nHello\n".write(to: srt, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: srt) }
+
+        let log = OutcomeLog()
+        // Stream 5 does not exist, so the pass over both targets throws and each is retried alone.
+        await AetherEngine.runExternalSubtitleFill(job: .init(
+            url: srt, headers: [:],
+            targets: [.init(streamIndex: 0, store: NativeSubtitleCueStore(), externalID: 100_000),
+                      .init(streamIndex: 5, store: NativeSubtitleCueStore(), externalID: 100_001)])) {
+            await log.add($0)
+        }
+
+        let outcomes = await log.outcomes
+        #expect(outcomes.first?.externalID == 100_001, "the later target hears it before the first target's retry")
+        #expect(outcomes.first?.complete == false)
+        #expect(outcomes.contains { $0.externalID == 100_000 && $0.complete })
+    }
+
+    @Test("a session teardown leaves no fill for a rebuilt session to wait on or backfill from (silo-apple#600)")
+    func teardownDropsFillState() throws {
+        let engine = try AetherEngine()
+        let (info, _) = trackWithRunningFill(engine, url: "https://s/x.ass", preserveASSMarkup: true)
+        engine.completedExternalStoreFillIDs = [info.id]
+        engine.externalStoreFillStyledResults[info.id] = SidecarDecodeResult(cues: [], assHeader: "[Script Info]")
+        let generation = engine.externalStoreFillGeneration
+
+        engine.stopInternal(resetDisplayCriteria: false, keepNativeHost: true, keepCustomReader: true)
+
+        #expect(engine.runningExternalStoreFillIDs.isEmpty)
+        #expect(engine.completedExternalStoreFillIDs.isEmpty)
+        #expect(engine.externalStoreFillStyledResults.isEmpty)
+        #expect(engine.externalStoreFillGeneration != generation, "the old run's completions are ignored")
+    }
+
+    @Test("a prepared track whose fill found no cues runs its own policy decode (silo-apple#600)")
+    func preparedTrackDoesNotBackfillEmpty() throws {
+        let engine = try AetherEngine()
+        var track = ExternalSubtitleTrack(url: URL(string: "https://s/x.vtt")!, language: "de")
+        track.preparationPolicy = ExternalSubtitlePreparationPolicy()
+        let info = engine.addExternalSubtitleTrack(track)
+        let store = NativeSubtitleCueStore()
+        engine.nativeSubtitleTrackTable = [.init(sourceStreamIndex: nil, externalID: info.id, language: "de")]
+        engine.testHookInstallNativeStores([store])
+        store.markFinished()
+        engine.completedExternalStoreFillIDs = [info.id]
+        engine.selectSubtitleTrack(index: info.id)
+        #expect(engine.sidecarTask != nil)
+    }
+
     private static let assFile = """
     [Script Info]
     ScriptType: v4.00+

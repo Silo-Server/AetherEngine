@@ -1605,10 +1605,10 @@ extension AetherEngine {
         let codec = ExternalSubtitleTrack.codecName(url: track.url, formatHint: track.formatHint)
         let wantsStyledASS = loadedOptions.preserveASSMarkup && codec == "ass"
         // A prepared track's own decode enforces its resource policy, which the fill does not. A
-        // bitmap sidecar joins the fill only because `codecName` labels it subrip: its store keeps
-        // no image cues, so the fill can never serve it. A track of another format, such as one
-        // stream of a subtitle container, shares the fill, and a fill that decodes images reports
-        // that it does not hold the whole track (`fillHoldsWholeTrack`).
+        // bitmap sidecar whose format `codecName` does not name (VobSub, DVB) joins the fill as
+        // subrip, but its store keeps no image cues, so the fill can never serve it. A track of
+        // another format, such as one stream of a subtitle container, shares the fill, and a fill
+        // that decodes images reports that it does not hold the whole track (`fillHoldsWholeTrack`).
         let sharesStoreFill = track.preparationPolicy == nil && !track.isKnownBitmapFormat
         let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: id, in: nativeSubtitleTrackTable)
         // Phase D: an OCR store holds recognized TEXT; the bitmap overlay must re-decode
@@ -1620,7 +1620,7 @@ extension AetherEngine {
             return
         }
         if !wantsStyledASS, let store, store.isFinished, !store.didEndEarly,
-           store.cueCount > 0 || completedExternalStoreFillIDs.contains(id) {
+           store.cueCount > 0 || (sharesStoreFill && completedExternalStoreFillIDs.contains(id)) {
             backfillExternalSubtitle(id: id, track: track, cues: store.snapshotCues(), assHeader: nil,
                                      source: "finished store")
             return
@@ -1685,7 +1685,9 @@ extension AetherEngine {
         runningExternalStoreFillIDs.remove(outcome.externalID)
         if outcome.complete {
             completedExternalStoreFillIDs.insert(outcome.externalID)
-            if let styled = outcome.styled { externalStoreFillStyledResults[outcome.externalID] = styled }
+            if let styled = outcome.styled, externalSubtitleRegistry[outcome.externalID] != nil {
+                externalStoreFillStyledResults[outcome.externalID] = styled
+            }
         }
         resumeSelectionAwaitingExternalStoreFill()
     }
@@ -1762,7 +1764,8 @@ extension AetherEngine {
     /// store that could not be filled stays UNfinished, or the rendition would serve a complete but
     /// blank .vtt.
     ///
-    /// `onFilled` (#600) hears every target once, filled or not, so a selection waiting on one resumes.
+    /// `onFilled` (#600) hears every target, filled or not, so a selection waiting on one resumes. When
+    /// the shared pass fails, the targets after the first hear it before their retries run.
     nonisolated static func runExternalSubtitleFill(
         job: ExternalSubtitleFillJob,
         onFilled: (@Sendable (ExternalSubtitleFillOutcome) async -> Void)? = nil
@@ -1784,6 +1787,10 @@ extension AetherEngine {
             return
         }
         EngineLog.emit("[AetherEngine] external native store fill: shared pass over \(job.url.lastPathComponent) failed, retrying \(job.targets.count) targets individually", category: .engine)
+        // Each retry reads the whole file for one target, so a selection waiting on a later target
+        // would sit through every read before its own. Only the first target's read starts now; the
+        // others decode on their own, as they did before the fill was shared.
+        await unfilled(Array(job.targets.dropFirst()), onFilled: onFilled)
         for target in job.targets {
             if Task.isCancelled { return }
             guard let fill = await fillDecode(job.url, {
@@ -1853,6 +1860,7 @@ extension AetherEngine {
         externalSubtitleIntentGeneration &+= 1
         guard externalSubtitleRegistry.removeValue(forKey: id) != nil else { return }
         subtitleTracks.removeAll { $0.id == id }
+        externalStoreFillStyledResults[id] = nil   // #600: nothing can select it again
         if activeSubtitleTrackIndex == id { clearSubtitle() }
         if activeSecondaryExternalSubtitleTrackID == id { clearSecondarySubtitle() }
         if pendingSecondaryExternalSubtitleTrackID == id {

@@ -8838,6 +8838,9 @@ public final class AetherEngine: ObservableObject {
         cancelSidecarTask()
         stopSubtitleDrainer(reason: .sessionStopped)   // #112 rework: both channels
         resetSubtitleOCRState()                // Phase D
+        // #600: a software reroute or a background teardown rebuilds without a new fill run, so no
+        // selection may wait on, or backfill from, the one this session started.
+        resetExternalStoreFillState()
         subtitleDrainTargets.removeAll()
         softwareSubtitlePacketStore = nil
         activeEmbeddedSubtitleStreamIndex = -1
