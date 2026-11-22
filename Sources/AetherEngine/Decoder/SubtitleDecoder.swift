@@ -42,17 +42,6 @@ enum SubtitleDecoderError: Error, CustomStringConvertible, LocalizedError {
 /// the script header ([Script Info] + [V4+ Styles] + [Events] Format line) from the stream's extradata.
 /// `plainCues` (#600) is the same stream as a decode without preserveASSMarkup reads it, present only
 /// when the caller asked for both readings and this stream kept its raw markup.
-extension SubtitleDecoderError {
-    /// The source broke off: an I/O error at open, or a read that ended short.
-    var isSourceCut: Bool {
-        switch self {
-        case .openFailed(let code): code == FFmpegErr.eio
-        case .truncated: true
-        default: false
-        }
-    }
-}
-
 struct SidecarDecodeResult {
     let cues: [SubtitleCue]
     let assHeader: String?
@@ -226,16 +215,42 @@ enum SubtitleDecoder {
         let result: [SidecarDecodeResult]
         do {
             result = try decode(sequential: sequentialSource)
-        } catch let error as SubtitleDecoderError
-                    where sequentialSource && error.isSourceCut && !token.isCancelled && !token.didFailSource {
-            // The single sequential GET has no reconnect. A text demuxer reads the whole body at
-            // open, so a connection that drops mid-file fails the open or ends the read short,
-            // depending on where the cut lands. The ranged open resumes at the frontier, which is
-            // what this read had before `sequentialSource`.
-            result = try decode(sequential: false)
+        } catch where sequentialSource && Self.rangedOpenMayRecover(error) && !token.isCancelled
+                        && !token.didFailSource {
+            // The single sequential GET has no reconnect and no retry. A text demuxer reads the whole
+            // body at open, so a connection that drops mid-file fails the open or ends the read short,
+            // depending on where the cut lands; a refused or unanswered request fails it outright. The
+            // ranged open resumes at the frontier and retries a busy origin, which is what this read
+            // had before `sequentialSource`.
+            let first = error
+            do {
+                result = try decode(sequential: false)
+            } catch {
+                // A cut keeps its cues and stays retryable as a truncation; an outright failure of
+                // the reopen would lose both, so the fuller cut of the two attempts is reported.
+                guard case SubtitleDecoderError.truncated(let kept, _) = first else { throw error }
+                if case SubtitleDecoderError.truncated(let again, _) = error,
+                   again.reduce(0, { $0 + $1.cues.count }) > kept.reduce(0, { $0 + $1.cues.count }) {
+                    throw error
+                }
+                throw first
+            }
         }
         if token.isCancelled { throw CancellationError() }
         return result
+    }
+
+    /// Whether a sequential read's failure is one the ranged open can get past: the source broke off
+    /// (an I/O error at open, or a read that ended short), the request went unanswered, or the origin
+    /// refused it with a status other than an authentication one, which a refresh owns.
+    private static func rangedOpenMayRecover(_ error: Error) -> Bool {
+        switch error {
+        case SubtitleDecoderError.openFailed(let code): return code == FFmpegErr.eio
+        case SubtitleDecoderError.truncated: return true
+        case AVIOReaderError.noResponse: return true
+        case AVIOReaderError.httpStatus(let status): return ![401, 403, 407].contains(status)
+        default: return false
+        }
     }
 
     /// Thread-safe cancellation token for the dispatched decode; also aborts any registered AVIO reader.

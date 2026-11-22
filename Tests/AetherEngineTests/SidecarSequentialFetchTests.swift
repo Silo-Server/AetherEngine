@@ -72,6 +72,20 @@ struct SidecarSequentialFetchTests {
         #expect(origin.requests.first?.range == nil, "the first read is the single sequential GET")
     }
 
+    @Test("a busy origin's refusal of the sequential GET falls back to the ranged open, which retries it (silo-apple#600)")
+    func refusedSequentialReadFallsBack() async throws {
+        let body = Data(Self.vtt.utf8)
+        let origin = try ProbeHTTPTestOrigin(data: body, response: { _, index in
+            index == 0 ? Data("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8) : nil
+        })
+        defer { origin.stop() }
+
+        let result = try await SubtitleDecoder.decodeFile(url: url(origin), sequentialSource: true)
+
+        #expect(result.cues.compactMap(\.text) == ["Hello", "World"])
+        #expect(origin.requests.first?.range == nil, "the first request is the sequential GET")
+    }
+
     @Test("a track that names a stream index is a container and keeps the ranged open, whatever its hint")
     func streamIndexKeepsRangedOpen() {
         let url = URL(string: "https://example.test/subtitles/0")!
