@@ -30,15 +30,45 @@ final class DisplayCriteriaController {
     /// which on unobservable-DV panels otherwise burns the full ~3s waitForSwitch cap on every channel change.
     private var lastApplied: AppliedCriteria?
 
-    /// Has a criteria write ever demonstrably driven THIS display into HDR (headroom observed above 1.0)?
+    /// Has this display demonstrably engaged HDR (headroom observed above 1.0, or an HDR master accepted)?
     ///
-    /// Deliberately never cleared, not by `reset()` and not by a switch that ends at headroom 1.0. The
-    /// headroom collapses while HDR video is on the screen (see `panelPresentsHDR`), so its absence at
-    /// exactly the moment a load asks proves nothing, and any invalidation rule built on it would re-arm
-    /// the very false negative this exists to answer. A display change cannot strand it either:
+    /// Never cleared by `reset()` or by a switch that ends at headroom 1.0. The headroom collapses while
+    /// HDR video is on the screen (see `panelPresentsHDR`), so its absence at exactly the moment a load asks
+    /// proves nothing, and any invalidation rule built on it would re-arm the very false negative this
+    /// exists to answer. Only an event that can mean a changed output configuration clears it: leaving for
+    /// the background or a refused HDR master (`forgetPanelProof`). A display change cannot strand it either:
     /// `effectiveVideoFormat` clamps to `displayCapabilities` before `apply()`, so an SDR route writes SDR
     /// criteria and never consults the proof.
-    private var panelProvenToEngageHDR: Bool = false
+    ///
+    /// Process-wide, like the display it describes: a host that builds an engine per item gets a fresh
+    /// controller for every load, and an instance flag lost the proof at every one, so an Apple TV whose
+    /// headroom never moves read `provenHDR=no` on the next title moments after AVFoundation had
+    /// accepted an HDR master on it. Readable for the tests; set only through `notePanelEngagedHDR`,
+    /// a headroom reading, and cleared by `forgetPanelProof`.
+    private static var panelProvenToEngageHDRInProcess = false {
+        didSet { if panelProvenToEngageHDRInProcess { observeProofInvalidation() } }
+    }
+    private(set) var panelProvenToEngageHDR: Bool {
+        get { Self.panelProvenToEngageHDRInProcess }
+        set { Self.panelProvenToEngageHDRInProcess = newValue }
+    }
+
+    #if os(iOS) || os(tvOS)
+    /// Installed once, the first time the proof latches, and kept for the process: the proof outlives
+    /// every engine (and every engine's lifecycle observers), so its invalidation must too.
+    private static var proofInvalidationObserver: NSObjectProtocol?
+
+    private static func observeProofInvalidation() {
+        guard proofInvalidationObserver == nil else { return }
+        proofInvalidationObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
+        ) { _ in
+            MainActor.assumeIsolated { forgetPanelProof("leaving for the background") }
+        }
+    }
+    #else
+    private static func observeProofInvalidation() {}
+    #endif
 
     #if os(tvOS)
     /// #339: armed at the criteria write, not when the play gate opens, so an engine-written switch is
@@ -46,7 +76,15 @@ final class DisplayCriteriaController {
     private let observation = SwitchObservation()
     /// DEC-105: what is left of the observed-end wait for the armed switch (`observedEndCap`).
     private var observedEndBudget: ObservedEndBudget?
+    /// AE#950: the panel's cadence read up to the criteria write, started by `beginPreWriteCadence()`.
+    private var preWriteCadence: DisplayLinkSampler?
     #endif
+
+    /// AE#950: how the panel's cadence just before a write related to the rate that write asked for, keyed
+    /// by the arm generation of that write so a later gate without a write of its own cannot read it.
+    private var preWriteRelation: (armGeneration: Int, relation: PanelRateRelation)?
+    /// AE#950: which load the running pre-write reading belongs to (`beginPreWriteCadence`).
+    private var preWriteCadenceToken = 0
 
     /// The arm generation whose record has been spent. Only a gate that ends the load's wait spends it, so
     /// both gates of one load see the same evidence while a later, unarmed gate sees none
@@ -288,17 +326,26 @@ final class DisplayCriteriaController {
     /// from the same `UIScreen`. That is not a sampling-time problem, it is a property tvOS does not
     /// maintain. There is no mode read-back; do not go looking for one here again (Sodalite#49).
     ///
-    /// The residual risk is the reverse: Match Dynamic Range switched off in Settings after a proven session,
-    /// without the app being killed. That offers one master to an SDR panel, which the reactive master-to-media
-    /// fallback (#98) and the startup-readiness gate (#35) already recover from. Trading a rare, self-healing
+    /// The residual risk is the reverse: the output configuration changed after a proven session without the
+    /// app leaving the foreground (Settings itself is only reachable by leaving, which clears the proof). That
+    /// offers one master to an SDR panel, which the reactive master-to-media fallback (#98) and the
+    /// startup-readiness gate (#35) already recover from, and the refusal clears the proof. Trading a rare, self-healing
     /// fallback for a silent permanent HDR loss on every replay is the point of this function.
+    ///
+    /// `matchingDisabled` is the one case where the proof counts without an HDR write. With Match Content
+    /// off nobody can switch the panel, neither the engine nor an AVKit sole writer, so it stays in the
+    /// output mode the user parked it in, and the proof (an accepted HDR master, typically) describes
+    /// exactly that mode. Changing it goes through Settings, which means leaving the app, which clears the
+    /// proof. AE#887: without this a live channel after a proven VOD title, both on a box parked in 4K HDR, was
+    /// labelled SDR for its whole length, because the skipped write left the attribution `.hostDriven`.
     nonisolated static func panelPresentsHDR(
         headroomAboveOne: Bool,
         attribution: CriteriaAttribution,
+        matchingDisabled: Bool,
         panelProvenToEngageHDR: Bool
     ) -> Bool {
         if headroomAboveOne { return true }
-        return attribution == .engineHDR && panelProvenToEngageHDR
+        return (attribution == .engineHDR || matchingDisabled) && panelProvenToEngageHDR
     }
 
     nonisolated static func criteriaAttribution(didApply: Bool, lastCriteriaWasHDR: Bool) -> CriteriaAttribution {
@@ -562,10 +609,21 @@ final class DisplayCriteriaController {
     /// frozen picture on a panel that was demonstrably presenting throughout. The `mode check (native)`
     /// line a few seconds later is the witness for the residue: it reads the panel again, so a switch
     /// that did arrive late is visible in the same capture rather than assumed away.
+    ///
+    /// AE#950 narrows both readings to a panel that did not have to change rate. When the panel read
+    /// something else just before the write (`preWrite` is `.different`), the display link reports the new
+    /// cadence as soon as the compositor runs at it, well before the HDMI sink has re-locked: on an LG C2
+    /// the gate released 50 to 135 ms after the switch started, tvOS reports such switches ending after
+    /// ~2.5 s, and half the starts flashed pink noise over the black in between. A reading reached by
+    /// switching says only that the switch began, so that write waits for the end, the in-progress flag or
+    /// the cap, as an HDR write does. The #449 panel read the requested rate before the write, which keeps
+    /// its fast exit; a missing pre-write reading changes nothing.
     nonisolated static func rateOnlySwitchIsSettled(attribution: CriteriaAttribution,
                                                     relation: PanelRateRelation,
-                                                    heldForMs: Int) -> Bool {
+                                                    heldForMs: Int,
+                                                    preWrite: PanelRateRelation? = nil) -> Bool {
         guard attribution == .engineRateOnly else { return false }
+        if case .different = preWrite { return false }
         switch relation {
         case .exact: return true
         case .multiple: return heldForMs >= panelMultipleDwellMs
@@ -751,6 +809,7 @@ final class DisplayCriteriaController {
         // Reset up front so a skipped apply (Match Content off, no window)
         // can't leave a prior HDR session's flag for waitForSwitch to read.
         lastCriteriaWasHDR = false
+        defer { endPreWriteCadence() }
 
         guard let window = resolveWindow() else {
             EngineLog.emit("[DisplayCriteria] skipped: no window", category: .engine)
@@ -841,10 +900,15 @@ final class DisplayCriteriaController {
 
         // Always pass the real rate; tvOS uses it when Match Frame Rate is on, ignores it otherwise (dynamic-range switch still fires).
         let criteria = AVDisplayCriteria(refreshRate: effectiveRate, formatDescription: desc)
+        // AE#950: read before the write, which is what makes the reading say where the panel came from.
+        let preWrite = Self.panelRateRelation(
+            requestedRate: effectiveRate,
+            panelNominalRate: preWriteCadence?.nominalRateNow(freshWithinMs: Self.panelCadenceFreshnessMs))
         // #339: arm before the write. The switch this triggers can start and finish while the AVPlayerItem
         // is being built, and observers registered at gate entry miss both notifications; that is why two of
         // three device runs in Sodalite#49 never saw an end for a switch that was already over.
         observation.arm()
+        preWriteRelation = (observation.snapshot().generation, preWrite)
         displayManager.preferredDisplayCriteria = criteria
         didApply = true
         lastCriteriaWasHDR = isHDR
@@ -853,7 +917,8 @@ final class DisplayCriteriaController {
         EngineLog.emit(
             "[DisplayCriteria] SET: format=\(format) codec=\(fourccString(codecType)) "
             + "rate=\(frameRate.map { String(format: "%.3f", $0) } ?? "default(24)") "
-            + "extensions=\(extensions != nil ? "HDR" : "none")",
+            + "extensions=\(extensions != nil ? "HDR" : "none") "
+            + "before write: \(preWrite.logDescription)",
             category: .engine
         )
         // SDR rate-only switches are sub-second; only HDR criteria need the waitForSwitch delay.
@@ -873,6 +938,39 @@ final class DisplayCriteriaController {
         #if os(tvOS)
         guard resolveWindow() != nil else { return }
         observation.arm()
+        #endif
+    }
+
+    /// AE#950: start reading the panel's cadence ahead of a criteria write the engine is about to make, so
+    /// `apply()` can tell a panel already at the requested rate from one that has to switch to it. Called
+    /// at the start of a load, before the probe whose result decides the rate: a display link needs a tick
+    /// before it says anything, and the write itself follows the probe without a pause. `apply()` stops it.
+    ///
+    /// Returns the token the load hands back to `endPreWriteCadence(token:)`. A newer load replaces the
+    /// reading of one it superseded, so the older load's exit cannot stop the reading the newer one needs.
+    @discardableResult
+    func beginPreWriteCadence() -> Int {
+        preWriteCadenceToken &+= 1
+        #if os(tvOS)
+        preWriteCadence?.invalidate()
+        preWriteCadence = nil
+        if let window = resolveWindow() {
+            let sampler = DisplayLinkSampler()
+            sampler.start(screen: window.screen)
+            preWriteCadence = sampler
+        }
+        #endif
+        return preWriteCadenceToken
+    }
+
+    /// Stop the pre-write reading. Idempotent. A load calls it with its token on every exit, so one that
+    /// never writes criteria (audio only, a host that owns them) does not leave it running; `apply()`
+    /// calls it without one, because the write is what the reading was for.
+    func endPreWriteCadence(token: Int? = nil) {
+        if let token, token != preWriteCadenceToken { return }
+        #if os(tvOS)
+        preWriteCadence?.invalidate()
+        preWriteCadence = nil
         #endif
     }
 
@@ -1088,6 +1186,11 @@ final class DisplayCriteriaController {
         // #449 round 2: the unbroken run of the same panel reading, so a cadence that only settles a
         // multiple after a dwell can be asked how long it has actually held it.
         var cadenceHistory = PanelCadenceHistory()
+        // AE#950: where the panel came from, for the write this gate is settling and no other.
+        let preWrite = preWriteRelation.flatMap {
+            $0.armGeneration == gateSnapshot.generation ? $0.relation : nil
+        }
+        var reportedSwitchedReading = false
         while !Self.isBudgetSpent(elapsedMs: Self.elapsedMs(since: stage2Entry), budgetMs: capMs) {
             guard await Self.gateTick(milliseconds: 50, isCurrent: isCurrent) else {
                 EngineLog.emit("[DisplayCriteria] gate abandoned while waiting for the end (\(timing())): the load it held was cancelled or superseded", category: .engine)
@@ -1105,9 +1208,17 @@ final class DisplayCriteriaController {
             // the notifications never finish reporting has nothing left to do. Named with the cap it did
             // not spend, because that is the number the fix has to be verified against, and with the dwell
             // where one was required, because a multiple settles on having HELD the reading.
+            let attribution = Self.criteriaAttribution(didApply: didApply, lastCriteriaWasHDR: lastCriteriaWasHDR)
+            if !reportedSwitchedReading, attribution == .engineRateOnly, let preWrite,
+               Self.rateOnlySwitchIsSettled(attribution: attribution, relation: relation, heldForMs: heldMs),
+               !Self.rateOnlySwitchIsSettled(attribution: attribution, relation: relation, heldForMs: heldMs,
+                                             preWrite: preWrite) {
+                reportedSwitchedReading = true
+                EngineLog.emit("[DisplayCriteria] #950: \(relation.logDescription) after \(stage2Ms)ms of the wait, but before the write it read \(preWrite.logDescription); the panel switched to it and the sink may still be re-locking, so waiting for the end", category: .engine)
+            }
             if Self.rateOnlySwitchIsSettled(
-                attribution: Self.criteriaAttribution(didApply: didApply, lastCriteriaWasHDR: lastCriteriaWasHDR),
-                relation: relation, heldForMs: heldMs) {
+                attribution: attribution,
+                relation: relation, heldForMs: heldMs, preWrite: preWrite) {
                 let dwell: String = {
                     guard case .multiple = relation else { return "" }
                     return ", held unbroken for \(heldMs)ms"
@@ -1210,7 +1321,10 @@ final class DisplayCriteriaController {
         return Self.panelPresentsHDR(
             headroomAboveOne: observeHeadroom(window.screen),
             attribution: Self.criteriaAttribution(didApply: didApply, lastCriteriaWasHDR: lastCriteriaWasHDR),
-            panelProvenToEngageHDR: panelProvenToEngageHDR
+            matchingDisabled: !window.avDisplayManager.isDisplayCriteriaMatchingEnabled,
+            // A proof from an earlier session is about this display's HDR mode; a display that cannot
+            // play HDR now (another TV, HDR switched off) has nothing for it to vouch for.
+            panelProvenToEngageHDR: panelProvenToEngageHDR && AVPlayer.eligibleForHDRPlayback
         )
         #else
         return false
@@ -1276,6 +1390,27 @@ final class DisplayCriteriaController {
     }
     #endif
 
+    /// AE#459's other proof: AVFoundation accepted an HDR master, which a display presenting SDR refuses.
+    /// It answers the same question the headroom does, so it latches the same proof. Without it a display
+    /// whose headroom never moves (an Apple TV 4K 1st generation on tvOS 26.6 read 1.00 throughout HDR and
+    /// Dolby Vision playback) proves HDR only on the AVPlayer route, and every later session on a path with
+    /// no master to accept (the software host, the Dolby Vision FEL route) kept its SDR label.
+    func notePanelEngagedHDR(_ evidence: String) {
+        guard !panelProvenToEngageHDR else { return }
+        EngineLog.emit("[DisplayCriteria] panel proven to engage HDR (\(evidence)); later sessions trust an accepted HDR write even without a headroom reading", category: .engine)
+        panelProvenToEngageHDR = true
+    }
+
+    /// AE#588's rule applied to the proof: it describes an output configuration, which the user changes in
+    /// Settings (only reachable by leaving the app) or by swapping the TV, so leaving for the background
+    /// forgets it (observed process-wide, with or without an engine alive), and so does an HDR master the
+    /// display refused. The next HDR session on the AVPlayer route proves it again.
+    static func forgetPanelProof(_ reason: String) {
+        guard panelProvenToEngageHDRInProcess else { return }
+        panelProvenToEngageHDRInProcess = false
+        EngineLog.emit("[DisplayCriteria] \(reason) clears the panel's HDR proof; the next session asks the display again",
+                       category: .engine)
+    }
     /// Nil-out preferredDisplayCriteria to return the panel to default. No-op when apply() was never called this session (suppressed host) to avoid racing AVKit's in-flight criteria management.
     func reset() {
         #if os(tvOS)
@@ -1289,6 +1424,7 @@ final class DisplayCriteriaController {
         window.avDisplayManager.preferredDisplayCriteria = nil
         didApply = false
         lastApplied = nil   // #133: a RESET returns the panel to default; the next apply must re-establish it.
+        preWriteRelation = nil
         EngineLog.emit("[DisplayCriteria] RESET", category: .engine)
         #endif
     }

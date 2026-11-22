@@ -115,7 +115,11 @@ struct SubtitleDrainCatchUpTests {
     private static let subripStreamIndex: Int32 = 1
 
     @MainActor
-    private func engineWithDenseText(through seconds: Double, perSecond: Int, playhead: Double)
+    /// `prefetchRead` records the forward prefetch's read of the whole stretch, as a real
+    /// prefetch does when it stores packets. Without it the #941 ledger reads the stretch past the
+    /// pump's reach as unread ground and holds the drain there.
+    private func engineWithDenseText(through seconds: Double, perSecond: Int, playhead: Double,
+                                     prefetchRead: Bool = true)
         throws -> (AetherEngine, Demuxer) {
         let data = try #require(Data(base64Encoded: Issue587PreserveASSMarkupCodecGateTests.base64.joined()))
         let demuxer = Demuxer()
@@ -126,6 +130,7 @@ struct SubtitleDrainCatchUpTests {
             store.append(streamIndex: Self.subripStreamIndex, ptsSeconds: Double(index) * interval,
                          durationSeconds: 1.0 / 24, payload: Data("sign \(index)".utf8))
         }
+        if prefetchRead { store.notePrefetchRead(from: 0, through: seconds) }
         let engine = try AetherEngine()
         engine.loadedURL = URL(string: "https://s/movie.mkv")!
         engine.softwareSubtitlePacketStore = store
@@ -176,7 +181,8 @@ struct SubtitleDrainCatchUpTests {
         // The prefetch stores the whole minute first; the pump re-reads the first 4.38 s behind it,
         // and those duplicates take fresh sequences. Without coverage the seam reads as a #362 hole.
         func drainedThrough(recordsCoverage: Bool) throws -> Double {
-            let (engine, demuxer) = try engineWithDenseText(through: 60, perSecond: 100, playhead: 0.36)
+            let (engine, demuxer) = try engineWithDenseText(through: 60, perSecond: 100, playhead: 0.36,
+                                                            prefetchRead: false)
             defer { demuxer.close() }
             let store = try #require(engine.softwareSubtitlePacketStore)
             for index in 0...438 {
@@ -199,13 +205,17 @@ struct SubtitleDrainCatchUpTests {
     @MainActor
     @Test("a hold set on unproven ground releases once a reader's run proves the span read")
     func holdReleasesWhenCoverageArrives() throws {
-        let (engine, demuxer) = try engineWithDenseText(through: 60, perSecond: 100, playhead: 0.36)
+        let (engine, demuxer) = try engineWithDenseText(through: 60, perSecond: 100, playhead: 0.36,
+                                                        prefetchRead: false)
         defer { demuxer.close() }
         let store = try #require(engine.softwareSubtitlePacketStore)
         for index in 0...438 {
             store.append(streamIndex: Self.subripStreamIndex, ptsSeconds: Double(index) * (1 / 100.0),
                          durationSeconds: 1.0 / 24, payload: Data("sign \(index)".utf8))
         }
+        // The pump re-read 0-4.38 s; nothing proves the prefetch's stretch past it.
+        store.noteHarvestAnchor(.pump, at: 0)
+        store.noteHarvestReach(.pump, through: 4.38)
         engine.subtitleDrainTick()
         let held = try #require(engine.subtitleDrainCursors[.primary]?.harvestGapAt, "held at the seam")
         #expect(abs(held - 4.38) < 1e-9)

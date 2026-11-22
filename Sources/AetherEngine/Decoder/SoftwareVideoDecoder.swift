@@ -52,6 +52,24 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// smeared picture names its own cause instead of looking like a renderer bug.
     private var loggedSARReject = false
 
+    /// AV1 Dolby Vision Profile 10.1 (`AV1DolbyVisionRPU.carriesProfile10_1`): every frame gets the RPU
+    /// of its temporal unit attached, the way `HardwareVideoDecoder` does it where AV1 decodes in
+    /// hardware. The frames already come from a pool of our own, which is what the system's Dolby Vision
+    /// display management needs to apply an attached RPU (see `HardwareVideoDecoder.handleDecodedFrame`).
+    private var attachesAV1DolbyVisionRPU = false
+    private let rpuTable = AV1DolbyVisionRPUTable(logPrefix: "[SWDecoder]")
+
+    /// 10-bit AV1: frames reach P010 on the GPU with their film grain applied there, and dav1d is told at
+    /// open to export the grain instead of applying it (see `GPUFrameConverter`). Nil for everything else,
+    /// which keeps `sws_scale`. Written in `open`, used under `lock` like the sws context.
+    private var gpuConverter: GPUFrameConverter?
+
+    /// Frames the GPU converted, grained and had to copy first; nil when this decoder does not use it.
+    var gpuConversionCounts: (converted: Int, grained: Int, copied: Int)? {
+        lock.lock(); defer { lock.unlock() }
+        return gpuConverter.map { ($0.framesConverted, $0.framesGrained, $0.framesCopied) }
+    }
+
     private var pixelBufferPool: CVPixelBufferPool?
     private var poolWidth = 0
     private var poolHeight = 0
@@ -188,6 +206,10 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// from one that is not.
     private var loggedSendFailure = false
 
+    /// Configured before open, only for the AVI MPEG-4 software-cache route. Observation metadata
+    /// never supplies frame timestamps; the established reorder/repair algorithm is unchanged.
+    var onCacheTiming: (@Sendable (UInt64, Int64, Int64) -> Void)?
+
     func open(stream: UnsafeMutablePointer<AVStream>, onFrame: @escaping DecodedFrameHandler) throws {
         self.onFrame = onFrame
         deinterlacer.config = deinterlaceConfig
@@ -249,10 +271,21 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             ctx.pointee.thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE
         }
 
+        // 10-bit AV1 converts on the GPU, and its grain is applied there: dav1d only exports the
+        // parameters. Decided before the open, since that is when dav1d reads whether to apply it.
+        gpuConverter = nil
+        if GPUFrameConverter.enabled, codecpar.pointee.codec_id == AV_CODEC_ID_AV1,
+           codecpar.pointee.format == AV_PIX_FMT_YUV420P10LE.rawValue,
+           let converter = GPUFrameConverter() {
+            gpuConverter = converter
+            ctx.pointee.export_side_data |= Int32(AV_CODEC_EXPORT_DATA_FILM_GRAIN)
+        }
+
         // Belt-and-suspenders hwaccel=none: some decoders ignore get_format.
         var opts: OpaquePointer?
         av_dict_set(&opts, "hwaccel", "none", 0)
 
+        if onCacheTiming != nil { ctx.pointee.flags |= AV_CODEC_FLAG_COPY_OPAQUE }
         guard avcodec_open2(ctx, codec, &opts) >= 0 else {
             av_dict_free(&opts)
             throw VideoDecoderError.sessionCreationFailed(status: -2)
@@ -264,9 +297,12 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let bitsPerSample = codecpar.pointee.bits_per_raw_sample
         let isHDRTransfer = ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc)
         use10Bit = bitsPerSample > 8 || isHDRTransfer
+        attachesAV1DolbyVisionRPU = AV1DolbyVisionRPU.carriesProfile10_1(stream: stream)
 
         // Release-visible log (no #if DEBUG): needed for TestFlight users and DrHurt #4 black-screen reports.
-        EngineLog.emit("[SWDecoder] Opened: \(codecpar.pointee.width)x\(codecpar.pointee.height), codec=\(String(cString: codec.pointee.name)), threads=\(ctx.pointee.thread_count), \(use10Bit ? "10-bit" : "8-bit")", category: .swPlayback)
+        EngineLog.emit("[SWDecoder] Opened: \(codecpar.pointee.width)x\(codecpar.pointee.height), codec=\(String(cString: codec.pointee.name)), threads=\(ctx.pointee.thread_count), \(use10Bit ? "10-bit" : "8-bit")"
+                       + (attachesAV1DolbyVisionRPU ? ", Dolby Vision 10.1 (RPU attached per frame)" : "")
+                       + (gpuConverter != nil ? ", P010 and film grain on the GPU" : ""), category: .swPlayback)
     }
 
     /// #407: the timestamp to put on a decoded frame that carries none, or nil when the frame is
@@ -306,6 +342,12 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// every subsequent send hit the same wall: video wedged permanently until a seek flushed
     /// the decoder, while audio kept playing.
     func decode(packet: UnsafeMutablePointer<AVPacket>, epoch: UInt64? = nil) {
+        // Before the send, outside the lock (libdovi parses the RPU here). A packet a flush then retires
+        // leaves an entry no frame will ask for, bounded by the table.
+        if attachesAV1DolbyVisionRPU, let data = packet.pointee.data, packet.pointee.size > 0 {
+            rpuTable.store(temporalUnit: UnsafePointer(data), size: Int(packet.pointee.size),
+                           pts: SourceTimestampBounds.cmTime(ticks: packet.pointee.pts, timeBase: timeBase))
+        }
         lock.lock()
         // AE#492: a packet decided on before a flush must not be sent after it. Checked here rather
         // than at the caller because only this lock orders the two: `flush()` takes it to retire the
@@ -377,6 +419,10 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                         category: .swPlayback
                     )
                 }
+            }
+
+            if let onCacheTiming, let (sourceEpoch, position) = SoftwarePacketCacheIdentity.identity(f) {
+                onCacheTiming(sourceEpoch, position, f.pointee.pts)
             }
 
             // #131: A53 captions surface as decoded-frame side data on the FFmpeg path (MPEG-2
@@ -458,6 +504,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         skipLock.lock()
         _framesDecoded &+= 1
         skipLock.unlock()
+        // Taken before the pre-roll skip, so a skipped frame does not leave its RPU in the table.
+        let rpu = attachesAV1DolbyVisionRPU ? rpuTable.take(for: cmPTS) : nil
         if let threshold = skipUntilPTS, cmPTS.isValid {
             if CMTimeCompare(cmPTS, threshold) < 0 {
                 return
@@ -494,6 +542,9 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             guard let converted = convertFrameToPixelBuffer(f) else { return }
             pixelBuffer = converted
         }
+        if attachesAV1DolbyVisionRPU {
+            AV1DolbyVisionRPUTable.attach(AV1DolbyVisionRPU.attachEnabled ? rpu : nil, to: pixelBuffer)
+        }
 
         reportDecodedFormat(pixelBuffer: pixelBuffer)
 
@@ -526,6 +577,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         _feedEpoch &+= 1
         // Deinterlacer temporal references are stale across seeks; drop the graph (lazily rebuilt on next interlaced frame).
         if resetFilterGraph { deinterlacer.teardown() }
+        rpuTable.removeAll()
         guard let ctx = codecContext else { return }
         avcodec_flush_buffers(ctx)
     }
@@ -563,6 +615,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             sws_freeContext(swsContext)
             swsContext = nil
         }
+        gpuConverter = nil
         pixelBufferPool = nil
         poolWidth = 0
         poolHeight = 0
@@ -573,6 +626,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
         // Nil onFrame inside the lock: emit() reads it under the same lock; unsynchronized write is a data race.
         onFrame = nil
+        onCacheTiming = nil
         lock.unlock()
     }
 
@@ -666,6 +720,19 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             )
         }
 
+        var pixelBuffer: CVPixelBuffer?
+        guard let pool = ensurePixelBufferPool(width: width, height: height, format: outputFormat) else { return nil }
+        let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pixelBuffer)
+        guard status == kCVReturnSuccess, let pb = pixelBuffer else { return nil }
+
+        attachColorSpace(from: frame, to: pb)
+        attachPixelAspectRatio(from: frame, to: pb)
+
+        if let gpuConverter, outputFormat.tenBit, GPUFrameConverter.accepts(frame),
+           gpuConverter.convert(frame, into: pb) {
+            return pb
+        }
+
         swsContext = sws_getCachedContext(
             swsContext,
             Int32(width), Int32(height), srcFmt,
@@ -675,14 +742,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             Int32(SWS_BILINEAR.rawValue), nil, nil, nil
         )
         guard swsContext != nil else { return nil }
-
-        var pixelBuffer: CVPixelBuffer?
-        guard let pool = ensurePixelBufferPool(width: width, height: height, format: outputFormat) else { return nil }
-        let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pixelBuffer)
-        guard status == kCVReturnSuccess, let pb = pixelBuffer else { return nil }
-
-        attachColorSpace(from: frame, to: pb)
-        attachPixelAspectRatio(from: frame, to: pb)
 
         CVPixelBufferLockBaseAddress(pb, [])
         defer { CVPixelBufferUnlockBaseAddress(pb, []) }
