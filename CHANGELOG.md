@@ -36,8 +36,12 @@ Changes this fork carries on top of upstream.
   and backfills from it. A styled ASS track (`preserveASSMarkup`) backfills too: the fill decodes it
   once with its markup and gives the store the plain-text reading of the same packets. A fill that
   ends early or fails still hands the selection to its own decode and refetches, and so does a
-  bitmap sidecar (`.sup`), whose images the store cannot keep. Secondary selections and tracks
-  added after load are unchanged.
+  bitmap sidecar the store cannot keep images for (VobSub, DVB; a `.sup` is an OCR track and never
+  joins the fill). Secondary selections and tracks added after load keep their own decode. A text
+  sidecar (`.srt`, `.ass`, `.ssa`, `.vtt`) is now read with one unranged request, in the fill and in
+  every selection's own decode: an origin that ignores Range and sends no length answered the ranged
+  open's tail, range and check requests with the whole body each time. That request has no
+  reconnect, so one cut mid-file falls back to the ranged open, which resumes it.
 
 - **Silo fork: a secondary ASS sidecar stays plain text.** Upstream #826 publishes raw ASS events and
   `secondarySidecarASSHeader` for a secondary sidecar when `preserveASSMarkup` is on. The fork keeps

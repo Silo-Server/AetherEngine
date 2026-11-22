@@ -83,8 +83,9 @@ public struct ExternalSubtitleTrack: Sendable, Equatable {
 
     /// Whether a decode reads this track with one unranged GET (`SubtitleDecoder.decodeFile`'s
     /// `sequentialSource`): a text file is read front to back, while anything else, a container
-    /// or an unknown format, may need to seek.
-    var readsSequentially: Bool { isTextFormat }
+    /// or an unknown format, may need to seek. A track that names a `sourceStreamIndex` addresses a
+    /// container, whatever its hint says.
+    var readsSequentially: Bool { isTextFormat && sourceStreamIndex == nil }
 
     /// Bitmap subtitle formats a sidecar is known to carry by its hint or extension (#600). The text
     /// store fill keeps no image cues, so such a track never shares it. An unrecognised format, such

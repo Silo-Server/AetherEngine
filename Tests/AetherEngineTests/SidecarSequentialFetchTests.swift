@@ -44,6 +44,41 @@ struct SidecarSequentialFetchTests {
         #expect(origin.requests.count > 1)
     }
 
+    @Test("a sequential read cut mid-file falls back to the ranged open instead of losing the track (silo-apple#600)")
+    func cutSequentialReadFallsBack() async throws {
+        let lines = (0..<500).map { "Line \($0)" }
+        func stamp(_ seconds: Int, _ millis: Int) -> String {
+            String(format: "%02d:%02d:%02d.%03d", seconds / 3600, seconds / 60 % 60, seconds % 60, millis)
+        }
+        let body = Data(("WEBVTT\n\n" + lines.enumerated().map { index, line in
+            "\(stamp(index, 0)) --> \(stamp(index, 500))\n\(line)\n\n"
+        }.joined()).utf8)
+        // The first answer promises the whole file and closes three quarters of the way in, which the
+        // ranged reader would have resumed and a single sequential GET cannot.
+        let cut = body.prefix(body.count * 3 / 4)
+        // Every later request gets the origin's ordinary ranged answer.
+        let origin = try ProbeHTTPTestOrigin(data: body, response: { _, index in
+            index == 0 ? Data("HTTP/1.1 200 OK\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8) + cut : nil
+        })
+        defer { origin.stop() }
+        let store = NativeSubtitleCueStore()
+
+        await AetherEngine.runExternalSubtitleFill(
+            job: .init(url: url(origin), headers: [:], targets: [.init(streamIndex: nil, store: store)],
+                       sequentialSource: true))
+
+        #expect(store.snapshotCues().compactMap(\.text) == lines)
+        #expect(store.isFinished && !store.didEndEarly)
+        #expect(origin.requests.first?.range == nil, "the first read is the single sequential GET")
+    }
+
+    @Test("a track that names a stream index is a container and keeps the ranged open, whatever its hint")
+    func streamIndexKeepsRangedOpen() {
+        let url = URL(string: "https://example.test/subtitles/0")!
+        #expect(ExternalSubtitleTrack(url: url, formatHint: "webvtt").readsSequentially)
+        #expect(!ExternalSubtitleTrack(url: url, formatHint: "webvtt", sourceStreamIndex: 2).readsSequentially)
+    }
+
     @Test("a fill job reads sequentially only when every track it fills is text")
     func fillJobsReadSequentiallyOnlyForText() {
         let text = URL(string: "https://example.test/subtitles/0")!

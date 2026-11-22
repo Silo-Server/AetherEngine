@@ -42,6 +42,17 @@ enum SubtitleDecoderError: Error, CustomStringConvertible, LocalizedError {
 /// the script header ([Script Info] + [V4+ Styles] + [Events] Format line) from the stream's extradata.
 /// `plainCues` (#600) is the same stream as a decode without preserveASSMarkup reads it, present only
 /// when the caller asked for both readings and this stream kept its raw markup.
+extension SubtitleDecoderError {
+    /// The source broke off: an I/O error at open, or a read that ended short.
+    var isSourceCut: Bool {
+        switch self {
+        case .openFailed(let code): code == FFmpegErr.eio
+        case .truncated: true
+        default: false
+        }
+    }
+}
+
 struct SidecarDecodeResult {
     let cues: [SubtitleCue]
     let assHeader: String?
@@ -204,12 +215,25 @@ enum SubtitleDecoder {
             }
             decodeURL = localURL
         }
-        let result = try decodeFileSync(
-            url: decodeURL, httpHeaders: httpRequestAuthorization == nil ? httpHeaders : [:],
-            preserveASSMarkup: preserveASSMarkup, alsoPlainText: alsoPlainText, requested: requested,
-            idleTimeout: idleTimeout, cancel: token, preparationPolicy: preparationPolicy,
-            sequentialSource: sequentialSource, keepsBitmapPackets: keepsBitmapPackets
-        )
+        func decode(sequential: Bool) throws -> [SidecarDecodeResult] {
+            try decodeFileSync(
+                url: decodeURL, httpHeaders: httpRequestAuthorization == nil ? httpHeaders : [:],
+                preserveASSMarkup: preserveASSMarkup, alsoPlainText: alsoPlainText, requested: requested,
+                idleTimeout: idleTimeout, cancel: token, preparationPolicy: preparationPolicy,
+                sequentialSource: sequential, keepsBitmapPackets: keepsBitmapPackets
+            )
+        }
+        let result: [SidecarDecodeResult]
+        do {
+            result = try decode(sequential: sequentialSource)
+        } catch let error as SubtitleDecoderError
+                    where sequentialSource && error.isSourceCut && !token.isCancelled && !token.didFailSource {
+            // The single sequential GET has no reconnect. A text demuxer reads the whole body at
+            // open, so a connection that drops mid-file fails the open or ends the read short,
+            // depending on where the cut lands. The ranged open resumes at the frontier, which is
+            // what this read had before `sequentialSource`.
+            result = try decode(sequential: false)
+        }
         if token.isCancelled { throw CancellationError() }
         return result
     }
