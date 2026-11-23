@@ -40,9 +40,12 @@ enum SubtitleDecoderError: Error, CustomStringConvertible, LocalizedError {
 
 /// Result of a sidecar decode: cue list plus, when preserveASSMarkup is set on an ASS/SSA file,
 /// the script header ([Script Info] + [V4+ Styles] + [Events] Format line) from the stream's extradata.
+/// `plainCues` (#600) is the same stream as a decode without preserveASSMarkup reads it, present only
+/// when the caller asked for both readings and this stream kept its raw markup.
 struct SidecarDecodeResult {
     let cues: [SubtitleCue]
     let assHeader: String?
+    var plainCues: [SubtitleCue]? = nil
     /// #921: set instead of `cues` when the caller asked for a bitmap stream's packets.
     var bitmapSource: SidecarBitmapSource? = nil
 }
@@ -76,6 +79,13 @@ enum SubtitleDecoder {
     /// URLs that are containers holding several subtitle streams; nil decodes the container's first
     /// subtitle stream (the pre-#266 behaviour). An index that is out of range or names a
     /// non-subtitle stream throws `streamIndexNotSubtitle`.
+    ///
+    /// `sequentialSource` reads an HTTP sidecar with one unranged GET from byte 0
+    /// (`AVIOReader.sequentialOnly`). For a text file, which FFmpeg reads front to back: the ranged
+    /// open otherwise sends a tail prefetch, a ranged request and a range check first, and an origin
+    /// that ignores Range and sends no length (a compressed subtitle response) answers each with
+    /// the whole body. A container that may need a seek keeps the ranged open.
+    ///
     /// `keepsBitmapPackets` (#921): a bitmap stream is read into a `SidecarBitmapSource` and not
     /// decoded at all; the result carries no cues. Text streams decode as before either way.
     static func decodeFile(
@@ -86,13 +96,15 @@ enum SubtitleDecoder {
         sourceStreamIndex: Int32? = nil,
         idleTimeout: TimeInterval = sidecarIdleTimeout,
         preparationPolicy: ExternalSubtitlePreparationPolicy? = nil,
+        sequentialSource: Bool = false,
         keepsBitmapPackets: Bool = false
     ) async throws -> SidecarDecodeResult {
         let results = try await decode(
             url: url, httpHeaders: httpHeaders, httpRequestAuthorization: httpRequestAuthorization,
             preserveASSMarkup: preserveASSMarkup,
             requested: sourceStreamIndex.map { [$0] }, idleTimeout: idleTimeout,
-            preparationPolicy: preparationPolicy, keepsBitmapPackets: keepsBitmapPackets
+            preparationPolicy: preparationPolicy, sequentialSource: sequentialSource,
+            keepsBitmapPackets: keepsBitmapPackets
         )
         guard let only = results.first else { throw SubtitleDecoderError.noSubtitleStream }
         return only
@@ -103,18 +115,25 @@ enum SubtitleDecoder {
     /// track. The result is POSITIONAL: element i holds the cues for `sourceStreamIndices[i]`, so a
     /// caller maps it straight back onto its own targets without resolving what a nil entry became.
     /// A repeated index is decoded once and returned at each of its positions.
+    ///
+    /// `alsoPlainText` (#600): a stream that keeps its raw ASS markup also carries the plain-text
+    /// reading of the same packets in `plainCues`, so one fetch serves both a styled overlay and a
+    /// plain-text consumer (the native WebVTT rendition store).
     static func decodeFile(
         url: URL,
         httpHeaders: [String: String] = [:],
         httpRequestAuthorization: HTTPRequestAuthorization? = nil,
         preserveASSMarkup: Bool = false,
-        sourceStreamIndices: [Int32?]
+        alsoPlainText: Bool = false,
+        sourceStreamIndices: [Int32?],
+        sequentialSource: Bool = false
     ) async throws -> [SidecarDecodeResult] {
         guard !sourceStreamIndices.isEmpty else { return [] }
         return try await decode(
             url: url, httpHeaders: httpHeaders, httpRequestAuthorization: httpRequestAuthorization,
-            preserveASSMarkup: preserveASSMarkup,
-            requested: sourceStreamIndices, idleTimeout: sidecarIdleTimeout
+            preserveASSMarkup: preserveASSMarkup, alsoPlainText: alsoPlainText,
+            requested: sourceStreamIndices, idleTimeout: sidecarIdleTimeout,
+            sequentialSource: sequentialSource
         )
     }
 
@@ -124,9 +143,11 @@ enum SubtitleDecoder {
         httpHeaders: [String: String],
         httpRequestAuthorization: HTTPRequestAuthorization?,
         preserveASSMarkup: Bool,
+        alsoPlainText: Bool = false,
         requested: [Int32?]?,
         idleTimeout: TimeInterval,
         preparationPolicy: ExternalSubtitlePreparationPolicy? = nil,
+        sequentialSource: Bool = false,
         keepsBitmapPackets: Bool = false
     ) async throws -> [SidecarDecodeResult] {
         // Task cancellation does not reach the dispatched decode. Bridge it explicitly via
@@ -140,9 +161,9 @@ enum SubtitleDecoder {
                 try decodeBlocking(
                     url: url, httpHeaders: httpHeaders,
                     httpRequestAuthorization: httpRequestAuthorization,
-                    preserveASSMarkup: preserveASSMarkup, requested: requested,
+                    preserveASSMarkup: preserveASSMarkup, alsoPlainText: alsoPlainText, requested: requested,
                     idleTimeout: idleTimeout, token: token, preparationPolicy: preparationPolicy,
-                    keepsBitmapPackets: keepsBitmapPackets)
+                    sequentialSource: sequentialSource, keepsBitmapPackets: keepsBitmapPackets)
             }.value
         } onCancel: {
             token.cancel()
@@ -154,10 +175,12 @@ enum SubtitleDecoder {
         httpHeaders: [String: String],
         httpRequestAuthorization: HTTPRequestAuthorization?,
         preserveASSMarkup: Bool,
+        alsoPlainText: Bool,
         requested: [Int32?]?,
         idleTimeout: TimeInterval,
         token: CancelFlag,
         preparationPolicy: ExternalSubtitlePreparationPolicy?,
+        sequentialSource: Bool,
         keepsBitmapPackets: Bool
     ) throws -> [SidecarDecodeResult] {
         if token.isCancelled { throw CancellationError() }
@@ -181,14 +204,54 @@ enum SubtitleDecoder {
             }
             decodeURL = localURL
         }
-        let result = try decodeFileSync(
-            url: decodeURL, httpHeaders: httpRequestAuthorization == nil ? httpHeaders : [:],
-            preserveASSMarkup: preserveASSMarkup, requested: requested, idleTimeout: idleTimeout,
-            cancel: token, preparationPolicy: preparationPolicy,
-            keepsBitmapPackets: keepsBitmapPackets
-        )
+        func decode(sequential: Bool) throws -> [SidecarDecodeResult] {
+            try decodeFileSync(
+                url: decodeURL, httpHeaders: httpRequestAuthorization == nil ? httpHeaders : [:],
+                preserveASSMarkup: preserveASSMarkup, alsoPlainText: alsoPlainText, requested: requested,
+                idleTimeout: idleTimeout, cancel: token, preparationPolicy: preparationPolicy,
+                sequentialSource: sequential, keepsBitmapPackets: keepsBitmapPackets
+            )
+        }
+        let result: [SidecarDecodeResult]
+        do {
+            result = try decode(sequential: sequentialSource)
+        } catch where sequentialSource && Self.rangedOpenMayRecover(error) && !token.isCancelled
+                        && !token.didFailSource {
+            // The single sequential GET has no reconnect and no retry. A text demuxer reads the whole
+            // body at open, so a connection that drops mid-file fails the open or ends the read short,
+            // depending on where the cut lands; a refused or unanswered request fails it outright. The
+            // ranged open resumes at the frontier and retries a busy origin, which is what this read
+            // had before `sequentialSource`.
+            let first = error
+            do {
+                result = try decode(sequential: false)
+            } catch {
+                if token.isCancelled { throw CancellationError() }
+                // A cut keeps its cues and stays retryable as a truncation; an outright failure of
+                // the reopen would lose both, so the fuller cut of the two attempts is reported.
+                guard case SubtitleDecoderError.truncated(let kept, _) = first else { throw error }
+                if case SubtitleDecoderError.truncated(let again, _) = error,
+                   again.reduce(0, { $0 + $1.cues.count }) > kept.reduce(0, { $0 + $1.cues.count }) {
+                    throw error
+                }
+                throw first
+            }
+        }
         if token.isCancelled { throw CancellationError() }
         return result
+    }
+
+    /// Whether a sequential read's failure is one the ranged open can get past: the source broke off
+    /// (an I/O error at open, or a read that ended short), the request went unanswered, or the origin
+    /// refused it with a status other than an authentication one, which a refresh owns.
+    private static func rangedOpenMayRecover(_ error: Error) -> Bool {
+        switch error {
+        case SubtitleDecoderError.openFailed(let code): return code == FFmpegErr.eio
+        case SubtitleDecoderError.truncated: return true
+        case AVIOReaderError.noResponse: return true
+        case AVIOReaderError.httpStatus(let status): return ![401, 403, 407].contains(status)
+        default: return false
+        }
     }
 
     /// Thread-safe cancellation token for the dispatched decode; also aborts any registered AVIO reader.
@@ -275,11 +338,16 @@ enum SubtitleDecoder {
         var decodeFailed = false
         var cues: [SubtitleCue] = []
         var nextID = 0
+        /// #600: the plain-text reading of the same packets, kept beside the raw ASS lines when the
+        /// caller asked for both. Nil otherwise, and always nil for a stream that keeps no markup
+        /// (its `cues` already are that reading).
+        var plainCues: [SubtitleCue]?
         /// Indices of image cues still "open" (PGS-style: ended by the next composition event).
         var pendingImageCueIndices: [Int] = []
         var lastPktPTS: Double = 0  // PTS anchor for flush events that have no packet of their own
 
-        init(streamIndex: Int32, stream: UnsafeMutablePointer<AVStream>, preserveASSMarkup: Bool, preparationPolicy: ExternalSubtitlePreparationPolicy? = nil) throws {
+        init(streamIndex: Int32, stream: UnsafeMutablePointer<AVStream>, preserveASSMarkup: Bool,
+             alsoPlainText: Bool = false, preparationPolicy: ExternalSubtitlePreparationPolicy? = nil) throws {
             guard let codecpar = stream.pointee.codecpar else {
                 throw SubtitleDecoderError.streamIndexNotSubtitle(index: streamIndex)
             }
@@ -332,6 +400,7 @@ enum SubtitleDecoder {
             let timeBase = stream.pointee.time_base
             self.tbSec = Double(timeBase.num) / Double(timeBase.den)
             self.keepMarkup = keepMarkup
+            self.plainCues = keepMarkup && alsoPlainText ? [] : nil
             self.assPlayRes = assPlayRes
             self.assHeader = assHeader
             self.codedWidth = Int(codecpar.pointee.width)
@@ -346,6 +415,25 @@ enum SubtitleDecoder {
         // Under preserveASSMarkup: keep raw ASS event line (ASSScriptBuilder re-stamps timing); otherwise plain text.
         private func line(for rect: UnsafeMutablePointer<AVSubtitleRect>) -> String? {
             keepMarkup ? SubtitleRectText.rawASSLine(for: rect) : SubtitleRectText.plainText(for: rect)
+        }
+
+        /// The reading of one text rect without preserveASSMarkup.
+        private func appendPlainText(of rect: UnsafeMutablePointer<AVSubtitleRect>, lines: inout [String],
+                                     styledBodies: inout [SubtitleCue.Body], placement: inout SubtitleTextPlacement?) {
+            if let assLine = SubtitleRectText.rawASSLine(for: rect),
+               let parsed = SubtitleRectText.styledBody(fromASSEventLine: assLine, playRes: assPlayRes) {
+                // #233: SRT and WebVTT sidecars reach libavcodec's ASS conversion too,
+                // so their markup survives here. Unstyled cues stay .text and merge
+                // with their siblings below, exactly as the plain path did.
+                placement = placement ?? parsed.placement
+                if case .text(let t) = parsed.body {
+                    lines.append(t)
+                } else {
+                    styledBodies.append(parsed.body)
+                }
+            } else if let text = SubtitleRectText.plainText(for: rect) {
+                lines.append(text)
+            }
         }
 
         func decode(packet pkt: UnsafeMutablePointer<AVPacket>) {
@@ -386,6 +474,9 @@ enum SubtitleDecoder {
             var images: [SubtitleImage] = []
             var styledBodies: [SubtitleCue.Body] = []
             var placement: SubtitleTextPlacement?
+            var plainLines: [String] = []
+            var plainStyledBodies: [SubtitleCue.Body] = []
+            var plainPlacement: SubtitleTextPlacement?
             if sub.num_rects > 0, let rects = sub.rects {
                 for i in 0..<Int(sub.num_rects) {
                     guard let rect = rects[i] else { continue }
@@ -398,20 +489,12 @@ enum SubtitleDecoder {
                         }
                     } else if keepMarkup {
                         if let raw = line(for: rect) { lines.append(raw) }
-                    } else if let assLine = SubtitleRectText.rawASSLine(for: rect),
-                              let parsed = SubtitleRectText.styledBody(fromASSEventLine: assLine,
-                                                                      playRes: assPlayRes) {
-                        // #233: SRT and WebVTT sidecars reach libavcodec's ASS conversion too,
-                        // so their markup survives here. Unstyled cues stay .text and merge
-                        // with their siblings below, exactly as the plain path did.
-                        placement = placement ?? parsed.placement
-                        if case .text(let t) = parsed.body {
-                            lines.append(t)
-                        } else {
-                            styledBodies.append(parsed.body)
+                        if plainCues != nil {
+                            appendPlainText(of: rect, lines: &plainLines, styledBodies: &plainStyledBodies,
+                                            placement: &plainPlacement)
                         }
-                    } else if let text = line(for: rect) {
-                        lines.append(text)
+                    } else {
+                        appendPlainText(of: rect, lines: &lines, styledBodies: &styledBodies, placement: &placement)
                     }
                 }
             }
@@ -421,6 +504,21 @@ enum SubtitleDecoder {
             // them), but the demuxer keeps them on the packet. An ASS `\an` / `\pos` still
             // wins, since that came from the payload itself.
             placement = placement ?? WebVTTCueSettings.placement(onPacket: pkt)
+            // #600: the plain-text reading of the same event, emitted the way the branch below
+            // emits it for a decode without preserveASSMarkup.
+            if plainCues != nil, endTime > startTime {
+                plainPlacement = plainPlacement ?? WebVTTCueSettings.placement(onPacket: pkt)
+                let plainMerged = plainLines
+                    .joined(separator: "\n")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !plainMerged.isEmpty {
+                    appendPlain(startTime: startTime, endTime: endTime, body: .text(plainMerged),
+                                placement: plainPlacement)
+                }
+                for body in plainStyledBodies {
+                    appendPlain(startTime: startTime, endTime: endTime, body: body, placement: plainPlacement)
+                }
+            }
 
             let merged = lines
                 .joined(separator: "\n")
@@ -459,11 +557,15 @@ enum SubtitleDecoder {
                     ? Double(flushSub.end_display_time) / 1000.0
                     : startOffset + 5.0
                 var lines: [String] = []
+                var plainLines: [String] = []
                 if flushSub.num_rects > 0, let rects = flushSub.rects {
                     for i in 0..<Int(flushSub.num_rects) {
                         guard let rect = rects[i] else { continue }
                         if let text = line(for: rect) {
                             lines.append(text)
+                        }
+                        if plainCues != nil, let text = SubtitleRectText.plainText(for: rect) {
+                            plainLines.append(text)
                         }
                     }
                 }
@@ -476,6 +578,10 @@ enum SubtitleDecoder {
                 let endTime = lastPktPTS + endOffset
                 if !merged.isEmpty && endTime > startTime {
                     append(startTime: startTime, endTime: endTime, body: .text(merged), placement: nil)
+                }
+                let plainMerged = plainLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                if !plainMerged.isEmpty && endTime > startTime {
+                    appendPlain(startTime: startTime, endTime: endTime, body: .text(plainMerged), placement: nil)
                 }
             }
         }
@@ -501,8 +607,18 @@ enum SubtitleDecoder {
             nextID += 1
         }
 
+        /// The plain-text reading has no resource policy of its own: only the load-time store fill
+        /// asks for it, and that decode runs without one.
+        private func appendPlain(startTime: Double, endTime: Double,
+                                 body: SubtitleCue.Body, placement: SubtitleTextPlacement?) {
+            guard let count = plainCues?.count else { return }
+            plainCues?.append(SubtitleCue(id: count, startTime: startTime, endTime: endTime,
+                                          body: body, placement: placement))
+        }
+
         var result: SidecarDecodeResult {
-            SidecarDecodeResult(cues: cues.sorted { $0.startTime < $1.startTime }, assHeader: assHeader)
+            SidecarDecodeResult(cues: cues.sorted { $0.startTime < $1.startTime }, assHeader: assHeader,
+                                plainCues: plainCues?.sorted { $0.startTime < $1.startTime })
         }
     }
 
@@ -510,9 +626,9 @@ enum SubtitleDecoder {
 
     private static func decodeFileSync(
         url: URL, httpHeaders: [String: String],
-        preserveASSMarkup: Bool, requested: [Int32?]?, idleTimeout: TimeInterval, cancel: CancelFlag,
-        preparationPolicy: ExternalSubtitlePreparationPolicy?,
-        keepsBitmapPackets: Bool = false
+        preserveASSMarkup: Bool, alsoPlainText: Bool, requested: [Int32?]?, idleTimeout: TimeInterval,
+        cancel: CancelFlag, preparationPolicy: ExternalSubtitlePreparationPolicy?,
+        sequentialSource: Bool, keepsBitmapPackets: Bool = false
     ) throws -> [SidecarDecodeResult] {
         if let preparationPolicy {
             #if DEBUG
@@ -526,7 +642,7 @@ enum SubtitleDecoder {
         var avioReader: AVIOReader?
 
         if isHTTP {
-            let reader = AVIOReader(url: url, extraHeaders: httpHeaders,
+            let reader = AVIOReader(url: url, extraHeaders: httpHeaders, sequentialOnly: sequentialSource,
                                     streamIdleTimeout: idleTimeout)
             // Register BEFORE open(): open does a synchronous network probe (up to ~60 s on stalled origins);
             // cancellation during the probe must abort via markClosed rather than waiting for timeout (#32).
@@ -624,7 +740,8 @@ enum SubtitleDecoder {
                 continue
             }
             decodersByStream[index] = try StreamDecode(
-                streamIndex: index, stream: stream, preserveASSMarkup: preserveASSMarkup, preparationPolicy: preparationPolicy)
+                streamIndex: index, stream: stream, preserveASSMarkup: preserveASSMarkup,
+                alsoPlainText: alsoPlainText, preparationPolicy: preparationPolicy)
         }
 
         var reachedEOF = false

@@ -204,6 +204,7 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
             let authorizationID: ObjectIdentifier?
         }
         var authorizationsByKey: [Key: HTTPRequestAuthorization] = [:]
+        var sequentialByKey: [Key: Bool] = [:]
         var order: [Key] = []
         var targetsByKey: [Key: [AetherEngine.ExternalSubtitleFillJob.Target]] = [:]
         for (ordinal, track) in tracks.enumerated() where ordinal < stores.count {
@@ -213,6 +214,7 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
                               mediaHeaders: defaultHeaders),
                           authorizationID: track.source.httpRequestAuthorization.map(ObjectIdentifier.init))
             authorizationsByKey[key] = track.source.httpRequestAuthorization
+            sequentialByKey[key] = (sequentialByKey[key] ?? true) && track.source.readsSequentially
             if targetsByKey[key] == nil { order.append(key) }
             targetsByKey[key, default: []].append(
                 .init(streamIndex: track.source.sourceStreamIndex, store: stores[ordinal]))
@@ -220,7 +222,8 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
         return order.map {
             AetherEngine.ExternalSubtitleFillJob(url: $0.url, headers: $0.headers,
                                                  httpRequestAuthorization: authorizationsByKey[$0],
-                                                 targets: targetsByKey[$0] ?? [])
+                                                 targets: targetsByKey[$0] ?? [],
+                                                 sequentialSource: sequentialByKey[$0] ?? false)
         }
     }
 

@@ -29,6 +29,21 @@ Changes this fork carries on top of upstream.
   DTS:X keep the channel bridge whatever `objectAudioRendering` asks, and
   `DualLayerDolbyVision` and `DolbyVisionStillReshaping` stay off.
 
+- **Silo fork: a load-declared sidecar is fetched once per selection (silo-apple#600).** Selecting a
+  track declared in `LoadOptions.externalSubtitles` while its native-store fill was still reading the
+  file started a second decode of the same URL, and a server that extracts an embedded track reads the
+  whole source once per request. The selection now waits for that fill, showing the track as loading,
+  and backfills from it. A styled ASS track (`preserveASSMarkup`) backfills too: the fill decodes it
+  once with its markup and gives the store the plain-text reading of the same packets. A fill that
+  ends early or fails still hands the selection to its own decode and refetches, and so does a
+  bitmap sidecar the store cannot keep images for (VobSub, DVB; a `.sup` is an OCR track and never
+  joins the fill). Secondary selections and tracks added after load keep their own decode. A text
+  sidecar (`.srt`, `.ass`, `.ssa`, `.vtt`) is now read with one unranged request, in the fill and in
+  every selection's own decode: an origin that ignores Range and sends no length answered the ranged
+  open's tail, range and check requests with the whole body each time. That request has no
+  reconnect or retry, so one cut mid-file, refused, or unanswered falls back to the ranged open,
+  which resumes or retries it.
+
 - **Silo fork: a secondary ASS sidecar stays plain text.** Upstream #826 publishes raw ASS events and
   `secondarySidecarASSHeader` for a secondary sidecar when `preserveASSMarkup` is on. The fork keeps
   raw ASS on the primary overlay only, as it already does for an embedded secondary track, so a host
