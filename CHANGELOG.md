@@ -14,6 +14,15 @@ the public-API contract.
 
 Changes this fork carries on top of upstream.
 
+- **A relayed remote HLS load now reports what its media took to arrive, without the origin's wait.**
+  A host that judged the link from `networkThroughputMbps` on this route read AVPlayer's access log
+  on the loopback hop, which times a segment request from when it was sent. A transcode server
+  answers only once its encoder has written the segment, so a slow encode (or a burn-in, a source
+  read, a node starting) read as a slow link, and Silo learned it as the device's bandwidth limit
+  for a day. `LiveTelemetry.relayMediaReceivedBytes` and `relayMediaReceivingMs` now carry the
+  relay's own count: media bodies timed from their first byte to their last, bodies under 1 s
+  left out, overlapping time counted once.
+
 - **A Matroska title on the frame grid no longer flashes a frame at segment starts.** AE#886 moves
   each 23.976 (or 29.97, 59.94, ...) DTS onto its 1/24000 slot, or rescales it when the PTS is off
   the grid, but a held packet's duration was still measured on the 1 ms source time base. Where

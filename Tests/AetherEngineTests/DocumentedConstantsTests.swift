@@ -31,6 +31,11 @@ final class DocumentedConstantsTests: XCTestCase {
         assertDocumented("Quarantine is bounded to 96 MiB and 10,000 packets", try documentation())
     }
 
+    func testRelayMediaTimingMinimumMatchesDocumentation() throws {
+        XCTAssertEqual(RelayTransferMeter.minimumReceivingMs, 1_000)
+        assertDocumented("Bodies that arrived in under 1 s", try documentation())
+    }
+
     func testAuthorizedResourceDeadlineMatchesDocumentation() throws {
         XCTAssertEqual(HTTPRequestAuthorization.resourceTransferTimeout, 20)
         assertDocumented("**20 second** deadline", try documentation())

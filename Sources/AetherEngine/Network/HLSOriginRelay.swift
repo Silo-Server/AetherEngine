@@ -92,6 +92,13 @@ final class HLSOriginRelay: @unchecked Sendable {
     private let heldBodyLimit: Int
     private let pendingLimit: Int
 
+    /// Silo fork: times the media bodies this relay receives from the origin, from their first byte to
+    /// their last (`RelayTransferMeter`).
+    private let transferMeter = RelayTransferMeter()
+
+    /// What the media bodies this relay received took to arrive, counted only while they were arriving.
+    var mediaTransferTotals: RelayTransferMeter.Totals { transferMeter.totals }
+
     /// Audit NET-107: fetches cut off because the consumer fell `pendingLimit` bytes behind. Diagnostics and tests.
     var cappedFetchCount: Int {
         stateLock.lock(); defer { stateLock.unlock() }
@@ -437,7 +444,7 @@ final class HLSOriginRelay: @unchecked Sendable {
         }
     }
 
-    private static func looksLikePlaylist(url: URL, contentType: String?) -> Bool {
+    static func looksLikePlaylist(url: URL, contentType: String?) -> Bool {
         if let type = contentType?.lowercased(), type.contains("mpegurl") || type.contains("m3u") {
             return true
         }
@@ -673,7 +680,9 @@ final class HLSOriginRelay: @unchecked Sendable {
             for: origin, label: "relay", timeout: slotWait)
         defer { OriginRequestBudget.shared.release(ticket) }
 
-        let pump = UpstreamPump(hardCapBytes: pendingLimit) { [weak self] in
+        // A sidecar relay's bodies and a body read whole for the engine are not media the player streams.
+        let pump = UpstreamPump(hardCapBytes: pendingLimit,
+                                transferMeter: rawResources || forceHold ? nil : transferMeter) { [weak self] in
             guard let self else { return }
             self.stateLock.lock()
             self._cappedFetchCount += 1
@@ -868,9 +877,14 @@ private final class UpstreamPump: NSObject, URLSessionDataDelegate, @unchecked S
 
     private let hardCapBytes: Int
     private let onCapped: @Sendable () -> Void
+    private let transferMeter: RelayTransferMeter?
+    /// Set from the response head when the body is media, before its first byte; read on the same
+    /// delegate queue.
+    private var timedTransfer: RelayTransferMeter.Transfer?
 
-    init(hardCapBytes: Int, onCapped: @escaping @Sendable () -> Void) {
+    init(hardCapBytes: Int, transferMeter: RelayTransferMeter? = nil, onCapped: @escaping @Sendable () -> Void) {
         self.hardCapBytes = hardCapBytes
+        self.transferMeter = transferMeter
         self.onCapped = onCapped
     }
 
@@ -970,6 +984,11 @@ private final class UpstreamPump: NSObject, URLSessionDataDelegate, @unchecked S
             completionHandler(.cancel)
             return
         }
+        if let transferMeter, let url = http.url,
+           RelayTransferMeter.timesBody(url: url, status: http.statusCode,
+                                        contentType: http.value(forHTTPHeaderField: "Content-Type")) {
+            timedTransfer = transferMeter.begin()
+        }
         condition.lock()
         head = http
         condition.broadcast()
@@ -978,6 +997,9 @@ private final class UpstreamPump: NSObject, URLSessionDataDelegate, @unchecked S
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        // Timed as it lands, before anything else happens to it: an arrival is a fact about the link
+        // whether or not the consumer is still there to take it.
+        if let timedTransfer { transferMeter?.received(data.count, on: timedTransfer) }
         condition.lock()
         var stop = consumerGaveUp || capped
         var newlyCapped = false

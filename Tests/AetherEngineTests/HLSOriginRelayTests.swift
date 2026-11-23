@@ -431,6 +431,46 @@ struct HLSOriginRelayAddressingTests {
         return (Date().timeIntervalSince(started), String(decoding: buffer[0..<read], as: UTF8.self))
     }
 
+    @Test("Silo fork: a media body is timed from its first byte, so the origin's wait before it is no link time")
+    func mediaTransferIsTimedWhileBytesArrive() async throws {
+        // A transcode server answers a segment only once its encoder has written all of it: a silent
+        // request, then a body at the link's full rate. AVPlayer's access log on the loopback hop counts
+        // that silence as transfer time, so a slow encoder read as a slow link and was learned as this
+        // device's bandwidth limit. The relay times the body itself.
+        let produced = try #require(await TricklingOrigin(slices: 8, pauseSeconds: 0, headDelaySeconds: 1.5))
+        defer { produced.stop() }
+        // A subtitle rendition the server streams while it extracts the track: slow, but not media.
+        let subtitle = try #require(await TricklingOrigin(slices: 8, pauseSeconds: 0.2, contentType: "text/vtt"))
+        defer { subtitle.stop() }
+        // A segment the link itself delivers slowly: eight slices over 2.8 s, far enough past the 1 s
+        // minimum that a late first delivery on a loaded runner still leaves a counted body.
+        let slow = try #require(await TricklingOrigin(slices: 8, pauseSeconds: 0.4))
+        defer { slow.stop() }
+        let relay = HLSOriginRelay()
+        let server = HLSLocalServer(relay: relay)
+        try server.start()
+        defer { server.stop(); relay.stop() }
+
+        for upstream in [produced, subtitle] {
+            let body = try await relayed(port: upstream.port, through: server)
+            #expect(body == TricklingOrigin.totalBytes(slices: 8))
+        }
+        #expect(relay.mediaTransferTotals == .init(), "counted \(relay.mediaTransferTotals)")
+
+        #expect(try await relayed(port: slow.port, through: server) == TricklingOrigin.totalBytes(slices: 8))
+        let timed = relay.mediaTransferTotals
+        #expect(timed.receivingMs >= 1_000, "timed \(timed)")
+        #expect(timed.bytes > 0 && timed.bytes < Int64(TricklingOrigin.totalBytes(slices: 8)), "timed \(timed)")
+    }
+
+    private func relayed(port: UInt16, through server: HLSLocalServer) async throws -> Int {
+        let entry = try #require(server.relayURL(for: URL(string: "http://127.0.0.1:\(port)/segment.m4s")!))
+        var request = URLRequest(url: entry)
+        request.timeoutInterval = 30
+        let (body, _) = try await URLSession.shared.data(for: request)
+        return body.count
+    }
+
     @Test("A body of unstated length is held, and held is not the same as rewritten")
     func heldMediaIsStillMedia() async throws {
         // A body with no Content-Length cannot be framed for the player without measuring it, so it
@@ -502,18 +542,24 @@ struct HLSOriginRelayAddressingTests {
         var port: UInt16 { launched.port }
         private let launched: PythonOrigin.Launched
 
-        init?(slices: Int = 8, pauseSeconds: Double = 0.05, declaresLength: Bool = true) async {
+        /// - Parameters:
+        ///   - headDelaySeconds: how long the origin holds a request before it answers, as a server
+        ///     producing the segment first does.
+        init?(slices: Int = 8, pauseSeconds: Double = 0.05, declaresLength: Bool = true,
+              headDelaySeconds: Double = 0, contentType: String = "video/mp2t") async {
             guard let launched = await PythonOrigin.launch(
                 prefix: "aether-trickle-origin",
                 script: Self.serverPy(slices: slices, pauseSeconds: pauseSeconds,
-                                      declaresLength: declaresLength))
+                                      declaresLength: declaresLength, headDelaySeconds: headDelaySeconds,
+                                      contentType: contentType))
             else { return nil }
             self.launched = launched
         }
 
         func stop() { launched.stop() }
 
-        private static func serverPy(slices: Int, pauseSeconds: Double, declaresLength: Bool)
+        private static func serverPy(slices: Int, pauseSeconds: Double, declaresLength: Bool,
+                                     headDelaySeconds: Double, contentType: String)
             -> String
         {
             """
@@ -523,6 +569,8 @@ struct HLSOriginRelayAddressingTests {
             SLICES = \(slices)
             PAUSE = \(pauseSeconds)
             DECLARE = \(declaresLength ? "True" : "False")
+            HEAD_DELAY = \(headDelaySeconds)
+            CONTENT_TYPE = "\(contentType)"
 
             class Handler(http.server.BaseHTTPRequestHandler):
                 protocol_version = "HTTP/1.1"
@@ -531,6 +579,7 @@ struct HLSOriginRelayAddressingTests {
                     pass
 
                 def do_GET(self):
+                    time.sleep(HEAD_DELAY)
                     self.send_response(200)
                     if DECLARE:
                         self.send_header("Content-Length", str(SLICE * SLICES))
@@ -539,7 +588,7 @@ struct HLSOriginRelayAddressingTests {
                         # reports -1 for it, which is the arm that has to be held rather than framed.
                         self.send_header("Connection", "close")
                         self.close_connection = True
-                    self.send_header("Content-Type", "video/mp2t")
+                    self.send_header("Content-Type", CONTENT_TYPE)
                     self.end_headers()
                     for _ in range(SLICES):
                         try:

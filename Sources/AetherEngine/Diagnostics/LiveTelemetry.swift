@@ -94,6 +94,22 @@ public struct LiveTelemetry: Equatable, Sendable {
     /// Bytes pulled from the SOURCE in the session, across every demuxer it has had. The origin-side
     /// counterpart to `networkTransferredBytes`, and the one that is about the same link on both paths.
     public let demuxerBytesFetched: Int64
+    /// Silo fork: on a relayed remote HLS load (`LoadOptions.httpRequestAuthorization`, or an origin the
+    /// system's trust refuses while `EngineTLS.serverTrustEvaluator` is set), the bytes of the media
+    /// bodies the relay received from the origin after each body's first chunk, as a running total for
+    /// the relay. The first chunk arrives before anything times it, so its bytes stay out. A body that
+    /// arrived in under 1 s, a subtitle rendition and a playlist do not count. nil without a relay; a
+    /// new load's relay starts again from 0. `relayMediaReceivingMs` is the time they took.
+    public let relayMediaReceivedBytes: Int64?
+    /// Silo fork: the milliseconds the bodies in `relayMediaReceivedBytes` spent arriving, each timed
+    /// from its first byte to its last, with time in which several were arriving counted once. The time
+    /// an origin takes to produce a segment before it answers is not in it, where
+    /// `networkThroughputMbps` (AVPlayer's access log on the loopback hop) reads that wait as transfer
+    /// time. The quotient of the two totals is a lower bound on the link's rate while it delivered. The
+    /// quotient of a difference between two readings is not: a body that reaches 1 s adds all its
+    /// bytes at once, while time it shared with a body counted earlier is already in the earlier
+    /// reading.
+    public let relayMediaReceivingMs: Int64?
     public let audioBridgeLiveBytes: Int
     public let rssMb: Int
 
@@ -120,6 +136,8 @@ public struct LiveTelemetry: Equatable, Sendable {
         serverBytesSentLifetime: Int64,
         serverRequestCount: Int,
         demuxerBytesFetched: Int64,
+        relayMediaReceivedBytes: Int64? = nil,
+        relayMediaReceivingMs: Int64? = nil,
         audioBridgeLiveBytes: Int,
         rssMb: Int
     ) {
@@ -145,6 +163,8 @@ public struct LiveTelemetry: Equatable, Sendable {
         self.serverBytesSentLifetime = serverBytesSentLifetime
         self.serverRequestCount = serverRequestCount
         self.demuxerBytesFetched = demuxerBytesFetched
+        self.relayMediaReceivedBytes = relayMediaReceivedBytes
+        self.relayMediaReceivingMs = relayMediaReceivingMs
         self.audioBridgeLiveBytes = audioBridgeLiveBytes
         self.rssMb = rssMb
     }

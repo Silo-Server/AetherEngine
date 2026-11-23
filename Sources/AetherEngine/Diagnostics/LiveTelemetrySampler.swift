@@ -429,6 +429,7 @@ final class LiveTelemetrySampler {
         }
 
         let softwareCache = engine.softwarePacketCacheSnapshot
+        let relayTransfer = engine.remoteHLSSubtitleProxy?.server.relay?.mediaTransferTotals
         let snapshot = LiveTelemetry(
             instantBitrateMbps: instantBitrateMbps,
             averageBitrateMbps: averageBitrateMbps,
@@ -452,6 +453,8 @@ final class LiveTelemetrySampler {
             serverBytesSentLifetime: engine.serverBytesSentLifetime,
             serverRequestCount: engine.serverRequestCount,
             demuxerBytesFetched: demuxerBytes,
+            relayMediaReceivedBytes: relayTransfer?.bytes,
+            relayMediaReceivingMs: relayTransfer?.receivingMs,
             audioBridgeLiveBytes: engine.audioBridgeLiveBytes,
             rssMb: AetherEngine.residentMemoryMB()
         )
